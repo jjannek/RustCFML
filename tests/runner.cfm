@@ -149,6 +149,7 @@ try { include "compat_engine/test_edge_cases.cfm"; } catch (any e) { writeOutput
 try { include "compat_engine/test_scope_behavior.cfm"; } catch (any e) { writeOutput("ERROR | compat_engine/test_scope_behavior.cfm | " & e.message & chr(10)); }
 try { include "native/test_native_fn.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_fn.cfm | " & e.message & chr(10)); }
 try { include "native/test_native_class.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_class.cfm | " & e.message & chr(10)); }
+try { include "native/test_native_thread.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_thread.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
