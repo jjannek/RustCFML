@@ -1,0 +1,16 @@
+[package]
+name = "greeter"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Relative path back to crates/cli inside this repo. For your own apps
+# outside the RustCFML checkout, replace this with an absolute path to your
+# checkout's crates/cli, e.g.
+#   rustcfml-cli = { path = "/path/to/RustCFML/crates/cli" }
+# (Once rustcfml-cli ships on crates.io this will become a version dep.)
+rustcfml-cli = { path = "../../../../crates/cli" }

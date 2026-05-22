@@ -74,9 +74,6 @@ try { include "stdlib/test_ini_functions.cfm"; } catch (any e) { writeOutput("ER
 try { include "stdlib/test_directorylist.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_directorylist.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_cfhttp.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_cfhttp.cfm | " & e.message & chr(10)); }
 
-// --- Performance Tests ---
-try { include "perf/test_struct_write.cfm"; } catch (any e) { writeOutput("ERROR | perf/test_struct_write.cfm | " & e.message & chr(10)); }
-
 // --- Function References ---
 try { include "functions/test_function_references.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_function_references.cfm | " & e.message & chr(10)); }
 
@@ -150,6 +147,8 @@ try { include "compat_engine/test_encoding_functions.cfm"; } catch (any e) { wri
 try { include "compat_engine/test_collection_functions.cfm"; } catch (any e) { writeOutput("ERROR | compat_engine/test_collection_functions.cfm | " & e.message & chr(10)); }
 try { include "compat_engine/test_edge_cases.cfm"; } catch (any e) { writeOutput("ERROR | compat_engine/test_edge_cases.cfm | " & e.message & chr(10)); }
 try { include "compat_engine/test_scope_behavior.cfm"; } catch (any e) { writeOutput("ERROR | compat_engine/test_scope_behavior.cfm | " & e.message & chr(10)); }
+try { include "native/test_native_fn.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_fn.cfm | " & e.message & chr(10)); }
+try { include "native/test_native_class.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_class.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

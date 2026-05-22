@@ -182,6 +182,51 @@ The embedded virtual filesystem is **read-only and non-persistent** — there is
 
 No JRE, no runtime, no dependencies. Compare: Lucee/BoxLang require a 200+ MB JRE.
 
+#### Native (Rust) Modules
+
+Self-contained binaries can include user-authored Rust code that surfaces as
+first-class CFML built-ins and classes. When `rustcfml --build` finds a
+`native/<crate>/Cargo.toml` inside your app dir, it generates a Cargo
+workspace and compiles your modules into the binary alongside the CFML.
+
+```
+myapp/
+├── main.cfm
+└── native/
+    └── greeter/
+        ├── Cargo.toml
+        └── src/lib.rs   — pub fn register(vm: &mut Vm)
+```
+
+In `src/lib.rs`:
+
+```rust
+use rustcfml_cli::{CfmlNative, CfmlResult, Value, Vm};
+
+pub fn register(vm: &mut Vm) {
+    vm.register_native_fn("rustGreet", |args| {
+        let name = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+        Ok(Value::String(format!("Hello, {}", name)))
+    });
+    vm.register_native_class("Tally", tally_new);
+}
+```
+
+In your CFML:
+
+```cfml
+writeOutput(rustGreet("Alex"));         // Hello, Alex
+counter = createObject("rust", "Tally");
+counter.bump();
+```
+
+Working example: [`examples/native_module_demo/`](examples/native_module_demo/).
+
+**Requirements.** `cargo`/`rustc` on PATH at build time (the standard Rust
+toolchain — install from https://rustup.rs). End users running the
+produced binary need nothing extra. Plain CFML apps with no `native/`
+directory keep the original toolchain-free bundling path.
+
 ## Performance
 
 Benchmarked serving a "Hello World" `.cfm` page using Apache Bench (`ab -n 100 -c 1`):
