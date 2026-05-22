@@ -21,7 +21,7 @@ This is **bold**, this is *italic*, and this is `code`.
 let x = 42;
 ```
 
-[Project repo](https://github.com/pixl8/RustCFML)
+[Project repo](https://github.com/RustCFML/RustCFML)
 ";
 
 // Default to the inline sample; if stdin has data, render that instead.

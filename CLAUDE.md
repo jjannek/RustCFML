@@ -150,4 +150,4 @@ Add bytecode cache for serve mode, fix all build warnings
 - Compatibility target: [cfdocs.org](https://cfdocs.org) (functions and tags)
 - [Work.md](Work.md) — detailed implementation status
 - [TESTING.md](TESTING.md) — testing guide
-- Repo: github.com/pixl8/RustCFML
+- Repo: github.com/RustCFML/RustCFML

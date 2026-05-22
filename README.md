@@ -18,7 +18,7 @@ RustCFML requires Rust stable (>= 1.75.0). Install via [rustup.rs](https://rustu
 ### Building from Source
 
 ```plaintext
-git clone https://github.com/pixl8/RustCFML.git
+git clone https://github.com/RustCFML/RustCFML.git
 cd RustCFML
 cargo build --release
 ```
