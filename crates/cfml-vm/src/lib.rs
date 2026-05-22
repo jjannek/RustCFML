@@ -581,32 +581,45 @@ impl CfmlVirtualMachine {
     /// stack push/pop round-trip. Used by LoadLocalProperty.
     fn lookup_property(obj: &CfmlValue, name: &str) -> CfmlValue {
         match obj {
-            CfmlValue::Struct(s) => s
-                .get(name)
-                .or_else(|| s.get(&name.to_uppercase()))
-                .or_else(|| s.get(&name.to_lowercase()))
-                .or_else(|| {
-                    let name_lower = name.to_lowercase();
-                    s.iter()
-                        .find(|(k, _)| k.to_lowercase() == name_lower)
-                        .map(|(_, v)| v)
-                })
-                .or_else(|| {
-                    if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+            CfmlValue::Struct(s) => {
+                let val = s
+                    .get(name)
+                    .or_else(|| s.get(&name.to_uppercase()))
+                    .or_else(|| s.get(&name.to_lowercase()))
+                    .or_else(|| {
                         let name_lower = name.to_lowercase();
-                        vars.get(name)
-                            .or_else(|| vars.get(&name_lower))
-                            .or_else(|| {
-                                vars.iter()
-                                    .find(|(k, _)| k.to_lowercase() == name_lower)
-                                    .map(|(_, v)| v)
-                            })
-                    } else {
-                        None
+                        s.iter()
+                            .find(|(k, _)| k.to_lowercase() == name_lower)
+                            .map(|(_, v)| v)
+                    })
+                    .or_else(|| {
+                        if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+                            let name_lower = name.to_lowercase();
+                            vars.get(name)
+                                .or_else(|| vars.get(&name_lower))
+                                .or_else(|| {
+                                    vars.iter()
+                                        .find(|(k, _)| k.to_lowercase() == name_lower)
+                                        .map(|(_, v)| v)
+                                })
+                        } else {
+                            None
+                        }
+                    })
+                    .cloned();
+                if let Some(v) = val {
+                    return v;
+                }
+                // Fall through to a Rust-backed parent if one is attached.
+                if let Some(CfmlValue::NativeObject(parent)) = s.get("__super") {
+                    if let Ok(guard) = parent.read() {
+                        if let Some(v) = guard.get_property(name) {
+                            return v;
+                        }
                     }
-                })
-                .cloned()
-                .unwrap_or(CfmlValue::Null),
+                }
+                CfmlValue::Null
+            }
             CfmlValue::Array(arr) => {
                 if name.eq_ignore_ascii_case("len") || name.eq_ignore_ascii_case("length") {
                     CfmlValue::Int(arr.len() as i64)
@@ -2146,6 +2159,26 @@ impl CfmlVirtualMachine {
                     // gets the local struct, sets the property, stores back.
                     if let Some(value) = stack.pop() {
                         if let Some(obj) = locals.get_mut(local_name.as_str()) {
+                            // CFC with a Rust-backed parent: try the native
+                            // setter first; None defers to the CFC struct.
+                            if let CfmlValue::Struct(ref s) = *obj {
+                                if let Some(CfmlValue::NativeObject(parent)) =
+                                    s.get("__super").cloned()
+                                {
+                                    let handled = {
+                                        let mut guard = parent.write().map_err(|_| {
+                                            CfmlError::runtime(
+                                                "NativeObject lock poisoned".to_string(),
+                                            )
+                                        })?;
+                                        guard.set_property(prop_name, value.clone())
+                                    };
+                                    if let Some(result) = handled {
+                                        result?;
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Some(s) = obj.as_struct_mut() {
                                 s.insert(prop_name.clone(), value);
                             } else {
@@ -2192,8 +2225,24 @@ impl CfmlVirtualMachine {
                                             None
                                         }
                                     })
-                                    .cloned()
-                                    .unwrap_or(CfmlValue::Null);
+                                    .cloned();
+                                let val = match val {
+                                    Some(v) => v,
+                                    None => {
+                                        // Fall through to a Rust-backed parent if attached.
+                                        if let Some(CfmlValue::NativeObject(parent)) =
+                                            s.get("__super")
+                                        {
+                                            if let Ok(guard) = parent.read() {
+                                                guard.get_property(name).unwrap_or(CfmlValue::Null)
+                                            } else {
+                                                CfmlValue::Null
+                                            }
+                                        } else {
+                                            CfmlValue::Null
+                                        }
+                                    }
+                                };
                                 stack.push(val);
                             }
                             CfmlValue::Array(arr) => {
@@ -2261,6 +2310,29 @@ impl CfmlVirtualMachine {
                 BytecodeOp::SetProperty(name) => {
                     if let Some(value) = stack.pop() {
                         if let Some(mut obj) = stack.pop() {
+                            // CFC with a Rust-backed parent: route writes the
+                            // native side recognises before touching the CFC
+                            // struct, so Rust state stays first-class. The
+                            // parent returns None to defer to the CFC.
+                            if let CfmlValue::Struct(ref s) = obj {
+                                if let Some(CfmlValue::NativeObject(parent)) =
+                                    s.get("__super").cloned()
+                                {
+                                    let handled = {
+                                        let mut guard = parent.write().map_err(|_| {
+                                            CfmlError::runtime(
+                                                "NativeObject lock poisoned".to_string(),
+                                            )
+                                        })?;
+                                        guard.set_property(name, value.clone())
+                                    };
+                                    if let Some(result) = handled {
+                                        result?;
+                                        stack.push(obj);
+                                        continue;
+                                    }
+                                }
+                            }
                             // If setting on a CFC struct with declared properties,
                             // also update __variables for properties declared via
                             // `property name="x"` so they're accessible unscoped in methods.
@@ -2324,6 +2396,9 @@ impl CfmlVirtualMachine {
 
                         // Resolve inheritance chain
                         let instance = self.resolve_inheritance(template, &locals);
+
+                        // Attach a Rust-class parent if extends="rust:Name"
+                        let instance = self.attach_native_parent(instance)?;
 
                         // Validate interface implementation and collect transitive interfaces
                         let instance = if let CfmlValue::Struct(ref s) = instance {
@@ -3238,6 +3313,48 @@ impl CfmlVirtualMachine {
                     if let Some(frame) = self.call_stack.last_mut() {
                         frame.line = *line;
                     }
+                }
+
+                BytecodeOp::CallRustSuperCtor(arg_count) => {
+                    let mut ctor_args: Vec<CfmlValue> =
+                        (0..*arg_count).filter_map(|_| stack.pop()).collect();
+                    ctor_args.reverse();
+
+                    let this_val = locals.get("this").cloned().ok_or_else(|| {
+                        CfmlError::runtime(
+                            "super(...) called outside of a CFC method".to_string(),
+                        )
+                    })?;
+                    let mut this_struct = match this_val {
+                        CfmlValue::Struct(s) => s,
+                        _ => {
+                            return Err(CfmlError::runtime(
+                                "super(...) requires `this` to be a component instance".to_string(),
+                            ));
+                        }
+                    };
+                    let rust_class = match this_struct.get("__rust_extends") {
+                        Some(CfmlValue::String(n)) => n.clone(),
+                        _ => {
+                            return Err(CfmlError::runtime(
+                                "super(...) is only valid in a CFC that extends a rust: class"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    let key = rust_class.to_lowercase();
+                    let ctor = self.native_classes.get(&key).copied().ok_or_else(|| {
+                        CfmlError::runtime(format!(
+                            "No native (Rust) class registered with name '{}'",
+                            rust_class
+                        ))
+                    })?;
+                    let parent = ctor(ctor_args)?;
+                    Arc::make_mut(&mut this_struct).insert("__super".to_string(), parent);
+                    let new_this = CfmlValue::Struct(this_struct);
+                    locals.insert("this".to_string(), new_this.clone());
+                    self.method_this_writeback = Some(new_this);
+                    stack.push(CfmlValue::Null);
                 }
 
                 BytecodeOp::Halt => break,
@@ -5292,7 +5409,7 @@ impl CfmlVirtualMachine {
                                 self.resolve_component_template(&comp_name, parent_locals)
                             {
                                 let instance = self.resolve_inheritance(template, parent_locals);
-                                return Ok(instance);
+                                return self.attach_native_parent(instance);
                             }
                         } else if obj_type == "rust" {
                             let class_name = args[1].as_string();
@@ -8057,6 +8174,22 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // Rust-parent fall-through: a CFC that extends="rust:Name" carries
+        // its parent under __super as a NativeObject. If the method wasn't
+        // found on the CFC and didn't match an implicit accessor, dispatch
+        // it to the native parent. Mirrors how CFC-extends-CFC inheritance
+        // merges parent methods into the child — the Rust parent isn't
+        // merged, so it needs an explicit fall-through.
+        if let CfmlValue::Struct(ref s) = object {
+            if let Some(CfmlValue::NativeObject(parent_obj)) = s.get("__super").cloned() {
+                let args: Vec<CfmlValue> = extra_args.drain(..).collect();
+                let mut guard = parent_obj.write().map_err(|_| {
+                    CfmlError::runtime("NativeObject lock poisoned".to_string())
+                })?;
+                return guard.call_method(method, args);
+            }
+        }
+
         // onMissingMethod fallback for components
         if let CfmlValue::Struct(ref s) = object {
             let missing_handler = s
@@ -9333,6 +9466,29 @@ impl CfmlVirtualMachine {
         }
         visited.insert(parent_name.to_lowercase());
 
+        // Rust-class parent: no CFML template to merge. Stash the class name
+        // for createObject to construct, and record the prefixed name in the
+        // extends chain so isInstanceOf("rust:X") works.
+        if let Some(rust_class) = parent_name.strip_prefix("rust:") {
+            let mut child_map = match child {
+                CfmlValue::Struct(s) => s,
+                other => return other,
+            };
+            Arc::make_mut(&mut child_map).insert(
+                "__rust_extends".to_string(),
+                CfmlValue::String(rust_class.to_string()),
+            );
+            let mut chain = vec![CfmlValue::String(parent_name.to_string())];
+            if let Some(CfmlValue::Array(existing)) = child_map.get("__extends_chain") {
+                for item in existing.iter() {
+                    chain.push(item.clone());
+                }
+            }
+            Arc::make_mut(&mut child_map)
+                .insert("__extends_chain".to_string(), CfmlValue::array(chain));
+            return CfmlValue::Struct(child_map);
+        }
+
         // Temporarily set source_file to the child CFC's path so parent
         // resolution finds siblings in the same directory
         let old_source_file = if let CfmlValue::Struct(ref cs) = child {
@@ -9481,6 +9637,34 @@ impl CfmlVirtualMachine {
         }
 
         CfmlValue::Struct(parent_map)
+    }
+
+    /// If `instance` was marked with `__rust_extends` by resolve_inheritance_chain,
+    /// look up the native constructor, default-construct it, and stash the
+    /// resulting NativeObject under `__super`. Errors if the named class is
+    /// not registered. Idempotent: returns early if `__super` is already set.
+    fn attach_native_parent(&mut self, instance: CfmlValue) -> CfmlResult {
+        let mut s = match instance {
+            CfmlValue::Struct(s) => s,
+            other => return Ok(other),
+        };
+        let rust_class = match s.get("__rust_extends") {
+            Some(CfmlValue::String(n)) => n.clone(),
+            _ => return Ok(CfmlValue::Struct(s)),
+        };
+        if s.get("__super").is_some() {
+            return Ok(CfmlValue::Struct(s));
+        }
+        let key = rust_class.to_lowercase();
+        let ctor = self.native_classes.get(&key).copied().ok_or_else(|| {
+            CfmlError::runtime(format!(
+                "No native (Rust) class registered with name '{}'",
+                rust_class
+            ))
+        })?;
+        let parent = ctor(Vec::new())?;
+        Arc::make_mut(&mut s).insert("__super".to_string(), parent);
+        Ok(CfmlValue::Struct(s))
     }
 
     // ---------------------------------------------------------------------------
@@ -10798,6 +10982,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::Throw | BytecodeOp::Rethrow => (0, 1),
         // Method call: pops obj + args, pushes 1
         BytecodeOp::CallMethod(_, n, _) => (1, n + 1),
+        BytecodeOp::CallRustSuperCtor(n) => (1, *n),
         // Include
         BytecodeOp::Include(_) => (0, 0),
         BytecodeOp::IncludeDynamic => (0, 1),

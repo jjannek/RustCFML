@@ -93,6 +93,21 @@ impl cfml_common::dynamic::CfmlNative for Counter {
             ))),
         }
     }
+    fn get_property(&self, name: &str) -> Option<CfmlValue> {
+        match name.to_lowercase().as_str() {
+            "value" => Some(CfmlValue::Int(self.value)),
+            _ => None,
+        }
+    }
+    fn set_property(&mut self, name: &str, value: CfmlValue) -> Option<Result<(), CfmlError>> {
+        match name.to_lowercase().as_str() {
+            "value" => {
+                self.value = coerce_num(&value) as i64;
+                Some(Ok(()))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn counter_new(args: Vec<CfmlValue>) -> CfmlResult {

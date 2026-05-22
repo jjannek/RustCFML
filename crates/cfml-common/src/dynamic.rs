@@ -27,6 +27,24 @@ pub trait CfmlNative: Send + Sync + fmt::Debug {
     /// Invoke a method on the underlying Rust value. Return
     /// `Err(CfmlError::…)` for unknown methods or argument mismatches.
     fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult;
+
+    /// Optional property read. Used when a CFC declares
+    /// `extends="rust:Name"` and host code reads `this.X` (or `inst.X`)
+    /// for a key the CFC struct doesn't define. Default returns `None` —
+    /// the runtime falls back to the standard CFC property lookup.
+    /// Implementers expose Rust-side state to the CFC half by returning
+    /// `Some(value)` for the names they recognise.
+    fn get_property(&self, _name: &str) -> Option<CfmlValue> {
+        None
+    }
+
+    /// Optional property write. Mirrors `get_property`: return `None` to
+    /// let the CFC struct take the assignment, or `Some(Ok(()))` /
+    /// `Some(Err(…))` to indicate the native side handled (or rejected)
+    /// the write. Default returns `None`.
+    fn set_property(&mut self, _name: &str, _value: CfmlValue) -> Option<Result<(), crate::vm::CfmlError>> {
+        None
+    }
 }
 
 #[derive(Clone)]

@@ -11,4 +11,10 @@ counter.bump();
 counter.bump();
 counter.bump();
 writeOutput("Tally after 3 bumps: " & counter.value() & chr(10));
+
+// A CFC inherits from the Rust Tally class via extends="rust:Tally".
+boosted = createObject("component", "BoostedTally");
+writeOutput("BoostedTally.bumpBy(5) = " & boosted.bumpBy(5) & chr(10));
+// Implicit fall-through: the CFC has no .value() method, so it reaches Tally.
+writeOutput("BoostedTally.value() (parent method) = " & boosted.value() & chr(10));
 </cfscript>

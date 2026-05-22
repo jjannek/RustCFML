@@ -35,7 +35,14 @@ Expected output:
 Greeting from Rust: Hello, Alex (from Rust)
 2 + 3 (computed in Rust) = 5
 Tally after 3 bumps: 3
+BoostedTally.bumpBy(5) = 5
+BoostedTally.value() (parent method) = 5
 ```
+
+The last two lines come from `BoostedTally.cfc`, which declares
+`extends="rust:Tally"` — a CFC subclassing a Rust-backed class. The
+CFC defines `bumpBy(n)` on top of the parent's `bump()`, and unhandled
+calls (`value()`) fall through to the Rust parent automatically.
 
 The first build is slow (cargo compiles rustcfml-cli + all its dependencies
 into a brand-new binary, ~2 minutes cold). Subsequent rebuilds use cargo's

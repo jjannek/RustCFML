@@ -150,6 +150,7 @@ try { include "compat_engine/test_scope_behavior.cfm"; } catch (any e) { writeOu
 try { include "native/test_native_fn.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_fn.cfm | " & e.message & chr(10)); }
 try { include "native/test_native_class.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_class.cfm | " & e.message & chr(10)); }
 try { include "native/test_native_thread.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_thread.cfm | " & e.message & chr(10)); }
+try { include "native/test_cfc_extends_rust.cfm"; } catch (any e) { writeOutput("ERROR | native/test_cfc_extends_rust.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

@@ -102,9 +102,10 @@ Examples of VM-intercepted: `writeOutput`, `writeDump`, `sleep`, `include`, all 
 
 Users can extend a self-contained binary with first-class Rust BIFs and classes. The plumbing:
 
-- `CfmlValue::NativeObject(Arc<RwLock<dyn CfmlNative>>)` in `cfml-common/src/dynamic.rs`. The `CfmlNative` trait (`Send + Sync + Debug`) exposes `class_name()` + `call_method(name, args)`.
+- `CfmlValue::NativeObject(Arc<RwLock<dyn CfmlNative>>)` in `cfml-common/src/dynamic.rs`. The `CfmlNative` trait (`Send + Sync + Debug`) exposes `class_name()` + `call_method(name, args)`, with optional `get_property`/`set_property` (default-impls return None) for CFC `this.X` fall-through.
 - `vm.register_native_fn(name, f)` and `vm.register_native_class(name, ctor)` (`cfml-vm/src/lib.rs`).
 - `createObject("rust", "Name", ...)` consults `vm.native_classes` before falling through. Method dispatch short-circuits in `call_member_function()` for `NativeObject`.
+- CFC inheritance from a Rust class: `component extends="rust:Name" { ... }`. `resolve_inheritance_chain` (`cfml-vm/src/lib.rs`) detects the `rust:` prefix and stashes `__rust_extends`; `attach_native_parent` default-constructs the parent into `__super`. `super(args)` inside `init` is compiled to `BytecodeOp::CallRustSuperCtor` which re-runs the registered ctor. `super.X` and unqualified method fall-through both reach the native parent. `this.X` reads/writes route through `CfmlNative::get_property`/`set_property` when CFC has no such key.
 - The `rustcfml-cli` crate is lib+bin. Library exposes `set_registrar` / `run_with_registrar` so externally-generated `main.rs` can inject modules.
 - `rustcfml --build` runs the "cocktail" path when a project contains `native/<crate>/Cargo.toml`: generates a synthetic Cargo workspace under `.rustcfml-cocktail/`, path-deps on `rustcfml-cli` + each user module, shells out to `cargo build --release`, then appends the VFS archive to the produced binary. Plain CFML apps with no `native/` directory stay on the toolchain-free bundling path.
 - The smoke-test in `crates/cli/src/main.rs` is gated on `RUSTCFML_NATIVE_SMOKE_TEST=1` and exercises `tests/native/*.cfm` end-to-end without needing the full cocktail build.

@@ -235,6 +235,12 @@ pub enum BytecodeOp {
     // Named function call: like Call but carries argument names for name-to-param mapping
     // (names, arg_count) — names[i] corresponds to the i-th arg on the stack
     CallNamed(Vec<String>, usize),
+
+    // Explicit super(args) constructor call for a CFC whose parent is a Rust class.
+    // Pops arg_count values, looks up the constructor registered under
+    // this.__rust_extends, calls it, and stores the new NativeObject on
+    // this.__super (replacing any default-constructed one). Pushes Null.
+    CallRustSuperCtor(usize),
 }
 
 impl CfmlCompiler {
@@ -2289,6 +2295,18 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::GetIndex);
             }
             Expression::FunctionCall(call) => {
+                // Special-case: super(args) — explicit Rust-parent ctor call from
+                // inside a CFC init() method. Compile args then emit a dedicated
+                // op that re-runs the registered constructor and replaces
+                // this.__super with the freshly-built NativeObject.
+                if matches!(&*call.name, Expression::Super(_)) {
+                    let n = call.arguments.len();
+                    for arg in &call.arguments {
+                        self.compile_expression(arg, instructions);
+                    }
+                    instructions.push(BytecodeOp::CallRustSuperCtor(n));
+                    return;
+                }
                 // Special-case: isDefined("varName") -> IsDefined bytecode
                 if let Expression::Identifier(ident) = &*call.name {
                     if ident.name.to_lowercase() == "isdefined" && call.arguments.len() == 1 {
