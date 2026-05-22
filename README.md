@@ -11,7 +11,7 @@ ColdFusion is a registered trademark of Adobe Inc. This project is not affiliate
 
 ## Usage
 
-**[Try RustCFML in your browser](https://pixl8.github.io/RustCFML/demo/)** — interactive demo running on WebAssembly.
+**[Try RustCFML in your browser](https://rustcfml.github.io/RustCFML/demo/)** — interactive demo running on WebAssembly.
 
 RustCFML requires Rust stable (>= 1.75.0). Install via [rustup.rs](https://rustup.rs/).
 
