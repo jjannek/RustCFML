@@ -98,6 +98,18 @@ Examples of VM-intercepted: `writeOutput`, `writeDump`, `sleep`, `include`, all 
 2. Use the harness: `suiteBegin("Name")`, `assert("label", actual, expected)`, `suiteEnd()`
 3. Add `try { include "category/test_file.cfm"; } catch ...` line in `tests/runner.cfm`
 
+### Native (Rust) modules
+
+Users can extend a self-contained binary with first-class Rust BIFs and classes. The plumbing:
+
+- `CfmlValue::NativeObject(Arc<RwLock<dyn CfmlNative>>)` in `cfml-common/src/dynamic.rs`. The `CfmlNative` trait (`Send + Sync + Debug`) exposes `class_name()` + `call_method(name, args)`.
+- `vm.register_native_fn(name, f)` and `vm.register_native_class(name, ctor)` (`cfml-vm/src/lib.rs`).
+- `createObject("rust", "Name", ...)` consults `vm.native_classes` before falling through. Method dispatch short-circuits in `call_member_function()` for `NativeObject`.
+- The `rustcfml-cli` crate is lib+bin. Library exposes `set_registrar` / `run_with_registrar` so externally-generated `main.rs` can inject modules.
+- `rustcfml --build` runs the "cocktail" path when a project contains `native/<crate>/Cargo.toml`: generates a synthetic Cargo workspace under `.rustcfml-cocktail/`, path-deps on `rustcfml-cli` + each user module, shells out to `cargo build --release`, then appends the VFS archive to the produced binary. Plain CFML apps with no `native/` directory stay on the toolchain-free bundling path.
+- The smoke-test in `crates/cli/src/main.rs` is gated on `RUSTCFML_NATIVE_SMOKE_TEST=1` and exercises `tests/native/*.cfm` end-to-end without needing the full cocktail build.
+- Working example: `examples/native_module_demo/`. Module author contract documented in its README.
+
 ## Important Conventions
 
 - **Case-insensitive**: All CFML identifiers, function names, scope keys are case-insensitive. Use `.to_lowercase()` or `eq_ignore_ascii_case()` for comparisons.
