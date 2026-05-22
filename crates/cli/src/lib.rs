@@ -2,7 +2,6 @@ mod rewrite;
 
 use clap::Parser;
 use std::collections::HashMap;
-use indexmap::IndexMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -23,6 +22,9 @@ use cfml_vm::{CfmlVirtualMachine, ServerState, compile_file_cached};
 pub use cfml_common::dynamic::{CfmlNative, CfmlValue as Value};
 pub use cfml_common::vm::{CfmlError, CfmlResult};
 pub use cfml_vm::CfmlVirtualMachine as Vm;
+// Re-exported so module authors can construct `Value::strukt(IndexMap::new())`
+// without declaring indexmap as a separate dep.
+pub use indexmap::IndexMap;
 
 // ---------------------------------------------------------------------------
 // Native-module registrar
@@ -1532,7 +1534,9 @@ fn main() {{
     fs::write(build_dir.join("src").join("main.rs"), main_src)
         .map_err(|e| format!("write main.rs: {}", e))?;
 
-    // Run cargo build --release inside the build dir.
+    // Run cargo build --release inside the build dir. We forward cargo's
+    // stdout/stderr to the terminal (the default for .status()) so the user
+    // sees compile errors live rather than having them buffered.
     println!("Mixing cocktail (cargo build --release)…");
     let status = std::process::Command::new("cargo")
         .arg("build")
@@ -1541,8 +1545,19 @@ fn main() {{
         .status()
         .map_err(|e| format!("invoke cargo build: {}", e))?;
     if !status.success() {
+        // Surface a multi-line hint pointing at the build dir so users can
+        // iterate on their module without going through `rustcfml --build`
+        // each time (which re-generates the workspace).
+        eprintln!();
+        eprintln!("─── Cocktail build failed ───");
+        eprintln!("To iterate on the error above without re-running `rustcfml --build`:");
+        eprintln!("    cd {}", build_dir.display());
+        eprintln!("    cargo build --release");
+        eprintln!("The generated workspace there path-deps directly on your native modules,");
+        eprintln!("so edits to native/<crate>/src/*.rs pick up incrementally.");
+        eprintln!();
         return Err(format!(
-            "cargo build failed (exit {:?}) — see output above. Build dir: {}",
+            "cargo build failed (exit {:?}). Build dir: {}",
             status.code(),
             build_dir.display()
         ));

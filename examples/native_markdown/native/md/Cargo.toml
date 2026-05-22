@@ -1,0 +1,17 @@
+[package]
+name = "md"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Relative path back to the in-repo rustcfml-cli. Outside this checkout,
+# use an absolute path to your RustCFML's crates/cli (or, eventually, the
+# crates.io version).
+rustcfml-cli = { path = "../../../../crates/cli" }
+# pulldown-cmark is the standard Rust markdown parser — small, mature,
+# CommonMark-compliant.
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

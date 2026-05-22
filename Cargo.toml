@@ -15,6 +15,7 @@ members = [
 # them.
 exclude = [
     "examples/native_module_demo/native/greeter",
+    "examples/native_markdown/native/md",
 ]
 
 [workspace.package]
