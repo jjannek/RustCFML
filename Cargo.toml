@@ -9,6 +9,13 @@ members = [
     "crates/cli",
     "crates/wasm",
 ]
+# Native modules under examples/ are standalone crates consumed only by
+# `rustcfml --build`. They must not be members of the rustcfml workspace,
+# otherwise cargo refuses to build the cocktail build directory nested under
+# them.
+exclude = [
+    "examples/native_module_demo/native/greeter",
+]
 
 [workspace.package]
 version = "0.9.1"

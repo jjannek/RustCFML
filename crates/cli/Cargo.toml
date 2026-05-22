@@ -8,6 +8,10 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[lib]
+name = "rustcfml_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rustcfml"
 path = "src/main.rs"

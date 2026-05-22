@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# `rustcfml --build` cocktail build dirs (auto-generated per app)
+**/.rustcfml-cocktail/
+
 # WASM build output (rebuilt by CI)
 crates/wasm/pkg/
 
