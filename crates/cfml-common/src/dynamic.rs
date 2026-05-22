@@ -1,9 +1,33 @@
 //! Dynamic value types for CFML runtime
 
+use crate::vm::CfmlResult;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+
+/// Trait implemented by Rust types that want to be addressable as CFML
+/// objects (`new rust:MyClass()` / member-call dispatch).
+///
+/// Implementers must be `Send + Sync` because instances can be shared across
+/// cfthread boundaries via the surrounding `Arc<RwLock<…>>`. `Debug` is
+/// required so the runtime can stringify native objects in dump output
+/// without an extra trait.
+///
+/// `call_method` is the single dispatch entry point: the runtime looks up
+/// `name` on the object and forwards `args`. Method names are matched
+/// case-insensitively at the call site, so implementers can choose either
+/// style — the convention is camelCase to match the rest of the CFML
+/// surface.
+pub trait CfmlNative: Send + Sync + fmt::Debug {
+    /// Logical class name (e.g. "Counter"). Used for `type_name`,
+    /// `getMetadata`, and dump output.
+    fn class_name(&self) -> &str;
+
+    /// Invoke a method on the underlying Rust value. Return
+    /// `Err(CfmlError::…)` for unknown methods or argument mismatches.
+    fn call_method(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult;
+}
 
 #[derive(Clone)]
 pub enum CfmlValue {
@@ -19,6 +43,10 @@ pub enum CfmlValue {
     Function(CfmlFunction),
     Query(CfmlQuery),
     Binary(Vec<u8>),
+    /// Instance of a Rust-backed class registered via
+    /// `CfmlVirtualMachine::register_native_class`. Method dispatch goes
+    /// through the `CfmlNative` trait.
+    NativeObject(Arc<RwLock<dyn CfmlNative>>),
 }
 
 /// Hand-rolled Debug elides the Arc<_> wrapper on Array/Struct so log diffs
@@ -38,6 +66,13 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Function(fun) => f.debug_tuple("Function").field(fun).finish(),
             CfmlValue::Query(q) => f.debug_tuple("Query").field(q).finish(),
             CfmlValue::Binary(b) => f.debug_tuple("Binary").field(b).finish(),
+            CfmlValue::NativeObject(obj) => match obj.read() {
+                Ok(g) => f
+                    .debug_tuple("NativeObject")
+                    .field(&g.class_name().to_string())
+                    .finish(),
+                Err(_) => f.debug_tuple("NativeObject").field(&"<poisoned>").finish(),
+            },
         }
     }
 }
@@ -57,6 +92,7 @@ impl CfmlValue {
             CfmlValue::Function(_) => "Function",
             CfmlValue::Query(_) => "Query",
             CfmlValue::Binary(_) => "Binary",
+            CfmlValue::NativeObject(_) => "NativeObject",
         }
     }
 
@@ -83,6 +119,7 @@ impl CfmlValue {
             CfmlValue::Function(_) => true,
             CfmlValue::Query(q) => !q.rows.is_empty(),
             CfmlValue::Binary(b) => !b.is_empty(),
+            CfmlValue::NativeObject(_) => true,
         }
     }
 
@@ -109,6 +146,10 @@ impl CfmlValue {
             CfmlValue::Function(f) => f.name.clone(),
             CfmlValue::Query(_) => "<Query>".to_string(),
             CfmlValue::Binary(_) => "<Binary>".to_string(),
+            CfmlValue::NativeObject(obj) => match obj.read() {
+                Ok(g) => format!("<NativeObject:{}>", g.class_name()),
+                Err(_) => "<NativeObject:poisoned>".to_string(),
+            },
         }
     }
 
@@ -188,6 +229,11 @@ impl CfmlValue {
     pub fn eq(&self, other: &CfmlValue) -> bool {
         match (self, other) {
             (CfmlValue::Null, CfmlValue::Null) => true,
+            // NativeObjects compare by identity: two CFML references that
+            // point at the same underlying Rust object are equal. A second
+            // `createObject("rust", "Name")` returns a fresh Arc and so is
+            // NOT equal even if the Rust state matches.
+            (CfmlValue::NativeObject(a), CfmlValue::NativeObject(b)) => Arc::ptr_eq(a, b),
             (CfmlValue::Bool(a), CfmlValue::Bool(b)) => a == b,
             (CfmlValue::Int(a), CfmlValue::Int(b)) => a == b,
             (CfmlValue::Double(a), CfmlValue::Double(b)) => a == b,

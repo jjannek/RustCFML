@@ -339,7 +339,17 @@ pub struct CfmlVirtualMachine {
     /// After a function call, holds modified complex-type argument values for
     /// pass-by-reference writeback. Maps param name → final value.
     arg_ref_writeback: Option<Vec<(String, CfmlValue)>>,
+    /// Registry of Rust-backed classes, keyed by lowercased class name.
+    /// Populated via `register_native_class`. The function is invoked when
+    /// CFML calls `createObject("rust", "Name", ...)` / `new rust:Name(...)`
+    /// to produce a fresh `CfmlValue::NativeObject`.
+    pub native_classes: HashMap<String, NativeConstructor>,
 }
+
+/// Constructor signature for a Rust-backed class registered via
+/// `register_native_class`. Receives the constructor arguments and must
+/// return a `CfmlValue::NativeObject` wrapping the new instance.
+pub type NativeConstructor = fn(Vec<CfmlValue>) -> CfmlResult;
 
 #[derive(Debug, Clone)]
 struct CallFrame {
@@ -411,7 +421,49 @@ impl CfmlVirtualMachine {
             enable_cfoutput_only: 0,
             sandbox: false,
             arg_ref_writeback: None,
+            native_classes: HashMap::new(),
         }
+    }
+
+    /// Register a Rust-backed class so that CFML code can construct
+    /// instances via `createObject("rust", "Name")` / `new rust:Name()`.
+    ///
+    /// `name` is matched case-insensitively (lowercased at registration and
+    /// at the call site). `constructor` receives the args passed to `new`
+    /// and must return a `CfmlValue::NativeObject` wrapping the new
+    /// instance — typically by allocating the underlying struct, wrapping
+    /// it in `Arc::new(RwLock::new(_))`, then `CfmlValue::NativeObject(arc)`.
+    pub fn register_native_class(&mut self, name: &str, constructor: NativeConstructor) {
+        self.native_classes
+            .insert(name.to_lowercase(), constructor);
+    }
+
+    /// Register a Rust function as a callable CFML built-in.
+    ///
+    /// Intended for use by `--build`-produced binaries (and tests) that need to
+    /// expose extra functions written in Rust without touching `cfml-stdlib`.
+    /// The function is reachable from CFML two ways: by direct call (`name(...)`)
+    /// and as a first-class value once `name` is looked up in `globals` — mirroring
+    /// the existing stdlib registration pattern in `cfml_stdlib::get_builtin_functions`
+    /// + `get_builtins`.
+    ///
+    /// `name` is stored as-provided; CFML's call dispatcher already does a
+    /// case-insensitive fallback on builtin lookup.
+    pub fn register_native_fn(&mut self, name: &str, f: BuiltinFunction) {
+        self.builtins.insert(name.to_string(), f);
+        self.globals.insert(
+            name.to_string(),
+            CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                name: name.to_string(),
+                params: Vec::new(),
+                body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
+                    CfmlValue::Null,
+                )),
+                return_type: None,
+                access: cfml_common::dynamic::CfmlAccess::Public,
+                captured_scope: None,
+            }),
+        );
     }
 
     fn build_stack_trace(&self) -> Vec<cfml_common::vm::StackFrame> {
@@ -5242,6 +5294,18 @@ impl CfmlVirtualMachine {
                                 let instance = self.resolve_inheritance(template, parent_locals);
                                 return Ok(instance);
                             }
+                        } else if obj_type == "rust" {
+                            let class_name = args[1].as_string();
+                            let key = class_name.to_lowercase();
+                            if let Some(ctor) = self.native_classes.get(&key).copied() {
+                                let ctor_args: Vec<CfmlValue> =
+                                    args.iter().skip(2).cloned().collect();
+                                return ctor(ctor_args);
+                            }
+                            return Err(CfmlError::runtime(format!(
+                                "No native (Rust) class registered with name '{}'",
+                                class_name
+                            )));
                         } else if obj_type == "java" {
                             let class_name = args[1].as_string().to_lowercase();
                             let empty_args: Vec<CfmlValue> = vec![];
@@ -7185,6 +7249,19 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         let method_lower = method.to_lowercase();
 
+        // Native-object dispatch short-circuits the rest of the function.
+        // Rust-backed objects implement their own method table via the
+        // `CfmlNative` trait — none of the struct/component/java-shim
+        // logic below applies to them. Lock for the duration of the call;
+        // re-entrant calls on the same object will deadlock by design.
+        if let CfmlValue::NativeObject(obj) = object {
+            let args = std::mem::take(extra_args);
+            let mut guard = obj.write().map_err(|_| {
+                CfmlError::runtime("NativeObject lock poisoned".to_string())
+            })?;
+            return guard.call_method(method, args);
+        }
+
         // Java shim dispatch must run BEFORE struct-method interception:
         // methods like append/clear/insert collide with struct-builtins and
         // would otherwise never reach the shim handler.
@@ -8156,6 +8233,10 @@ impl CfmlVirtualMachine {
                     })
             }
             (CfmlValue::Binary(a), CfmlValue::Binary(b)) => a == b,
+            // NativeObjects: pointer identity. Two refs to the same Arc are
+            // equal; otherwise treat as different (the underlying Rust state
+            // is opaque to the writeback diff).
+            (CfmlValue::NativeObject(a), CfmlValue::NativeObject(b)) => Arc::ptr_eq(a, b),
             // Components: treat as always different (complex state)
             _ => false,
         }
@@ -10566,6 +10647,11 @@ fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
     match (a, b) {
         (CfmlValue::Null, CfmlValue::Null) => true,
         (CfmlValue::Null, _) | (_, CfmlValue::Null) => false,
+        // NativeObjects compare by identity. Two CfmlValue references that
+        // hold the same Arc are equal; freshly-constructed instances are not,
+        // even if their internal state matches. This matches how `==` works
+        // for other object-shaped values in the language (CFCs, java shims).
+        (CfmlValue::NativeObject(a), CfmlValue::NativeObject(b)) => Arc::ptr_eq(a, b),
         (CfmlValue::Bool(x), CfmlValue::Bool(y)) => x == y,
         // Bool-number coercion: true==1, false==0
         (CfmlValue::Bool(b), CfmlValue::Int(i)) | (CfmlValue::Int(i), CfmlValue::Bool(b)) => {

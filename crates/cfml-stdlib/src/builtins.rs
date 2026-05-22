@@ -2407,6 +2407,7 @@ fn fn_is_object(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::Struct(s)) => {
             s.contains_key("__name") || s.contains_key("__java_shim")
         }
+        Some(CfmlValue::NativeObject(_)) => true,
         _ => false,
     }))
 }
@@ -3860,6 +3861,15 @@ fn serialize_value(val: &CfmlValue) -> String {
                 format!("{{{}}}", fields.join(","))
             }).collect();
             format!("[{}]", rows.join(","))
+        }
+        CfmlValue::NativeObject(obj) => {
+            // Native Rust-backed objects don't have a JSON representation by
+            // default. Emit a tagged marker rather than silently outputting
+            // "null" — keeps the output visibly wrong if a caller forgets to
+            // expose a Serializable method on their CfmlNative implementation.
+            let name = obj.read().map(|g| g.class_name().to_string())
+                .unwrap_or_else(|_| "poisoned".to_string());
+            format!("\"<NativeObject:{}>\"", name.replace('"', "\\\""))
         }
         _ => "null".to_string(),
     }
