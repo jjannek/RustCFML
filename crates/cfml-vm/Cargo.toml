@@ -1,6 +1,10 @@
 [package]
 name = "cfml-vm"
-description = "CFML virtual machine"
+description = "Stack-based bytecode VM for the RustCFML interpreter. Executes compiled CFML, dispatches builtin and user-defined functions, and exposes the register_native_fn / register_native_class APIs for Rust-backed extensions."
+keywords = ["cfml", "coldfusion", "vm", "interpreter", "rustcfml"]
+categories = ["compilers"]
+readme = "../../README.md"
+documentation = "https://docs.rs/cfml-vm"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

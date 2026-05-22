@@ -1,6 +1,10 @@
 [package]
 name = "rustcfml-cli"
-description = "CFML interpreter CLI"
+description = "CFML (ColdFusion Markup Language) interpreter and self-contained app builder, written in Rust. Provides the `rustcfml` binary and a library for embedding the runtime in `rustcfml --build`-produced binaries that include native Rust modules."
+keywords = ["cfml", "coldfusion", "interpreter", "lucee", "boxlang"]
+categories = ["command-line-utilities", "compilers", "web-programming"]
+readme = "../../README.md"
+documentation = "https://docs.rs/rustcfml-cli"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

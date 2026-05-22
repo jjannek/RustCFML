@@ -1,6 +1,10 @@
 [package]
 name = "cfml-stdlib"
-description = "CFML standard library"
+description = "400+ built-in CFML functions for the RustCFML interpreter — strings, arrays, structs, dates, hashing/crypto, HTTP, database (sqlite/mysql/postgres/mssql), XML, HTML, ZIP, and SMTP. Feature-gated so unused subsystems compile out."
+keywords = ["cfml", "coldfusion", "stdlib", "builtins", "rustcfml"]
+categories = ["compilers", "web-programming"]
+readme = "../../README.md"
+documentation = "https://docs.rs/cfml-stdlib"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

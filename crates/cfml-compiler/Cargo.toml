@@ -1,6 +1,10 @@
 [package]
 name = "cfml-compiler"
-description = "CFML compiler - Parser and AST"
+description = "CFML lexer, tag preprocessor, recursive-descent parser and AST for the RustCFML interpreter. Turns .cfm / .cfc source into the AST consumed by cfml-codegen."
+keywords = ["cfml", "coldfusion", "parser", "lexer", "rustcfml"]
+categories = ["parser-implementations", "compilers"]
+readme = "../../README.md"
+documentation = "https://docs.rs/cfml-compiler"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

@@ -1,6 +1,10 @@
 [package]
 name = "cfml-common"
-description = "Common utilities for RustCFML"
+description = "Core value types (CfmlValue, CfmlError) and trait surface (CfmlNative, Vfs) shared across the RustCFML compiler, VM, and stdlib."
+keywords = ["cfml", "coldfusion", "rustcfml"]
+categories = ["data-structures", "compilers"]
+readme = "../../README.md"
+documentation = "https://docs.rs/cfml-common"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

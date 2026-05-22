@@ -1,6 +1,10 @@
 [package]
 name = "cfml-codegen"
-description = "CFML bytecode code generator"
+description = "Walks the cfml-compiler AST and emits bytecode for cfml-vm. Includes optimisation passes such as counted-loop fusion."
+keywords = ["cfml", "coldfusion", "bytecode", "codegen", "rustcfml"]
+categories = ["compilers"]
+readme = "../../README.md"
+documentation = "https://docs.rs/cfml-codegen"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
