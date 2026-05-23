@@ -20,7 +20,7 @@ http = ["ureq"]
 database = ["sqlite"]
 sqlite = ["rusqlite"]
 mysql_db = ["dep:mysql"]
-postgres_db = ["dep:postgres"]
+postgres_db = ["dep:postgres", "dep:rust_decimal", "dep:uuid"]
 mssql_db = ["dep:tiberius", "dep:tokio", "dep:tokio-util"]
 all-databases = ["sqlite", "mysql_db", "postgres_db", "mssql_db"]
 xml = ["quick-xml"]
@@ -42,8 +42,10 @@ sha1 = "0.10"
 ureq = { version = "2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 mysql = { version = "25", optional = true }
-postgres = { version = "0.19", optional = true }
-tiberius = { version = "0.12", default-features = false, features = ["rustls"], optional = true }
+postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+rust_decimal = { version = "1", default-features = false, features = ["db-postgres"], optional = true }
+uuid = { version = "1", optional = true }
+tiberius = { version = "0.12", default-features = false, features = ["rustls", "chrono", "tds73"], optional = true }
 tokio = { version = "1", features = ["rt", "net"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 r2d2 = "0.8"

@@ -6357,9 +6357,22 @@ fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
                 Err(_) => CfmlValue::Binary(b),
             }
         }
-        mysql::Value::Date(..) | mysql::Value::Time(..) => {
-            // Format dates/times as strings
-            CfmlValue::String(format!("{:?}", val))
+        // DATE columns come with all-zero time fields; DATETIME/TIMESTAMP have
+        // populated time fields. Match CFML's canonical formats so dateFormat
+        // and timeFormat work without further coercion.
+        mysql::Value::Date(y, mo, d, h, mi, s, _us) => {
+            if h == 0 && mi == 0 && s == 0 {
+                CfmlValue::String(format!("{:04}-{:02}-{:02}", y, mo, d))
+            } else {
+                CfmlValue::String(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s))
+            }
+        }
+        // TIME columns — CFML idiom is the epoch-style 1899-12-30 prefix so
+        // dateFormat/timeFormat work. `days` can carry overflow; fold into hours.
+        mysql::Value::Time(neg, days, h, mi, s, _us) => {
+            let total_h = (days as u64) * 24 + h as u64;
+            let sign = if neg { "-" } else { "" };
+            CfmlValue::String(format!("1899-12-30 {}{:02}:{:02}:{:02}", sign, total_h, mi, s))
         }
     }
 }
@@ -6550,33 +6563,117 @@ fn postgres_row_to_cfml(row: &postgres::Row, col_idx: usize) -> CfmlValue {
     use postgres::types::Type;
     let col_type = row.columns()[col_idx].type_();
 
+    // try_get never panics: a type mismatch returns Err rather than aborting
+    // the worker. Each arm maps the typed value into the closest CFML form
+    // (matches Lucee/BoxLang semantics: UUIDs canonical, JSON raw string,
+    // numeric precision preserved as String, arrays as native CFML Array).
+    fn arr<I: IntoIterator<Item = CfmlValue>>(it: I) -> CfmlValue {
+        CfmlValue::Array(Arc::new(it.into_iter().collect()))
+    }
+
     match *col_type {
-        Type::BOOL => row.get::<_, Option<bool>>(col_idx)
-            .map(|b| CfmlValue::Bool(b))
-            .unwrap_or(CfmlValue::Null),
-        Type::INT2 => row.get::<_, Option<i16>>(col_idx)
-            .map(|i| CfmlValue::Int(i as i64))
-            .unwrap_or(CfmlValue::Null),
-        Type::INT4 => row.get::<_, Option<i32>>(col_idx)
-            .map(|i| CfmlValue::Int(i as i64))
-            .unwrap_or(CfmlValue::Null),
-        Type::INT8 => row.get::<_, Option<i64>>(col_idx)
-            .map(|i| CfmlValue::Int(i))
-            .unwrap_or(CfmlValue::Null),
-        Type::FLOAT4 => row.get::<_, Option<f32>>(col_idx)
-            .map(|f| CfmlValue::Double(f as f64))
-            .unwrap_or(CfmlValue::Null),
-        Type::FLOAT8 => row.get::<_, Option<f64>>(col_idx)
-            .map(|f| CfmlValue::Double(f))
-            .unwrap_or(CfmlValue::Null),
-        Type::BYTEA => row.get::<_, Option<Vec<u8>>>(col_idx)
-            .map(|b| CfmlValue::Binary(b))
-            .unwrap_or(CfmlValue::Null),
-        _ => {
-            // Default: try to get as string (works for VARCHAR, TEXT, DATE, TIMESTAMP, etc.)
-            row.get::<_, Option<String>>(col_idx)
-                .map(|s| CfmlValue::String(s))
-                .unwrap_or(CfmlValue::Null)
+        Type::BOOL => match row.try_get::<_, Option<bool>>(col_idx) {
+            Ok(Some(b)) => CfmlValue::Bool(b), _ => CfmlValue::Null,
+        },
+        Type::INT2 => match row.try_get::<_, Option<i16>>(col_idx) {
+            Ok(Some(i)) => CfmlValue::Int(i as i64), _ => CfmlValue::Null,
+        },
+        Type::INT4 => match row.try_get::<_, Option<i32>>(col_idx) {
+            Ok(Some(i)) => CfmlValue::Int(i as i64), _ => CfmlValue::Null,
+        },
+        Type::INT8 => match row.try_get::<_, Option<i64>>(col_idx) {
+            Ok(Some(i)) => CfmlValue::Int(i), _ => CfmlValue::Null,
+        },
+        Type::FLOAT4 => match row.try_get::<_, Option<f32>>(col_idx) {
+            Ok(Some(f)) => CfmlValue::Double(f as f64), _ => CfmlValue::Null,
+        },
+        Type::FLOAT8 => match row.try_get::<_, Option<f64>>(col_idx) {
+            Ok(Some(f)) => CfmlValue::Double(f), _ => CfmlValue::Null,
+        },
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME =>
+            match row.try_get::<_, Option<String>>(col_idx) {
+                Ok(Some(s)) => CfmlValue::String(s), _ => CfmlValue::Null,
+            },
+        Type::BYTEA => match row.try_get::<_, Option<Vec<u8>>>(col_idx) {
+            Ok(Some(b)) => CfmlValue::Binary(b), _ => CfmlValue::Null,
+        },
+        Type::UUID => match row.try_get::<_, Option<uuid::Uuid>>(col_idx) {
+            Ok(Some(u)) => CfmlValue::String(u.hyphenated().to_string()),
+            _ => CfmlValue::Null,
+        },
+        Type::TIMESTAMP => match row.try_get::<_, Option<NaiveDateTime>>(col_idx) {
+            Ok(Some(d)) => CfmlValue::String(d.format("%Y-%m-%d %H:%M:%S").to_string()),
+            _ => CfmlValue::Null,
+        },
+        // TIMESTAMPTZ stored in UTC; render in local TZ to match Lucee's
+        // session-TZ behavior on a host with the same default TZ.
+        Type::TIMESTAMPTZ => match row.try_get::<_, Option<chrono::DateTime<Utc>>>(col_idx) {
+            Ok(Some(d)) => CfmlValue::String(
+                d.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string()
+            ),
+            _ => CfmlValue::Null,
+        },
+        Type::DATE => match row.try_get::<_, Option<NaiveDate>>(col_idx) {
+            Ok(Some(d)) => CfmlValue::String(d.format("%Y-%m-%d").to_string()),
+            _ => CfmlValue::Null,
+        },
+        // TIME has no native date portion; CFML idiom is the epoch-style
+        // 1899-12-30 prefix so dateFormat/timeFormat work.
+        Type::TIME => match row.try_get::<_, Option<NaiveTime>>(col_idx) {
+            Ok(Some(t)) => CfmlValue::String(format!("1899-12-30 {}", t.format("%H:%M:%S"))),
+            _ => CfmlValue::Null,
+        },
+        Type::JSON | Type::JSONB => match row.try_get::<_, Option<serde_json::Value>>(col_idx) {
+            Ok(Some(v)) => CfmlValue::String(v.to_string()),
+            _ => CfmlValue::Null,
+        },
+        // NUMERIC as String preserves precision; CFML has no native BigDecimal.
+        Type::NUMERIC => match row.try_get::<_, Option<rust_decimal::Decimal>>(col_idx) {
+            Ok(Some(d)) => CfmlValue::String(d.to_string()),
+            _ => CfmlValue::Null,
+        },
+        // Array types: BoxLang-style native CFML Array (better DX than Lucee's
+        // java.sql.Array passthrough).
+        Type::BOOL_ARRAY => match row.try_get::<_, Option<Vec<Option<bool>>>>(col_idx) {
+            Ok(Some(v)) => arr(v.into_iter().map(|x| x.map(CfmlValue::Bool).unwrap_or(CfmlValue::Null))),
+            _ => CfmlValue::Null,
+        },
+        Type::INT2_ARRAY => match row.try_get::<_, Option<Vec<Option<i16>>>>(col_idx) {
+            Ok(Some(v)) => arr(v.into_iter().map(|x| x.map(|i| CfmlValue::Int(i as i64)).unwrap_or(CfmlValue::Null))),
+            _ => CfmlValue::Null,
+        },
+        Type::INT4_ARRAY => match row.try_get::<_, Option<Vec<Option<i32>>>>(col_idx) {
+            Ok(Some(v)) => arr(v.into_iter().map(|x| x.map(|i| CfmlValue::Int(i as i64)).unwrap_or(CfmlValue::Null))),
+            _ => CfmlValue::Null,
+        },
+        Type::INT8_ARRAY => match row.try_get::<_, Option<Vec<Option<i64>>>>(col_idx) {
+            Ok(Some(v)) => arr(v.into_iter().map(|x| x.map(CfmlValue::Int).unwrap_or(CfmlValue::Null))),
+            _ => CfmlValue::Null,
+        },
+        Type::FLOAT4_ARRAY => match row.try_get::<_, Option<Vec<Option<f32>>>>(col_idx) {
+            Ok(Some(v)) => arr(v.into_iter().map(|x| x.map(|f| CfmlValue::Double(f as f64)).unwrap_or(CfmlValue::Null))),
+            _ => CfmlValue::Null,
+        },
+        Type::FLOAT8_ARRAY => match row.try_get::<_, Option<Vec<Option<f64>>>>(col_idx) {
+            Ok(Some(v)) => arr(v.into_iter().map(|x| x.map(CfmlValue::Double).unwrap_or(CfmlValue::Null))),
+            _ => CfmlValue::Null,
+        },
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::BPCHAR_ARRAY | Type::NAME_ARRAY =>
+            match row.try_get::<_, Option<Vec<Option<String>>>>(col_idx) {
+                Ok(Some(v)) => arr(v.into_iter().map(|x| x.map(CfmlValue::String).unwrap_or(CfmlValue::Null))),
+                _ => CfmlValue::Null,
+            },
+        Type::UUID_ARRAY => match row.try_get::<_, Option<Vec<Option<uuid::Uuid>>>>(col_idx) {
+            Ok(Some(v)) => arr(v.into_iter().map(|x|
+                x.map(|u| CfmlValue::String(u.hyphenated().to_string())).unwrap_or(CfmlValue::Null)
+            )),
+            _ => CfmlValue::Null,
+        },
+        // Unknown / unsupported type: try a string conversion, fall back to
+        // Null on type mismatch. Never panics.
+        _ => match row.try_get::<_, Option<String>>(col_idx) {
+            Ok(Some(s)) => CfmlValue::String(s),
+            _ => CfmlValue::Null,
         }
     }
 }
@@ -6648,7 +6745,7 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
             for row in &result {
                 let mut row_map = IndexMap::new();
                 for (i, col) in columns.iter().enumerate() {
-                    let val = mssql_column_to_cfml(row.get::<'_, &str, _>(i));
+                    let val = mssql_column_to_cfml(row, i);
                     row_map.insert(col.clone(), val);
                 }
                 rows.push(row_map);
@@ -6713,19 +6810,117 @@ fn mssql_inline_params(sql: &str, params: &[CfmlValue]) -> String {
 }
 
 #[cfg(feature = "mssql_db")]
-fn mssql_column_to_cfml(val: Option<&str>) -> CfmlValue {
-    match val {
-        None => CfmlValue::Null,
-        Some(s) => {
-            // Try integer first, then float, else string
-            if let Ok(i) = s.parse::<i64>() {
-                CfmlValue::Int(i)
-            } else if let Ok(f) = s.parse::<f64>() {
-                CfmlValue::Double(f)
-            } else {
-                CfmlValue::String(s.to_string())
-            }
+fn mssql_column_to_cfml(row: &tiberius::Row, col_idx: usize) -> CfmlValue {
+    use tiberius::ColumnType;
+    use tiberius::numeric::Numeric;
+    let col_type = row.columns()[col_idx].column_type();
+
+    // try_get returns Result<Option<T>>: a type mismatch yields Err rather than
+    // panicking the worker. Each arm maps the typed value into the closest CFML
+    // form (canonical UUIDs, datetime strings, precision-preserving decimals).
+    match col_type {
+        ColumnType::Bit | ColumnType::Bitn =>
+            match row.try_get::<bool, _>(col_idx) {
+                Ok(Some(b)) => CfmlValue::Bool(b), _ => CfmlValue::Null,
+            },
+        ColumnType::Int1 => match row.try_get::<u8, _>(col_idx) {
+            Ok(Some(i)) => CfmlValue::Int(i as i64), _ => CfmlValue::Null,
+        },
+        ColumnType::Int2 => match row.try_get::<i16, _>(col_idx) {
+            Ok(Some(i)) => CfmlValue::Int(i as i64), _ => CfmlValue::Null,
+        },
+        ColumnType::Int4 => match row.try_get::<i32, _>(col_idx) {
+            Ok(Some(i)) => CfmlValue::Int(i as i64), _ => CfmlValue::Null,
+        },
+        ColumnType::Int8 => match row.try_get::<i64, _>(col_idx) {
+            Ok(Some(i)) => CfmlValue::Int(i), _ => CfmlValue::Null,
+        },
+        // Intn is variable-width — try widest first, then narrower
+        ColumnType::Intn => {
+            if let Ok(Some(i)) = row.try_get::<i64, _>(col_idx) { return CfmlValue::Int(i); }
+            if let Ok(Some(i)) = row.try_get::<i32, _>(col_idx) { return CfmlValue::Int(i as i64); }
+            if let Ok(Some(i)) = row.try_get::<i16, _>(col_idx) { return CfmlValue::Int(i as i64); }
+            if let Ok(Some(i)) = row.try_get::<u8, _>(col_idx)  { return CfmlValue::Int(i as i64); }
+            CfmlValue::Null
         }
+        ColumnType::Float4 => match row.try_get::<f32, _>(col_idx) {
+            Ok(Some(f)) => CfmlValue::Double(f as f64), _ => CfmlValue::Null,
+        },
+        ColumnType::Float8 => match row.try_get::<f64, _>(col_idx) {
+            Ok(Some(f)) => CfmlValue::Double(f), _ => CfmlValue::Null,
+        },
+        ColumnType::Floatn => {
+            if let Ok(Some(f)) = row.try_get::<f64, _>(col_idx) { return CfmlValue::Double(f); }
+            if let Ok(Some(f)) = row.try_get::<f32, _>(col_idx) { return CfmlValue::Double(f as f64); }
+            CfmlValue::Null
+        }
+        // Money is fixed-point currency; Display gives a decimal string.
+        ColumnType::Money | ColumnType::Money4 =>
+            match row.try_get::<f64, _>(col_idx) {
+                Ok(Some(f)) => CfmlValue::Double(f), _ => CfmlValue::Null,
+            },
+        // GUIDs canonical lowercase, no braces.
+        ColumnType::Guid => match row.try_get::<uuid::Uuid, _>(col_idx) {
+            Ok(Some(u)) => CfmlValue::String(u.hyphenated().to_string()),
+            _ => CfmlValue::Null,
+        },
+        // Decimal/numeric: tiberius's Numeric Display format preserves precision.
+        ColumnType::Decimaln | ColumnType::Numericn =>
+            match row.try_get::<Numeric, _>(col_idx) {
+                Ok(Some(n)) => CfmlValue::String(n.to_string()),
+                _ => CfmlValue::Null,
+            },
+        // DATETIME / DATETIME2 / smalldatetime → "%Y-%m-%d %H:%M:%S".
+        ColumnType::Datetime | ColumnType::Datetime2 | ColumnType::Datetime4 | ColumnType::Datetimen =>
+            match row.try_get::<NaiveDateTime, _>(col_idx) {
+                Ok(Some(d)) => CfmlValue::String(d.format("%Y-%m-%d %H:%M:%S").to_string()),
+                _ => CfmlValue::Null,
+            },
+        ColumnType::Daten => match row.try_get::<NaiveDate, _>(col_idx) {
+            Ok(Some(d)) => CfmlValue::String(d.format("%Y-%m-%d").to_string()),
+            _ => CfmlValue::Null,
+        },
+        ColumnType::Timen => match row.try_get::<NaiveTime, _>(col_idx) {
+            Ok(Some(t)) => CfmlValue::String(format!("1899-12-30 {}", t.format("%H:%M:%S"))),
+            _ => CfmlValue::Null,
+        },
+        // DATETIMEOFFSET stored in UTC + offset; render in local TZ to match
+        // CFML's session-TZ-style behavior, consistent with the PG TIMESTAMPTZ path.
+        ColumnType::DatetimeOffsetn =>
+            match row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(col_idx) {
+                Ok(Some(d)) => CfmlValue::String(
+                    d.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string()
+                ),
+                _ => CfmlValue::Null,
+            },
+        // Binary types → CFML Binary.
+        ColumnType::BigVarBin | ColumnType::BigBinary | ColumnType::Image =>
+            match row.try_get::<&[u8], _>(col_idx) {
+                Ok(Some(b)) => CfmlValue::Binary(b.to_vec()),
+                _ => CfmlValue::Null,
+            },
+        // String / character types — all map to CFML String.
+        ColumnType::BigVarChar | ColumnType::BigChar | ColumnType::NVarchar
+        | ColumnType::NChar | ColumnType::Text | ColumnType::NText =>
+            match row.try_get::<&str, _>(col_idx) {
+                Ok(Some(s)) => CfmlValue::String(s.to_string()),
+                _ => CfmlValue::Null,
+            },
+        // XML uses a separate XmlData wrapper in tiberius; fall through to
+        // try_get::<&str> after the wrapper's FromSql impl unwraps it.
+        ColumnType::Xml => {
+            if let Ok(Some(x)) = row.try_get::<&tiberius::xml::XmlData, _>(col_idx) {
+                return CfmlValue::String(x.as_ref().to_string());
+            }
+            CfmlValue::Null
+        }
+        ColumnType::Null => CfmlValue::Null,
+        // UDT / SSVariant and anything we missed — best-effort string read,
+        // safe Null fallback. Never panics.
+        _ => match row.try_get::<&str, _>(col_idx) {
+            Ok(Some(s)) => CfmlValue::String(s.to_string()),
+            _ => CfmlValue::Null,
+        },
     }
 }
 
