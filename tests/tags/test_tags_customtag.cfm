@@ -36,4 +36,40 @@
 </cftry>
 <cfscript>assertTrue("missing custom tag throws error", errorThrown);</cfscript>
 
+<!--- Test 8-11: quoted attribute values with operator-like chars must be treated as strings --->
+<cfset echoed = "">
+<cf_echo_attr value="caller-ok">
+<cfscript>assert("quoted attr with hyphen", echoed, "caller-ok");</cfscript>
+
+<cfset echoed = "">
+<cf_echo_attr value="a.b.c">
+<cfscript>assert("quoted attr with dots", echoed, "a.b.c");</cfscript>
+
+<cfset echoed = "">
+<cf_echo_attr value="one+two">
+<cfscript>assert("quoted attr with plus", echoed, "one+two");</cfscript>
+
+<cfset echoed = "">
+<cf_echo_attr value="path/to/thing">
+<cfscript>assert("quoted attr with slashes", echoed, "path/to/thing");</cfscript>
+
+<!--- Test 12: hash interpolation inside quoted attribute --->
+<cfset suffix = "world">
+<cfset echoed = "">
+<cf_echo_attr value="hello-#suffix#">
+<cfscript>assert("quoted attr with hash interpolation", echoed, "hello-world");</cfscript>
+
+<!--- Test 13: caller write-back to a nested struct --->
+<cfset user = { name: "old", age: 99 }>
+<cf_nested_setter name="new">
+<cfscript>
+    assert("caller.user.name nested mutation", user.name, "new");
+    assert("caller.user.age sibling preserved", user.age, 99);
+</cfscript>
+
+<!--- Test 14: cfmodule with hyphenated attribute value --->
+<cfset echoed = "">
+<cfmodule template="customtags/echo_attr.cfm" value="mod-hyphen-ok">
+<cfscript>assert("cfmodule attr with hyphen", echoed, "mod-hyphen-ok");</cfscript>
+
 <cfscript>suiteEnd();</cfscript>

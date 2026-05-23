@@ -237,7 +237,7 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
     }
 
     // Parse attributes
-    let (attrs, tag_end) = parse_tag_attributes(chars, tag_name_end, len);
+    let (attrs, quoted, tag_end) = parse_tag_attributes(chars, tag_name_end, len);
 
     // Look up taglib path, consulting TLD cache for file name overrides
     let prefix_lower = prefix.to_lowercase();
@@ -254,8 +254,7 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
     // Build attributes struct
     let mut attr_parts = Vec::new();
     for (k, v) in &attrs {
-        let val = strip_hashes(v);
-        attr_parts.push(format!("{}: {}", k, quote_if_needed(&val)));
+        attr_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
     }
     let attrs_expr = format!("{{ {} }}", attr_parts.join(", "));
 
@@ -375,7 +374,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
     }
 
     // Parse attributes for all other tags
-    let (attrs, tag_end) = parse_tag_attributes(chars, name_end, len);
+    let (attrs, quoted, tag_end) = parse_tag_attributes(chars, name_end, len);
 
     match tag_lower.as_str() {
         "cfoutput" => {
@@ -1064,8 +1063,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     if reserved.contains(&k.as_str()) {
                         continue;
                     }
-                    let val = strip_hashes(&v);
-                    extra_parts.push(format!("{}: {}", k, quote_if_needed(&val)));
+                    extra_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
                 }
                 format!("{{ {} }}", extra_parts.join(", "))
             };
@@ -1104,8 +1102,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 if kl == "name" && !uses_template {
                     continue;
                 }
-                let val = strip_hashes(v);
-                attr_parts.push(format!("{}: {}", k, quote_if_needed(&val)));
+                attr_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
             }
             let attrs_expr = format!("{{ {} }}", attr_parts.join(", "));
 
@@ -1372,8 +1369,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // Build attributes struct from all attrs
                 let mut attr_parts = Vec::new();
                 for (k, v) in &attrs {
-                    let val = strip_hashes(v);
-                    attr_parts.push(format!("{}: {}", k, quote_if_needed(&val)));
+                    attr_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k))));
                 }
                 let attrs_expr = format!("{{ {} }}", attr_parts.join(", "));
 
@@ -1427,8 +1423,9 @@ fn parse_tag_attributes(
     chars: &[char],
     start: usize,
     len: usize,
-) -> (std::collections::HashMap<String, String>, usize) {
+) -> (std::collections::HashMap<String, String>, std::collections::HashSet<String>, usize) {
     let mut attrs = std::collections::HashMap::new();
+    let mut quoted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut i = start;
 
     // Skip whitespace
@@ -1517,7 +1514,9 @@ fn parse_tag_attributes(
                 if i < len {
                     i += 1; // skip closing quote
                 }
-                attrs.insert(attr_name.to_lowercase(), val);
+                let key = attr_name.to_lowercase();
+                quoted.insert(key.clone());
+                attrs.insert(key, val);
             } else {
                 // Unquoted value
                 let val_start = i;
@@ -1539,7 +1538,71 @@ fn parse_tag_attributes(
 
     // Find the actual end of the tag
     let tag_end = find_tag_end(chars, i, len);
-    (attrs, tag_end)
+    (attrs, quoted, tag_end)
+}
+
+/// Format an attribute value for emission inside a script struct literal.
+/// If the value came from a quoted attribute (e.g. `value="caller-ok"`), emit
+/// a proper script string literal, expanding `#expr#` segments to `&` concat.
+/// If it came from an unquoted attribute (e.g. `value=someExpr`), fall back to
+/// the legacy expression-or-literal heuristic in `quote_if_needed`.
+fn format_attr_value(raw: &str, was_quoted: bool) -> String {
+    if !was_quoted {
+        return quote_if_needed(&strip_hashes(raw));
+    }
+    // Quoted attribute. Split into literal segments and `#...#` expressions.
+    let chars: Vec<char> = raw.chars().collect();
+    let len = chars.len();
+    let mut parts: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '#' {
+            // Doubled '##' is a literal '#'
+            if i + 1 < len && chars[i + 1] == '#' {
+                buf.push('#');
+                i += 2;
+                continue;
+            }
+            // Flush literal, then collect expression up to closing '#'
+            if !buf.is_empty() || parts.is_empty() {
+                parts.push(format!("\"{}\"", escape_for_string_literal(&buf)));
+                buf.clear();
+            }
+            i += 1;
+            let expr_start = i;
+            let mut depth = 0usize;
+            while i < len {
+                if chars[i] == '#' && depth == 0 {
+                    break;
+                }
+                if chars[i] == '(' { depth += 1; }
+                if chars[i] == ')' && depth > 0 { depth -= 1; }
+                i += 1;
+            }
+            let expr: String = chars[expr_start..i].iter().collect();
+            parts.push(format!("({})", expr));
+            if i < len { i += 1; } // skip closing '#'
+        } else {
+            buf.push(chars[i]);
+            i += 1;
+        }
+    }
+    if !buf.is_empty() || parts.is_empty() {
+        parts.push(format!("\"{}\"", escape_for_string_literal(&buf)));
+    }
+    if parts.len() == 1 {
+        parts.remove(0)
+    } else {
+        parts.join(" & ")
+    }
+}
+
+fn escape_for_string_literal(s: &str) -> String {
+    // CFML double-quoted strings escape `"` by doubling. We emit script-style
+    // string literals into generated code that goes through the script parser;
+    // the script parser supports both `\"` and `""`. Use `""` to keep it CFML-native.
+    s.replace('"', "\"\"")
 }
 
 /// Quote a string value if it's not already a number, boolean, expression, or quoted
@@ -1717,7 +1780,7 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
                 while j < len && chars[j].is_alphanumeric() {
                     j += 1;
                 }
-                let (tag_attrs, _) = parse_tag_attributes(chars, j, len);
+                let (tag_attrs, _, _) = parse_tag_attributes(chars, j, len);
                 if let Some(name) = tag_attrs.get("name") {
                     names.push(name.clone());
                 }
@@ -1852,7 +1915,7 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 let tag_content_start = i + 1;
                 let mut j = tag_content_start;
                 while j < len && chars[j].is_alphanumeric() { j += 1; }
-                let (_attrs, tag_end) = parse_tag_attributes(&chars, j, len);
+                let (_attrs, _, tag_end) = parse_tag_attributes(&chars, j, len);
                 // Find closing </cfdefaultcase>
                 if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfdefaultcase") {
                     let case_body: String = chars[tag_end..close_pos].iter().collect();
@@ -1868,7 +1931,7 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                 let tag_content_start = i + 1;
                 let mut j = tag_content_start;
                 while j < len && chars[j].is_alphanumeric() { j += 1; }
-                let (case_attrs, tag_end) = parse_tag_attributes(&chars, j, len);
+                let (case_attrs, _, tag_end) = parse_tag_attributes(&chars, j, len);
                 let value = case_attrs.get("value").cloned().unwrap_or_default();
                 // Find closing </cfcase>
                 if let Some(close_pos) = find_closing_tag(&chars, tag_end, len, "cfcase") {
@@ -2003,7 +2066,7 @@ fn extract_datasource_from_body(body: &str) -> Option<String> {
         while i < len && chars[i].is_alphanumeric() {
             i += 1;
         }
-        let (attrs, _) = parse_tag_attributes(&chars, i, len);
+        let (attrs, _, _) = parse_tag_attributes(&chars, i, len);
         return attrs.get("datasource").cloned();
     }
     None
@@ -2049,7 +2112,7 @@ fn scan_cfqueryparam_tags(sql_body: &str) -> (String, Vec<CfQueryParam>) {
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     // Parse the tag attributes
                     let name_end = i + 13; // after "cfqueryparam"
-                    let (tag_attrs, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
 
                     // Extract cfqueryparam attributes
                     let explicit_value = tag_attrs.contains_key("value");
@@ -2202,7 +2265,7 @@ fn parse_cfhttpparam_tags(body: &str) -> Vec<String> {
                 let next_after = chars.get(i + 12);
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     let name_end = i + 12;
-                    let (tag_attrs, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
 
                     let mut parts = Vec::new();
                     if let Some(t) = tag_attrs.get("type") {
@@ -2271,7 +2334,7 @@ fn parse_cfmailparam_tags(body: &str) -> Vec<String> {
                 let next_after = chars.get(i + 12);
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     let name_end = i + 12;
-                    let (tag_attrs, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
 
                     let mut parts = Vec::new();
                     if let Some(n) = tag_attrs.get("name") {
@@ -2337,7 +2400,7 @@ fn parse_cfmailpart_tags(body: &str) -> (Vec<String>, String) {
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     let tag_start = i;
                     let name_end = i + 11;
-                    let (tag_attrs, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
 
                     // Find > to get start of body content
                     while i < len && chars[i] != '>' { i += 1; }
@@ -2418,7 +2481,7 @@ fn parse_cfprocparam_tags(body: &str) -> Vec<ProcParam> {
                 let next_after = chars.get(i + 12);
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     let name_end = i + 12;
-                    let (tag_attrs, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
 
                     params.push(ProcParam {
                         value: tag_attrs.get("value").cloned(),
@@ -2452,7 +2515,7 @@ fn parse_cfprocresult_tags(body: &str) -> Vec<(String, usize)> {
                 let next_after = chars.get(i + 13);
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     let name_end = i + 13;
-                    let (tag_attrs, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
 
                     let name = tag_attrs.get("name").cloned().unwrap_or_else(|| "cfresult".to_string());
                     let resultset: usize = tag_attrs.get("resultset")
