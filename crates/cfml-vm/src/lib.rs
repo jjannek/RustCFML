@@ -92,6 +92,121 @@ impl BytecodeCache {
     }
 }
 
+/// Build the `server` scope struct. Populates Lucee-compatible keys so that
+/// migration code reading `server.system.environment.FOO`,
+/// `server.system.properties["os.name"]`, `server.separator.file`, etc. works
+/// out of the box. Snapshotted on each access; cheap because env vars and
+/// args are small.
+fn build_server_scope() -> IndexMap<String, CfmlValue> {
+    let mut info = IndexMap::new();
+
+    let mut cf = IndexMap::new();
+    cf.insert(
+        "productname".to_string(),
+        CfmlValue::String("RustCFML".to_string()),
+    );
+    cf.insert(
+        "productversion".to_string(),
+        CfmlValue::String(env!("CARGO_PKG_VERSION").to_string()),
+    );
+    cf.insert(
+        "productlevel".to_string(),
+        CfmlValue::String("Final".to_string()),
+    );
+    info.insert("coldfusion".to_string(), CfmlValue::strukt(cf));
+
+    let mut os = IndexMap::new();
+    os.insert(
+        "name".to_string(),
+        CfmlValue::String(std::env::consts::OS.to_string()),
+    );
+    os.insert(
+        "arch".to_string(),
+        CfmlValue::String(std::env::consts::ARCH.to_string()),
+    );
+    if let Ok(host) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
+        os.insert("hostname".to_string(), CfmlValue::String(host));
+    }
+    info.insert("os".to_string(), CfmlValue::strukt(os));
+
+    let file_sep = std::path::MAIN_SEPARATOR.to_string();
+    let path_sep = if cfg!(windows) { ";" } else { ":" }.to_string();
+    let line_sep = if cfg!(windows) { "\r\n" } else { "\n" }.to_string();
+
+    let mut sep = IndexMap::new();
+    sep.insert("file".to_string(), CfmlValue::String(file_sep.clone()));
+    sep.insert("path".to_string(), CfmlValue::String(path_sep.clone()));
+    sep.insert("line".to_string(), CfmlValue::String(line_sep.clone()));
+    info.insert("separator".to_string(), CfmlValue::strukt(sep));
+
+    let mut java = IndexMap::new();
+    java.insert(
+        "version".to_string(),
+        CfmlValue::String(String::new()),
+    );
+    java.insert(
+        "vendor".to_string(),
+        CfmlValue::String("RustCFML (no JVM)".to_string()),
+    );
+    java.insert(
+        "archModel".to_string(),
+        CfmlValue::String(
+            if cfg!(target_pointer_width = "64") { "64" } else { "32" }.to_string(),
+        ),
+    );
+    info.insert("java".to_string(), CfmlValue::strukt(java));
+
+    let mut system = IndexMap::new();
+
+    let mut env = IndexMap::new();
+    for (k, v) in std::env::vars() {
+        env.insert(k, CfmlValue::String(v));
+    }
+    system.insert("environment".to_string(), CfmlValue::strukt(env));
+
+    let mut props = IndexMap::new();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let tmp = std::env::temp_dir().to_string_lossy().to_string();
+    props.insert(
+        "os.name".to_string(),
+        CfmlValue::String(std::env::consts::OS.to_string()),
+    );
+    props.insert(
+        "os.arch".to_string(),
+        CfmlValue::String(std::env::consts::ARCH.to_string()),
+    );
+    props.insert("user.dir".to_string(), CfmlValue::String(cwd));
+    props.insert("user.home".to_string(), CfmlValue::String(home));
+    props.insert("user.name".to_string(), CfmlValue::String(user));
+    props.insert("java.io.tmpdir".to_string(), CfmlValue::String(tmp));
+    props.insert("file.separator".to_string(), CfmlValue::String(file_sep));
+    props.insert("path.separator".to_string(), CfmlValue::String(path_sep));
+    props.insert("line.separator".to_string(), CfmlValue::String(line_sep));
+    props.insert(
+        "file.encoding".to_string(),
+        CfmlValue::String("UTF-8".to_string()),
+    );
+    system.insert("properties".to_string(), CfmlValue::strukt(props));
+
+    let args: Vec<CfmlValue> = std::env::args()
+        .skip(1)
+        .map(CfmlValue::String)
+        .collect();
+    system.insert("arguments".to_string(), CfmlValue::Array(args.into()));
+
+    info.insert("system".to_string(), CfmlValue::strukt(system));
+
+    info
+}
+
 /// Lexically normalise a path: collapse `.` and `..` segments without
 /// touching the filesystem. Used by `<cfinclude>` so that
 /// `examples/api_empty/../dashboard/dashboard.cfm` resolves to
@@ -861,38 +976,7 @@ impl CfmlVirtualMachine {
                             .cloned()
                             .unwrap_or(CfmlValue::strukt(IndexMap::new()))
                     } else if name_lower == "server" {
-                        let mut info = IndexMap::new();
-                        info.insert(
-                            "coldfusion".to_string(),
-                            CfmlValue::strukt({
-                                let mut cf = IndexMap::new();
-                                cf.insert(
-                                    "productname".to_string(),
-                                    CfmlValue::String("RustCFML".to_string()),
-                                );
-                                cf.insert(
-                                    "productversion".to_string(),
-                                    CfmlValue::String(env!("CARGO_PKG_VERSION").to_string()),
-                                );
-                                cf
-                            }),
-                        );
-                        info.insert(
-                            "os".to_string(),
-                            CfmlValue::strukt({
-                                let mut os = IndexMap::new();
-                                os.insert(
-                                    "name".to_string(),
-                                    CfmlValue::String(std::env::consts::OS.to_string()),
-                                );
-                                os.insert(
-                                    "arch".to_string(),
-                                    CfmlValue::String(std::env::consts::ARCH.to_string()),
-                                );
-                                os
-                            }),
-                        );
-                        CfmlValue::strukt(info)
+                        CfmlValue::strukt(build_server_scope())
                     } else if let Some(val) =
                         self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
                     {
@@ -8256,7 +8340,7 @@ impl CfmlVirtualMachine {
                 .cloned()
                 .or(Some(CfmlValue::strukt(IndexMap::new())))
         } else if root == "server" {
-            Some(CfmlValue::strukt(IndexMap::new())) // server scope always exists
+            Some(CfmlValue::strukt(build_server_scope()))
         } else {
             // Check locals (exact then CI)
             locals
