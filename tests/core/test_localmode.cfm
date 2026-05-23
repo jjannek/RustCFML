@@ -41,8 +41,15 @@ shadow = probe.runClosureShadowsCapturedVar();
 assertTrue ("modern closure shadowing captured var: closure sees its own write",  shadow.closureSawAfter);
 assertTrue ("modern closure shadowing captured var: outer's var is unchanged",    shadow.outerStillBefore);
 
-assertTrue ("closure with localMode=""classic"" override inside modern fn leaks to variables", probe.runClosureExplicitOverride());
+override = probe.runClosureExplicitOverride();
+assertTrue ("closure localMode=""classic"" override takes effect (unscoped write bypasses local)", override.classicOverrideTookEffect);
+assertTrue ("closure localMode=""classic"" override surfaces on outer CFC variables",              override.leakedToVariables);
 assertTrue ("closure inside classic fn stays classic (leaks to variables)",                    probe.runClosureInheritsClassic());
+
+// --- HOF callback in modern context doesn't pollute caller locals ---
+hof = probe.runHofCallbackModern();
+assertTrue("modern HOF callback: outer local not polluted", hof.outerLocalUnpolluted);
+assertTrue("modern HOF callback: variables not polluted",   hof.variablesUnpolluted);
 
 // --- Explicit scope prefixes are unaffected ---
 explicit = probe.runExplicitScopes();

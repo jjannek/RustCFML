@@ -100,16 +100,27 @@ component {
         };
     }
 
-    // PR-2: A closure with an explicit attribute overrides the enclosing mode.
+    // PR-2: A closure with an explicit attribute overrides the enclosing
+    // mode. Returns two distinct facts so the suite can tell apart "classic
+    // mode actually took effect inside the closure" (the unscoped write
+    // bypassed `local`) from "the write surfaced on the outer CFC's
+    // variables" (the side-effect callers see).
     function runClosureExplicitOverride() localMode="modern" {
+        var sawAsLocal = true;
         cb = function() localMode="classic" {
             overrideKey = "classic-override";
+            // In classic mode, unscoped writes target variables — not local.
             return structKeyExists(local, "overrideKey");
         };
-        cb();
-        // classic override: write went to variables of the *outer* CFC scope
-        // (closures share the enclosing method's variables in CFML).
-        return structKeyExists(variables, "overrideKey");
+        sawAsLocal = cb();
+        return {
+            // Classic override took effect inside the closure: the write
+            // did NOT land in local.
+            classicOverrideTookEffect: sawAsLocal EQ false,
+            // The write surfaced on the enclosing CFC's variables, as
+            // closures share variables with their defining method.
+            leakedToVariables: structKeyExists(variables, "overrideKey")
+        };
     }
 
     // PR-2: A closure inside a classic function stays classic by default.
@@ -119,6 +130,23 @@ component {
         };
         cb();
         return structKeyExists(variables, "classicInherited");
+    }
+
+    // PR-3 follow-up: HOF callbacks invoked from a modern method should
+    // themselves run in modern context — an unscoped write inside the
+    // callback should land in the callback's own local, not surface on the
+    // outer method's local or on variables.
+    function runHofCallbackModern() localMode="modern" {
+        arrayMap([1, 2, 3], function(n) {
+            // Unscoped write; in modern context this targets the callback's
+            // own `local` scope only — not the outer method's local or
+            // variables.
+            hofTouched = "n=" & n;
+        });
+        return {
+            outerLocalUnpolluted: NOT structKeyExists(local, "hofTouched"),
+            variablesUnpolluted:  NOT structKeyExists(variables, "hofTouched")
+        };
     }
 
     // Explicit scope prefixes are unaffected by localMode.
