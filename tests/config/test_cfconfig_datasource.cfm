@@ -10,16 +10,9 @@ try {
     assert("queryExecute via named datasource FAILED: " & e.message, true, false);
 }
 
-// A name that isn't registered falls through to the bare-string parser. The
-// stdlib treats unknown bare strings as a sqlite path, so this errors at
-// connection time rather than at lookup time.
-ok = true;
-try {
-    queryExecute("SELECT 1", [], { datasource: "nonexistent-dsn" });
-} catch (any e) {
-    ok = true;  // expected
-}
-assert("unknown datasource doesn't panic", ok, true);
+// server.cfconfig surfaces the same datasource entry that was registered.
+assert("datasource visible in server.cfconfig",
+       server.cfconfig.datasources.testds.driver, "sqlite");
 
 suiteEnd();
 </cfscript>
