@@ -1419,6 +1419,46 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
         .unwrap()
 }
 
+/// Resolve cfconfig for a `--build`-produced binary at runtime. Resolution
+/// order, first match wins:
+///   1. `.cfconfig.json` in the same directory as the running binary
+///      (operator override — no rebuild needed)
+///   2. `.cfconfig.json` embedded in the VFS at build time (read via the
+///      `vfs` arg using the embedded base dir)
+///   3. Compiled-in defaults
+fn load_embedded_cfconfig(vfs: &dyn Vfs, base_dir: &str) -> RustCfmlConfig {
+    // 1. External next to the binary
+    if let Some(dir) = resolve::exe_dir() {
+        let external = dir.join(".cfconfig.json");
+        if external.is_file() {
+            match RustCfmlConfig::from_file(&external) {
+                Ok(c) => {
+                    log::info!("loaded external .cfconfig.json from {}", external.display());
+                    return c;
+                }
+                Err(e) => log::warn!("failed to load external .cfconfig.json: {}", e),
+            }
+        }
+    }
+    // 2. Embedded copy
+    let embedded_path = format!("{}/.cfconfig.json", base_dir);
+    if vfs.is_file(&embedded_path) {
+        if let Ok(bytes) = vfs.read(&embedded_path) {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                match RustCfmlConfig::from_str(text) {
+                    Ok(c) => {
+                        log::info!("loaded embedded .cfconfig.json from VFS");
+                        return c;
+                    }
+                    Err(e) => log::warn!("failed to parse embedded .cfconfig.json: {}", e),
+                }
+            }
+        }
+    }
+    // 3. Defaults
+    RustCfmlConfig::default()
+}
+
 /// Push every cfconfig datasource into the cfml-stdlib global registry so
 /// cfquery / queryExecute can resolve `datasource="myDSN"` to a connection
 /// URL. Drivers that don't compile in (e.g. mssql without the feature) are
@@ -2299,9 +2339,18 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             // the host FS, so respect the explicit env-var opt-in.
             let production = sandbox
                 || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
-            // Embedded-binary cfconfig load lands in a later phase; for now
-            // use defaults so the rest of the wiring compiles.
-            let cfconfig = Arc::new(RustCfmlConfig::default());
+            // Resolve cfconfig for an embedded binary: external file next to
+            // the exe wins so operators can tweak settings without rebuilding;
+            // otherwise read the copy embedded into the VFS at build time;
+            // otherwise defaults.
+            let cfconfig = Arc::new(load_embedded_cfconfig(vfs.as_ref(), base_dir));
+            populate_datasource_registry(&cfconfig);
+            populate_default_mail_server(&cfconfig);
+            cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
+                csrf_enabled: cfconfig.security.csrf_enabled,
+                secure_json: cfconfig.security.secure_json,
+                secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
+            });
             run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production, cfconfig);
         }
         _ => {
@@ -2315,9 +2364,18 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             // the host FS, so respect the explicit env-var opt-in.
             let production = sandbox
                 || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
-            // Embedded-binary cfconfig load lands in a later phase; for now
-            // use defaults so the rest of the wiring compiles.
-            let cfconfig = Arc::new(RustCfmlConfig::default());
+            // Resolve cfconfig for an embedded binary: external file next to
+            // the exe wins so operators can tweak settings without rebuilding;
+            // otherwise read the copy embedded into the VFS at build time;
+            // otherwise defaults.
+            let cfconfig = Arc::new(load_embedded_cfconfig(vfs.as_ref(), base_dir));
+            populate_datasource_registry(&cfconfig);
+            populate_default_mail_server(&cfconfig);
+            cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
+                csrf_enabled: cfconfig.security.csrf_enabled,
+                secure_json: cfconfig.security.secure_json,
+                secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
+            });
             run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production, cfconfig);
         }
     }
