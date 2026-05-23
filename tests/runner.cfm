@@ -20,6 +20,7 @@ try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput
 try { include "core/test_language_features.cfm"; } catch (any e) { writeOutput("ERROR | core/test_language_features.cfm | " & e.message & chr(10)); }
 try { include "core/test_scopes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scopes.cfm | " & e.message & chr(10)); }
 try { include "core/test_server_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_server_scope.cfm | " & e.message & chr(10)); }
+try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
 try { include "core/test_null_coalescing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_coalescing.cfm | " & e.message & chr(10)); }
 

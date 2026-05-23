@@ -578,6 +578,7 @@ impl Parser {
                         params: vec![],
                         body,
                         location: stmt_loc.clone(),
+                        metadata: Vec::new(),
                     }));
                     let call = Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
@@ -3040,6 +3041,7 @@ impl Parser {
                             params,
                             body,
                             location: self.current_location(),
+                            metadata: Vec::new(),
                         })));
                     }
 
@@ -3074,13 +3076,22 @@ impl Parser {
         let params = self.parse_param_list()?;
         self.consume(&Token::RParen)?;
 
-        // Skip optional closure metadata attributes (e.g., `localmode = "classic"`)
-        // These appear between the RParen and LBrace
+        // Capture optional closure metadata attributes (e.g.,
+        // `localmode = "classic"`). These appear between the RParen and
+        // LBrace. Only literal-string values are stored — anything else is
+        // skipped to preserve forward-compat with future attribute kinds.
+        let mut metadata: Vec<(String, String)> = Vec::new();
         while !self.check(&Token::LBrace) && !self.is_at_end() {
             if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
-                self.advance(); // skip attribute name
+                let key = self.extract_identifier()?;
                 self.advance(); // skip =
-                self.parse_expression()?; // skip attribute value
+                if let Token::String(val) = self.peek(0).clone() {
+                    self.advance();
+                    metadata.push((key, val));
+                } else {
+                    // Non-string value — preserve old behaviour and skip.
+                    self.parse_expression()?;
+                }
             } else {
                 break;
             }
@@ -3092,6 +3103,7 @@ impl Parser {
             params,
             body,
             location: self.current_location(),
+            metadata,
         })))
     }
 

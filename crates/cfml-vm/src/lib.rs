@@ -443,6 +443,11 @@ pub struct CfmlVirtualMachine {
     held_locks: Vec<(String, HeldLock)>,
     /// Custom tag paths from this.customTagPaths in Application.cfc
     pub custom_tag_paths: Vec<String>,
+    /// Application-wide default for Lucee `localMode`. Set from
+    /// `this.localMode` in Application.cfc; functions that don't declare
+    /// their own `localMode` attribute inherit this. Default: classic
+    /// (false) for back-compat.
+    pub app_local_mode_modern: bool,
     /// Stack for nested body-mode custom tags
     custom_tag_stack: Vec<CustomTagState>,
     /// In-memory cache: key -> (value, optional expiry instant)
@@ -531,6 +536,7 @@ impl CfmlVirtualMachine {
             query_execute_fn: None,
             held_locks: Vec::new(),
             custom_tag_paths: Vec::new(),
+            app_local_mode_modern: false,
             custom_tag_stack: Vec::new(),
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
@@ -854,6 +860,12 @@ impl CfmlVirtualMachine {
         // invocation share one Rc<RefCell<HashMap>>. Lazily created on first DefineFunction.
         let mut closure_env: Option<Arc<RwLock<IndexMap<String, CfmlValue>>>> = None;
 
+        // Effective Lucee localMode for this frame: function's declared attribute
+        // wins; otherwise inherits the application default (`this.localMode` in
+        // Application.cfc); otherwise classic.
+        let effective_local_mode_modern: bool =
+            func.declared_local_mode.unwrap_or(self.app_local_mode_modern);
+
         // Copy parent scope variables (closures and nested functions see parent vars).
         // Skip Function values — they're immutable and already available via
         // user_functions, so cloning them (and their captured scopes) is pure waste.
@@ -1167,8 +1179,12 @@ impl CfmlVirtualMachine {
                             && !locals.contains_key(name.as_str())
                             && name_lower != "arguments"
                             && name_lower != "cfcatch"
+                            && !effective_local_mode_modern
                         {
-                            // CFC method: unscoped, non-local variables go to __variables
+                            // CFC method, classic localmode (default): unscoped,
+                            // non-local variables go to __variables (the component scope).
+                            // In modern localmode this branch is skipped and the write
+                            // falls through to the locals-insert branch below.
                             if let Some(vars) =
                                 locals.get_mut("__variables").and_then(|v| v.as_struct_mut())
                             {
@@ -2082,28 +2098,35 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
-                    // Closure parent scope write-back on early return
+                    // Closure parent scope write-back on early return.
+                    // Modern localmode (Lucee parity): no unscoped write — new
+                    // or shadowing an existing captured var — propagates out
+                    // of the closure. All bareword writes stayed in the
+                    // closure's own `local`. Explicit `variables.x = …` writes
+                    // bypass StoreLocal's locals path entirely, so they're
+                    // unaffected by this skip.
                     if let Some(parent) = parent_scope {
-                        let mut writeback = IndexMap::new();
-                        for (k, v) in &locals {
-                            // Skip function params, arguments scope, 'this', var-declared locals,
-                            if k == "arguments"
-                                || k == "this"
-                                || func.params.contains(k)
-                                || declared_locals.contains(k.as_str())
-                            {
-                                continue;
-                            }
-                            if let Some(parent_val) = parent.get(k) {
-                                if !Self::values_equal_shallow(v, parent_val) {
+                        if !effective_local_mode_modern {
+                            let mut writeback = IndexMap::new();
+                            for (k, v) in &locals {
+                                if k == "arguments"
+                                    || k == "this"
+                                    || func.params.contains(k)
+                                    || declared_locals.contains(k.as_str())
+                                {
+                                    continue;
+                                }
+                                if let Some(parent_val) = parent.get(k) {
+                                    if !Self::values_equal_shallow(v, parent_val) {
+                                        writeback.insert(k.clone(), v.clone());
+                                    }
+                                } else {
                                     writeback.insert(k.clone(), v.clone());
                                 }
-                            } else {
-                                writeback.insert(k.clone(), v.clone());
                             }
-                        }
-                        if !writeback.is_empty() {
-                            self.closure_parent_writeback = Some(writeback);
+                            if !writeback.is_empty() {
+                                self.closure_parent_writeback = Some(writeback);
+                            }
                         }
                     }
                     // Pass-by-reference writeback: collect final values of complex-type params
@@ -3478,33 +3501,36 @@ impl CfmlVirtualMachine {
             }
         }
 
-        // Closure parent scope write-back: compute diff of parent-scope vars
+        // Closure parent scope write-back: compute diff of parent-scope vars.
+        // Modern localmode (Lucee parity): no unscoped write propagates out of
+        // the closure — neither new keys nor shadowing-mutations of captured
+        // outer vars. All bareword writes stayed in the closure's own `local`.
+        // Explicit `variables.x = …` bypasses this path, so it still works.
         if let Some(parent) = parent_scope {
-            let mut writeback = IndexMap::new();
-            for (k, v) in &locals {
-                // Skip function params, arguments scope, 'this', var-declared locals,
-                // and __variables (handled by method_variables_writeback)
-                if k == "arguments"
-                    || k == "this"
-                    || k == "__variables"
-                    || func.params.contains(k)
-                    || declared_locals.contains(k.as_str())
-                {
-                    continue;
-                }
-                // Only write back vars that existed in parent scope OR are new
-                if let Some(parent_val) = parent.get(k) {
-                    // Only include if changed
-                    if !Self::values_equal_shallow(v, parent_val) {
+            if !effective_local_mode_modern {
+                let mut writeback = IndexMap::new();
+                for (k, v) in &locals {
+                    // Skip function params, arguments scope, 'this', var-declared
+                    // locals, and __variables (handled by method_variables_writeback)
+                    if k == "arguments"
+                        || k == "this"
+                        || k == "__variables"
+                        || func.params.contains(k)
+                        || declared_locals.contains(k.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(parent_val) = parent.get(k) {
+                        if !Self::values_equal_shallow(v, parent_val) {
+                            writeback.insert(k.clone(), v.clone());
+                        }
+                    } else {
                         writeback.insert(k.clone(), v.clone());
                     }
-                } else {
-                    // New variable created in closure - propagate to parent
-                    writeback.insert(k.clone(), v.clone());
                 }
-            }
-            if !writeback.is_empty() {
-                self.closure_parent_writeback = Some(writeback);
+                if !writeback.is_empty() {
+                    self.closure_parent_writeback = Some(writeback);
+                }
             }
         }
 
@@ -10246,7 +10272,7 @@ impl CfmlVirtualMachine {
         }
 
         // Extract and install mappings early so resolve_inheritance can find parent classes
-        let (_, _, mut early_mappings, _, _, _) = Self::extract_app_config(&template);
+        let (_, _, mut early_mappings, _, _, _, _) = Self::extract_app_config(&template);
         let app_cfc_dir = std::path::Path::new(path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -10280,7 +10306,8 @@ impl CfmlVirtualMachine {
     }
 
     /// Extract application config from a component struct
-    /// Returns (app_name, config, mappings, session_management, session_timeout_secs)
+    /// Returns (app_name, config, mappings, session_management, session_timeout_secs,
+    /// custom_tag_paths, local_mode_modern_default)
     fn extract_app_config(
         template: &CfmlValue,
     ) -> (
@@ -10290,6 +10317,7 @@ impl CfmlVirtualMachine {
         bool,
         u64,
         Vec<String>,
+        Option<bool>,
     ) {
         let s = match template {
             CfmlValue::Struct(s) => s,
@@ -10301,6 +10329,7 @@ impl CfmlVirtualMachine {
                     false,
                     1800,
                     Vec::new(),
+                    None,
                 )
             }
         };
@@ -10406,6 +10435,22 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // Extract this.localMode (Lucee compatibility — modern vs classic
+        // function-local scope semantics). Accepts the same aliases as the
+        // function-attribute helper.
+        let local_mode_modern_default = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("localmode"))
+            .and_then(|(_, v)| match v {
+                CfmlValue::String(sv) => match sv.trim().to_ascii_lowercase().as_str() {
+                    "modern" | "always" | "true" => Some(true),
+                    "classic" | "update" | "false" => Some(false),
+                    _ => None,
+                },
+                CfmlValue::Bool(b) => Some(*b),
+                _ => None,
+            });
+
         (
             app_name,
             config,
@@ -10413,6 +10458,7 @@ impl CfmlVirtualMachine {
             session_management,
             session_timeout,
             custom_tag_paths,
+            local_mode_modern_default,
         )
     }
 
@@ -10509,7 +10555,14 @@ impl CfmlVirtualMachine {
             session_management,
             session_timeout,
             custom_tag_paths,
+            local_mode_modern_default,
         ) = Self::extract_app_config(&template);
+
+        // 3a. Apply this.localMode as the request-level default. Functions
+        // without an explicit `localMode` attribute inherit this at runtime.
+        if let Some(modern) = local_mode_modern_default {
+            self.app_local_mode_modern = modern;
+        }
 
         // 3b. Expand mapping paths relative to Application.cfc directory
         let app_cfc_dir = std::path::Path::new(&app_cfc_path)

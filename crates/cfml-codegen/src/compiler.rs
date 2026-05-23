@@ -62,6 +62,13 @@ pub struct CfmlCompiler {
     /// but inside a function body `variables` refers to the local-scope merge or
     /// a CFC's `__variables` struct — different semantics entirely.
     function_depth: usize,
+    /// Declared `localMode` of the function currently being compiled. Used so
+    /// that closures defined inside that function inherit its declared mode
+    /// when the closure itself doesn't carry an explicit attribute. `None` =
+    /// at page scope or inside a function that didn't declare its mode (the
+    /// closure also inherits `None` and falls back to the application
+    /// default at runtime).
+    current_fn_local_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +84,33 @@ pub struct BytecodeFunction {
     pub required_params: Vec<bool>,
     pub instructions: Vec<BytecodeOp>,
     pub source_file: Option<String>,
+    /// Lucee `localMode` for this function. `Some(true)` = modern (unscoped
+    /// writes stay in `local`), `Some(false)` = classic (unscoped writes go
+    /// to `variables`/`__variables`). `None` = inherit at runtime from the
+    /// application default (`this.localMode` in Application.cfc), falling
+    /// back to classic if no app default is set.
+    pub declared_local_mode: Option<bool>,
+}
+
+/// Inspect a function/closure metadata attribute list for `localMode`.
+/// Returns `Some(true)` for modern aliases (`modern`/`always`/`true`),
+/// `Some(false)` for classic aliases (`classic`/`update`/`false`),
+/// `None` if no `localMode` attribute is present, or its value is not a
+/// recognised alias. `None` means "inherit at runtime" — the VM resolves it
+/// against the application default (`this.localMode` in Application.cfc),
+/// falling back to classic. Case-insensitive. The VM extractor in
+/// `extract_app_config` uses the same alias set and `None`-on-unknown rule.
+pub fn metadata_declared_local_mode(metadata: &[(String, String)]) -> Option<bool> {
+    for (k, v) in metadata {
+        if k.eq_ignore_ascii_case("localmode") {
+            return match v.trim().to_ascii_lowercase().as_str() {
+                "modern" | "always" | "true" => Some(true),
+                "classic" | "update" | "false" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// Comparison operator tag for fused-compare super-instructions.
@@ -253,11 +287,13 @@ impl CfmlCompiler {
                     required_params: Vec::new(),
                     instructions: Vec::new(),
                     source_file: None,
+                    declared_local_mode: None,
                 })],
             },
             loop_stack: Vec::new(),
             current_finally: None,
             function_depth: 0,
+            current_fn_local_mode: None,
         }
     }
 
@@ -1738,6 +1774,13 @@ impl CfmlCompiler {
 
         self.function_depth += 1;
 
+        // Save/restore the surrounding function's declared localMode so nested
+        // closures inherit *this* function's mode rather than something further
+        // up the stack.
+        let declared_mode = metadata_declared_local_mode(&func.metadata);
+        let prev_fn_local_mode = self.current_fn_local_mode;
+        self.current_fn_local_mode = declared_mode.or(prev_fn_local_mode);
+
         // Emit default parameter value preamble:
         // For each param with a default, if the arg is null, assign the default
         // and also update the arguments scope
@@ -1768,6 +1811,7 @@ impl CfmlCompiler {
         func_instructions.push(BytecodeOp::Return);
 
         self.function_depth -= 1;
+        self.current_fn_local_mode = prev_fn_local_mode;
 
         let bc_func = BytecodeFunction {
             name: func.name.clone(),
@@ -1775,6 +1819,7 @@ impl CfmlCompiler {
             required_params: func.params.iter().map(|p| p.required).collect(),
             instructions: func_instructions,
             source_file: None,
+            declared_local_mode: declared_mode,
         };
 
         let func_idx = self.program.functions.len();
@@ -1956,6 +2001,7 @@ impl CfmlCompiler {
                         BytecodeOp::Return,
                     ],
                     source_file: None,
+                    declared_local_mode: None,
                 };
                 let getter_idx = self.program.functions.len();
                 self.program.functions.push(Arc::new(getter_func));
@@ -1997,6 +2043,7 @@ impl CfmlCompiler {
                         BytecodeOp::Return,
                     ],
                     source_file: None,
+                    declared_local_mode: None,
                 };
                 let setter_idx = self.program.functions.len();
                 self.program.functions.push(Arc::new(setter_func));
@@ -2548,7 +2595,15 @@ impl CfmlCompiler {
                 }
             }
             Expression::Closure(closure) => {
-                // Compile closure body into separate function
+                // Compile closure body into separate function.
+                // Lucee: closure inherits its enclosing function's localMode
+                // when it doesn't carry its own attribute. Track current_fn for
+                // nested closures-inside-closures too.
+                let closure_declared = metadata_declared_local_mode(&closure.metadata);
+                let effective_declared = closure_declared.or(self.current_fn_local_mode);
+                let prev_fn_local_mode = self.current_fn_local_mode;
+                self.current_fn_local_mode = effective_declared;
+
                 let mut func_instructions = Vec::new();
                 // Emit default parameter value preamble for closures
                 for param in &closure.params {
@@ -2580,13 +2635,20 @@ impl CfmlCompiler {
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     instructions: func_instructions,
                     source_file: None,
+                    declared_local_mode: effective_declared,
                 };
 
                 let func_idx = self.program.functions.len();
                 self.program.functions.push(Arc::new(bc_func));
                 instructions.push(BytecodeOp::DefineFunction(func_idx));
+                self.current_fn_local_mode = prev_fn_local_mode;
             }
             Expression::ArrowFunction(arrow) => {
+                // Arrow functions inherit enclosing function's mode too
+                // (they have no attribute syntax of their own).
+                let arrow_effective = self.current_fn_local_mode;
+                let prev_fn_local_mode = self.current_fn_local_mode;
+                self.current_fn_local_mode = arrow_effective;
                 let mut func_instructions = Vec::new();
                 // Emit default parameter value preamble for arrow functions
                 for param in &arrow.params {
@@ -2615,11 +2677,13 @@ impl CfmlCompiler {
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     instructions: func_instructions,
                     source_file: None,
+                    declared_local_mode: arrow_effective,
                 };
 
                 let func_idx = self.program.functions.len();
                 self.program.functions.push(Arc::new(bc_func));
                 instructions.push(BytecodeOp::DefineFunction(func_idx));
+                self.current_fn_local_mode = prev_fn_local_mode;
             }
             Expression::This(_) => {
                 instructions.push(BytecodeOp::LoadLocal("this".to_string()));

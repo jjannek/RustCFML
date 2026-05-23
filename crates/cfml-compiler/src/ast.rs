@@ -487,6 +487,9 @@ pub struct Closure {
     pub params: Vec<Param>,
     pub body: Vec<Statement>,
     pub location: SourceLocation,
+    /// Function attributes parsed between `)` and `{` — e.g.
+    /// `function (x) localMode="modern" { ... }`.
+    pub metadata: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
