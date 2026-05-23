@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cfml-common",
+    "crates/cfml-config",
     "crates/cfml-compiler",
     "crates/cfml-codegen",
     "crates/cfml-vm",
@@ -29,6 +30,7 @@ license = "MIT"
 
 [workspace.dependencies]
 cfml-common = { path = "crates/cfml-common", version = "0.14.0" }
+cfml-config = { path = "crates/cfml-config", version = "0.14.0" }
 cfml-compiler = { path = "crates/cfml-compiler", version = "0.14.0" }
 cfml-codegen = { path = "crates/cfml-codegen", version = "0.14.0" }
 cfml-vm = { path = "crates/cfml-vm", version = "0.14.0" }
