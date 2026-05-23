@@ -637,19 +637,52 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     "[]".to_string()
                 } else {
                     let param_strs: Vec<String> = query_params.iter().map(|p| {
-                        let mut parts = Vec::new();
-                        parts.push(format!("value: {}", p.value_expr));
-                        parts.push(format!("cfsqltype: \"{}\"", p.cfsqltype));
-                        if p.null {
-                            parts.push("null: true".to_string());
-                        }
-                        if p.list {
-                            parts.push("list: true".to_string());
-                            if p.separator != "," {
-                                parts.push(format!("separator: \"{}\"", p.separator));
+                        if let Some(ac_expr) = &p.attribute_collection_expr {
+                            // Build explicit-only overrides; if none, just hand the
+                            // user's struct straight through.
+                            let mut explicit = Vec::new();
+                            if p.explicit_value || p.explicit_null {
+                                explicit.push(format!("value: {}", p.value_expr));
                             }
+                            if p.explicit_cfsqltype {
+                                explicit.push(format!("cfsqltype: \"{}\"", p.cfsqltype));
+                            }
+                            if p.explicit_null {
+                                explicit.push(format!("null: {}", p.null));
+                            }
+                            if p.explicit_list {
+                                explicit.push(format!("list: {}", p.list));
+                            }
+                            if p.explicit_separator {
+                                explicit.push(format!("separator: \"{}\"", p.separator));
+                            }
+                            if explicit.is_empty() {
+                                ac_expr.clone()
+                            } else {
+                                // duplicate() so we don't mutate the user's struct;
+                                // structAppend(..., ..., true) lets the explicit
+                                // overrides win.
+                                format!(
+                                    "structAppend(duplicate({}), {{ {} }}, true)",
+                                    ac_expr,
+                                    explicit.join(", ")
+                                )
+                            }
+                        } else {
+                            let mut parts = Vec::new();
+                            parts.push(format!("value: {}", p.value_expr));
+                            parts.push(format!("cfsqltype: \"{}\"", p.cfsqltype));
+                            if p.null {
+                                parts.push("null: true".to_string());
+                            }
+                            if p.list {
+                                parts.push("list: true".to_string());
+                                if p.separator != "," {
+                                    parts.push(format!("separator: \"{}\"", p.separator));
+                                }
+                            }
+                            format!("{{ {} }}", parts.join(", "))
                         }
-                        format!("{{ {} }}", parts.join(", "))
                     }).collect();
                     format!("[{}]", param_strs.join(", "))
                 };
@@ -1986,6 +2019,15 @@ struct CfQueryParam {
     null: bool,
     list: bool,
     separator: String,
+    // Optional bare script expression supplied via `attributeCollection="#expr#"`.
+    // When Some, the param item is built by overlaying the explicit attrs on top
+    // of this struct so explicit `value=`/`cfsqltype=` win, per Lucee semantics.
+    attribute_collection_expr: Option<String>,
+    explicit_value: bool,
+    explicit_cfsqltype: bool,
+    explicit_null: bool,
+    explicit_list: bool,
+    explicit_separator: bool,
 }
 
 /// Scan SQL body for <cfqueryparam> tags, replace them with ? placeholders,
@@ -2010,6 +2052,12 @@ fn scan_cfqueryparam_tags(sql_body: &str) -> (String, Vec<CfQueryParam>) {
                     let (tag_attrs, _) = parse_tag_attributes(&chars, name_end, len);
 
                     // Extract cfqueryparam attributes
+                    let explicit_value = tag_attrs.contains_key("value");
+                    let explicit_cfsqltype = tag_attrs.contains_key("cfsqltype");
+                    let explicit_null = tag_attrs.contains_key("null");
+                    let explicit_list = tag_attrs.contains_key("list");
+                    let explicit_separator = tag_attrs.contains_key("separator");
+
                     let value_raw = tag_attrs.get("value").cloned().unwrap_or_default();
                     let cfsqltype = tag_attrs.get("cfsqltype").cloned()
                         .unwrap_or_else(|| "cf_sql_varchar".to_string());
@@ -2020,6 +2068,22 @@ fn scan_cfqueryparam_tags(sql_body: &str) -> (String, Vec<CfQueryParam>) {
                         .map(|v| v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
                         .unwrap_or(false);
                     let separator = tag_attrs.get("separator").cloned().unwrap_or_else(|| ",".to_string());
+
+                    // attributeCollection="#expr#" — bare script expression that
+                    // evaluates to a struct of param attributes.
+                    let attribute_collection_expr = tag_attrs.get("attributecollection").and_then(|raw| {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            return None;
+                        }
+                        let stripped = strip_hashes(trimmed);
+                        if stripped != trimmed {
+                            Some(stripped)
+                        } else {
+                            // Bare identifier (no hashes) — treat as variable reference.
+                            Some(trimmed.to_string())
+                        }
+                    });
 
                     // Convert value to script expression
                     let value_expr = if null {
@@ -2043,6 +2107,12 @@ fn scan_cfqueryparam_tags(sql_body: &str) -> (String, Vec<CfQueryParam>) {
                         null,
                         list,
                         separator,
+                        attribute_collection_expr,
+                        explicit_value,
+                        explicit_cfsqltype,
+                        explicit_null,
+                        explicit_list,
+                        explicit_separator,
                     });
 
                     // Replace with ? placeholder
