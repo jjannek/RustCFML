@@ -337,8 +337,39 @@ fn execute_code(source: &str, debug: bool) {
     execute_code_with_file(source, debug, None);
 }
 
+/// Resolve cfconfig in CLI (non-serve) mode. Searches the entry file's
+/// directory, then cwd, then exe dir. Returns `None` so the VM can still
+/// operate without a server_state attached.
+fn load_cli_cfconfig(source_file: &Option<String>) -> Arc<RustCfmlConfig> {
+    let mut search: Vec<PathBuf> = Vec::new();
+    if let Some(ref f) = source_file {
+        if let Some(parent) = std::path::Path::new(f).parent() {
+            search.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        search.push(cwd);
+    }
+    if let Some(d) = resolve::exe_dir() {
+        search.push(d);
+    }
+    Arc::new(RustCfmlConfig::load(&search).unwrap_or_default())
+}
+
 fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>) {
-    match compile_and_run(source, debug, source_file, IndexMap::new(), None, None, None, vfs::real_fs(), false) {
+    // CLI mode: load .cfconfig.json once, attach via a minimal ServerState so
+    // the VM picks up runtime knobs, datasource registry, and security flags.
+    // Without this, CFML tests can't observe cfconfig effects.
+    let cfconfig = load_cli_cfconfig(&source_file);
+    populate_datasource_registry(&cfconfig);
+    populate_default_mail_server(&cfconfig);
+    cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
+        csrf_enabled: cfconfig.security.csrf_enabled,
+        secure_json: cfconfig.security.secure_json,
+        secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
+    });
+    let server_state = ServerState::with_config(false, cfconfig);
+    match compile_and_run(source, debug, source_file, IndexMap::new(), Some(&server_state), None, None, vfs::real_fs(), false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);

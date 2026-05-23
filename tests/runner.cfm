@@ -5,6 +5,11 @@ writeOutput("============================================================" & chr
 
 include "harness.cfm";
 
+// --- cfconfig ---
+try { include "config/test_cfconfig_loading.cfm"; } catch (any e) { writeOutput("ERROR | config/test_cfconfig_loading.cfm | " & e.message & chr(10)); }
+try { include "config/test_cfconfig_datasource.cfm"; } catch (any e) { writeOutput("ERROR | config/test_cfconfig_datasource.cfm | " & e.message & chr(10)); }
+try { include "config/test_cfconfig_security.cfm"; } catch (any e) { writeOutput("ERROR | config/test_cfconfig_security.cfm | " & e.message & chr(10)); }
+
 // --- Core Language ---
 try { include "core/test_variables.cfm"; } catch (any e) { writeOutput("ERROR | core/test_variables.cfm | " & e.message & chr(10)); }
 try { include "core/test_access_identifiers.cfm"; } catch (any e) { writeOutput("ERROR | core/test_access_identifiers.cfm | " & e.message & chr(10)); }

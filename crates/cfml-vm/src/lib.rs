@@ -3763,6 +3763,18 @@ impl CfmlVirtualMachine {
         parent_locals: &IndexMap<String, CfmlValue>,
     ) -> CfmlResult {
         if let CfmlValue::Function(func) = func_ref {
+            // security.disallowedFunctions: enforced at the very top so the
+            // user-defined fast path below can't bypass it. Checked once per
+            // call; the HashSet lookup is cheap.
+            if !self.disallowed_functions.is_empty() {
+                let name_lower_dis = func.name.to_lowercase();
+                if self.disallowed_functions.contains(&name_lower_dis) {
+                    return Err(CfmlError::runtime(format!(
+                        "Function '{}' is disallowed by security policy",
+                        func.name
+                    )));
+                }
+            }
             // Fast path: if the function has a stored bytecode index, dispatch directly
             // (skips all builtin matching for user-defined functions)
             if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = func.body {
@@ -3808,18 +3820,6 @@ impl CfmlVirtualMachine {
 
             // Check builtin functions (case-insensitive)
             let name_lower = func.name.to_lowercase();
-
-            // security.disallowedFunctions: refuse the call entirely.
-            // Checked before any VM intercept dispatch so blocked names can't
-            // sneak through a higher-priority handler.
-            if !self.disallowed_functions.is_empty()
-                && self.disallowed_functions.contains(&name_lower)
-            {
-                return Err(CfmlError::runtime(format!(
-                    "Function '{}' is disallowed by security policy",
-                    func.name
-                )));
-            }
 
             // writeOutput/writeDump must be handled before the builtin lookup
             // so output goes to output_buffer (not stdout via the builtin fn)

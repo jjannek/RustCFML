@@ -1,0 +1,30 @@
+{
+  "server": {
+    "port": 9999,
+    "welcomeFiles": ["index.cfm", "default.cfm"],
+    "maxRequestBodySize": 5242880
+  },
+  "runtime": {
+    "locale": "en-GB",
+    "timezone": "Europe/London",
+    "sessionTimeout": "0,0,15,0"
+  },
+  "datasources": {
+    "testds": {
+      "driver": "sqlite",
+      "database": ":memory:"
+    }
+  },
+  "mappings": {
+    "/cfconfig-test": "/var/tmp/rustcfml-cfconfig-test"
+  },
+  "security": {
+    "csrfEnabled": true,
+    "secureJSON": false,
+    "disallowedFunctions": ["cfconfigSecurityProbe"]
+  },
+  "debugging": {
+    "enabled": true,
+    "errorStatusCode": false
+  }
+}
