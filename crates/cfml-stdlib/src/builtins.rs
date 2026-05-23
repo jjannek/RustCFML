@@ -5757,11 +5757,55 @@ fn parse_datasource(ds: &str) -> DbDriver {
 }
 
 // -----------------------------------------------
+// Datasource Registry
+// -----------------------------------------------
+//
+// Named datasources from `.cfconfig.json` resolve to connection URLs through
+// this global registry. cfquery / queryExecute consult the registry before
+// falling through to bare-string parsing, so `datasource="myDSN"` works the
+// same way it does in Lucee/ACF. Populated once by the CLI at startup.
+
+use std::sync::{Mutex, OnceLock};
+
+static DATASOURCE_REGISTRY: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Register a name → connection-URL mapping. Names are stored lowercased so
+/// lookups are case-insensitive (matching CFML's general identifier handling).
+/// Re-registering an existing name overwrites it.
+pub fn register_datasource(name: &str, url: String) {
+    let m = DATASOURCE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    m.lock().unwrap().insert(name.to_lowercase(), url);
+}
+
+/// Mark `name` as the default datasource (used when cfquery has no
+/// `datasource` attribute). Stored under the reserved key `""`.
+pub fn set_default_datasource(url: String) {
+    let m = DATASOURCE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    m.lock().unwrap().insert(String::new(), url);
+}
+
+/// Resolve a datasource identifier to a connection URL. If `name` matches a
+/// registered datasource, return its URL; otherwise return `name` unchanged
+/// so callers can still pass raw `mysql://...` strings.
+pub fn resolve_datasource(name: &str) -> String {
+    if let Some(m) = DATASOURCE_REGISTRY.get() {
+        if let Some(url) = m.lock().unwrap().get(&name.to_lowercase()) {
+            return url.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// Resolve the default datasource registered via `set_default_datasource`.
+fn default_datasource() -> Option<String> {
+    DATASOURCE_REGISTRY
+        .get()
+        .and_then(|m| m.lock().unwrap().get("").cloned())
+}
+
+// -----------------------------------------------
 // Connection Pool Manager
 // -----------------------------------------------
-
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-use std::sync::{Mutex, OnceLock};
 
 /// Global pool manager — maps datasource URL → pool instance (type-erased)
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
@@ -6125,13 +6169,20 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         _ => (sql, raw_params),
     };
 
-    // Extract datasource from options
-    let datasource = match &options_arg {
-        CfmlValue::Struct(opts) => opts.iter()
+    // Extract datasource from options. Look up against the cfconfig
+    // registry first; fall back to the default datasource if the call
+    // omitted one entirely; final fallback is the historical `:memory:`
+    // sqlite default so existing tests keep working.
+    let datasource_attr: Option<String> = match &options_arg {
+        CfmlValue::Struct(opts) => opts
+            .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| v.as_string())
-            .unwrap_or_else(|| ":memory:".to_string()),
-        _ => ":memory:".to_string(),
+            .map(|(_, v)| v.as_string()),
+        _ => None,
+    };
+    let datasource = match datasource_attr {
+        Some(name) => resolve_datasource(&name),
+        None => default_datasource().unwrap_or_else(|| ":memory:".to_string()),
     };
 
     // Extract returnType from options. For returntype="struct", also pull

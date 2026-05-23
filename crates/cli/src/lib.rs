@@ -578,6 +578,11 @@ async fn async_run_server(
         fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
     );
 
+    // Populate the global datasource registry from cfconfig so cfquery /
+    // queryExecute can resolve `datasource="myDSN"` lookups. Done once per
+    // process; replaying with new values is idempotent for tests.
+    populate_datasource_registry(&cfconfig);
+
     // Load URL rewrite rules if urlrewrite.xml exists
     let rewrite_xml = doc_root.join("urlrewrite.xml");
     let rewrite_xml_str = rewrite_xml.to_string_lossy().to_string();
@@ -1282,6 +1287,28 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// Push every cfconfig datasource into the cfml-stdlib global registry so
+/// cfquery / queryExecute can resolve `datasource="myDSN"` to a connection
+/// URL. Drivers that don't compile in (e.g. mssql without the feature) are
+/// still registered — they'll fail later at query time with a clearer
+/// "driver not available" error from the stdlib than from a silent miss.
+fn populate_datasource_registry(cfg: &RustCfmlConfig) {
+    for (name, ds) in cfg.datasources.iter() {
+        if let Some(url) = ds.connection_url() {
+            cfml_stdlib::builtins::register_datasource(name, url.clone());
+            if ds.default {
+                cfml_stdlib::builtins::set_default_datasource(url);
+            }
+        } else {
+            log::warn!(
+                "cfconfig datasource '{}': unrecognised driver '{}'; skipping",
+                name,
+                ds.driver
+            );
+        }
+    }
 }
 
 /// Return true if the URL path points at a file the web server must not serve

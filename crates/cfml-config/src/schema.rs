@@ -164,6 +164,47 @@ pub struct DatasourceCfg {
     pub default: bool,
 }
 
+impl DatasourceCfg {
+    /// Build a connection string that the cfml-stdlib query driver layer can
+    /// consume. Honors `connectionString` verbatim when provided; otherwise
+    /// synthesises a URL from `driver` + host/port/database/credentials.
+    /// Returns `None` for an unsupported / unrecognised driver.
+    pub fn connection_url(&self) -> Option<String> {
+        if !self.connection_string.is_empty() {
+            return Some(self.connection_string.clone());
+        }
+        let driver = self.driver.to_ascii_lowercase();
+        let creds = if self.username.is_empty() && self.password.is_empty() {
+            String::new()
+        } else if self.password.is_empty() {
+            format!("{}@", self.username)
+        } else {
+            format!("{}:{}@", self.username, self.password)
+        };
+        let port = if self.port.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", self.port)
+        };
+        match driver.as_str() {
+            "mysql" | "mariadb" => Some(format!(
+                "mysql://{}{}{}/{}",
+                creds, self.host, port, self.database
+            )),
+            "postgresql" | "postgres" => Some(format!(
+                "postgresql://{}{}{}/{}",
+                creds, self.host, port, self.database
+            )),
+            "mssql" | "sqlserver" => Some(format!(
+                "mssql://{}{}{}/{}",
+                creds, self.host, port, self.database
+            )),
+            "sqlite" => Some(format!("sqlite://{}", self.database)),
+            _ => None,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────
 // Mail
 // ─────────────────────────────────────────────
@@ -478,6 +519,44 @@ mod tests {
         assert_eq!(RuntimeCfg::parse_timeout_seconds("0, 1, 0, 0"), Some(3600));
         assert_eq!(RuntimeCfg::parse_timeout_seconds("bad"), None);
         assert_eq!(RuntimeCfg::parse_timeout_seconds("1,2,3"), None);
+    }
+
+    #[test]
+    fn datasource_connection_url_mysql() {
+        let mut ds = DatasourceCfg::default();
+        ds.driver = "mysql".into();
+        ds.host = "db.example.com".into();
+        ds.port = "3306".into();
+        ds.database = "app".into();
+        ds.username = "u".into();
+        ds.password = "p".into();
+        assert_eq!(
+            ds.connection_url().unwrap(),
+            "mysql://u:p@db.example.com:3306/app"
+        );
+    }
+
+    #[test]
+    fn datasource_connection_url_sqlite_path() {
+        let mut ds = DatasourceCfg::default();
+        ds.driver = "sqlite".into();
+        ds.database = "./data/dev.db".into();
+        assert_eq!(ds.connection_url().unwrap(), "sqlite://./data/dev.db");
+    }
+
+    #[test]
+    fn datasource_connection_url_passthrough() {
+        let mut ds = DatasourceCfg::default();
+        ds.driver = "mysql".into();
+        ds.connection_string = "mysql://override/db".into();
+        assert_eq!(ds.connection_url().unwrap(), "mysql://override/db");
+    }
+
+    #[test]
+    fn datasource_connection_url_unknown_driver() {
+        let mut ds = DatasourceCfg::default();
+        ds.driver = "h2".into();
+        assert!(ds.connection_url().is_none());
     }
 
     #[test]

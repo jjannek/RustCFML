@@ -10732,9 +10732,41 @@ impl CfmlVirtualMachine {
             mut mappings,
             session_management,
             session_timeout,
-            custom_tag_paths,
+            mut custom_tag_paths,
             local_mode_modern_default,
         ) = Self::extract_app_config(&template);
+
+        // 3.0 Layer .cfconfig.json global mappings + customTagPaths underneath
+        // the per-application ones, so Application.cfc wins on any conflict.
+        // Mapping keys are normalised the same way extract_app_config does.
+        if let Some(ref ss) = self.server_state {
+            let cfg = ss.cfconfig.clone();
+            let app_keys: Vec<String> =
+                mappings.iter().map(|m| m.name.to_lowercase()).collect();
+            for (raw_name, raw_path) in cfg.mappings.iter() {
+                let mut name = raw_name.clone();
+                if !name.starts_with('/') {
+                    name = format!("/{}", name);
+                }
+                if !name.ends_with('/') {
+                    name = format!("{}/", name);
+                }
+                if app_keys.contains(&name.to_lowercase()) {
+                    continue;
+                }
+                mappings.push(CfmlMapping {
+                    name,
+                    path: raw_path.clone(),
+                });
+            }
+            // customTagPaths: cfconfig paths appended after Application.cfc's
+            // (Application.cfc searched first).
+            for p in cfg.custom_tag_paths.iter() {
+                if !custom_tag_paths.iter().any(|existing| existing == p) {
+                    custom_tag_paths.push(p.clone());
+                }
+            }
+        }
 
         // 3a. Apply this.localMode as the request-level default. Functions
         // without an explicit `localMode` attribute inherit this at runtime.
