@@ -623,15 +623,33 @@ async fn async_run_server(
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
 
-    // Load URL rewrite rules if urlrewrite.xml exists
-    let rewrite_xml = doc_root.join("urlrewrite.xml");
-    let rewrite_xml_str = rewrite_xml.to_string_lossy().to_string();
-    let rewrite_rules = if vfs.is_file(&rewrite_xml_str) {
-        let rules = rewrite::parse_urlrewrite_xml(&rewrite_xml);
-        println!("Loaded {} URL rewrite rule(s) from urlrewrite.xml", rules.len());
-        rules
-    } else {
+    // Load URL rewrite rules from cfconfig.urlRewriting.configFile (default
+    // "urlrewrite.xml"). Skipped entirely if urlRewriting.enabled = false.
+    let rewrite_rules = if !cfconfig.url_rewriting.enabled {
         Vec::new()
+    } else {
+        let cfg_path = if cfconfig.url_rewriting.config_file.is_empty() {
+            "urlrewrite.xml".to_string()
+        } else {
+            cfconfig.url_rewriting.config_file.clone()
+        };
+        let rewrite_xml = if std::path::Path::new(&cfg_path).is_absolute() {
+            PathBuf::from(&cfg_path)
+        } else {
+            doc_root.join(&cfg_path)
+        };
+        let rewrite_xml_str = rewrite_xml.to_string_lossy().to_string();
+        if vfs.is_file(&rewrite_xml_str) {
+            let rules = rewrite::parse_urlrewrite_xml(&rewrite_xml);
+            println!(
+                "Loaded {} URL rewrite rule(s) from {}",
+                rules.len(),
+                rewrite_xml.display()
+            );
+            rules
+        } else {
+            Vec::new()
+        }
     };
 
     let mode = if single_threaded { "single-threaded" } else { "multi-threaded" };
