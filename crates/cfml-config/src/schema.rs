@@ -17,7 +17,7 @@ use crate::env::expand_env_vars;
 // Root
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct RustCfmlConfig {
     pub server: ServerCfg,
@@ -47,7 +47,7 @@ pub struct RustCfmlConfig {
 // Server
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ServerCfg {
     pub host: String,
@@ -88,7 +88,7 @@ impl Default for ServerCfg {
 // Runtime
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct RuntimeCfg {
     #[serde(rename = "nullSupport")]
@@ -143,7 +143,7 @@ impl RuntimeCfg {
 // Datasources
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct DatasourceCfg {
     pub driver: String,
@@ -209,7 +209,7 @@ impl DatasourceCfg {
 // Mail
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct MailServerCfg {
     pub smtp: String,
@@ -225,14 +225,14 @@ pub struct MailServerCfg {
 // Caches
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct CacheCfg {
     pub provider: String,
     pub properties: CacheProperties,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct CacheProperties {
     #[serde(rename = "maxObjects")]
@@ -257,7 +257,7 @@ impl Default for CacheProperties {
 // Logging
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct LoggingCfg {
     #[serde(rename = "logsDirectory")]
@@ -278,7 +278,7 @@ impl Default for LoggingCfg {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct LoggerCfg {
     pub level: String,
@@ -289,7 +289,7 @@ pub struct LoggerCfg {
 // Debugging
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct DebuggingCfg {
     pub enabled: bool,
@@ -316,7 +316,7 @@ impl Default for DebuggingCfg {
 // Security
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct SecurityCfg {
     pub sandbox: bool,
@@ -357,7 +357,7 @@ impl Default for SecurityCfg {
 // URL rewriting
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct UrlRewritingCfg {
     #[serde(rename = "configFile")]

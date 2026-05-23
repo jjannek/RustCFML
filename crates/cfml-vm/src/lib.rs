@@ -111,6 +111,44 @@ impl BytecodeCache {
 /// `server.system.properties["os.name"]`, `server.separator.file`, etc. works
 /// out of the box. Snapshotted on each access; cheap because env vars and
 /// args are small.
+/// Convert a parsed `.cfconfig.json` into a CFML-visible read-only struct.
+/// Goes via `serde_json::Value` so we get a single converter for all the
+/// schema's nested types. Returns an empty struct on serialise failure
+/// (should never happen — every field has Serialize).
+pub(crate) fn cfconfig_to_cfml(cfg: &cfml_config::RustCfmlConfig) -> CfmlValue {
+    match serde_json::to_value(cfg) {
+        Ok(v) => json_value_to_cfml(v),
+        Err(_) => CfmlValue::strukt(IndexMap::new()),
+    }
+}
+
+fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
+    match value {
+        serde_json::Value::Null => CfmlValue::Null,
+        serde_json::Value::Bool(b) => CfmlValue::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                CfmlValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                CfmlValue::Double(f)
+            } else {
+                CfmlValue::Int(0)
+            }
+        }
+        serde_json::Value::String(s) => CfmlValue::String(s),
+        serde_json::Value::Array(arr) => {
+            CfmlValue::array(arr.into_iter().map(json_value_to_cfml).collect())
+        }
+        serde_json::Value::Object(obj) => {
+            let mut map = IndexMap::new();
+            for (k, v) in obj {
+                map.insert(k, json_value_to_cfml(v));
+            }
+            CfmlValue::strukt(map)
+        }
+    }
+}
+
 fn build_server_scope() -> IndexMap<String, CfmlValue> {
     let mut info = IndexMap::new();
 
@@ -1136,7 +1174,14 @@ impl CfmlVirtualMachine {
                             .cloned()
                             .unwrap_or(CfmlValue::strukt(IndexMap::new()))
                     } else if name_lower == "server" {
-                        CfmlValue::strukt(build_server_scope())
+                        let mut scope = build_server_scope();
+                        if let Some(ref ss) = self.server_state {
+                            scope.insert(
+                                "cfconfig".to_string(),
+                                cfconfig_to_cfml(&ss.cfconfig),
+                            );
+                        }
+                        CfmlValue::strukt(scope)
                     } else if let Some(val) =
                         self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
                     {

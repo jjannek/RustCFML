@@ -23,6 +23,12 @@ pub use schema::{
     RustCfmlConfig, SecurityCfg, ServerCfg, UrlRewritingCfg,
 };
 
+/// Re-export of `serde_json::Value` used when callers want to convert the
+/// config into another runtime's value type (e.g. CfmlValue) via a generic
+/// JSON intermediate. Cheap because the underlying serializer is the same
+/// one used during parse.
+pub use serde_json::{to_value as to_json_value, Value as JsonValue};
+
 use std::path::Path;
 use thiserror::Error;
 

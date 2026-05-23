@@ -582,6 +582,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "rust_decimal",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
