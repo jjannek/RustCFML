@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use cfml_codegen::compiler::CfmlCompiler;
 use cfml_common::dynamic::CfmlValue;
@@ -117,6 +117,13 @@ struct Args {
     #[arg(long)]
     single_threaded: bool,
 
+    /// Enable production mode: cache Application.cfc resolution, URL→file
+    /// resolution, and bytecode cache entries permanently (no mtime checks,
+    /// no readdir per request). Restart the server to pick up file changes.
+    /// Also honored via `RUSTCFML_PRODUCTION=1`.
+    #[arg(long)]
+    production: bool,
+
     /// Build a self-contained binary: embed a CFML app into a single executable
     /// Usage: rustcfml --build <app-dir> [-o output-binary] [--mode serve|cli]
     #[arg(long, value_name = "APP_DIR")]
@@ -203,7 +210,9 @@ fn real_main() {
             eprintln!("Error: Document root is not a directory: {}", doc_root.display());
             exit(1);
         }
-        run_server(&doc_root, args.port, args.debug, args.single_threaded, vfs::real_fs(), false);
+        let production = args.production
+            || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
+        run_server(&doc_root, args.port, args.debug, args.single_threaded, vfs::real_fs(), false, production);
         return;
     }
 
@@ -469,9 +478,12 @@ struct AppState {
     rewrite_rules: Vec<rewrite::RewriteRule>,
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
+    /// Cache of URL-path → resolved file. Only populated in production mode;
+    /// keyed by the rewritten URL path (after rewrite rules have applied).
+    resolved_file_cache: Arc<RwLock<HashMap<String, Option<ResolvedFile>>>>,
 }
 
-fn run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vfs: Arc<dyn Vfs>, sandbox: bool) {
+fn run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vfs: Arc<dyn Vfs>, sandbox: bool, production: bool) {
     let rt = if single_threaded {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -484,11 +496,11 @@ fn run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vf
             .build()
             .unwrap()
     };
-    rt.block_on(async_run_server(doc_root, port, debug, single_threaded, vfs, sandbox));
+    rt.block_on(async_run_server(doc_root, port, debug, single_threaded, vfs, sandbox, production));
 }
 
-async fn async_run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vfs: Arc<dyn Vfs>, sandbox: bool) {
-    let mut server_state = ServerState::new();
+async fn async_run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vfs: Arc<dyn Vfs>, sandbox: bool, production: bool) {
+    let mut server_state = ServerState::with_production(production);
     server_state.webroot = Some(
         fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
     );
@@ -517,6 +529,7 @@ async fn async_run_server(doc_root: &Path, port: u16, debug: bool, single_thread
         rewrite_rules,
         vfs,
         sandbox,
+        resolved_file_cache: Arc::new(RwLock::new(HashMap::new())),
     });
 
     let app = axum::Router::new()
@@ -607,8 +620,24 @@ async fn handle_request(
         }
     }
 
-    // Resolve file path from URL
-    let resolved = resolve_file(&state.doc_root, &path, state.vfs.as_ref());
+    // Resolve file path from URL (memoized in production mode)
+    let resolved = if state.server_state.production_mode {
+        let cached = state.resolved_file_cache.read().unwrap().get(&path).cloned();
+        match cached {
+            Some(hit) => hit,
+            None => {
+                let r = resolve_file(&state.doc_root, &path, state.vfs.as_ref());
+                state
+                    .resolved_file_cache
+                    .write()
+                    .unwrap()
+                    .insert(path.clone(), r.clone());
+                r
+            }
+        }
+    } else {
+        resolve_file(&state.doc_root, &path, state.vfs.as_ref())
+    };
 
     match resolved {
         Some(ref rf) if rf.file_path.extension().map_or(false, |e| e == "cfm") => {
@@ -785,6 +814,7 @@ async fn handle_request(
 }
 
 /// Result of resolving a URL path to a file.
+#[derive(Clone)]
 struct ResolvedFile {
     file_path: PathBuf,
     /// The script portion of the URL (e.g. "/index.cfm")
@@ -1877,14 +1907,26 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             if sandbox { println!("Sandbox mode: host filesystem access disabled"); }
             println!("RustCFML self-contained app ({} embedded files)", file_count);
             let doc_root = PathBuf::from(base_dir);
-            run_server(&doc_root, port, false, single_threaded, vfs, sandbox);
+            // Sandbox-mode binaries serve exclusively from the embedded
+            // archive (immutable at runtime), so production-mode caches are
+            // always safe and beneficial. Non-sandbox binaries can read from
+            // the host FS, so respect the explicit env-var opt-in.
+            let production = sandbox
+                || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
+            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production);
         }
         _ => {
             // Foreground mode (default: just run)
             if sandbox { println!("Sandbox mode: host filesystem access disabled"); }
             println!("RustCFML self-contained app ({} embedded files)", file_count);
             let doc_root = PathBuf::from(base_dir);
-            run_server(&doc_root, port, false, single_threaded, vfs, sandbox);
+            // Sandbox-mode binaries serve exclusively from the embedded
+            // archive (immutable at runtime), so production-mode caches are
+            // always safe and beneficial. Non-sandbox binaries can read from
+            // the host FS, so respect the explicit env-var opt-in.
+            let production = sandbox
+                || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
+            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production);
         }
     }
 }

@@ -231,14 +231,28 @@ directory keep the original toolchain-free bundling path.
 
 Benchmarked serving a "Hello World" `.cfm` page using Apache Bench (`ab -n 100 -c 1`):
 
-| Metric | RustCFML | Lucee 7.0.1 | BoxLang 1.10 |
-|---|---|---|---|
-| **Memory (RSS)** | **~8 MB** | ~350 MB | ~305 MB |
-| **Requests/sec** | **1,949 req/s** | 635 req/s | 293 req/s |
-| **Avg response time** | **0.5 ms** | 1.6 ms | 3.4 ms |
-| **Startup** | instant | ~15s | ~15s |
+| Metric | RustCFML (dev) | RustCFML (`--production`) | Lucee 7.0.1 | BoxLang 1.10 |
+|---|---|---|---|---|
+| **Memory (RSS)** | **~8 MB** | **~8 MB** | ~350 MB | ~305 MB |
+| **Requests/sec** | 1,949 req/s | **2,558 req/s** | 635 req/s | 293 req/s |
+| **Avg response time** | 0.5 ms | **0.39 ms** | 1.6 ms | 3.4 ms |
+| **Startup** | instant | instant | ~15s | ~15s |
 
 RustCFML compiles to a native binary with no runtime VM overhead, resulting in significantly lower memory usage and faster response times compared to JVM-based CFML engines.
+
+### Production mode
+
+By default, the server re-validates files on each request: it walks up from the page directory to find `Application.cfc`, stats the resolved file, and stats every cached bytecode entry to detect source changes. This keeps the dev loop hot — edit a file and refresh.
+
+Passing `--production` (or setting `RUSTCFML_PRODUCTION=1`) enables three in-memory caches that persist for the server's lifetime:
+
+- **Application.cfc path resolution** — the first request walks the directory tree; subsequent requests hit a hashmap. Negative results (no `Application.cfc` anywhere in the chain) are cached too.
+- **URL → file resolution** — `is_file` stats from request routing are memoized.
+- **Bytecode cache trust** — the per-hit `mtime` check on every compiled file is skipped.
+
+Net effect: requests pay zero filesystem IO once the cache is warm. The typical speedup on an app with `Application.cfc` + cfincludes is 3–4× requests/sec (measured on `examples/miniapp`: 671 → 2,558 req/s at `-c 1`, 3,440 → 11,812 req/s at `-c 10`). Files added or modified on disk are not picked up until the server is restarted.
+
+Self-contained binaries built with `rustcfml --build` that run in sandbox mode enable production caching automatically, since the embedded VFS is immutable at runtime.
 
 ## Features
 

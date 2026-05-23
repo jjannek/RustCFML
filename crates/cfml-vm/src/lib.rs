@@ -63,17 +63,31 @@ pub struct CachedProgram {
 #[derive(Clone)]
 pub struct BytecodeCache {
     entries: Arc<parking_lot::RwLock<HashMap<String, CachedProgram>>>,
+    /// When true, skip the per-hit `vfs.modified()` stat and always trust
+    /// cached entries. Set from the `--production` flag.
+    trusted: bool,
 }
 
 impl BytecodeCache {
     pub fn new() -> Self {
+        Self::with_trust(false)
+    }
+
+    pub fn with_trust(trusted: bool) -> Self {
         Self {
             entries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            trusted,
         }
     }
 
-    /// Return a cached program if the file's mtime matches the cached entry.
+    /// Return a cached program if present. In trusted (production) mode the
+    /// file's mtime is not re-checked; otherwise the entry is only returned
+    /// when the on-disk mtime still matches.
     pub fn get(&self, path: &str, vfs: &dyn Vfs) -> Option<BytecodeProgram> {
+        if self.trusted {
+            let entries = self.entries.read();
+            return entries.get(path).map(|e| e.program.clone());
+        }
         let mtime = vfs.modified(path).ok()?;
         let entries = self.entries.read();
         let entry = entries.get(path)?;
@@ -339,16 +353,28 @@ pub struct ServerState {
     /// when resolving dotted CFC paths (e.g. `taffy.core.api`) for files
     /// that live outside the Application.cfc directory.
     pub webroot: Option<std::path::PathBuf>,
+    /// When true, in-memory caches (bytecode, Application.cfc path, resolved
+    /// URLs) are never invalidated until server restart. Set by `--production`.
+    pub production_mode: bool,
+    /// Cache of Application.cfc path resolution keyed by the page's parent
+    /// directory. Only populated when `production_mode` is true.
+    pub app_cfc_path_cache: Arc<parking_lot::RwLock<HashMap<std::path::PathBuf, Option<String>>>>,
 }
 
 impl ServerState {
     pub fn new() -> Self {
+        Self::with_production(false)
+    }
+
+    pub fn with_production(production_mode: bool) -> Self {
         Self {
             applications: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             named_locks: Arc::new(Mutex::new(HashMap::new())),
-            bytecode_cache: BytecodeCache::new(),
+            bytecode_cache: BytecodeCache::with_trust(production_mode),
             webroot: None,
+            production_mode,
+            app_cfc_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 }
@@ -10188,7 +10214,9 @@ impl CfmlVirtualMachine {
         Ok(CfmlValue::strukt(result))
     }
 
-    /// Walk up the directory tree from source_file to find Application.cfc
+    /// Walk up the directory tree from source_file to find Application.cfc.
+    /// In production mode, the resolved path (or absence) is memoized by
+    /// start directory on `ServerState.app_cfc_path_cache`.
     fn find_application_cfc(&self) -> Option<String> {
         let start_dir = if let Some(ref source) = self.source_file {
             std::path::Path::new(source)
@@ -10199,16 +10227,31 @@ impl CfmlVirtualMachine {
             std::env::current_dir().unwrap_or_default()
         };
 
+        // Production-mode cache hit
+        if let Some(ref ss) = self.server_state {
+            if ss.production_mode {
+                if let Some(cached) = ss.app_cfc_path_cache.read().get(&start_dir) {
+                    return cached.clone();
+                }
+            }
+        }
+
         let mut dir = start_dir.as_path();
+        let mut found: Option<String> = None;
         loop {
             // Check for Application.cfc (case-insensitive) via VFS
             let dir_str = dir.to_string_lossy().to_string();
             if let Ok(entries) = self.vfs.read_dir(&dir_str) {
+                let mut hit = None;
                 for entry in &entries {
                     if entry.name.to_lowercase() == "application.cfc" {
-                        let full_path = dir.join(&entry.name).to_string_lossy().to_string();
-                        return Some(full_path);
+                        hit = Some(dir.join(&entry.name).to_string_lossy().to_string());
+                        break;
                     }
+                }
+                if hit.is_some() {
+                    found = hit;
+                    break;
                 }
             }
             match dir.parent() {
@@ -10216,7 +10259,16 @@ impl CfmlVirtualMachine {
                 _ => break,
             }
         }
-        None
+
+        if let Some(ref ss) = self.server_state {
+            if ss.production_mode {
+                ss.app_cfc_path_cache
+                    .write()
+                    .insert(start_dir, found.clone());
+            }
+        }
+
+        found
     }
 
     /// Load and execute Application.cfc, returning the component struct
