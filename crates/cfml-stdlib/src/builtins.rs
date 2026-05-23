@@ -6558,6 +6558,91 @@ fn rewrite_params_for_postgres(sql: &str, params_arg: &CfmlValue) -> Result<(Str
     }
 }
 
+// Custom FromSql wrappers for PG types that postgres-types does not provide
+// a built-in impl for: TIMETZ (12B: int64 time + int32 zone) and INTERVAL
+// (16B: int64 microseconds + int32 days + int32 months).
+#[cfg(feature = "postgres_db")]
+struct PgTimeTz { time_us: i64, zone_secs: i32 }
+
+#[cfg(feature = "postgres_db")]
+impl<'a> postgres::types::FromSql<'a> for PgTimeTz {
+    fn from_sql(_ty: &postgres::types::Type, raw: &'a [u8])
+        -> Result<Self, Box<dyn std::error::Error + Sync + Send>>
+    {
+        if raw.len() != 12 { return Err("TIMETZ wire size != 12".into()); }
+        let time_us = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+        let zone_secs = i32::from_be_bytes(raw[8..12].try_into().unwrap());
+        Ok(PgTimeTz { time_us, zone_secs })
+    }
+    fn accepts(ty: &postgres::types::Type) -> bool { *ty == postgres::types::Type::TIMETZ }
+}
+
+#[cfg(feature = "postgres_db")]
+struct PgInterval { time_us: i64, days: i32, months: i32 }
+
+#[cfg(feature = "postgres_db")]
+impl<'a> postgres::types::FromSql<'a> for PgInterval {
+    fn from_sql(_ty: &postgres::types::Type, raw: &'a [u8])
+        -> Result<Self, Box<dyn std::error::Error + Sync + Send>>
+    {
+        if raw.len() != 16 { return Err("INTERVAL wire size != 16".into()); }
+        let time_us = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+        let days = i32::from_be_bytes(raw[8..12].try_into().unwrap());
+        let months = i32::from_be_bytes(raw[12..16].try_into().unwrap());
+        Ok(PgInterval { time_us, days, months })
+    }
+    fn accepts(ty: &postgres::types::Type) -> bool { *ty == postgres::types::Type::INTERVAL }
+}
+
+#[cfg(feature = "postgres_db")]
+fn format_pg_timetz(t: &PgTimeTz) -> String {
+    let mut us = t.time_us;
+    let h = us / 3_600_000_000; us %= 3_600_000_000;
+    let m = us / 60_000_000;    us %= 60_000_000;
+    let s = us / 1_000_000;     let frac = us % 1_000_000;
+    // PG stores zone as seconds-west-of-UTC (so +02:00 → -7200). Negate for
+    // human display: e.g. zone_secs = -7200 → "+02:00".
+    let off_secs = -t.zone_secs;
+    let sign = if off_secs >= 0 { '+' } else { '-' };
+    let abs = off_secs.unsigned_abs() as i64;
+    let oh = abs / 3600;
+    let om = (abs % 3600) / 60;
+    if frac == 0 {
+        format!("1899-12-30 {:02}:{:02}:{:02}{}{:02}:{:02}", h, m, s, sign, oh, om)
+    } else {
+        format!("1899-12-30 {:02}:{:02}:{:02}.{:06}{}{:02}:{:02}", h, m, s, frac, sign, oh, om)
+    }
+}
+
+#[cfg(feature = "postgres_db")]
+fn format_pg_interval(iv: &PgInterval) -> String {
+    // Mirror PG's textual rendering: "1 year 2 mons 3 days HH:MM:SS[.frac]".
+    // Lucee/BoxLang pass the driver's PGInterval.toString() through, which
+    // produces the same text — match that for downstream string comparisons.
+    let years = iv.months / 12;
+    let mons  = iv.months % 12;
+    let mut parts: Vec<String> = Vec::new();
+    if years != 0 { parts.push(format!("{} year{}", years, if years.abs() == 1 { "" } else { "s" })); }
+    if mons  != 0 { parts.push(format!("{} mon{}",  mons,  if mons.abs()  == 1 { "" } else { "s" })); }
+    if iv.days != 0 { parts.push(format!("{} day{}", iv.days, if iv.days.abs() == 1 { "" } else { "s" })); }
+    if iv.time_us != 0 || parts.is_empty() {
+        let neg = iv.time_us < 0;
+        let mut us = iv.time_us.unsigned_abs();
+        let h = us / 3_600_000_000; us %= 3_600_000_000;
+        let m = us / 60_000_000;    us %= 60_000_000;
+        let s = us / 1_000_000;     let frac = us % 1_000_000;
+        let sign = if neg { "-" } else { "" };
+        if frac == 0 {
+            parts.push(format!("{}{:02}:{:02}:{:02}", sign, h, m, s));
+        } else {
+            let frac_trim = format!("{:06}", frac);
+            let trimmed = frac_trim.trim_end_matches('0');
+            parts.push(format!("{}{:02}:{:02}:{:02}.{}", sign, h, m, s, trimmed));
+        }
+    }
+    parts.join(" ")
+}
+
 #[cfg(feature = "postgres_db")]
 fn postgres_row_to_cfml(row: &postgres::Row, col_idx: usize) -> CfmlValue {
     use postgres::types::Type;
@@ -6621,6 +6706,18 @@ fn postgres_row_to_cfml(row: &postgres::Row, col_idx: usize) -> CfmlValue {
         // 1899-12-30 prefix so dateFormat/timeFormat work.
         Type::TIME => match row.try_get::<_, Option<NaiveTime>>(col_idx) {
             Ok(Some(t)) => CfmlValue::String(format!("1899-12-30 {}", t.format("%H:%M:%S"))),
+            _ => CfmlValue::Null,
+        },
+        // TIMETZ: postgres-types has no FromSql impl; use our 12-byte parser
+        // and emit a CFML datetime with explicit ±HH:MM offset.
+        Type::TIMETZ => match row.try_get::<_, Option<PgTimeTz>>(col_idx) {
+            Ok(Some(t)) => CfmlValue::String(format_pg_timetz(&t)),
+            _ => CfmlValue::Null,
+        },
+        // INTERVAL: no native CFML timespan; format like PG/Lucee's textual
+        // rendering so string comparison stays meaningful.
+        Type::INTERVAL => match row.try_get::<_, Option<PgInterval>>(col_idx) {
+            Ok(Some(iv)) => CfmlValue::String(format_pg_interval(&iv)),
             _ => CfmlValue::Null,
         },
         Type::JSON | Type::JSONB => match row.try_get::<_, Option<serde_json::Value>>(col_idx) {
