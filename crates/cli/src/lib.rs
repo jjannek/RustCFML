@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use cfml_codegen::compiler::CfmlCompiler;
 use cfml_common::dynamic::CfmlValue;
 use cfml_common::vfs::{self, Vfs};
+use cfml_config::{resolve, RustCfmlConfig};
 use cfml_compiler::lexer;
 use cfml_compiler::parser::Parser as CfmlParser;
 use cfml_compiler::tag_parser;
@@ -205,14 +206,61 @@ fn real_main() {
     }
 
     if let Some(ref doc_root) = args.serve {
-        let doc_root = PathBuf::from(doc_root);
+        let mut doc_root = PathBuf::from(doc_root);
         if !doc_root.is_dir() {
             eprintln!("Error: Document root is not a directory: {}", doc_root.display());
             exit(1);
         }
         let production = args.production
             || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
-        run_server(&doc_root, args.port, args.debug, args.single_threaded, vfs::real_fs(), false, production);
+
+        // Load .cfconfig.json: webroot → cwd → exe dir.
+        let mut search_paths: Vec<PathBuf> = vec![doc_root.clone()];
+        if let Ok(cwd) = std::env::current_dir() {
+            search_paths.push(cwd);
+        }
+        if let Some(dir) = resolve::exe_dir() {
+            search_paths.push(dir);
+        }
+        let mut cfconfig = match RustCfmlConfig::load(&search_paths) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Error loading .cfconfig.json: {}", e);
+                exit(1);
+            }
+        };
+
+        // CLI flags win over config. Args::port has a clap default of 8500, so
+        // we can't easily tell "user passed 8500" from "user passed nothing".
+        // Convention: any non-default --port overrides; otherwise config wins.
+        let port = if args.port != 8500 {
+            args.port
+        } else if cfconfig.server.port != 0 {
+            cfconfig.server.port
+        } else {
+            args.port
+        };
+        // server.webroot from config only applies when --serve had no path.
+        if doc_root == PathBuf::from(".") && !cfconfig.server.webroot.is_empty() {
+            doc_root = PathBuf::from(&cfconfig.server.webroot);
+            if !doc_root.is_dir() {
+                eprintln!("Error: cfconfig server.webroot is not a directory: {}", doc_root.display());
+                exit(1);
+            }
+        }
+        // Record resolved values so request handlers see the merged view.
+        cfconfig.server.port = port;
+
+        run_server(
+            &doc_root,
+            port,
+            args.debug,
+            args.single_threaded,
+            vfs::real_fs(),
+            false,
+            production,
+            Arc::new(cfconfig),
+        );
         return;
     }
 
@@ -481,9 +529,22 @@ struct AppState {
     /// Cache of URL-path → resolved file. Only populated in production mode;
     /// keyed by the rewritten URL path (after rewrite rules have applied).
     resolved_file_cache: Arc<RwLock<HashMap<String, Option<ResolvedFile>>>>,
+    /// Resolved RustCFML configuration. In production mode this is read once
+    /// at startup; dev mode currently also reads once (live-reload lands in a
+    /// later phase). Used for HTTP-block list and downstream wiring.
+    cfconfig: Arc<RustCfmlConfig>,
 }
 
-fn run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vfs: Arc<dyn Vfs>, sandbox: bool, production: bool) {
+fn run_server(
+    doc_root: &Path,
+    port: u16,
+    debug: bool,
+    single_threaded: bool,
+    vfs: Arc<dyn Vfs>,
+    sandbox: bool,
+    production: bool,
+    cfconfig: Arc<RustCfmlConfig>,
+) {
     let rt = if single_threaded {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -496,10 +557,19 @@ fn run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vf
             .build()
             .unwrap()
     };
-    rt.block_on(async_run_server(doc_root, port, debug, single_threaded, vfs, sandbox, production));
+    rt.block_on(async_run_server(doc_root, port, debug, single_threaded, vfs, sandbox, production, cfconfig));
 }
 
-async fn async_run_server(doc_root: &Path, port: u16, debug: bool, single_threaded: bool, vfs: Arc<dyn Vfs>, sandbox: bool, production: bool) {
+async fn async_run_server(
+    doc_root: &Path,
+    port: u16,
+    debug: bool,
+    single_threaded: bool,
+    vfs: Arc<dyn Vfs>,
+    sandbox: bool,
+    production: bool,
+    cfconfig: Arc<RustCfmlConfig>,
+) {
     let mut server_state = ServerState::with_production(production);
     server_state.webroot = Some(
         fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
@@ -530,6 +600,7 @@ async fn async_run_server(doc_root: &Path, port: u16, debug: bool, single_thread
         vfs,
         sandbox,
         resolved_file_cache: Arc::new(RwLock::new(HashMap::new())),
+        cfconfig,
     });
 
     let app = axum::Router::new()
@@ -570,6 +641,18 @@ async fn handle_request(
         Some(pos) => (&url[..pos], &url[pos + 1..]),
         None => (url.as_str(), ""),
     };
+
+    // Block direct access to config and meta files. 404 (not 403) so the
+    // existence of the file is not confirmed to a probing client. Always
+    // applies regardless of any rewrite rules.
+    if is_blocked_path(raw_path, &state.cfconfig) {
+        log::debug!("  -> 404 (blocked path)");
+        return axum::response::Response::builder()
+            .status(404)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(axum::body::Body::from("Not found"))
+            .unwrap();
+    }
 
     // Apply URL rewrite rules before file resolution
     let mut path = raw_path.to_string();
@@ -1167,6 +1250,100 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// Return true if the URL path points at a file the web server must not serve
+/// directly. Covers `.cfconfig*` / `.env` / `*.lex` unconditionally, then
+/// applies the glob patterns from `security.blockedPaths`.
+fn is_blocked_path(url_path: &str, cfconfig: &RustCfmlConfig) -> bool {
+    let basename = url_path.rsplit('/').next().unwrap_or(url_path);
+    if cfml_config::resolve::is_protected_filename(basename) {
+        return true;
+    }
+    let url_lower = url_path.to_ascii_lowercase();
+    let base_lower = basename.to_ascii_lowercase();
+    for pat in &cfconfig.security.blocked_paths {
+        let pat_lower = pat.to_ascii_lowercase();
+        if glob_matches(&pat_lower, &base_lower) || glob_matches(&pat_lower, &url_lower) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Minimal `*` glob matcher (no `?`, no character classes). Sufficient for
+/// the simple patterns used in `security.blockedPaths` (e.g. `*.cfm.bak`,
+/// `Application.cfc`, `*.config.cfm`).
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let p: Vec<&str> = pattern.split('*').collect();
+    if p.len() == 1 {
+        return pattern == text;
+    }
+    let mut cursor = 0;
+    if !p[0].is_empty() {
+        if !text.starts_with(p[0]) {
+            return false;
+        }
+        cursor = p[0].len();
+    }
+    for (idx, segment) in p.iter().enumerate().skip(1) {
+        if segment.is_empty() {
+            continue;
+        }
+        if idx == p.len() - 1 {
+            // Last segment must match the tail.
+            if cursor > text.len() {
+                return false;
+            }
+            return text[cursor..].ends_with(segment);
+        }
+        match text[cursor..].find(segment) {
+            Some(pos) => cursor += pos + segment.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod cfconfig_block_tests {
+    use super::*;
+
+    #[test]
+    fn glob_star_extension() {
+        assert!(glob_matches("*.cfm.bak", "foo.cfm.bak"));
+        assert!(!glob_matches("*.cfm.bak", "foo.cfm"));
+    }
+
+    #[test]
+    fn glob_exact_name() {
+        assert!(glob_matches("application.cfc", "application.cfc"));
+        assert!(!glob_matches("application.cfc", "myapp.cfc"));
+    }
+
+    #[test]
+    fn glob_internal_wildcard() {
+        assert!(glob_matches("foo*bar", "foo123bar"));
+        assert!(glob_matches("foo*bar", "foobar"));
+        assert!(!glob_matches("foo*bar", "foo123"));
+    }
+
+    #[test]
+    fn block_protects_cfconfig() {
+        let cfg = RustCfmlConfig::default();
+        assert!(is_blocked_path("/.cfconfig.json", &cfg));
+        assert!(is_blocked_path("/sub/.cfconfig.json", &cfg));
+        assert!(is_blocked_path("/.CFConfig.json", &cfg));
+        assert!(is_blocked_path("/.env", &cfg));
+        assert!(!is_blocked_path("/index.cfm", &cfg));
+    }
+
+    #[test]
+    fn block_honors_default_patterns() {
+        let cfg = RustCfmlConfig::default();
+        assert!(is_blocked_path("/Application.cfc", &cfg));
+        assert!(is_blocked_path("/sub/foo.cfm.bak", &cfg));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1913,7 +2090,10 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             // the host FS, so respect the explicit env-var opt-in.
             let production = sandbox
                 || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
-            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production);
+            // Embedded-binary cfconfig load lands in a later phase; for now
+            // use defaults so the rest of the wiring compiles.
+            let cfconfig = Arc::new(RustCfmlConfig::default());
+            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production, cfconfig);
         }
         _ => {
             // Foreground mode (default: just run)
@@ -1926,7 +2106,10 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             // the host FS, so respect the explicit env-var opt-in.
             let production = sandbox
                 || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
-            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production);
+            // Embedded-binary cfconfig load lands in a later phase; for now
+            // use defaults so the rest of the wiring compiles.
+            let cfconfig = Arc::new(RustCfmlConfig::default());
+            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production, cfconfig);
         }
     }
 }

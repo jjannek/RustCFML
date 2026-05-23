@@ -2773,6 +2773,7 @@ dependencies = [
  "cfml-codegen",
  "cfml-common",
  "cfml-compiler",
+ "cfml-config",
  "cfml-stdlib",
  "cfml-vm",
  "clap",
