@@ -42,6 +42,10 @@ cargo run --release -- --serve examples/miniapp --port 3000  # Custom root and p
 
 The server is built on [Axum](https://github.com/tokio-rs/axum) with concurrent request handling. It serves `.cfm` files and static assets from the document root. Directory requests serve `index.cfm` if present. Path info routing is supported (`/index.cfm/users/123` resolves to `index.cfm` with path info `/users/123`). Bytecode caching skips recompilation for unchanged files across requests.
 
+#### Configuration (`.cfconfig.json`)
+
+Drop a `.cfconfig.json` at the webroot to configure datasources, mappings, mail, security policies, error handling, and more. The format follows the Ortus CFConfig filename convention with a BoxLang-style flat schema, so the same file works across CommandBox/Lucee, BoxLang, and RustCFML — engine-specific keys are silently ignored. See **[CFCONFIG.md](CFCONFIG.md)** for the full reference.
+
 #### URL Rewriting
 
 Place a `urlrewrite.xml` file in your document root for Tuckey-compatible URL rewriting. This enables clean URLs and REST-style routing:
