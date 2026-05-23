@@ -467,6 +467,9 @@ fn compile_and_run(
 
     // Wire up server state if provided (for --serve mode)
     if let Some(ss) = server_state {
+        // Overlay .cfconfig.json runtime knobs onto the VM. ServerState owns
+        // the Arc; we only need a borrow long enough to copy values across.
+        vm.apply_cfconfig(&ss.cfconfig);
         vm.server_state = Some(ss.clone());
     }
 
@@ -570,7 +573,7 @@ async fn async_run_server(
     production: bool,
     cfconfig: Arc<RustCfmlConfig>,
 ) {
-    let mut server_state = ServerState::with_production(production);
+    let mut server_state = ServerState::with_config(production, cfconfig.clone());
     server_state.webroot = Some(
         fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
     );
@@ -629,8 +632,13 @@ async fn handle_request(
         .map(|(name, value)| (name.as_str().to_string(), value.to_str().unwrap_or("").to_string()))
         .collect();
 
-    // Read body bytes
-    let body_bytes = axum::body::to_bytes(body, 10_000_000).await.unwrap_or_default();
+    // Read body bytes. `server.maxRequestBodySize` from cfconfig caps the
+    // allowed size (default 10 MB, `0` = unlimited).
+    let body_limit = match state.cfconfig.server.max_request_body_size {
+        0 => usize::MAX,
+        n => n as usize,
+    };
+    let body_bytes = axum::body::to_bytes(body, body_limit).await.unwrap_or_default();
 
     let debug = state.debug;
 
@@ -704,12 +712,14 @@ async fn handle_request(
     }
 
     // Resolve file path from URL (memoized in production mode)
+    let welcome_files = &state.cfconfig.server.welcome_files;
+    let cfml_exts = &state.cfconfig.server.cfml_extensions;
     let resolved = if state.server_state.production_mode {
         let cached = state.resolved_file_cache.read().unwrap().get(&path).cloned();
         match cached {
             Some(hit) => hit,
             None => {
-                let r = resolve_file(&state.doc_root, &path, state.vfs.as_ref());
+                let r = resolve_file(&state.doc_root, &path, state.vfs.as_ref(), welcome_files, cfml_exts);
                 state
                     .resolved_file_cache
                     .write()
@@ -719,11 +729,20 @@ async fn handle_request(
             }
         }
     } else {
-        resolve_file(&state.doc_root, &path, state.vfs.as_ref())
+        resolve_file(&state.doc_root, &path, state.vfs.as_ref(), welcome_files, cfml_exts)
+    };
+
+    // CFML extensions to dispatch through the interpreter. `.cfc` files are
+    // never served as static even if absent from cfml_extensions — that would
+    // expose source. Likewise `.cfm` stays in the default list.
+    let is_cfml_file = |p: &Path| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| cfml_exts.iter().any(|ext| ext.eq_ignore_ascii_case(e)))
     };
 
     match resolved {
-        Some(ref rf) if rf.file_path.extension().map_or(false, |e| e == "cfm") => {
+        Some(ref rf) if is_cfml_file(&rf.file_path) => {
             // Execute .cfm file — in non-debug serve mode the bytecode cache reads the
             // file itself, so we pass an empty source and skip the redundant read.
             let source = if debug {
@@ -907,45 +926,67 @@ struct ResolvedFile {
 }
 
 /// Resolve a URL path to a file in the document root.
-fn resolve_file(doc_root: &Path, url_path: &str, vfs: &dyn Vfs) -> Option<ResolvedFile> {
-    // Normalize: strip leading slash, default to index.cfm
+///
+/// `welcome_files` are the names tried when the URL resolves to a directory
+/// (in preference order). `cfml_extensions` are the file extensions treated
+/// as CFML for path-info matching (e.g. `/foo.cfm/bar/baz`).
+fn resolve_file(
+    doc_root: &Path,
+    url_path: &str,
+    vfs: &dyn Vfs,
+    welcome_files: &[String],
+    cfml_extensions: &[String],
+) -> Option<ResolvedFile> {
     let relative = url_path.trim_start_matches('/');
+
+    let try_welcome_in = |dir: &Path, rel: &str| -> Option<ResolvedFile> {
+        for welcome in welcome_files {
+            let candidate = dir.join(welcome);
+            if vfs.is_file(&candidate.to_string_lossy()) {
+                let script = if rel.is_empty() {
+                    format!("/{}", welcome)
+                } else {
+                    format!("/{}/{}", rel, welcome)
+                };
+                return Some(ResolvedFile {
+                    file_path: candidate,
+                    script_name: script,
+                    path_info: String::new(),
+                });
+            }
+        }
+        None
+    };
 
     // Try exact path first
     if !relative.is_empty() {
         let candidate = doc_root.join(relative);
-        let candidate_str = candidate.to_string_lossy().to_string();
-        if vfs.is_file(&candidate_str) {
+        if vfs.is_file(&candidate.to_string_lossy()) {
             return Some(ResolvedFile {
                 file_path: candidate,
                 script_name: format!("/{}", relative),
                 path_info: String::new(),
             });
         }
-        // Try as directory with index.cfm
-        let dir_index = doc_root.join(relative).join("index.cfm");
-        let dir_index_str = dir_index.to_string_lossy().to_string();
-        if vfs.is_file(&dir_index_str) {
-            let script = if relative.is_empty() {
-                "/index.cfm".to_string()
-            } else {
-                format!("/{}/index.cfm", relative)
-            };
-            return Some(ResolvedFile {
-                file_path: dir_index,
-                script_name: script,
-                path_info: String::new(),
-            });
+        if let Some(rf) = try_welcome_in(&doc_root.join(relative), relative) {
+            return Some(rf);
         }
-        // Try path info pattern: /script.cfm/extra/path
-        // Walk up the path segments to find a .cfm file
+        // Path-info pattern: walk up segments looking for a CFML file.
         let mut parts: Vec<&str> = relative.split('/').collect();
         while parts.len() > 1 {
             parts.pop();
             let partial = parts.join("/");
             let candidate = doc_root.join(&partial);
-            let candidate_str = candidate.to_string_lossy().to_string();
-            if vfs.is_file(&candidate_str) && candidate.extension().map_or(false, |e| e == "cfm" || e == "cfc") {
+            if vfs.is_file(&candidate.to_string_lossy())
+                && candidate
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| {
+                        cfml_extensions
+                            .iter()
+                            .any(|ext| ext.eq_ignore_ascii_case(e))
+                    })
+            {
                 let script_name = format!("/{}", partial);
                 let path_info = url_path[script_name.len()..].to_string();
                 return Some(ResolvedFile {
@@ -955,17 +996,8 @@ fn resolve_file(doc_root: &Path, url_path: &str, vfs: &dyn Vfs) -> Option<Resolv
                 });
             }
         }
-    } else {
-        // Root path → index.cfm
-        let index = doc_root.join("index.cfm");
-        let index_str = index.to_string_lossy().to_string();
-        if vfs.is_file(&index_str) {
-            return Some(ResolvedFile {
-                file_path: index,
-                script_name: "/index.cfm".to_string(),
-                path_info: String::new(),
-            });
-        }
+    } else if let Some(rf) = try_welcome_in(doc_root, "") {
+        return Some(rf);
     }
 
     None

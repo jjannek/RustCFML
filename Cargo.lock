@@ -576,6 +576,7 @@ dependencies = [
  "cfml-codegen",
  "cfml-common",
  "cfml-compiler",
+ "cfml-config",
  "indexmap",
  "log",
  "parking_lot",

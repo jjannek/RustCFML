@@ -359,6 +359,9 @@ pub struct ServerState {
     /// Cache of Application.cfc path resolution keyed by the page's parent
     /// directory. Only populated when `production_mode` is true.
     pub app_cfc_path_cache: Arc<parking_lot::RwLock<HashMap<std::path::PathBuf, Option<String>>>>,
+    /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
+    /// every cloned ServerState shares the same struct without re-parsing.
+    pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
 }
 
 impl ServerState {
@@ -367,6 +370,13 @@ impl ServerState {
     }
 
     pub fn with_production(production_mode: bool) -> Self {
+        Self::with_config(production_mode, Arc::new(cfml_config::RustCfmlConfig::default()))
+    }
+
+    pub fn with_config(
+        production_mode: bool,
+        cfconfig: Arc<cfml_config::RustCfmlConfig>,
+    ) -> Self {
         Self {
             applications: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -375,6 +385,7 @@ impl ServerState {
             webroot: None,
             production_mode,
             app_cfc_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            cfconfig,
         }
     }
 }
@@ -490,6 +501,35 @@ pub struct CfmlVirtualMachine {
     /// CFML calls `createObject("rust", "Name", ...)` / `new rust:Name(...)`
     /// to produce a fresh `CfmlValue::NativeObject`.
     pub native_classes: HashMap<String, NativeConstructor>,
+
+    // ── Runtime knobs sourced from `.cfconfig.json`. Seeded by the CLI from
+    // ServerState.cfconfig at VM construction time; Application.cfc `this.*`
+    // can override at app scope (handled in extract_app_config). Builtins
+    // that care about these values read them from the VM directly so they
+    // don't have to chase through server_state every call.
+
+    /// `runtime.nullSupport`. When true, unset variables return null instead
+    /// of empty string. Default `false` (Lucee/ACF classic).
+    pub null_support: bool,
+    /// `runtime.dotNotationUpperCase`. When true, dot-notation struct key
+    /// assignment forces upper-case (classic CF behaviour). Default `true`.
+    pub dot_notation_upper: bool,
+    /// `runtime.locale` — IETF BCP 47 (e.g. `en-GB`). Empty = system locale.
+    /// Consumed by lsXxx() formatters as the default when none is supplied.
+    pub locale: String,
+    /// `runtime.timezone` — IANA tz name (e.g. `Europe/London`). Empty =
+    /// system timezone. Consumed by now() and date formatters.
+    pub timezone: String,
+    /// `runtime.whitespaceCompressionEnabled` — global equivalent of
+    /// `cfsetting enableCFOutputOnly=true`. Defaults `false`.
+    pub whitespace_compression: bool,
+    /// Resolved session timeout in seconds (default 1800). `this.sessionTimeout`
+    /// in Application.cfc overrides this at app scope.
+    pub session_timeout_secs: u64,
+    /// Resolved application timeout in seconds (default 86400).
+    pub application_timeout_secs: u64,
+    /// Resolved client timeout in seconds (default 604800).
+    pub client_timeout_secs: u64,
 }
 
 /// Constructor signature for a Rust-backed class registered via
@@ -569,6 +609,49 @@ impl CfmlVirtualMachine {
             sandbox: false,
             arg_ref_writeback: None,
             native_classes: HashMap::new(),
+            // Compiled-in runtime defaults. `apply_cfconfig` overlays the
+            // user's `.cfconfig.json` values when a VM is constructed via
+            // the serve / CLI path that has a ServerState.
+            null_support: false,
+            dot_notation_upper: true,
+            locale: String::new(),
+            timezone: String::new(),
+            whitespace_compression: false,
+            session_timeout_secs: 1800,
+            application_timeout_secs: 86_400,
+            client_timeout_secs: 604_800,
+        }
+    }
+
+    /// Overlay `.cfconfig.json` runtime knobs onto a freshly-constructed VM.
+    /// Call this immediately after `new()` (and before stdlib registration)
+    /// so timeouts, locale, and timezone defaults reflect the config file.
+    pub fn apply_cfconfig(&mut self, cfg: &cfml_config::RustCfmlConfig) {
+        let r = &cfg.runtime;
+        self.null_support = r.null_support;
+        self.dot_notation_upper = r.dot_notation_upper_case;
+        if !r.locale.is_empty() {
+            self.locale = r.locale.clone();
+        }
+        if !r.timezone.is_empty() {
+            self.timezone = r.timezone.clone();
+        }
+        self.whitespace_compression = r.whitespace_compression_enabled;
+        if let Some(secs) = cfml_config::RuntimeCfg::parse_timeout_seconds(&r.session_timeout) {
+            self.session_timeout_secs = secs;
+        }
+        if let Some(secs) =
+            cfml_config::RuntimeCfg::parse_timeout_seconds(&r.application_timeout)
+        {
+            self.application_timeout_secs = secs;
+        }
+        if let Some(secs) = cfml_config::RuntimeCfg::parse_timeout_seconds(&r.client_timeout) {
+            self.client_timeout_secs = secs;
+        }
+        // security.sandbox sets the default when no CLI flag overrode it.
+        // The CLI path sets `vm.sandbox` explicitly afterwards if it needs to.
+        if cfg.security.sandbox {
+            self.sandbox = true;
         }
     }
 
