@@ -798,6 +798,10 @@ fn fn_len(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::Array(a)) => Ok(CfmlValue::Int(a.len() as i64)),
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Int(s.len() as i64)),
         Some(CfmlValue::Binary(b)) => Ok(CfmlValue::Int(b.len() as i64)),
+        // Lucee@7 parity: len(q.col) treats the column as a string and returns
+        // the first row's stringified length. This deliberately disagrees with
+        // arrayLen() — which errors instead, matching Lucee's stricter rules.
+        Some(v @ CfmlValue::QueryColumn(_)) => Ok(CfmlValue::Int(v.as_string().chars().count() as i64)),
         _ => Ok(CfmlValue::Int(0)),
     }
 }
@@ -1614,6 +1618,11 @@ fn fn_array_new(_args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
         Some(CfmlValue::Array(a)) => Ok(CfmlValue::Int(a.len() as i64)),
+        // Lucee@7 parity: arrayLen(q.col) errors — column proxies are NOT arrays.
+        Some(v @ CfmlValue::QueryColumn(_)) => Err(CfmlError::runtime(format!(
+            "Can't cast String [{}] to a value of type [Array]",
+            v.as_string()
+        ))),
         // Arguments scope is a struct but arrayLen should return count of positional entries
         Some(CfmlValue::Struct(s)) => {
             // Count entries with numeric keys (1-based positional args)
@@ -1686,7 +1695,7 @@ fn fn_array_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        if let CfmlValue::Array(arr) = &args[0] {
+        if let Some(arr) = args[0].as_array() {
             let needle = args[1].as_string();
             return Ok(CfmlValue::Bool(arr.iter().any(|v| v.as_string() == needle)));
         }
@@ -1696,7 +1705,7 @@ fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_contains_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        if let CfmlValue::Array(arr) = &args[0] {
+        if let Some(arr) = args[0].as_array() {
             let needle = args[1].as_string().to_lowercase();
             return Ok(CfmlValue::Bool(
                 arr.iter().any(|v| v.as_string().to_lowercase() == needle),
@@ -1941,6 +1950,7 @@ fn fn_array_each(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_array(args: Vec<CfmlValue>) -> CfmlResult {
+    // Lucee@7 parity: QueryColumn is NOT an array.
     Ok(CfmlValue::Bool(matches!(args.first(), Some(CfmlValue::Array(_)))))
 }
 
@@ -9272,7 +9282,8 @@ fn fn_value_list(args: Vec<CfmlValue>) -> CfmlResult {
     let arr = args.get(0).ok_or_else(|| CfmlError::runtime("valueList() requires a query column".to_string()))?;
     let delim = args.get(1).map(|v| v.as_string()).unwrap_or_else(|| ",".to_string());
     match arr {
-        CfmlValue::Array(items) => {
+        // valueList canonically iterates rows on Lucee — accept both Array and QueryColumn.
+        CfmlValue::Array(items) | CfmlValue::QueryColumn(items) => {
             let result: Vec<String> = items.iter().map(|v| v.as_string()).collect();
             Ok(CfmlValue::String(result.join(&delim)))
         }
@@ -9284,7 +9295,7 @@ fn fn_quoted_value_list(args: Vec<CfmlValue>) -> CfmlResult {
     let arr = args.get(0).ok_or_else(|| CfmlError::runtime("quotedValueList() requires a query column".to_string()))?;
     let delim = args.get(1).map(|v| v.as_string()).unwrap_or_else(|| ",".to_string());
     match arr {
-        CfmlValue::Array(items) => {
+        CfmlValue::Array(items) | CfmlValue::QueryColumn(items) => {
             let result: Vec<String> = items.iter().map(|v| format!("'{}'", v.as_string())).collect();
             Ok(CfmlValue::String(result.join(&delim)))
         }

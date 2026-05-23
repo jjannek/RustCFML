@@ -773,7 +773,9 @@ impl CfmlVirtualMachine {
                                     .unwrap_or(CfmlValue::Null)
                             })
                             .collect();
-                        CfmlValue::array(col_data)
+                        // QueryColumn proxy: acts as Array for indexing/iteration
+                        // but stringifies to first row (Lucee parity).
+                        CfmlValue::QueryColumn(std::sync::Arc::new(col_data))
                     } else {
                         CfmlValue::Null
                     }
@@ -2171,7 +2173,7 @@ impl CfmlVirtualMachine {
                     let index = stack.pop().unwrap_or(CfmlValue::Null);
                     let collection = stack.pop().unwrap_or(CfmlValue::Null);
                     match &collection {
-                        CfmlValue::Array(arr) => {
+                        CfmlValue::Array(arr) | CfmlValue::QueryColumn(arr) => {
                             let idx = match &index {
                                 CfmlValue::Int(i) => *i as usize,
                                 CfmlValue::Double(d) => *d as usize,
@@ -2379,10 +2381,9 @@ impl CfmlVirtualMachine {
                                         stack.push(CfmlValue::String(q.columns.join(",")));
                                     }
                                     _ => {
-                                        // Column access: q.columnName returns array of values.
-                                        // NOTE: Lucee returns a QueryColumn object that acts as
-                                        // both string (first row) and array. We return the array
-                                        // for broader compatibility with existing tests.
+                                        // Column access: q.columnName returns a QueryColumn
+                                        // proxy — acts as Array for indexing/iteration/length,
+                                        // but stringifies to the first row (Lucee parity).
                                         let col_lower = name.to_lowercase();
                                         let is_col =
                                             q.columns.iter().any(|c| c.to_lowercase() == col_lower);
@@ -2399,7 +2400,7 @@ impl CfmlVirtualMachine {
                                                         .unwrap_or(CfmlValue::Null)
                                                 })
                                                 .collect();
-                                            stack.push(CfmlValue::array(col_data));
+                                            stack.push(CfmlValue::QueryColumn(std::sync::Arc::new(col_data)));
                                         } else {
                                             stack.push(CfmlValue::Null);
                                         }
@@ -3036,6 +3037,13 @@ impl CfmlVirtualMachine {
                                     .map(|row| CfmlValue::strukt(row.clone()))
                                     .collect();
                                 stack.push(CfmlValue::array(rows));
+                            }
+                            // Lucee@7 parity: `for (v in q.col)` yields a single
+                            // element — the stringified first row — because
+                            // Lucee treats QueryColumn as a string in iter context.
+                            CfmlValue::QueryColumn(a) => {
+                                let first = a.first().cloned().unwrap_or(CfmlValue::Null);
+                                stack.push(CfmlValue::array(vec![first]));
                             }
                             other => stack.push(other), // arrays pass through
                         }

@@ -55,6 +55,11 @@ pub enum CfmlValue {
     Double(f64),
     String(String),
     Array(Arc<Vec<CfmlValue>>),
+    /// Lucee-style query column proxy: behaves as Array for iteration/indexing/length,
+    /// but stringifies to the first row's value (so `q.col & "x"` works) and reports
+    /// `type_name()` as "Array" so `isArray()` is true. Produced by `query.colname`
+    /// member-access on a Query. Payload is the column's row values.
+    QueryColumn(Arc<Vec<CfmlValue>>),
     Struct(Arc<IndexMap<String, CfmlValue>>),
     Closure(Box<CfmlClosure>),
     Component(Box<CfmlComponent>),
@@ -78,6 +83,7 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Double(d) => f.debug_tuple("Double").field(d).finish(),
             CfmlValue::String(s) => f.debug_tuple("String").field(s).finish(),
             CfmlValue::Array(a) => f.debug_tuple("Array").field(&**a).finish(),
+            CfmlValue::QueryColumn(a) => f.debug_tuple("QueryColumn").field(&**a).finish(),
             CfmlValue::Struct(s) => f.debug_tuple("Struct").field(&**s).finish(),
             CfmlValue::Closure(c) => f.debug_tuple("Closure").field(c).finish(),
             CfmlValue::Component(c) => f.debug_tuple("Component").field(c).finish(),
@@ -104,6 +110,10 @@ impl CfmlValue {
             CfmlValue::Double(_) => "Double",
             CfmlValue::String(_) => "String",
             CfmlValue::Array(_) => "Array",
+            // Lucee@7: `isArray(q.col)` is false — QueryColumn is a string proxy
+            // with bracket-indexing for rows, not an array. Distinct type_name
+            // means isArray/isStruct/etc. all report false.
+            CfmlValue::QueryColumn(_) => "QueryColumn",
             CfmlValue::Struct(_) => "Struct",
             CfmlValue::Closure(_) => "Closure",
             CfmlValue::Component(_) => "Component",
@@ -131,6 +141,8 @@ impl CfmlValue {
                 }
             }
             CfmlValue::Array(a) => !a.is_empty(),
+            // QueryColumn truthiness: first row's truthiness (Lucee proxies to first row).
+            CfmlValue::QueryColumn(a) => a.first().map(|v| v.is_true()).unwrap_or(false),
             CfmlValue::Struct(s) => !s.is_empty(),
             CfmlValue::Closure(_) => true,
             CfmlValue::Component(_) => true,
@@ -152,6 +164,9 @@ impl CfmlValue {
                 let items: Vec<String> = a.iter().map(|v| v.as_string()).collect();
                 format!("[{}]", items.join(", "))
             }
+            // QueryColumn stringifies to the first row's value, matching Lucee's
+            // proxy behavior so `q.col & "x"` concatenates the first row.
+            CfmlValue::QueryColumn(a) => a.first().map(|v| v.as_string()).unwrap_or_default(),
             CfmlValue::Struct(s) => {
                 let items: Vec<String> = s
                     .iter()
@@ -174,7 +189,7 @@ impl CfmlValue {
     pub fn get(&self, key: &str) -> Option<CfmlValue> {
         match self {
             CfmlValue::Struct(s) => s.get(key).cloned(),
-            CfmlValue::Array(a) => {
+            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     a.get(idx).cloned()
                 } else {
@@ -223,6 +238,18 @@ impl CfmlValue {
         }
     }
 
+    /// Like `as_array` but also returns the row view when called on a
+    /// `QueryColumn`. Use for narrow opt-in cases (e.g. `valueList(q.col)`
+    /// which canonically iterates rows on Lucee). Most array consumers
+    /// should stay on `as_array` so that `arrayLen(q.col)` etc. cleanly
+    /// reject the value, matching Lucee@7.
+    pub fn as_array_or_query_column(&self) -> Option<&Vec<CfmlValue>> {
+        match self {
+            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => Some(a),
+            _ => None,
+        }
+    }
+
     pub fn as_struct(&self) -> Option<&IndexMap<String, CfmlValue>> {
         match self {
             CfmlValue::Struct(s) => Some(s),
@@ -258,7 +285,10 @@ impl CfmlValue {
             (CfmlValue::String(a), CfmlValue::String(b)) => a.to_lowercase() == b.to_lowercase(),
             (CfmlValue::Int(a), CfmlValue::Double(b)) => *a as f64 == *b,
             (CfmlValue::Double(a), CfmlValue::Int(b)) => *a == *b as f64,
-            (CfmlValue::Array(a), CfmlValue::Array(b)) => {
+            (
+                CfmlValue::Array(a) | CfmlValue::QueryColumn(a),
+                CfmlValue::Array(b) | CfmlValue::QueryColumn(b),
+            ) => {
                 if a.len() != b.len() {
                     return false;
                 }
