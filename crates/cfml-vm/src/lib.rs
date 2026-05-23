@@ -530,6 +530,15 @@ pub struct CfmlVirtualMachine {
     pub application_timeout_secs: u64,
     /// Resolved client timeout in seconds (default 604800).
     pub client_timeout_secs: u64,
+
+    /// `security.disallowedFunctions` — lower-cased BIF names that are
+    /// refused before dispatch. A call to a banned name raises a runtime
+    /// error rather than executing the implementation.
+    pub disallowed_functions: std::collections::HashSet<String>,
+    /// `security.disallowedImports` — regex patterns blocking the path arg
+    /// of `createObject("component", path)` and class arg of
+    /// `createObject("rust", name)`. Match = refusal.
+    pub disallowed_imports: Vec<regex::Regex>,
 }
 
 /// Constructor signature for a Rust-backed class registered via
@@ -620,6 +629,8 @@ impl CfmlVirtualMachine {
             session_timeout_secs: 1800,
             application_timeout_secs: 86_400,
             client_timeout_secs: 604_800,
+            disallowed_functions: std::collections::HashSet::new(),
+            disallowed_imports: Vec::new(),
         }
     }
 
@@ -653,6 +664,32 @@ impl CfmlVirtualMachine {
         if cfg.security.sandbox {
             self.sandbox = true;
         }
+        // security.disallowedFunctions: lower-case all names once for cheap
+        // case-insensitive matching at call time.
+        self.disallowed_functions = cfg
+            .security
+            .disallowed_functions
+            .iter()
+            .map(|n| n.to_lowercase())
+            .collect();
+        // security.disallowedImports: compile each regex. Invalid patterns
+        // are logged and skipped — a typo shouldn't take down the VM.
+        self.disallowed_imports = cfg
+            .security
+            .disallowed_imports
+            .iter()
+            .filter_map(|p| match regex::Regex::new(p) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    log::warn!(
+                        "cfconfig security.disallowedImports: invalid regex '{}': {}",
+                        p,
+                        e
+                    );
+                    None
+                }
+            })
+            .collect();
     }
 
     /// Register a Rust-backed class so that CFML code can construct
@@ -3727,6 +3764,18 @@ impl CfmlVirtualMachine {
             // Check builtin functions (case-insensitive)
             let name_lower = func.name.to_lowercase();
 
+            // security.disallowedFunctions: refuse the call entirely.
+            // Checked before any VM intercept dispatch so blocked names can't
+            // sneak through a higher-priority handler.
+            if !self.disallowed_functions.is_empty()
+                && self.disallowed_functions.contains(&name_lower)
+            {
+                return Err(CfmlError::runtime(format!(
+                    "Function '{}' is disallowed by security policy",
+                    func.name
+                )));
+            }
+
             // writeOutput/writeDump must be handled before the builtin lookup
             // so output goes to output_buffer (not stdout via the builtin fn)
             if name_lower == "writeoutput" {
@@ -5636,6 +5685,23 @@ impl CfmlVirtualMachine {
                 "createobject" => {
                     if args.len() >= 2 {
                         let obj_type = args[0].as_string().to_lowercase();
+                        // security.disallowedImports: block component / rust
+                        // paths whose argument matches any compiled pattern.
+                        if !self.disallowed_imports.is_empty()
+                            && (obj_type == "component" || obj_type == "rust")
+                        {
+                            let target = args[1].as_string();
+                            if self
+                                .disallowed_imports
+                                .iter()
+                                .any(|re| re.is_match(&target))
+                            {
+                                return Err(CfmlError::runtime(format!(
+                                    "createObject('{}', '{}') is disallowed by security policy",
+                                    obj_type, target
+                                )));
+                            }
+                        }
                         if obj_type == "component" {
                             let comp_name = args[1].as_string();
                             if let Some(template) =

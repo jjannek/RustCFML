@@ -617,6 +617,11 @@ async fn async_run_server(
     // process; replaying with new values is idempotent for tests.
     populate_datasource_registry(&cfconfig);
     populate_default_mail_server(&cfconfig);
+    cfml_stdlib::builtins::set_security_flags(cfml_stdlib::builtins::SecurityFlags {
+        csrf_enabled: cfconfig.security.csrf_enabled,
+        secure_json: cfconfig.security.secure_json,
+        secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
+    });
 
     // Load URL rewrite rules if urlrewrite.xml exists
     let rewrite_xml = doc_root.join("urlrewrite.xml");

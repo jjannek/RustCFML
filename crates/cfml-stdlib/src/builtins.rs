@@ -3844,7 +3844,13 @@ fn fn_list_filter(_args: Vec<CfmlValue>) -> CfmlResult {
 // ===============================================
 
 fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::String(serialize_value(args.first().unwrap_or(&CfmlValue::Null))))
+    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null));
+    let flags = security_flags();
+    if flags.secure_json && !flags.secure_json_prefix.is_empty() {
+        Ok(CfmlValue::String(format!("{}{}", flags.secure_json_prefix, body)))
+    } else {
+        Ok(CfmlValue::String(body))
+    }
 }
 
 fn serialize_value(val: &CfmlValue) -> String {
@@ -5803,6 +5809,45 @@ pub fn default_mail_server() -> Option<DefaultMailServer> {
     DEFAULT_MAIL_SERVER
         .get()
         .and_then(|m| m.lock().unwrap().clone())
+}
+
+// -----------------------------------------------
+// Security flags from cfconfig
+// -----------------------------------------------
+//
+// CSRF can be disabled outright. serializeJSON output can be wrapped with a
+// hijack-prevention prefix. Set once at startup by the CLI; reads from the
+// builtins are lock-free after init.
+
+#[derive(Clone, Debug, Default)]
+pub struct SecurityFlags {
+    pub csrf_enabled: bool,
+    pub secure_json: bool,
+    pub secure_json_prefix: String,
+}
+
+impl SecurityFlags {
+    pub const fn defaults() -> Self {
+        Self {
+            csrf_enabled: true,
+            secure_json: false,
+            secure_json_prefix: String::new(),
+        }
+    }
+}
+
+static SECURITY_FLAGS: OnceLock<Mutex<SecurityFlags>> = OnceLock::new();
+
+pub fn set_security_flags(flags: SecurityFlags) {
+    let m = SECURITY_FLAGS.get_or_init(|| Mutex::new(SecurityFlags::defaults()));
+    *m.lock().unwrap() = flags;
+}
+
+pub fn security_flags() -> SecurityFlags {
+    SECURITY_FLAGS
+        .get()
+        .map(|m| m.lock().unwrap().clone())
+        .unwrap_or_else(SecurityFlags::defaults)
 }
 
 /// Register a name → connection-URL mapping. Names are stored lowercased so
@@ -10482,6 +10527,12 @@ fn fn_argon2_check_hash(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_csrf_generate_token(args: Vec<CfmlValue>) -> CfmlResult {
     use rand::RngCore;
 
+    if !security_flags().csrf_enabled {
+        return Err(CfmlError::runtime(
+            "csrfGenerateToken is disabled by security.csrfEnabled".to_string(),
+        ));
+    }
+
     // key (args[0]) and forceNew (args[1]) are accepted but ignored
     // since we don't have server-side session storage
     let _ = &args;
@@ -10497,6 +10548,11 @@ fn fn_csrf_generate_token(args: Vec<CfmlValue>) -> CfmlResult {
 /// 64-character hex string. Returns boolean.
 #[cfg(feature = "security")]
 fn fn_csrf_verify_token(args: Vec<CfmlValue>) -> CfmlResult {
+    if !security_flags().csrf_enabled {
+        return Err(CfmlError::runtime(
+            "csrfVerifyToken is disabled by security.csrfEnabled".to_string(),
+        ));
+    }
     if args.is_empty() {
         return Err(CfmlError::runtime("csrfVerifyToken requires at least 1 argument: token".to_string()));
     }

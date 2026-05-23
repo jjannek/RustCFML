@@ -580,6 +580,7 @@ dependencies = [
  "indexmap",
  "log",
  "parking_lot",
+ "regex",
  "rust_decimal",
  "thiserror 1.0.69",
 ]
