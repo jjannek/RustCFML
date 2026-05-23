@@ -6124,12 +6124,25 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         _ => ":memory:".to_string(),
     };
 
-    // Extract returnType from options
+    // Extract returnType from options. For returntype="struct", also pull
+    // columnkey and bake it into the wire string as "struct:<key>" so the
+    // four per-driver execute_* paths don't need new arguments.
     let return_type = match &options_arg {
-        CfmlValue::Struct(opts) => opts.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("returntype") || k.eq_ignore_ascii_case("returnType"))
-            .map(|(_, v)| v.as_string().to_lowercase())
-            .unwrap_or_else(|| "query".to_string()),
+        CfmlValue::Struct(opts) => {
+            let rt = opts.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("returntype") || k.eq_ignore_ascii_case("returnType"))
+                .map(|(_, v)| v.as_string().to_lowercase())
+                .unwrap_or_else(|| "query".to_string());
+            if rt == "struct" {
+                let key = opts.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("columnkey") || k.eq_ignore_ascii_case("columnKey"))
+                    .map(|(_, v)| v.as_string())
+                    .unwrap_or_default();
+                if key.is_empty() { rt } else { format!("struct:{}", key) }
+            } else {
+                rt
+            }
+        }
         _ => "query".to_string(),
     };
 
@@ -7314,6 +7327,31 @@ fn build_query_result(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue
             .map(|r| CfmlValue::strukt(r))
             .collect();
         Ok(CfmlValue::array(arr))
+    } else if let Some(key) = return_type.strip_prefix("struct:") {
+        // returntype="struct" columnkey="<key>" — build an ordered map keyed
+        // by the value of that column. Lucee/Adobe behavior: each entry holds
+        // the row struct. Schema-introspection patterns (pg_indexes, etc.)
+        // rely on this.
+        let key_lower = key.to_lowercase();
+        let mut out: IndexMap<String, CfmlValue> = IndexMap::new();
+        for row in rows.into_iter() {
+            let key_val = row.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&key_lower))
+                .map(|(_, v)| v.as_string())
+                .unwrap_or_default();
+            if !key_val.is_empty() {
+                out.insert(key_val, CfmlValue::strukt(row));
+            }
+        }
+        Ok(CfmlValue::strukt(out))
+    } else if return_type == "struct" {
+        // returntype="struct" without columnkey — treat as a single-row map
+        // (matches Lucee for single-row results); for multi-row, take the first.
+        if let Some(row) = rows.into_iter().next() {
+            Ok(CfmlValue::strukt(row))
+        } else {
+            Ok(CfmlValue::strukt(IndexMap::new()))
+        }
     } else {
         let query = CfmlQuery {
             columns,
