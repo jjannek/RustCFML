@@ -3061,7 +3061,11 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::Include(path) => {
-                    // Resolve path relative to source file or CWD
+                    // Resolve path relative to source file or CWD.
+                    // NB: source_dir.join(path) with an *absolute* path returns
+                    // the absolute path unchanged (Path::join semantics), so a
+                    // leading-slash CFML include initially resolves to an OS-root
+                    // path here. The mapping/webroot fallback below catches that.
                     let resolved = if let Some(ref source) = self.source_file {
                         let source_dir = std::path::Path::new(source)
                             .parent()
@@ -3071,10 +3075,12 @@ impl CfmlVirtualMachine {
                         path.clone()
                     };
 
-                    // If relative resolution fails and path starts with "/", try mappings
+                    // Leading-slash includes are webroot-relative in CFML, not
+                    // OS-absolute. Try in order: configured mappings,
+                    // serve-mode webroot, then CLI-mode base_template_path's
+                    // parent.
                     let resolved = if !self.vfs.exists(&resolved) && path.starts_with('/') {
-                        // Convert /taffy/core/foo.cfm → try mapping lookup
-                        self.resolve_include_with_mappings(&path)
+                        self.resolve_leading_slash_include(&path)
                             .unwrap_or(resolved)
                     } else {
                         resolved
@@ -3232,7 +3238,7 @@ impl CfmlVirtualMachine {
                     };
 
                     let resolved = if !self.vfs.exists(&resolved) && path.starts_with('/') {
-                        self.resolve_include_with_mappings(&path)
+                        self.resolve_leading_slash_include(&path)
                             .unwrap_or(resolved)
                     } else {
                         resolved
@@ -8591,6 +8597,35 @@ impl CfmlVirtualMachine {
     }
 
     /// Resolve an include path (e.g. "/taffy/core/foo.cfm") using component mappings.
+    /// Resolve a CFML leading-slash include path (`/foo/bar.cfm`) by trying,
+    /// in order: configured `this.mappings` from Application.cfc, the
+    /// serve-mode webroot, then the CLI-mode entry template's parent
+    /// directory. Returns `None` only if none of those produce an existing
+    /// file. Leading-slash means "webroot-relative" in CFML — it must not be
+    /// interpreted as OS-absolute.
+    fn resolve_leading_slash_include(&self, include_path: &str) -> Option<String> {
+        if let Some(via_mapping) = self.resolve_include_with_mappings(include_path) {
+            return Some(via_mapping);
+        }
+        let stripped = include_path.trim_start_matches('/');
+        if let Some(webroot) = self.server_state.as_ref().and_then(|s| s.webroot.as_ref()) {
+            let candidate = webroot.join(stripped).to_string_lossy().to_string();
+            if self.vfs.exists(&candidate) {
+                return Some(candidate);
+            }
+        }
+        if let Some(ref base) = self.base_template_path {
+            let base_dir = std::path::Path::new(base)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let candidate = base_dir.join(stripped).to_string_lossy().to_string();
+            if self.vfs.exists(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     fn resolve_include_with_mappings(&self, include_path: &str) -> Option<String> {
         if self.mappings.is_empty() {
             return None;

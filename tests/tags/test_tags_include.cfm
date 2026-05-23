@@ -18,4 +18,12 @@
 <cfinclude template="customtags/../_include_target.cfm">
 <cfscript>assert("cfinclude canonicalises .. segments", request._includeTest, "included");</cfscript>
 
+<!--- Leading-slash includes are webroot-relative (issue 21).
+      The entry template's directory is treated as the webroot in CLI mode,
+      so /tests/tags/_include_target.cfm resolves to the same file the
+      relative include above used. --->
+<cfset request._includeTest = "">
+<cfinclude template="/tags/_include_target.cfm">
+<cfscript>assert("cfinclude resolves leading-slash via webroot", request._includeTest, "included");</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
