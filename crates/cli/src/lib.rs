@@ -582,6 +582,7 @@ async fn async_run_server(
     // queryExecute can resolve `datasource="myDSN"` lookups. Done once per
     // process; replaying with new values is idempotent for tests.
     populate_datasource_registry(&cfconfig);
+    populate_default_mail_server(&cfconfig);
 
     // Load URL rewrite rules if urlrewrite.xml exists
     let rewrite_xml = doc_root.join("urlrewrite.xml");
@@ -1308,6 +1309,26 @@ fn populate_datasource_registry(cfg: &RustCfmlConfig) {
                 ds.driver
             );
         }
+    }
+}
+
+/// First mailServers entry from cfconfig becomes the process-wide default
+/// for cfmail when its tag attributes omit `server`. Empty list leaves the
+/// stdlib unconfigured — cfmail will keep raising the existing
+/// "no SMTP Server defined" error.
+fn populate_default_mail_server(cfg: &RustCfmlConfig) {
+    if let Some(m) = cfg.mail_servers.first() {
+        cfml_stdlib::builtins::set_default_mail_server(
+            cfml_stdlib::builtins::DefaultMailServer {
+                server: m.smtp.clone(),
+                port: m.port,
+                username: m.username.clone(),
+                password: m.password.clone(),
+                tls: m.tls,
+                ssl: m.ssl,
+                timeout: m.timeout,
+            },
+        );
     }
 }
 

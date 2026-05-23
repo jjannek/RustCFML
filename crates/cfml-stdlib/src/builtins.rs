@@ -5769,6 +5769,42 @@ use std::sync::{Mutex, OnceLock};
 
 static DATASOURCE_REGISTRY: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
+// -----------------------------------------------
+// Default Mail Server
+// -----------------------------------------------
+//
+// cfconfig's first `mailServers` entry becomes the process-wide default that
+// cfmail falls back to when its tag attributes omit `server`. Populated by
+// the CLI at startup; consumed inside fn_cfmail.
+
+#[derive(Clone, Debug, Default)]
+pub struct DefaultMailServer {
+    pub server: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub tls: bool,
+    pub ssl: bool,
+    pub timeout: u32,
+}
+
+static DEFAULT_MAIL_SERVER: OnceLock<Mutex<Option<DefaultMailServer>>> = OnceLock::new();
+
+/// Register the default SMTP server. Replaces any previous default.
+pub fn set_default_mail_server(server: DefaultMailServer) {
+    let m = DEFAULT_MAIL_SERVER.get_or_init(|| Mutex::new(None));
+    *m.lock().unwrap() = Some(server);
+}
+
+/// Look up the registered default. Returns `None` if no cfconfig mailServers
+/// entry was present at startup, in which case cfmail's pre-existing
+/// "no SMTP Server defined" error fires.
+pub fn default_mail_server() -> Option<DefaultMailServer> {
+    DEFAULT_MAIL_SERVER
+        .get()
+        .and_then(|m| m.lock().unwrap().clone())
+}
+
 /// Register a name → connection-URL mapping. Names are stored lowercased so
 /// lookups are case-insensitive (matching CFML's general identifier handling).
 /// Re-registering an existing name overwrites it.
@@ -9777,13 +9813,35 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     #[cfg(feature = "smtp")]
     let bcc = get_opt("bcc");
     #[cfg(feature = "smtp")]
-    let server = get_opt("server");
+    let cfg_default = default_mail_server();
     #[cfg(feature = "smtp")]
-    let port_str = get_opt("port");
+    let server = get_opt("server").or_else(|| {
+        cfg_default
+            .as_ref()
+            .map(|d| d.server.clone())
+            .filter(|s| !s.is_empty())
+    });
     #[cfg(feature = "smtp")]
-    let username = get_opt("username");
+    let port_str = get_opt("port").or_else(|| {
+        cfg_default
+            .as_ref()
+            .filter(|d| d.port != 0)
+            .map(|d| d.port.to_string())
+    });
     #[cfg(feature = "smtp")]
-    let password = get_opt("password");
+    let username = get_opt("username").or_else(|| {
+        cfg_default
+            .as_ref()
+            .map(|d| d.username.clone())
+            .filter(|s| !s.is_empty())
+    });
+    #[cfg(feature = "smtp")]
+    let password = get_opt("password").or_else(|| {
+        cfg_default
+            .as_ref()
+            .map(|d| d.password.clone())
+            .filter(|s| !s.is_empty())
+    });
 
     // Log to stderr for debugging visibility
     eprintln!("[CFMAIL] To: {} | From: {} | Subject: {} | Type: {}", to, from, subject, mail_type);
