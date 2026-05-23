@@ -230,6 +230,40 @@ fn real_main() {
             }
         };
 
+        // Logging: --verbose and RUST_LOG keep priority. Otherwise apply
+        // logging.level from cfconfig (default "warn"). logsDirectory and
+        // format are accepted by the schema but not yet wired — log a
+        // one-line warning if the user set them so the silence isn't
+        // mysterious. logger-name overrides are merged into the same
+        // env_logger filter string.
+        if !args.verbose && std::env::var("RUST_LOG").is_err() {
+            let mut filter = cfconfig.logging.level.clone();
+            if filter.is_empty() {
+                filter = "warn".to_string();
+            }
+            for (name, lcfg) in cfconfig.logging.loggers.iter() {
+                if !lcfg.level.is_empty() {
+                    filter.push_str(&format!(",{}={}", name, lcfg.level));
+                }
+            }
+            let _ = env_logger::Builder::from_env(
+                env_logger::Env::default().default_filter_or(filter),
+            )
+            .try_init();
+            if !cfconfig.logging.logs_directory.is_empty() {
+                log::warn!(
+                    "cfconfig logging.logsDirectory='{}' is not yet supported — logs go to stderr",
+                    cfconfig.logging.logs_directory
+                );
+            }
+            if !cfconfig.logging.format.is_empty() && cfconfig.logging.format != "text" {
+                log::warn!(
+                    "cfconfig logging.format='{}' is not yet supported — using text",
+                    cfconfig.logging.format
+                );
+            }
+        }
+
         // CLI flags win over config. Args::port has a clap default of 8500, so
         // we can't easily tell "user passed 8500" from "user passed nothing".
         // Convention: any non-default --port overrides; otherwise config wins.
@@ -870,19 +904,7 @@ async fn handle_request(
                     builder.body(axum::body::Body::from(body)).unwrap()
                 }
                 Err(e) => {
-                    let mut body = String::new();
-                    if !e.output.is_empty() {
-                        body.push_str(&e.output);
-                    }
-                    body.push_str(&format!(
-                        "<html><body><h1>500 Internal Server Error</h1><pre>{}</pre></body></html>",
-                        html_escape(&e.message)
-                    ));
-                    axum::response::Response::builder()
-                        .status(500)
-                        .header("Content-Type", "text/html; charset=utf-8")
-                        .body(axum::body::Body::from(body))
-                        .unwrap()
+                    render_error_response(&state, &e)
                 }
             }
         }
@@ -1288,6 +1310,90 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// Render the response body for an unhandled CFML execution error, honoring
+/// the `debugging.*` section of cfconfig:
+///   * `enabled`        — when false, the underlying error message is hidden
+///                        from the client; full detail still hits the server log.
+///   * `errorStatusCode` — when false, response status is 200 (handy when
+///                        a front-end takes over error rendering).
+///   * `errorTemplate`   — when set, the file is rendered as a fresh CFML
+///                        request with the error available as request._error.
+///                        Render failure falls back to the inline page.
+fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::response::Response {
+    let dbg = &state.cfconfig.debugging;
+    let status: u16 = if dbg.error_status_code { 500 } else { 200 };
+
+    // Always log full detail server-side regardless of the public surface.
+    log::error!("CFML error: {}", e.message);
+
+    // errorTemplate path: best effort. If the template isn't readable or
+    // execution itself errors, fall through to the inline render.
+    if !dbg.error_template.is_empty() {
+        let template_path = if std::path::Path::new(&dbg.error_template).is_absolute() {
+            PathBuf::from(&dbg.error_template)
+        } else {
+            state.doc_root.join(&dbg.error_template)
+        };
+        if let Ok(source) = fs::read_to_string(&template_path) {
+            let mut extra = IndexMap::new();
+            let mut err_struct = IndexMap::new();
+            err_struct.insert("message".to_string(), CfmlValue::String(e.message.clone()));
+            err_struct.insert("output".to_string(), CfmlValue::String(e.output.clone()));
+            let mut req = IndexMap::new();
+            req.insert("_error".to_string(), CfmlValue::strukt(err_struct));
+            extra.insert("request".to_string(), CfmlValue::strukt(req));
+            if let Ok(resp) = compile_and_run(
+                &source,
+                state.debug,
+                Some(template_path.to_string_lossy().to_string()),
+                extra,
+                Some(&state.server_state),
+                None,
+                None,
+                state.vfs.clone(),
+                state.sandbox,
+            ) {
+                let mut builder = axum::response::Response::builder()
+                    .status(status)
+                    .header("Content-Type", "text/html; charset=utf-8");
+                for (k, v) in &resp.response_headers {
+                    builder = builder.header(k, v);
+                }
+                return builder
+                    .body(axum::body::Body::from(resp.output))
+                    .unwrap();
+            }
+        }
+        log::warn!(
+            "debugging.errorTemplate '{}' could not be rendered; falling back",
+            dbg.error_template
+        );
+    }
+
+    // Inline render.
+    let mut body = String::new();
+    if !e.output.is_empty() {
+        body.push_str(&e.output);
+    }
+    if dbg.enabled {
+        body.push_str(&format!(
+            "<html><body><h1>{} Internal Server Error</h1><pre>{}</pre></body></html>",
+            status,
+            html_escape(&e.message)
+        ));
+    } else {
+        body.push_str(&format!(
+            "<html><body><h1>{} Internal Server Error</h1><p>The server encountered an error processing your request.</p></body></html>",
+            status,
+        ));
+    }
+    axum::response::Response::builder()
+        .status(status)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(axum::body::Body::from(body))
+        .unwrap()
 }
 
 /// Push every cfconfig datasource into the cfml-stdlib global registry so
