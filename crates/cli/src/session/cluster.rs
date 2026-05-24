@@ -1,0 +1,536 @@
+//! Native gossip-backed clustered session store.
+//!
+//! Enabled by the `cluster` Cargo feature. Native rustcfml nodes only —
+//! not available in WASM builds.
+//!
+//! Architecture (see `SharedSessionImplementation.md` Phase 3):
+//! - `memberlist` 0.8 provides cluster membership, Phi-accrual failure
+//!   detection, and gossip-grade message delivery over TCP.
+//! - `automerge` 0.9 provides per-session conflict-free merging.
+//! - One `AutoCommit` Automerge doc per CFML session id, holding a single
+//!   `data` field whose value is the JSON-encoded `SessionData`.
+//! - Live mutations: encode the doc's incremental change and reliably push
+//!   it to every currently-online peer.
+//! - Anti-entropy: memberlist's TCP push/pull periodically calls
+//!   `local_state` / `merge_remote_state` on our delegate, which round-trip
+//!   the union of all docs. This catches anything dropped on the live path
+//!   and seeds new joiners.
+
+#[cfg(feature = "cluster")]
+mod inner {
+    use bincode::{
+        config::standard as bincode_std,
+        serde::{decode_from_slice, encode_to_vec},
+    };
+    use cfml_common::dynamic::CfmlValue;
+    use cfml_vm::{SessionData, session_store::SessionStore};
+    use indexmap::IndexMap;
+    use memberlist::{
+        Options,
+        agnostic::tokio::TokioRuntime,
+        bytes::Bytes,
+        delegate::{CompositeDelegate, NodeDelegate},
+        net::{
+            NetTransportOptions,
+            resolver::socket_addr::SocketAddrResolver,
+            stream_layer::tcp::Tcp,
+        },
+        proto::{MaybeResolvedAddress, Meta, NodeId},
+        tokio::TokioTcpMemberlist,
+    };
+    use serde::{Deserialize, Serialize};
+    use indexmap::IndexSet;
+    use std::{
+        borrow::Cow,
+        collections::HashMap,
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+    use tokio::sync::mpsc;
+
+    const TOMBSTONE_TTL: Duration = Duration::from_secs(60);
+    const OUTBOUND_QUEUE_CAP: usize = 1024;
+
+    // ─────────────────────────────────────────────
+    // Wire frames
+    // ─────────────────────────────────────────────
+
+    #[derive(Clone, Serialize, Deserialize)]
+    enum ClusterMsg {
+        /// A change to a session's Automerge doc — incremental bytes from
+        /// `AutoCommit::save_incremental()` since the last broadcast.
+        Delta { id: String, change: Vec<u8> },
+        /// Session removed (invalidate / expire). Receivers drop the local
+        /// doc and remember the id briefly so late `Delta`s are ignored.
+        Tombstone { id: String },
+    }
+
+    /// State serialised by `local_state` and consumed by
+    /// `merge_remote_state`. Each entry is the full `AutoCommit::save()` of
+    /// one session doc.
+    #[derive(Serialize, Deserialize)]
+    struct StateBundle {
+        sessions: Vec<(String, Vec<u8>)>,
+        tombstones: Vec<String>,
+    }
+
+    // ─────────────────────────────────────────────
+    // Shared state — held by both ClusterStore and the delegate
+    // ─────────────────────────────────────────────
+
+    struct SharedState {
+        /// Per-session Automerge documents.
+        docs: Mutex<HashMap<String, automerge::AutoCommit>>,
+        /// Recently-removed session ids; late deltas for these are ignored.
+        tombstones: Mutex<HashMap<String, Instant>>,
+        /// Stable node identifier (used for logs and tie-breaking).
+        node_name: String,
+        /// Outbound message queue — drained by the background sender task.
+        tx: mpsc::Sender<ClusterMsg>,
+    }
+
+    impl SharedState {
+        fn gc_tombstones(&self) {
+            if let Ok(mut t) = self.tombstones.lock() {
+                let now = Instant::now();
+                t.retain(|_, when| now.duration_since(*when) < TOMBSTONE_TTL);
+            }
+        }
+
+        /// Apply an incoming live message to local state. Returns nothing —
+        /// the live message is NOT re-broadcast (every peer received the
+        /// original from its sender).
+        fn apply_incoming(&self, msg: ClusterMsg) {
+            match msg {
+                ClusterMsg::Delta { id, change } => {
+                    if self
+                        .tombstones
+                        .lock()
+                        .map(|t| t.contains_key(&id))
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+                    if let Ok(mut docs) = self.docs.lock() {
+                        let doc = docs
+                            .entry(id.clone())
+                            .or_insert_with(automerge::AutoCommit::new);
+                        if let Err(e) = doc.load_incremental(&change) {
+                            eprintln!(
+                                "[session/cluster] failed to apply delta for session {}: {}",
+                                id, e
+                            );
+                        }
+                    }
+                }
+                ClusterMsg::Tombstone { id } => {
+                    if let Ok(mut docs) = self.docs.lock() {
+                        docs.remove(&id);
+                    }
+                    if let Ok(mut t) = self.tombstones.lock() {
+                        t.insert(id, Instant::now());
+                    }
+                }
+            }
+        }
+
+        /// Snapshot every local doc plus tombstones for `local_state`.
+        fn snapshot(&self) -> Vec<u8> {
+            self.gc_tombstones();
+            let sessions: Vec<(String, Vec<u8>)> = match self.docs.lock() {
+                Ok(mut docs) => docs
+                    .iter_mut()
+                    .map(|(id, doc)| (id.clone(), doc.save()))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let tombstones: Vec<String> = match self.tombstones.lock() {
+                Ok(t) => t.keys().cloned().collect(),
+                Err(_) => Vec::new(),
+            };
+            let bundle = StateBundle { sessions, tombstones };
+            encode_to_vec(&bundle, bincode_std()).unwrap_or_default()
+        }
+
+        /// Merge a remote `StateBundle` into local docs.
+        fn merge_snapshot(&self, buf: &[u8]) {
+            let bundle: StateBundle = match decode_from_slice(buf, bincode_std()) {
+                Ok((b, _)) => b,
+                Err(e) => {
+                    eprintln!("[session/cluster] malformed remote state: {}", e);
+                    return;
+                }
+            };
+            // Honour tombstones — drop matching ids locally, remember them.
+            if let Ok(mut t) = self.tombstones.lock() {
+                for id in &bundle.tombstones {
+                    t.entry(id.clone()).or_insert_with(Instant::now);
+                }
+            }
+            if let Ok(mut docs) = self.docs.lock() {
+                for id in &bundle.tombstones {
+                    docs.remove(id);
+                }
+                for (id, raw) in bundle.sessions {
+                    if self
+                        .tombstones
+                        .lock()
+                        .map(|t| t.contains_key(&id))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    match docs.get_mut(&id) {
+                        Some(doc) => {
+                            if let Err(e) = doc.load_incremental(&raw) {
+                                eprintln!(
+                                    "[session/cluster] merge_incremental failed for {}: {}",
+                                    id, e
+                                );
+                            }
+                        }
+                        None => match automerge::AutoCommit::load(&raw) {
+                            Ok(loaded) => {
+                                docs.insert(id, loaded);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[session/cluster] AutoCommit::load failed for {}: {}",
+                                    id, e
+                                );
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Delegate
+    // ─────────────────────────────────────────────
+
+    struct ClusterDelegate {
+        shared: Arc<SharedState>,
+    }
+
+    impl NodeDelegate for ClusterDelegate {
+        async fn node_meta(&self, _limit: usize) -> Meta {
+            Meta::empty()
+        }
+
+        async fn notify_message(&self, msg: Cow<'_, [u8]>) {
+            let decoded: ClusterMsg = match decode_from_slice(&msg, bincode_std()) {
+                Ok((m, _)) => m,
+                Err(e) => {
+                    eprintln!("[session/cluster] malformed incoming message: {}", e);
+                    return;
+                }
+            };
+            self.shared.apply_incoming(decoded);
+        }
+
+        async fn broadcast_messages<F>(
+            &self,
+            _limit: usize,
+            _encoded_len: F,
+        ) -> impl Iterator<Item = Bytes> + Send
+        where
+            F: Fn(Bytes) -> (usize, Bytes) + Send + Sync + 'static,
+        {
+            // We push live deltas via direct send_reliable from the sender
+            // task; we don't piggyback on gossip. Returning an empty
+            // iterator is the documented way to opt out.
+            std::iter::empty()
+        }
+
+        async fn local_state(&self, _join: bool) -> Bytes {
+            Bytes::from(self.shared.snapshot())
+        }
+
+        async fn merge_remote_state(&self, buf: &[u8], _join: bool) {
+            self.shared.merge_snapshot(buf);
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // SessionData ⇄ Automerge bytes-blob (v1)
+    // ─────────────────────────────────────────────
+    //
+    // For Phase 3 v1 we store the entire `SessionData` as a single
+    // JSON-encoded byte field inside each per-session Automerge doc.
+    // This gives us:
+    // - deterministic last-write-wins merging when two nodes mutate
+    //   the same session concurrently (Automerge orders by change hash)
+    // - small incremental change records (the only field that ever
+    //   changes is `data`)
+    // - trivial round-trip in/out of `SessionData`
+    //
+    // Per-field merging inside SessionData (e.g. so two concurrent
+    // `session.foo = ...` and `session.bar = ...` would both survive)
+    // is left for v2; sessions are typically pinned to one node at a
+    // time so the cost is small in practice.
+
+    const SESSION_FIELD: &str = "data";
+
+    fn write_session(doc: &mut automerge::AutoCommit, data: &SessionData) -> Result<(), String> {
+        use automerge::{ObjType, ReadDoc, ROOT, transaction::Transactable};
+        let json = serde_json::to_vec(data).map_err(|e| e.to_string())?;
+        doc.put(ROOT, SESSION_FIELD, automerge::ScalarValue::Bytes(json))
+            .map_err(|e| e.to_string())?;
+        // Make the change observable to incremental save.
+        let _ = ObjType::Map; // silence unused-import on some builds
+        let _ = doc.commit();
+        let _ = <automerge::AutoCommit as ReadDoc>::get(doc, ROOT, SESSION_FIELD);
+        Ok(())
+    }
+
+    fn read_session(doc: &automerge::AutoCommit) -> Option<SessionData> {
+        use automerge::ReadDoc;
+        let (val, _) = doc.get(automerge::ROOT, SESSION_FIELD).ok().flatten()?;
+        let bytes = match val {
+            automerge::Value::Scalar(s) => match s.into_owned() {
+                automerge::ScalarValue::Bytes(b) => b,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        serde_json::from_slice::<SessionData>(&bytes).ok()
+    }
+
+    // ─────────────────────────────────────────────
+    // ClusterStore
+    // ─────────────────────────────────────────────
+
+    pub struct ClusterStore {
+        shared: Arc<SharedState>,
+    }
+
+    impl ClusterStore {
+        /// Build a clustered session store and join the gossip cluster.
+        /// Must be called from within a Tokio runtime.
+        pub async fn new(
+            listen_addr: &str,
+            seeds: Vec<String>,
+            node_name: String,
+        ) -> Result<Self, String> {
+            let bind: SocketAddr = listen_addr
+                .parse()
+                .map_err(|e| format!("invalid listenAddr {}: {}", listen_addr, e))?;
+
+            let (tx, mut rx) = mpsc::channel::<ClusterMsg>(OUTBOUND_QUEUE_CAP);
+
+            let shared = Arc::new(SharedState {
+                docs: Mutex::new(HashMap::new()),
+                tombstones: Mutex::new(HashMap::new()),
+                node_name: node_name.clone(),
+                tx,
+            });
+
+            let node_id = NodeId::try_from(node_name.clone())
+                .map_err(|e| format!("invalid nodeName {}: {}", node_name, e))?;
+
+            let mut binds: IndexSet<SocketAddr> = IndexSet::new();
+            binds.insert(bind);
+            let net_opts = NetTransportOptions::<
+                NodeId,
+                SocketAddrResolver<TokioRuntime>,
+                Tcp<TokioRuntime>,
+            >::new(node_id)
+            .with_bind_addresses(binds);
+
+            let delegate = CompositeDelegate::<NodeId, SocketAddr>::default()
+                .with_node_delegate(ClusterDelegate {
+                    shared: shared.clone(),
+                });
+
+            let memberlist =
+                TokioTcpMemberlist::with_delegate(delegate, net_opts, Options::lan())
+                    .await
+                    .map_err(|e| format!("memberlist init failed: {}", e))?;
+
+            let memberlist = Arc::new(memberlist);
+
+            // Join seeds (best-effort; missing seeds are logged, not fatal).
+            if !seeds.is_empty() {
+                let parsed: Vec<MaybeResolvedAddress<_, _>> = seeds
+                    .iter()
+                    .filter_map(|s| match s.parse::<SocketAddr>() {
+                        Ok(sa) => Some(MaybeResolvedAddress::resolved(sa)),
+                        Err(e) => {
+                            eprintln!("[session/cluster] bad seed {}: {}", s, e);
+                            None
+                        }
+                    })
+                    .collect();
+                match memberlist.join_many(parsed.into_iter()).await {
+                    Ok(addrs) => {
+                        println!(
+                            "[session/cluster] joined {} seed(s) successfully",
+                            addrs.len()
+                        );
+                    }
+                    Err((addrs, e)) => {
+                        eprintln!(
+                            "[session/cluster] partial join — reached {} seed(s); error: {}",
+                            addrs.len(),
+                            e
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "[session/cluster] no seeds configured — this node is the first member"
+                );
+            }
+
+            // Background sender task: drain outbound queue, reliable-send
+            // each message to every currently-online peer.
+            let mlist_send = memberlist.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    let bytes = match encode_to_vec(&msg, bincode_std()) {
+                        Ok(b) => Bytes::from(b),
+                        Err(e) => {
+                            eprintln!("[session/cluster] encode failed: {}", e);
+                            continue;
+                        }
+                    };
+                    let members = mlist_send.online_members().await;
+                    let me = mlist_send.local_id().clone();
+                    for member in members.iter() {
+                        if member.id() == &me {
+                            continue;
+                        }
+                        if let Err(e) = mlist_send
+                            .send_reliable(member.address(), bytes.clone())
+                            .await
+                        {
+                            eprintln!(
+                                "[session/cluster] send to {} failed: {}",
+                                member.id(),
+                                e
+                            );
+                        }
+                    }
+                }
+            });
+
+            println!(
+                "[session/cluster] node '{}' listening on {}",
+                shared.node_name, bind
+            );
+
+            Ok(Self { shared })
+        }
+
+        /// Encode the local doc's incremental change since the last call
+        /// and enqueue a Delta for broadcast.
+        fn broadcast_delta(&self, id: &str, doc: &mut automerge::AutoCommit) {
+            let change = doc.save_incremental();
+            if change.is_empty() {
+                return;
+            }
+            let msg = ClusterMsg::Delta {
+                id: id.to_string(),
+                change,
+            };
+            // try_send: if the queue is full, drop the message — anti-entropy
+            // will catch it on the next push/pull.
+            if let Err(e) = self.shared.tx.try_send(msg) {
+                eprintln!(
+                    "[session/cluster] outbound queue full or closed, dropping delta: {}",
+                    e
+                );
+            }
+        }
+
+        fn broadcast_tombstone(&self, id: &str) {
+            let msg = ClusterMsg::Tombstone { id: id.to_string() };
+            let _ = self.shared.tx.try_send(msg);
+        }
+    }
+
+    impl SessionStore for ClusterStore {
+        fn get(&self, id: &str) -> Option<SessionData> {
+            let docs = self.shared.docs.lock().ok()?;
+            let doc = docs.get(id)?;
+            read_session(doc)
+        }
+
+        fn set(&self, id: &str, data: SessionData) {
+            let mut docs = match self.shared.docs.lock() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            let doc = docs
+                .entry(id.to_string())
+                .or_insert_with(automerge::AutoCommit::new);
+            if let Err(e) = write_session(doc, &data) {
+                eprintln!("[session/cluster] write_session failed: {}", e);
+                return;
+            }
+            self.broadcast_delta(id, doc);
+        }
+
+        fn remove(&self, id: &str) {
+            if let Ok(mut docs) = self.shared.docs.lock() {
+                docs.remove(id);
+            }
+            if let Ok(mut t) = self.shared.tombstones.lock() {
+                t.insert(id.to_string(), Instant::now());
+            }
+            self.broadcast_tombstone(id);
+        }
+
+        fn rotate(&self, old_id: &str, new_id: &str) {
+            let existing = {
+                let docs = match self.shared.docs.lock() {
+                    Ok(d) => d,
+                    Err(_) => return,
+                };
+                docs.get(old_id).and_then(read_session)
+            };
+            if let Some(data) = existing {
+                self.set(new_id, data);
+                self.remove(old_id);
+            }
+        }
+
+        fn take_expired(&self, now_secs: u64) -> Vec<(String, IndexMap<String, CfmlValue>)> {
+            let expired_ids: Vec<String> = match self.shared.docs.lock() {
+                Ok(docs) => docs
+                    .iter()
+                    .filter_map(|(id, doc)| {
+                        let s = read_session(doc)?;
+                        if now_secs.saturating_sub(s.last_accessed_secs) > s.timeout_secs {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                Err(_) => return Vec::new(),
+            };
+            let mut out = Vec::with_capacity(expired_ids.len());
+            for id in expired_ids {
+                let vars = {
+                    let docs = match self.shared.docs.lock() {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    docs.get(&id).and_then(read_session).map(|s| s.variables)
+                };
+                if let Some(vars) = vars {
+                    out.push((id.clone(), vars));
+                    self.remove(&id);
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+pub use inner::ClusterStore;

@@ -19,8 +19,8 @@ pub mod schema;
 pub use env::expand_env_vars;
 pub use resolve::{resolve_config_path, LoadMode};
 pub use schema::{
-    CacheCfg, DatasourceCfg, DebuggingCfg, LoggerCfg, LoggingCfg, MailServerCfg, RuntimeCfg,
-    RustCfmlConfig, SecurityCfg, ServerCfg, UrlRewritingCfg,
+    CacheCfg, CacheProperties, DatasourceCfg, DebuggingCfg, LoggerCfg, LoggingCfg, MailServerCfg,
+    RuntimeCfg, RustCfmlConfig, SecurityCfg, ServerCfg, UrlRewritingCfg,
 };
 
 /// Re-export of `serde_json::Value` used when callers want to convert the

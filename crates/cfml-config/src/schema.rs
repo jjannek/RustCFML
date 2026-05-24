@@ -228,19 +228,54 @@ pub struct MailServerCfg {
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct CacheCfg {
+    /// RustCFML / BoxLang-style provider name: "memory", "memcached", "cluster".
     pub provider: String,
+    /// Lucee-style Java class name (e.g. "org.lucee.extension.io.cache.memcache.MemCacheRaw").
+    /// When non-empty and `provider` is empty, the class is mapped to the equivalent provider.
+    pub class: String,
+    /// Must be `true` for the cache to be eligible for session/client storage.
+    /// Lucee requires this flag explicitly; RustCFML emits a warning when it is
+    /// absent but does not refuse to use the cache.
+    pub storage: bool,
+    /// Lucee-style flat property map (all values are strings). Used when a
+    /// `.cfconfig.json` was exported from Lucee — the Memcached extension stores
+    /// connection details here rather than in `properties`.
+    pub custom: IndexMap<String, String>,
     pub properties: CacheProperties,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct CacheProperties {
+    // Generic cache settings
     #[serde(rename = "maxObjects")]
     pub max_objects: u64,
     #[serde(rename = "defaultTimeout")]
     pub default_timeout: u64,
     #[serde(rename = "evictionPolicy")]
     pub eviction_policy: String,
+
+    // memcached provider
+    /// Memcached server addresses, e.g. ["localhost:11211"]
+    pub servers: Vec<String>,
+    /// Key prefix prepended to every session ID stored in Memcached.
+    /// Defaults to "rustcfml:sess:".
+    #[serde(rename = "keyPrefix")]
+    pub key_prefix: String,
+
+    // cluster provider (memberlist + CRDT)
+    /// UDP/QUIC address this node binds for cluster gossip. Default "0.0.0.0:7946".
+    #[serde(rename = "listenAddr")]
+    pub listen_addr: String,
+    /// Public address advertised to other cluster members (required when
+    /// `listenAddr` binds 0.0.0.0). Leave empty to use `listenAddr`.
+    #[serde(rename = "advertiseAddr")]
+    pub advertise_addr: String,
+    /// Seed node addresses used to bootstrap cluster membership.
+    pub seeds: Vec<String>,
+    /// Stable human-readable node name. Defaults to hostname:listenPort.
+    #[serde(rename = "nodeName")]
+    pub node_name: String,
 }
 
 impl Default for CacheProperties {
@@ -249,6 +284,12 @@ impl Default for CacheProperties {
             max_objects: 1000,
             default_timeout: 3600,
             eviction_policy: "LRU".into(),
+            servers: Vec::new(),
+            key_prefix: "rustcfml:sess:".into(),
+            listen_addr: "0.0.0.0:7946".into(),
+            advertise_addr: String::new(),
+            seeds: Vec::new(),
+            node_name: String::new(),
         }
     }
 }
@@ -428,6 +469,10 @@ impl RustCfmlConfig {
         // caches
         for c in self.caches.values_mut() {
             expand(&mut c.provider);
+            expand(&mut c.class);
+            for v in c.custom.values_mut() {
+                expand(v);
+            }
             expand(&mut c.properties.eviction_policy);
         }
         expand(&mut self.session_storage);

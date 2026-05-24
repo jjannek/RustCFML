@@ -217,9 +217,182 @@ First entry becomes cfmail's default when its tag attributes omit `server`.
 
 ### `caches` and `sessionStorage`
 
-Accepted by the parser for forward compatibility with shared Lucee/BoxLang
-configs, but **not applied at runtime** — RustCFML uses an in-process cache
-and has no alternative session backend.
+`sessionStorage` names a cache defined in `caches` that should back the session store.
+`caches` is a map of named cache definitions, each with a `provider` and `properties` block.
+
+**Supported providers:**
+
+| `provider` | Description |
+|-----------|-------------|
+| `"memory"` | In-process store (default — no config needed) |
+| `"memcached"` | External Memcached cluster — requires `--features memcached` build flag |
+| `"cluster"` | Gossip-based multi-node replication via memberlist + Automerge CRDT — requires `--features cluster` build flag |
+
+**Example — Memcached (RustCFML native format):**
+```json
+{
+    "sessionStorage": "mc",
+    "caches": {
+        "mc": {
+            "provider": "memcached",
+            "storage": true,
+            "properties": {
+                "servers": ["localhost:11211"],
+                "keyPrefix": "myapp:sess:"
+            }
+        }
+    }
+}
+```
+
+**Lucee compatibility format** — if you export a `.cfconfig.json` from Lucee with the Memcached extension installed, it uses `class` instead of `provider` and a `custom` map with a space-separated `servers` string. RustCFML accepts this format directly:
+
+```json
+{
+    "sessionStorage": "sessions",
+    "caches": {
+        "sessions": {
+            "class": "org.lucee.extension.io.cache.memcache.MemCacheRaw",
+            "storage": true,
+            "custom": {
+                "servers": "host1:11211 host2:11211",
+                "storage_format": "Binary"
+            }
+        }
+    }
+}
+```
+
+Both Lucee Memcached class names are recognised:
+- `org.lucee.extension.io.cache.memcache.MemCacheRaw` (Lucee 5 / early 6)
+- `org.lucee.extension.cache.mc.MemcachedCache` (Lucee 6 current)
+
+**Lucee notes:**
+- The `storage: true` flag is required by Lucee for session-eligible caches. RustCFML emits a warning if it is absent but does not refuse.
+- Lucee serialises sessions as binary Java objects; RustCFML serialises as JSON. Sessions written by one engine cannot be read by the other — they do not share session data in the same Memcached instance.
+- Lucee has `sessionCluster: true/false` (`this.sessionCluster` in Application.cfc) to control whether reads are always pulled from the external store. RustCFML always reads from the store on each request.
+
+**Example — Cluster (single-node config):**
+```json
+{
+    "sessionStorage": "cluster",
+    "caches": {
+        "cluster": {
+            "provider": "cluster",
+            "storage": true,
+            "properties": {
+                "listenAddr": "0.0.0.0:7946",
+                "advertiseAddr": "192.168.1.10:7946",
+                "seeds": ["node2.internal:7946", "node3.internal:7946"],
+                "nodeName": "node1"
+            }
+        }
+    }
+}
+```
+
+> **Build flag required.** The cluster provider is only available when `rustcfml` is built with `--features cluster` (`cargo build --release --features cluster`). The stock release binary does not include it; trying to use `provider: "cluster"` on a non-cluster build will log a warning and fall back to the in-process memory store.
+
+> **`storage: true` is required.** The cache must explicitly opt in to being used as session storage. Lucee enforces this; RustCFML warns if it is missing but uses the cache anyway.
+
+Cluster properties:
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `listenAddr` | `0.0.0.0:7946` | TCP `host:port` this node binds for memberlist gossip. Use `0.0.0.0` to bind every interface; restrict to a specific IP for tighter networking. |
+| `advertiseAddr` | (empty) | Public address other nodes should reach this one on. Required when `listenAddr` binds `0.0.0.0`; leave empty when `listenAddr` already specifies a routable address. Also used as the default `nodeName`. |
+| `seeds` | `[]` | List of peer `host:port` addresses to contact on startup. **Any single reachable seed is enough** to bootstrap — the new node will discover the rest via gossip. An empty list means "I am the first member." |
+| `nodeName` | derived | Stable identifier used as the node's id. Defaults to `advertiseAddr`, or `listenAddr-<uuid>` when neither is set. Set this explicitly in production so a node keeps the same identity across restarts. |
+
+### Three-node walkthrough
+
+Three machines, all on the same internal network, all running `rustcfml --serve --port 8500`:
+
+```jsonc
+// On node1 (192.168.1.10) — .cfconfig.json
+{
+    "sessionStorage": "cluster",
+    "caches": { "cluster": { "provider": "cluster", "storage": true,
+        "properties": {
+            "listenAddr":    "0.0.0.0:7946",
+            "advertiseAddr": "192.168.1.10:7946",
+            "seeds":         [],
+            "nodeName":      "node1"
+        } } }
+}
+```
+```jsonc
+// On node2 (192.168.1.11) — .cfconfig.json
+{ "sessionStorage": "cluster",
+  "caches": { "cluster": { "provider": "cluster", "storage": true,
+    "properties": {
+        "listenAddr":    "0.0.0.0:7946",
+        "advertiseAddr": "192.168.1.11:7946",
+        "seeds":         ["192.168.1.10:7946"],
+        "nodeName":      "node2"
+    } } } }
+```
+```jsonc
+// On node3 (192.168.1.12) — .cfconfig.json
+{ "sessionStorage": "cluster",
+  "caches": { "cluster": { "provider": "cluster", "storage": true,
+    "properties": {
+        "listenAddr":    "0.0.0.0:7946",
+        "advertiseAddr": "192.168.1.12:7946",
+        "seeds":         ["192.168.1.10:7946", "192.168.1.11:7946"],
+        "nodeName":      "node3"
+    } } } }
+```
+
+Start order: any node can start first. Nodes whose seeds are unreachable at boot log a `partial join` warning, but the cluster heals automatically as the missing peers come up — periodic anti-entropy will pull the latest state in the next push/pull cycle.
+
+Each node logs a single line on success, e.g. `[session/cluster] node 'node2' listening on 0.0.0.0:7946` plus `[session/cluster] joined 1 seed(s) successfully`.
+
+### Firewalls and ports
+
+The cluster uses **one TCP port per node** (the `listenAddr` port — 7946 by default, matching HashiCorp Serf's convention). Open it bidirectionally between every pair of cluster members. No additional UDP ports are needed in this build (the `tcp` feature is the only transport enabled).
+
+Run multiple nodes on one host (e.g. for local testing) by giving each a distinct `listenAddr` port:
+```bash
+# node A on :7946, node B on :7947
+```
+
+### How it works
+
+Each session is held in its own per-process [Automerge](https://automerge.org) document. On `set` / `remove`, the local document records a change and the incremental change bytes are reliably sent to every currently-online cluster member as a [memberlist](https://github.com/al8n/memberlist) user-message. On receive, the change is applied via Automerge's CRDT merge — concurrent writes converge deterministically across the cluster without coordination.
+
+Membership and failure detection come from memberlist (the Rust port of HashiCorp's gossip protocol). On node join, memberlist's TCP push/pull state exchange invokes the cluster store's `local_state` hook on each side, round-tripping the union of all session documents — so a newly-joined node catches up to the cluster's full state immediately, and the same mechanism runs periodically thereafter as anti-entropy against any messages dropped on the live path.
+
+### Sizing
+
+Tested for native rustcfml server deployments up to a few dozen nodes on LAN or WAN. WASM and Cloudflare Workers **cannot** participate — memberlist requires a persistent TCP socket model unavailable in those runtimes.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `[session] Cluster provider requested but binary was not compiled with --features cluster — using memory store` | Wrong binary — stock release build was used. | Rebuild with `cargo build --release --features cluster` or use a cluster-enabled distribution. |
+| `[session/cluster] partial join — reached 0 seed(s); error: Connection refused` on every node | None of the seeds were running yet, **or** they aren't actually listening on `listenAddr`, **or** a firewall is blocking the port. | Start at least one seed first, double-check the `host:port` strings, open the port between the nodes. |
+| Session set on node A is never visible on node B | Almost always: `nodeName` collision (two nodes share the same name, so memberlist sees them as the same node and ignores one). Less commonly: `advertiseAddr` is set to a value the peer can't actually reach. | Give every node a unique `nodeName`. Verify each `advertiseAddr` resolves and is reachable from every other node. |
+| Sessions sometimes appear after a delay rather than immediately | Live `send_reliable` was dropped (network glitch). Anti-entropy will catch it on the next push/pull cycle (a few seconds). | Expected behaviour — the cluster is eventually consistent. If delays exceed ~10 s, investigate network or memberlist tuning. |
+| A node's CFML test suite fails when the cluster is configured | Unlikely — the test runner uses CLI mode and never touches `build_session_store`. | If you actually see this, file a bug with the failing suite name. |
+
+**Application.cfc override** — per-app session storage follows Lucee conventions:
+```cfml
+component {
+    this.name            = "MyApp";
+    this.sessionManagement = true;
+    this.sessionStorage  = "mc";  // references a named cache
+
+    this.cache["mc"] = {
+        provider: "memcached",
+        properties: { servers: ["localhost:11211"] }
+    };
+}
+```
+
+`this.cache` definitions merge with and override same-named entries from `.cfconfig.json`.
+`this.sessionStorage` overrides the server-wide `sessionStorage` for this application.
 
 ## Inspecting the resolved config from CFML
 

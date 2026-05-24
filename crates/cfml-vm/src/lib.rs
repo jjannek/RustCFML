@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 mod java_shims;
+pub mod session_store;
+pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_collections, handle_java_concurrenthashmap, handle_java_concurrentlinkedqueue,
     handle_java_file, handle_java_inetaddress, handle_java_linkedhashmap,
@@ -31,6 +33,12 @@ pub struct ApplicationState {
     /// The program.functions.len() at which cached_functions were originally inserted.
     /// Used to compute index offsets when restoring on subsequent requests.
     pub cached_functions_original_offset: usize,
+    /// Value of `this.sessionStorage` from Application.cfc — name of the cache to use
+    /// for session storage. Overrides the server-wide `.cfconfig.json` setting.
+    pub session_storage: Option<String>,
+    /// Named cache definitions from `this.cache` in Application.cfc.
+    /// These merge with (and override) the server-wide `caches` from `.cfconfig.json`.
+    pub app_caches: indexmap::IndexMap<String, cfml_config::CacheCfg>,
 }
 
 /// A CFML component mapping: virtual prefix → physical directory.
@@ -41,15 +49,26 @@ pub struct CfmlMapping {
 }
 
 /// Session data for a single user session.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionData {
     pub variables: IndexMap<String, CfmlValue>,
-    pub created: std::time::Instant,
-    pub last_accessed: std::time::Instant,
+    /// Unix epoch seconds when the session was created.
+    pub created_secs: u64,
+    /// Unix epoch seconds of the most recent access.
+    pub last_accessed_secs: u64,
     pub auth_user: Option<String>,
     pub auth_roles: Vec<String>,
     /// Session timeout in seconds (default 1800 = 30 minutes)
     pub timeout_secs: u64,
+}
+
+/// Returns current Unix epoch seconds.
+#[inline]
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// A cached compiled bytecode program with its source file modification time.
@@ -382,7 +401,7 @@ pub fn compile_file_cached(
 #[derive(Clone)]
 pub struct ServerState {
     pub applications: Arc<Mutex<HashMap<String, ApplicationState>>>,
-    pub sessions: Arc<Mutex<HashMap<String, SessionData>>>,
+    pub sessions: Arc<dyn SessionStore>,
     /// Named locks for cflock: name → RwLock (exclusive = write, readonly = read)
     pub named_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
     /// Bytecode cache — skips recompilation when file mtime is unchanged
@@ -417,7 +436,7 @@ impl ServerState {
     ) -> Self {
         Self {
             applications: Arc::new(Mutex::new(HashMap::new())),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(MemoryStore::new()),
             named_locks: Arc::new(Mutex::new(HashMap::new())),
             bytecode_cache: BytecodeCache::with_trust(production_mode),
             webroot: None,
@@ -6675,9 +6694,7 @@ impl CfmlVirtualMachine {
                 "sessioninvalidate" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
-                        if let Ok(mut sessions) = state.sessions.lock() {
-                            sessions.remove(sid);
-                        }
+                        state.sessions.remove(sid);
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -6686,18 +6703,8 @@ impl CfmlVirtualMachine {
                     if let (Some(ref state), Some(ref old_sid)) =
                         (&self.server_state, &self.session_id)
                     {
-                        let new_sid = {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos();
-                            format!("{:x}", ts)
-                        };
-                        if let Ok(mut sessions) = state.sessions.lock() {
-                            if let Some(old_data) = sessions.remove(old_sid) {
-                                sessions.insert(new_sid.clone(), old_data);
-                            }
-                        }
+                        let new_sid = uuid::Uuid::new_v4().to_string();
+                        state.sessions.rotate(old_sid, &new_sid);
                         self.session_id = Some(new_sid);
                     }
                     return Ok(CfmlValue::Null);
@@ -6706,18 +6713,17 @@ impl CfmlVirtualMachine {
                     let mut meta = IndexMap::new();
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
-                        if let Ok(sessions) = state.sessions.lock() {
-                            if let Some(session) = sessions.get(sid) {
-                                meta.insert(
-                                    "sessionId".to_string(),
-                                    CfmlValue::String(sid.clone()),
-                                );
-                                meta.insert(
-                                    "timeCreated".to_string(),
-                                    CfmlValue::Int(session.created.elapsed().as_secs() as i64),
-                                );
-                                meta.insert("lastAccessed".to_string(), CfmlValue::Int(session.last_accessed.elapsed().as_secs() as i64));
-                            }
+                        if let Some(session) = state.sessions.get(sid) {
+                            let now = now_epoch_secs();
+                            meta.insert(
+                                "sessionId".to_string(),
+                                CfmlValue::String(sid.clone()),
+                            );
+                            meta.insert(
+                                "timeCreated".to_string(),
+                                CfmlValue::Int(now.saturating_sub(session.created_secs) as i64),
+                            );
+                            meta.insert("lastAccessed".to_string(), CfmlValue::Int(now.saturating_sub(session.last_accessed_secs) as i64));
                         }
                     }
                     return Ok(CfmlValue::strukt(meta));
@@ -6725,11 +6731,9 @@ impl CfmlVirtualMachine {
                 "getauthuser" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
-                        if let Ok(sessions) = state.sessions.lock() {
-                            if let Some(session) = sessions.get(sid) {
-                                if let Some(ref user) = session.auth_user {
-                                    return Ok(CfmlValue::String(user.clone()));
-                                }
+                        if let Some(session) = state.sessions.get(sid) {
+                            if let Some(ref user) = session.auth_user {
+                                return Ok(CfmlValue::String(user.clone()));
                             }
                         }
                     }
@@ -6738,10 +6742,8 @@ impl CfmlVirtualMachine {
                 "isuserloggedin" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
-                        if let Ok(sessions) = state.sessions.lock() {
-                            if let Some(session) = sessions.get(sid) {
-                                return Ok(CfmlValue::Bool(session.auth_user.is_some()));
-                            }
+                        if let Some(session) = state.sessions.get(sid) {
+                            return Ok(CfmlValue::Bool(session.auth_user.is_some()));
                         }
                     }
                     return Ok(CfmlValue::Bool(false));
@@ -6753,12 +6755,10 @@ impl CfmlVirtualMachine {
                         .unwrap_or_default();
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
-                        if let Ok(sessions) = state.sessions.lock() {
-                            if let Some(session) = sessions.get(sid) {
-                                let has_role =
-                                    session.auth_roles.iter().any(|r| r.to_lowercase() == role);
-                                return Ok(CfmlValue::Bool(has_role));
-                            }
+                        if let Some(session) = state.sessions.get(sid) {
+                            let has_role =
+                                session.auth_roles.iter().any(|r| r.to_lowercase() == role);
+                            return Ok(CfmlValue::Bool(has_role));
                         }
                     }
                     return Ok(CfmlValue::Bool(false));
@@ -6774,35 +6774,28 @@ impl CfmlVirtualMachine {
                         .collect();
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
-                        if let Ok(mut sessions) = state.sessions.lock() {
-                            if let Some(session) = sessions.get_mut(sid) {
-                                session.auth_user = Some(name);
-                                session.auth_roles = roles;
-                            } else {
-                                sessions.insert(
-                                    sid.clone(),
-                                    SessionData {
-                                        variables: IndexMap::new(),
-                                        created: std::time::Instant::now(),
-                                        last_accessed: std::time::Instant::now(),
-                                        auth_user: Some(name),
-                                        auth_roles: roles,
-                                        timeout_secs: 1800,
-                                    },
-                                );
-                            }
-                        }
+                        let now = now_epoch_secs();
+                        let mut session = state.sessions.get(sid).unwrap_or_else(|| SessionData {
+                            variables: IndexMap::new(),
+                            created_secs: now,
+                            last_accessed_secs: now,
+                            auth_user: None,
+                            auth_roles: Vec::new(),
+                            timeout_secs: 1800,
+                        });
+                        session.auth_user = Some(name);
+                        session.auth_roles = roles;
+                        state.sessions.set(sid, session);
                     }
                     return Ok(CfmlValue::Null);
                 }
                 "__cflogout" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
-                        if let Ok(mut sessions) = state.sessions.lock() {
-                            if let Some(session) = sessions.get_mut(sid) {
-                                session.auth_user = None;
-                                session.auth_roles.clear();
-                            }
+                        if let Some(mut session) = state.sessions.get(sid) {
+                            session.auth_user = None;
+                            session.auth_roles.clear();
+                            state.sessions.set(sid, session);
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -9183,10 +9176,8 @@ impl CfmlVirtualMachine {
     /// Get the session scope for the current request
     fn get_session_scope(&self) -> CfmlValue {
         if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
-            if let Ok(sessions) = state.sessions.lock() {
-                if let Some(session) = sessions.get(sid) {
-                    return CfmlValue::strukt(session.variables.clone());
-                }
+            if let Some(session) = state.sessions.get(sid) {
+                return CfmlValue::strukt(session.variables.clone());
             }
         }
         CfmlValue::strukt(IndexMap::new())
@@ -9195,24 +9186,18 @@ impl CfmlVirtualMachine {
     /// Set the session scope for the current request
     fn set_session_scope(&self, vars: IndexMap<String, CfmlValue>) {
         if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
-            if let Ok(mut sessions) = state.sessions.lock() {
-                if let Some(session) = sessions.get_mut(sid) {
-                    session.variables = vars;
-                    session.last_accessed = std::time::Instant::now();
-                } else {
-                    sessions.insert(
-                        sid.clone(),
-                        SessionData {
-                            variables: vars,
-                            created: std::time::Instant::now(),
-                            last_accessed: std::time::Instant::now(),
-                            auth_user: None,
-                            auth_roles: Vec::new(),
-                            timeout_secs: 1800,
-                        },
-                    );
-                }
-            }
+            let now = now_epoch_secs();
+            let mut session = state.sessions.get(sid).unwrap_or_else(|| SessionData {
+                variables: IndexMap::new(),
+                created_secs: now,
+                last_accessed_secs: now,
+                auth_user: None,
+                auth_roles: Vec::new(),
+                timeout_secs: 1800,
+            });
+            session.variables = vars;
+            session.last_accessed_secs = now;
+            state.sessions.set(sid, session);
         }
     }
 
@@ -9220,26 +9205,18 @@ impl CfmlVirtualMachine {
     #[allow(dead_code)]
     fn set_session_variable(&self, key: &str, value: CfmlValue) {
         if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
-            if let Ok(mut sessions) = state.sessions.lock() {
-                if let Some(session) = sessions.get_mut(sid) {
-                    session.variables.insert(key.to_string(), value);
-                    session.last_accessed = std::time::Instant::now();
-                } else {
-                    let mut vars = IndexMap::new();
-                    vars.insert(key.to_string(), value);
-                    sessions.insert(
-                        sid.clone(),
-                        SessionData {
-                            variables: vars,
-                            created: std::time::Instant::now(),
-                            last_accessed: std::time::Instant::now(),
-                            auth_user: None,
-                            auth_roles: Vec::new(),
-                            timeout_secs: 1800,
-                        },
-                    );
-                }
-            }
+            let now = now_epoch_secs();
+            let mut session = state.sessions.get(sid).unwrap_or_else(|| SessionData {
+                variables: IndexMap::new(),
+                created_secs: now,
+                last_accessed_secs: now,
+                auth_user: None,
+                auth_roles: Vec::new(),
+                timeout_secs: 1800,
+            });
+            session.variables.insert(key.to_string(), value);
+            session.last_accessed_secs = now;
+            state.sessions.set(sid, session);
         }
     }
 
@@ -10561,7 +10538,7 @@ impl CfmlVirtualMachine {
         }
 
         // Extract and install mappings early so resolve_inheritance can find parent classes
-        let (_, _, mut early_mappings, _, _, _, _) = Self::extract_app_config(&template);
+        let (_, _, mut early_mappings, _, _, _, _, _, _) = Self::extract_app_config(&template);
         let app_cfc_dir = std::path::Path::new(path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -10594,9 +10571,9 @@ impl CfmlVirtualMachine {
         Some(resolved)
     }
 
-    /// Extract application config from a component struct
+    /// Extract application config from a component struct.
     /// Returns (app_name, config, mappings, session_management, session_timeout_secs,
-    /// custom_tag_paths, local_mode_modern_default)
+    /// custom_tag_paths, local_mode_modern_default, session_storage, app_caches)
     fn extract_app_config(
         template: &CfmlValue,
     ) -> (
@@ -10607,6 +10584,8 @@ impl CfmlVirtualMachine {
         u64,
         Vec<String>,
         Option<bool>,
+        Option<String>,
+        indexmap::IndexMap<String, cfml_config::CacheCfg>,
     ) {
         let s = match template {
             CfmlValue::Struct(s) => s,
@@ -10619,6 +10598,8 @@ impl CfmlVirtualMachine {
                     1800,
                     Vec::new(),
                     None,
+                    None,
+                    indexmap::IndexMap::new(),
                 )
             }
         };
@@ -10740,6 +10721,84 @@ impl CfmlVirtualMachine {
                 _ => None,
             });
 
+        // Extract this.sessionStorage — name of the named cache to use for sessions.
+        let session_storage = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("sessionstorage"))
+            .and_then(|(_, v)| match v {
+                CfmlValue::String(st) if !st.is_empty() => Some(st.clone()),
+                _ => None,
+            });
+
+        // Extract this.cache — named cache definitions (Lucee-compatible struct of structs).
+        let mut app_caches = indexmap::IndexMap::new();
+        if let Some(cache_val) = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cache"))
+            .map(|(_, v)| v)
+        {
+            if let CfmlValue::Struct(cache_map) = cache_val {
+                for (cache_name, cache_def) in cache_map.iter() {
+                    if let CfmlValue::Struct(def) = cache_def {
+                        let provider = def
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("provider"))
+                            .and_then(|(_, v)| match v {
+                                CfmlValue::String(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let mut props = cfml_config::schema::CacheProperties::default();
+                        if let Some(CfmlValue::Struct(p)) = def
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("properties"))
+                            .map(|(_, v)| v)
+                        {
+                            for (pk, pv) in p.iter() {
+                                match pk.to_lowercase().as_str() {
+                                    "servers" => {
+                                        if let CfmlValue::Array(arr) = pv {
+                                            props.servers =
+                                                arr.iter().map(|v| v.as_string()).collect();
+                                        }
+                                    }
+                                    "keyprefix" => props.key_prefix = pv.as_string(),
+                                    "listenaddr" => props.listen_addr = pv.as_string(),
+                                    "advertiseaddr" => props.advertise_addr = pv.as_string(),
+                                    "seeds" => {
+                                        if let CfmlValue::Array(arr) = pv {
+                                            props.seeds =
+                                                arr.iter().map(|v| v.as_string()).collect();
+                                        }
+                                    }
+                                    "nodename" => props.node_name = pv.as_string(),
+                                    "maxobjects" => {
+                                        if let CfmlValue::Int(i) = pv {
+                                            props.max_objects = *i as u64;
+                                        }
+                                    }
+                                    "defaulttimeout" => {
+                                        if let CfmlValue::Int(i) = pv {
+                                            props.default_timeout = *i as u64;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        app_caches.insert(
+                            cache_name.to_lowercase(),
+                            cfml_config::CacheCfg {
+                                provider,
+                                properties: props,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
         (
             app_name,
             config,
@@ -10748,6 +10807,8 @@ impl CfmlVirtualMachine {
             session_timeout,
             custom_tag_paths,
             local_mode_modern_default,
+            session_storage,
+            app_caches,
         )
     }
 
@@ -10845,6 +10906,8 @@ impl CfmlVirtualMachine {
             session_timeout,
             mut custom_tag_paths,
             local_mode_modern_default,
+            app_session_storage,
+            app_caches,
         ) = Self::extract_app_config(&template);
 
         // 3.0 Layer .cfconfig.json global mappings + customTagPaths underneath
@@ -10950,6 +11013,8 @@ impl CfmlVirtualMachine {
                     config: _config.clone(),
                     cached_functions: Vec::new(),
                     cached_functions_original_offset: 0,
+                    session_storage: app_session_storage.clone(),
+                    app_caches: app_caches.clone(),
                 };
                 apps.insert(app_name.clone(), app_state);
             }
@@ -11043,33 +11108,32 @@ impl CfmlVirtualMachine {
             if let Some(ref server_state) = self.server_state.clone() {
                 let sid = self.session_id.clone().unwrap_or_default();
                 if !sid.is_empty() {
-                    let mut sessions = server_state.sessions.lock().unwrap();
-                    let is_new = !sessions.contains_key(&sid);
+                    let is_new = !server_state.sessions.contains(&sid);
 
                     if is_new {
                         // Create new session
-                        sessions.insert(
-                            sid.clone(),
+                        let now = now_epoch_secs();
+                        server_state.sessions.set(
+                            &sid,
                             SessionData {
                                 variables: IndexMap::new(),
-                                created: std::time::Instant::now(),
-                                last_accessed: std::time::Instant::now(),
+                                created_secs: now,
+                                last_accessed_secs: now,
                                 auth_user: None,
                                 auth_roles: Vec::new(),
                                 timeout_secs: session_timeout,
                             },
                         );
-                        drop(sessions);
 
                         // Call onSessionStart
                         let _ = self.call_lifecycle_method(&mut template, "onSessionStart", vec![]);
                     } else {
                         // Update last_accessed
-                        if let Some(session) = sessions.get_mut(&sid) {
-                            session.last_accessed = std::time::Instant::now();
+                        if let Some(mut session) = server_state.sessions.get(&sid) {
+                            session.last_accessed_secs = now_epoch_secs();
                             session.timeout_secs = session_timeout;
+                            server_state.sessions.set(&sid, session);
                         }
-                        drop(sessions);
                     }
                 }
             }
@@ -11129,21 +11193,14 @@ impl CfmlVirtualMachine {
         // 8b. Session expiry — scan and expire timed-out sessions
         if session_management {
             if let Some(ref server_state) = self.server_state.clone() {
-                let expired: Vec<(String, IndexMap<String, CfmlValue>)> = {
-                    let sessions = server_state.sessions.lock().unwrap();
-                    sessions
-                        .iter()
-                        .filter(|(_, s)| s.last_accessed.elapsed().as_secs() > s.timeout_secs)
-                        .map(|(k, s)| (k.clone(), s.variables.clone()))
-                        .collect()
-                };
+                let expired = server_state.sessions.take_expired(now_epoch_secs());
                 if !expired.is_empty() {
                     let app_scope_val = self
                         .application_scope
                         .as_ref()
                         .and_then(|a| a.lock().ok().map(|s| CfmlValue::strukt(s.clone())))
                         .unwrap_or(CfmlValue::strukt(IndexMap::new()));
-                    for (sid, session_vars) in &expired {
+                    for (_, session_vars) in &expired {
                         // Call onSessionEnd(sessionScope, applicationScope)
                         let _ = self.call_lifecycle_method(
                             &mut template,
@@ -11153,7 +11210,6 @@ impl CfmlVirtualMachine {
                                 app_scope_val.clone(),
                             ],
                         );
-                        server_state.sessions.lock().unwrap().remove(sid);
                     }
                 }
             }

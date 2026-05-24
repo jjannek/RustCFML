@@ -1,4 +1,5 @@
 mod rewrite;
+mod session;
 
 use clap::Parser;
 use std::collections::HashMap;
@@ -628,6 +629,164 @@ fn run_server(
     rt.block_on(async_run_server(doc_root, port, debug, single_threaded, vfs, sandbox, production, cfconfig));
 }
 
+/// Known Lucee Memcached extension Java class names (both the old and new bundle).
+const LUCEE_MEMCACHED_CLASSES: &[&str] = &[
+    "org.lucee.extension.io.cache.memcache.memcacheraw",  // Lucee 5 / early 6
+    "org.lucee.extension.cache.mc.memcachedcache",        // Lucee 6 current
+];
+
+/// Map a Lucee-style `class` field to a RustCFML provider string, or return
+/// the `provider` field directly when no class is present.
+fn resolve_provider(cache_cfg: &cfml_config::CacheCfg) -> &str {
+    if !cache_cfg.provider.is_empty() {
+        return &cache_cfg.provider;
+    }
+    let class_lc = cache_cfg.class.to_lowercase();
+    if LUCEE_MEMCACHED_CLASSES.iter().any(|c| class_lc.as_str() == *c) {
+        return "memcached";
+    }
+    ""
+}
+
+/// Parse a Memcached server list from either format:
+/// - RustCFML `properties.servers` — `["host:port", ...]` JSON array
+/// - Lucee `custom.servers` — `"host1:port host2:port"` space/comma-separated string
+#[cfg(feature = "memcached")]
+fn resolve_memcached_servers(cache_cfg: &cfml_config::CacheCfg) -> Vec<String> {
+    if !cache_cfg.properties.servers.is_empty() {
+        return cache_cfg.properties.servers.clone();
+    }
+    if let Some(raw) = cache_cfg.custom.get("servers") {
+        return raw
+            .split([' ', ','])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Construct the session store from `.cfconfig.json` settings.
+///
+/// Resolution order: `sessionStorage` name in cfconfig → look up `caches`
+/// entry → dispatch on `provider` (or Lucee `class`). Falls back to
+/// `MemoryStore` if no config is present or the named cache is not found.
+async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::session_store::SessionStore> {
+    let storage_name = cfconfig.session_storage.trim();
+    if storage_name.is_empty() || storage_name.eq_ignore_ascii_case("memory") {
+        return Arc::new(cfml_vm::session_store::MemoryStore::new());
+    }
+
+    let cache_cfg = match cfconfig.caches.get(storage_name) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "[session] sessionStorage cache '{}' not found in caches — using in-process memory store",
+                storage_name
+            );
+            return Arc::new(cfml_vm::session_store::MemoryStore::new());
+        }
+    };
+
+    // Warn if the cache is not flagged for storage (Lucee requires storage=true).
+    // We emit a warning but do not refuse — RustCFML configs may omit the flag.
+    if !cache_cfg.storage {
+        eprintln!(
+            "[session] Cache '{}' does not have storage=true — if this came from a Lucee \
+             .cfconfig.json, add \"storage\": true to the cache definition",
+            storage_name
+        );
+    }
+
+    let provider = resolve_provider(cache_cfg).to_lowercase();
+
+    match provider.as_str() {
+        "memory" | "" => Arc::new(cfml_vm::session_store::MemoryStore::new()),
+
+        #[cfg(feature = "memcached")]
+        "memcached" => {
+            let servers = resolve_memcached_servers(cache_cfg);
+            if servers.is_empty() {
+                eprintln!("[session] Memcached provider configured but no servers listed — using memory store");
+                return Arc::new(cfml_vm::session_store::MemoryStore::new());
+            }
+            let key_prefix = if !cache_cfg.properties.key_prefix.is_empty() {
+                cache_cfg.properties.key_prefix.clone()
+            } else {
+                "rustcfml:sess:".to_string()
+            };
+            match session::memcached::MemcachedStore::new(&servers, &key_prefix) {
+                Ok(store) => {
+                    println!("[session] Using Memcached session store ({})", servers.join(", "));
+                    Arc::new(store)
+                }
+                Err(e) => {
+                    eprintln!("[session] Failed to connect to Memcached: {} — falling back to memory store", e);
+                    Arc::new(cfml_vm::session_store::MemoryStore::new())
+                }
+            }
+        }
+
+        #[cfg(not(feature = "memcached"))]
+        "memcached" => {
+            eprintln!("[session] Memcached provider requested but binary was not compiled with --features memcached — using memory store");
+            Arc::new(cfml_vm::session_store::MemoryStore::new())
+        }
+
+        #[cfg(feature = "cluster")]
+        "cluster" => {
+            let listen_addr = if !cache_cfg.properties.listen_addr.is_empty() {
+                cache_cfg.properties.listen_addr.clone()
+            } else {
+                "0.0.0.0:7946".to_string()
+            };
+            let seeds = cache_cfg.properties.seeds.clone();
+            let node_name = if !cache_cfg.properties.node_name.is_empty() {
+                cache_cfg.properties.node_name.clone()
+            } else if !cache_cfg.properties.advertise_addr.is_empty() {
+                cache_cfg.properties.advertise_addr.clone()
+            } else {
+                format!("{}-{}", listen_addr, uuid::Uuid::new_v4().simple())
+            };
+            let result = session::cluster::ClusterStore::new(
+                &listen_addr,
+                seeds.clone(),
+                node_name.clone(),
+            )
+            .await;
+            match result {
+                Ok(store) => {
+                    println!(
+                        "[session] Using cluster session store (listen={}, seeds=[{}])",
+                        listen_addr,
+                        seeds.join(", ")
+                    );
+                    Arc::new(store)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[session] Failed to start cluster store on {}: {} — falling back to memory store",
+                        listen_addr, e
+                    );
+                    Arc::new(cfml_vm::session_store::MemoryStore::new())
+                }
+            }
+        }
+
+        #[cfg(not(feature = "cluster"))]
+        "cluster" => {
+            eprintln!("[session] Cluster provider requested but binary was not compiled with --features cluster — using memory store");
+            Arc::new(cfml_vm::session_store::MemoryStore::new())
+        }
+
+        other => {
+            eprintln!("[session] Unknown session storage provider '{}' — using memory store", other);
+            Arc::new(cfml_vm::session_store::MemoryStore::new())
+        }
+    }
+}
+
 async fn async_run_server(
     doc_root: &Path,
     port: u16,
@@ -639,6 +798,7 @@ async fn async_run_server(
     cfconfig: Arc<RustCfmlConfig>,
 ) {
     let mut server_state = ServerState::with_config(production, cfconfig.clone());
+    server_state.sessions = build_session_store(&cfconfig).await;
     server_state.webroot = Some(
         fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
     );
@@ -882,12 +1042,7 @@ async fn handle_request(
                             None
                         }
                     });
-                existing_sid.unwrap_or_else(|| {
-                    // Generate a new session ID
-                    use std::time::SystemTime;
-                    let ts = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
-                    format!("{:x}", ts)
-                })
+                existing_sid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
             };
             let session_id_clone = session_id.clone();
 

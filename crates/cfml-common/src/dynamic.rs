@@ -403,3 +403,149 @@ impl CfmlQuery {
         }
     }
 }
+
+// ─────────────────────────────────────────────
+// CfmlValue serde support (for session serialization)
+// ─────────────────────────────────────────────
+
+impl serde::Serialize for CfmlValue {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            CfmlValue::Null => s.serialize_none(),
+            CfmlValue::Bool(b) => s.serialize_bool(*b),
+            CfmlValue::Int(i) => s.serialize_i64(*i),
+            CfmlValue::Double(d) => s.serialize_f64(*d),
+            CfmlValue::String(st) => s.serialize_str(st),
+            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => {
+                let mut seq = s.serialize_seq(Some(a.len()))?;
+                for v in a.iter() {
+                    seq.serialize_element(v)?;
+                }
+                seq.end()
+            }
+            CfmlValue::Struct(m) => {
+                let mut map = s.serialize_map(Some(m.len()))?;
+                for (k, v) in m.iter() {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+            CfmlValue::Binary(b) => {
+                let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+                let mut map = s.serialize_map(Some(2))?;
+                map.serialize_entry("_cftype", "binary")?;
+                map.serialize_entry("data", &hex)?;
+                map.end()
+            }
+            CfmlValue::Query(q) => {
+                let mut map = s.serialize_map(Some(3))?;
+                map.serialize_entry("_cftype", "query")?;
+                map.serialize_entry("columns", &q.columns)?;
+                let rows: Vec<std::collections::HashMap<&str, &CfmlValue>> = q
+                    .rows
+                    .iter()
+                    .map(|row| row.iter().map(|(k, v)| (k.as_str(), v)).collect())
+                    .collect();
+                map.serialize_entry("rows", &rows)?;
+                map.end()
+            }
+            CfmlValue::Closure(_) | CfmlValue::Function(_) | CfmlValue::Component(_) | CfmlValue::NativeObject(_) => {
+                log::debug!("serializing non-serializable CfmlValue variant as null");
+                s.serialize_none()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CfmlValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(CfmlValueVisitor)
+    }
+}
+
+struct CfmlValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
+    type Value = CfmlValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a CFML value (null, bool, number, string, array, or object)")
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<CfmlValue, E> {
+        Ok(CfmlValue::Null)
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<CfmlValue, E> {
+        Ok(CfmlValue::Null)
+    }
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<CfmlValue, D::Error> {
+        serde::Deserialize::deserialize(d)
+    }
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<CfmlValue, E> {
+        Ok(CfmlValue::Bool(v))
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<CfmlValue, E> {
+        Ok(CfmlValue::Int(v))
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<CfmlValue, E> {
+        Ok(CfmlValue::Int(v as i64))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<CfmlValue, E> {
+        if v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
+            Ok(CfmlValue::Int(v as i64))
+        } else {
+            Ok(CfmlValue::Double(v))
+        }
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<CfmlValue, E> {
+        Ok(CfmlValue::String(v.to_string()))
+    }
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<CfmlValue, E> {
+        Ok(CfmlValue::String(v))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<CfmlValue, A::Error> {
+        let mut vec = Vec::new();
+        while let Some(v) = a.next_element::<CfmlValue>()? {
+            vec.push(v);
+        }
+        Ok(CfmlValue::array(vec))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<CfmlValue, A::Error> {
+        let mut map: IndexMap<String, CfmlValue> = IndexMap::new();
+        while let Some((k, v)) = a.next_entry::<String, CfmlValue>()? {
+            map.insert(k, v);
+        }
+        // Detect tagged special types
+        if let Some(CfmlValue::String(t)) = map.get("_cftype") {
+            match t.as_str() {
+                "binary" => {
+                    if let Some(CfmlValue::String(hex)) = map.get("data") {
+                        let bytes: Vec<u8> = (0..hex.len())
+                            .step_by(2)
+                            .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+                            .collect();
+                        return Ok(CfmlValue::Binary(bytes));
+                    }
+                }
+                "query" => {
+                    if let Some(CfmlValue::Array(cols)) = map.get("columns") {
+                        let columns: Vec<String> =
+                            cols.iter().map(|v| v.as_string()).collect();
+                        let mut query = CfmlQuery::new(columns.clone());
+                        if let Some(CfmlValue::Array(rows)) = map.get("rows") {
+                            for row_val in rows.iter() {
+                                if let CfmlValue::Struct(row_map) = row_val {
+                                    query.rows.push((**row_map).clone());
+                                }
+                            }
+                        }
+                        return Ok(CfmlValue::Query(query));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(CfmlValue::strukt(map))
+    }
+}

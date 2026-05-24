@@ -46,6 +46,15 @@ The server is built on [Axum](https://github.com/tokio-rs/axum) with concurrent 
 
 Drop a `.cfconfig.json` at the webroot to configure datasources, mappings, mail, security policies, error handling, and more. The format follows the Ortus CFConfig filename convention with a BoxLang-style flat schema, so the same file works across CommandBox/Lucee, BoxLang, and RustCFML — engine-specific keys are silently ignored. See **[CFCONFIG.md](CFCONFIG.md)** for the full reference.
 
+#### Distributed sessions
+
+RustCFML supports two pluggable session backends beyond the in-process default, both selected via `.cfconfig.json`:
+
+- **Memcached** — sessions stored in an external Memcached cluster (build with `--features memcached`). Lucee-compatible config shape.
+- **Cluster** — gossip-based peer-to-peer replication across native RustCFML nodes using [memberlist](https://github.com/al8n/memberlist) for membership and [Automerge](https://automerge.org) CRDTs for conflict-free merging (build with `--features cluster`). Suitable for LAN or WAN deployments up to a few dozen nodes; no external store required.
+
+Both backends share the same `sessionStorage` / `caches` keys in `.cfconfig.json` so the configuration shape carries across Lucee and BoxLang. See the **[`caches` and `sessionStorage` section of CFCONFIG.md](CFCONFIG.md#caches-and-sessionstorage)** for the full reference, a three-node walkthrough, and a troubleshooting table.
+
 #### URL Rewriting
 
 Place a `urlrewrite.xml` file in your document root for Tuckey-compatible URL rewriting. This enables clean URLs and REST-style routing:
