@@ -272,10 +272,59 @@ pub struct CacheProperties {
     #[serde(rename = "advertiseAddr")]
     pub advertise_addr: String,
     /// Seed node addresses used to bootstrap cluster membership.
+    /// Legacy: when `discovery` is not specified but `seeds` is non-empty,
+    /// behaves as `discovery.method = "static"`.
     pub seeds: Vec<String>,
     /// Stable human-readable node name. Defaults to hostname:listenPort.
     #[serde(rename = "nodeName")]
     pub node_name: String,
+    /// Peer discovery strategy. When absent, falls back to static seeds
+    /// (see `seeds`) for backwards compatibility.
+    pub discovery: Discovery,
+}
+
+/// Cluster-peer discovery configuration.
+///
+/// `method` selects one of:
+/// - `"static"`  — use `seeds` from the parent properties (or `seeds` here)
+/// - `"dns"`     — resolve `name` to A/AAAA records every `interval`
+/// - `"multicast"` — broadcast self on `group:port` every `interval`
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct Discovery {
+    /// "static" | "dns" | "multicast". Empty falls back to "static".
+    pub method: String,
+
+    // dns + static
+    /// DNS name to resolve, or for static an inline seed list (via `seeds`).
+    pub name: String,
+    /// Port to attach to addresses returned by DNS resolution.
+    /// Defaults to the cluster listen port.
+    pub port: u16,
+    /// Optional explicit seed list (overrides parent `seeds` when set).
+    pub seeds: Vec<String>,
+
+    // multicast
+    /// IPv4 multicast group, e.g. "239.255.42.42". Admin-scoped (239/8) recommended.
+    pub group: String,
+
+    // shared
+    /// Refresh interval in seconds. Default 10s for dns, 5s for multicast.
+    #[serde(rename = "intervalSecs")]
+    pub interval_secs: u64,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self {
+            method: String::new(),
+            name: String::new(),
+            port: 0,
+            seeds: Vec::new(),
+            group: "239.255.42.42".into(),
+            interval_secs: 0,
+        }
+    }
 }
 
 impl Default for CacheProperties {
@@ -290,6 +339,7 @@ impl Default for CacheProperties {
             advertise_addr: String::new(),
             seeds: Vec::new(),
             node_name: String::new(),
+            discovery: Discovery::default(),
         }
     }
 }

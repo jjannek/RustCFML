@@ -303,6 +303,28 @@ mod inner {
     // ClusterStore
     // ─────────────────────────────────────────────
 
+    /// Treat `0.0.0.0:<port>` and `[::]:<port>` as equivalent to any local
+    /// address on `<port>`; this avoids re-joining ourselves when DNS
+    /// resolves the cluster hostname to include this node.
+    fn is_self_addr(candidate: &SocketAddr, local_bind: &SocketAddr) -> bool {
+        if candidate == local_bind {
+            return true;
+        }
+        if candidate.port() != local_bind.port() {
+            return false;
+        }
+        let bind_is_unspec = local_bind.ip().is_unspecified();
+        if !bind_is_unspec {
+            return false;
+        }
+        // Best-effort: if the bind is wildcard, drop candidates that point
+        // at any address whose port matches and whose IP belongs to one
+        // of our local interfaces. Detecting "is this one of our IPs?"
+        // without an extra dep is awkward, so we settle for filtering
+        // wildcard self-loopbacks.
+        candidate.ip().is_loopback() || candidate.ip().is_unspecified()
+    }
+
     pub struct ClusterStore {
         shared: Arc<SharedState>,
     }
@@ -310,9 +332,12 @@ mod inner {
     impl ClusterStore {
         /// Build a clustered session store and join the gossip cluster.
         /// Must be called from within a Tokio runtime.
+        ///
+        /// `discovery` drives both initial bootstrap and ongoing peer
+        /// re-discovery. See `crate::session::discovery::Discovery`.
         pub async fn new(
             listen_addr: &str,
-            seeds: Vec<String>,
+            discovery: crate::session::discovery::Discovery,
             node_name: String,
         ) -> Result<Self, String> {
             let bind: SocketAddr = listen_addr
@@ -352,37 +377,116 @@ mod inner {
 
             let memberlist = Arc::new(memberlist);
 
-            // Join seeds (best-effort; missing seeds are logged, not fatal).
-            if !seeds.is_empty() {
-                let parsed: Vec<MaybeResolvedAddress<_, _>> = seeds
+            // Initial discovery + join.
+            let initial = discovery.discover().await;
+            if initial.is_empty() {
+                println!(
+                    "[session/cluster] discovery ({}) returned no peers — this node is starting solo",
+                    discovery.label()
+                );
+            } else {
+                let online: std::collections::HashSet<SocketAddr> = memberlist
+                    .online_members()
+                    .await
                     .iter()
-                    .filter_map(|s| match s.parse::<SocketAddr>() {
-                        Ok(sa) => Some(MaybeResolvedAddress::resolved(sa)),
-                        Err(e) => {
-                            eprintln!("[session/cluster] bad seed {}: {}", s, e);
-                            None
-                        }
-                    })
+                    .map(|m| *m.address())
                     .collect();
-                match memberlist.join_many(parsed.into_iter()).await {
-                    Ok(addrs) => {
-                        println!(
-                            "[session/cluster] joined {} seed(s) successfully",
-                            addrs.len()
-                        );
-                    }
-                    Err((addrs, e)) => {
-                        eprintln!(
-                            "[session/cluster] partial join — reached {} seed(s); error: {}",
-                            addrs.len(),
+                let to_join: Vec<MaybeResolvedAddress<_, _>> = initial
+                    .iter()
+                    .filter(|sa| !is_self_addr(sa, &bind))
+                    .filter(|sa| !online.contains(sa))
+                    .map(|sa| MaybeResolvedAddress::resolved(*sa))
+                    .collect();
+                if !to_join.is_empty() {
+                    let count = to_join.len();
+                    match memberlist.join_many(to_join.into_iter()).await {
+                        Ok(joined) => println!(
+                            "[session/cluster] joined {} of {} initial peer(s) via {}",
+                            joined.len(),
+                            count,
+                            discovery.label()
+                        ),
+                        Err((joined, e)) => eprintln!(
+                            "[session/cluster] partial initial join — {}/{} reached: {}",
+                            joined.len(),
+                            count,
                             e
-                        );
+                        ),
                     }
                 }
-            } else {
-                println!(
-                    "[session/cluster] no seeds configured — this node is the first member"
-                );
+            }
+
+            // Periodic re-discovery: memberlist's join_many future is
+            // !Send (internal RefCell-backed cache), so we cannot run it
+            // on the main multi-thread runtime. Spawn a dedicated OS
+            // thread with its own current-thread runtime instead — the
+            // memberlist Arc is Send+Sync, so cross-thread access is
+            // fine. Static discovery has no interval and skips this.
+            if let Some(period) = discovery.interval() {
+                let mlist_disc = memberlist.clone();
+                let disc = discovery.clone();
+                let bind_filter = bind;
+                std::thread::Builder::new()
+                    .name("cluster-discovery".into())
+                    .spawn(move || {
+                        let rt = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                eprintln!(
+                                    "[session/cluster] failed to build discovery runtime: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        };
+                        rt.block_on(async move {
+                            let mut tick = tokio::time::interval(period);
+                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            // First tick fires immediately; skip — already joined.
+                            tick.tick().await;
+                            loop {
+                                tick.tick().await;
+                                let addrs = disc.discover().await;
+                                if addrs.is_empty() {
+                                    continue;
+                                }
+                                let online: std::collections::HashSet<SocketAddr> = mlist_disc
+                                    .online_members()
+                                    .await
+                                    .iter()
+                                    .map(|m| *m.address())
+                                    .collect();
+                                let to_join: Vec<MaybeResolvedAddress<_, _>> = addrs
+                                    .iter()
+                                    .filter(|sa| !is_self_addr(sa, &bind_filter))
+                                    .filter(|sa| !online.contains(sa))
+                                    .map(|sa| MaybeResolvedAddress::resolved(*sa))
+                                    .collect();
+                                if to_join.is_empty() {
+                                    continue;
+                                }
+                                let count = to_join.len();
+                                match mlist_disc.join_many(to_join.into_iter()).await {
+                                    Ok(joined) if !joined.is_empty() => println!(
+                                        "[session/cluster] re-discovery joined {} new peer(s) (of {})",
+                                        joined.len(),
+                                        count
+                                    ),
+                                    Ok(_) => {}
+                                    Err((joined, e)) => eprintln!(
+                                        "[session/cluster] re-discovery partial join {}/{}: {}",
+                                        joined.len(),
+                                        count,
+                                        e
+                                    ),
+                                }
+                            }
+                        });
+                    })
+                    .ok();
             }
 
             // Background sender task: drain outbound queue, reliable-send

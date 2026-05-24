@@ -299,10 +299,98 @@ Cluster properties:
 
 | Property | Default | Description |
 |----------|---------|-------------|
-| `listenAddr` | `0.0.0.0:7946` | TCP `host:port` this node binds for memberlist gossip. Use `0.0.0.0` to bind every interface; restrict to a specific IP for tighter networking. |
-| `advertiseAddr` | (empty) | Public address other nodes should reach this one on. Required when `listenAddr` binds `0.0.0.0`; leave empty when `listenAddr` already specifies a routable address. Also used as the default `nodeName`. |
-| `seeds` | `[]` | List of peer `host:port` addresses to contact on startup. **Any single reachable seed is enough** to bootstrap — the new node will discover the rest via gossip. An empty list means "I am the first member." |
+| `listenAddr` | `0.0.0.0:7946` | TCP `host:port` this node binds for memberlist gossip. Use `0.0.0.0` (IPv4) or `[::]` (dual-stack) to bind every interface; restrict to a specific IP for tighter networking. **On Fly.io use `[::]:7946`** — 6PN is IPv6-only. |
+| `advertiseAddr` | (empty) | Public address other nodes should reach this one on. Required when `listenAddr` binds `0.0.0.0`/`[::]`; leave empty when `listenAddr` already specifies a routable address. Also used as the default `nodeName`. |
+| `seeds` | `[]` | Legacy static seed list. Used when `discovery` is absent; equivalent to `discovery.method = "static"`. Prefer `discovery` for new configs. |
 | `nodeName` | derived | Stable identifier used as the node's id. Defaults to `advertiseAddr`, or `listenAddr-<uuid>` when neither is set. Set this explicitly in production so a node keeps the same identity across restarts. |
+| `discovery` | `{}` | Peer discovery strategy. See [Discovery methods](#discovery-methods) below. |
+
+### Discovery methods
+
+`discovery.method` selects how this node finds peers. The choice determines whether the cluster can scale dynamically.
+
+| Method | What it does | Use for |
+|--------|---|---|
+| `static`   | Connects to the addresses in `seeds`. No refresh. | Tests, fixed 2–3 node deployments. |
+| `dns`      | Resolves a DNS name to A/AAAA records every `intervalSecs` and joins any new addresses. | **Fly.io**, Kubernetes headless services, ECS / Nomad service discovery, anywhere the platform exposes peers via DNS. |
+| `multicast`| UDP multicast announce / listen on `group:port`. | LAN / bare-metal / VMware development; Kubernetes clusters using a CNI that carries multicast (Calico VXLAN, Weave, Flannel VXLAN). **Does not work** on AWS VPC CNI, Fly.io, GCP, Azure. |
+
+Common `discovery` fields:
+
+| Field | Default | Used by | Description |
+|-------|---------|---------|-------------|
+| `method` | (legacy: `static` if `seeds` set) | all | `"static"` / `"dns"` / `"multicast"`. |
+| `name` | (empty) | `dns` | DNS name to resolve. |
+| `port` | derived from `listenAddr` | `dns`, `multicast` | Port to attach to discovered addresses. |
+| `intervalSecs` | `10` for dns, `5` for multicast | `dns`, `multicast` | Refresh / announce interval in seconds. |
+| `group` | `239.255.42.42` | `multicast` | IPv4 multicast group (admin-scoped `239/8` recommended). |
+| `seeds` | (empty) | `static` | Per-strategy seed list; overrides the top-level `seeds` when set. |
+
+### Fly.io recipe (DNS discovery on 6PN)
+
+Fly's private network is IPv6-only WireGuard and **does not support multicast**. Fly's internal DNS exposes every running Machine via `<app>.internal`, so DNS polling is the right strategy:
+
+```json
+{
+    "sessionStorage": "cluster",
+    "caches": { "cluster": { "provider": "cluster", "storage": true,
+        "properties": {
+            "listenAddr": "[::]:7946",
+            "nodeName":   "${FLY_MACHINE_ID}",
+            "discovery": {
+                "method":       "dns",
+                "name":         "${FLY_APP_NAME}.internal",
+                "port":         7946,
+                "intervalSecs": 5
+            }
+        } } }
+}
+```
+
+Variants:
+- `top6.nearest.of.${FLY_APP_NAME}.internal` — bound the cluster to the 6 nearest Machines by latency.
+- `<region>.${FLY_APP_NAME}.internal` — region-scoped cluster (`lhr.…`, `iad.…`).
+- `${FLY_PROCESS_GROUP}.process.${FLY_APP_NAME}.internal` — process-group-scoped.
+
+### Kubernetes recipe (DNS via headless service)
+
+Create a headless `Service` (`clusterIP: None`) for the session cluster pods with `publishNotReadyAddresses: true`. Then point each pod at its DNS name:
+
+```json
+{
+    "sessionStorage": "cluster",
+    "caches": { "cluster": { "provider": "cluster", "storage": true,
+        "properties": {
+            "listenAddr": "0.0.0.0:7946",
+            "nodeName":   "${HOSTNAME}",
+            "discovery": {
+                "method":       "dns",
+                "name":         "rustcfml-cluster.default.svc.cluster.local",
+                "port":         7946,
+                "intervalSecs": 10
+            }
+        } } }
+}
+```
+
+For EKS clusters running Calico/Weave/Flannel that carry multicast, `discovery.method = "multicast"` also works.
+
+### Local development (multicast)
+
+Two `rustcfml --serve` processes on the same LAN/laptop auto-find each other:
+
+```json
+{
+    "sessionStorage": "cluster",
+    "caches": { "cluster": { "provider": "cluster", "storage": true,
+        "properties": {
+            "listenAddr": "192.168.1.42:7946",
+            "discovery": { "method": "multicast" }
+        } } }
+}
+```
+
+Multicast announcements include this node's `listenAddr` so peers can dial back — don't leave `listenAddr` as a wildcard with multicast (a warning is logged if you do).
 
 ### Three-node walkthrough
 

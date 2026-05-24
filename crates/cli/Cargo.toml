@@ -43,11 +43,12 @@ memcache = { version = "0.17", optional = true }
 memberlist = { version = "0.8", optional = true, default-features = false, features = ["tokio", "tcp", "serde"] }
 automerge = { version = "0.9", optional = true }
 bincode = { version = "2", optional = true, features = ["serde"] }
+socket2 = { version = "0.5", optional = true, features = ["all"] }
 
 [features]
 default = ["memcached", "cluster"]
 memcached = ["dep:memcache"]
-cluster = ["dep:memberlist", "dep:automerge", "dep:bincode"]
+cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

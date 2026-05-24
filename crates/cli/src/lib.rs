@@ -667,6 +667,105 @@ fn resolve_memcached_servers(cache_cfg: &cfml_config::CacheCfg) -> Vec<String> {
     Vec::new()
 }
 
+/// Build a `Discovery` strategy from the cluster cache properties.
+///
+/// Resolution order:
+/// 1. `discovery.method` set explicitly → use that method.
+/// 2. Legacy: `discovery.method` empty + `seeds` non-empty → "static".
+/// 3. Otherwise → empty static (node starts solo).
+#[cfg(feature = "cluster")]
+fn build_discovery(
+    props: &cfml_config::CacheProperties,
+    listen_addr: &str,
+) -> session::discovery::Discovery {
+    use session::discovery::{Discovery, DnsDiscovery, MulticastDiscovery, StaticSeeds};
+
+    // Default port for DNS/multicast: pull from listen_addr.
+    let default_port: u16 = listen_addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(7946);
+
+    let method = props.discovery.method.trim().to_lowercase();
+    let method = if method.is_empty() && !props.seeds.is_empty() {
+        "static".to_string()
+    } else if method.is_empty() {
+        // Treat absent discovery + empty seeds as a solo-static node.
+        "static".to_string()
+    } else {
+        method
+    };
+
+    match method.as_str() {
+        "static" => {
+            let seeds: Vec<String> = if !props.discovery.seeds.is_empty() {
+                props.discovery.seeds.clone()
+            } else {
+                props.seeds.clone()
+            };
+            Discovery::Static(StaticSeeds::new(&seeds))
+        }
+        "dns" => {
+            let name = props.discovery.name.clone();
+            if name.is_empty() {
+                eprintln!(
+                    "[session/cluster] discovery.method=dns but discovery.name is empty — falling back to static seeds"
+                );
+                return Discovery::Static(StaticSeeds::new(&props.seeds));
+            }
+            let port = if props.discovery.port == 0 {
+                default_port
+            } else {
+                props.discovery.port
+            };
+            Discovery::Dns(DnsDiscovery::new(name, port, props.discovery.interval_secs))
+        }
+        "multicast" => {
+            let group = props.discovery.group.clone();
+            let port = if props.discovery.port == 0 {
+                default_port
+            } else {
+                props.discovery.port
+            };
+            // Advertise the listen address so peers can connect back. If
+            // the bind is a wildcard, multicast announcements with that
+            // address are useless to peers — warn the operator.
+            let self_addr: std::net::SocketAddr =
+                listen_addr.parse().unwrap_or_else(|_| {
+                    "0.0.0.0:7946".parse().expect("hardcoded fallback addr is valid")
+                });
+            if self_addr.ip().is_unspecified() {
+                eprintln!(
+                    "[session/cluster] discovery.method=multicast but listenAddr is a wildcard ({}) — peers won't be able to dial back. Set listenAddr to a routable address.",
+                    listen_addr
+                );
+            }
+            match MulticastDiscovery::start(
+                group,
+                port,
+                props.discovery.interval_secs,
+                self_addr,
+            ) {
+                Ok(m) => Discovery::Multicast(m),
+                Err(e) => {
+                    eprintln!(
+                        "[session/cluster] failed to start multicast discovery: {} — falling back to static seeds",
+                        e
+                    );
+                    Discovery::Static(StaticSeeds::new(&props.seeds))
+                }
+            }
+        }
+        other => {
+            eprintln!(
+                "[session/cluster] unknown discovery.method='{}' — falling back to static seeds",
+                other
+            );
+            Discovery::Static(StaticSeeds::new(&props.seeds))
+        }
+    }
+}
+
 /// Construct the session store from `.cfconfig.json` settings.
 ///
 /// Resolution order: `sessionStorage` name in cfconfig → look up `caches`
@@ -741,7 +840,6 @@ async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::sess
             } else {
                 "0.0.0.0:7946".to_string()
             };
-            let seeds = cache_cfg.properties.seeds.clone();
             let node_name = if !cache_cfg.properties.node_name.is_empty() {
                 cache_cfg.properties.node_name.clone()
             } else if !cache_cfg.properties.advertise_addr.is_empty() {
@@ -749,18 +847,19 @@ async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::sess
             } else {
                 format!("{}-{}", listen_addr, uuid::Uuid::new_v4().simple())
             };
+            let discovery = build_discovery(&cache_cfg.properties, &listen_addr);
+            let label = discovery.label();
             let result = session::cluster::ClusterStore::new(
                 &listen_addr,
-                seeds.clone(),
+                discovery,
                 node_name.clone(),
             )
             .await;
             match result {
                 Ok(store) => {
                     println!(
-                        "[session] Using cluster session store (listen={}, seeds=[{}])",
-                        listen_addr,
-                        seeds.join(", ")
+                        "[session] Using cluster session store (listen={}, discovery={})",
+                        listen_addr, label
                     );
                     Arc::new(store)
                 }
