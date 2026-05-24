@@ -45,6 +45,7 @@ automerge = { version = "0.9", optional = true }
 bincode = { version = "2", optional = true, features = ["serde"] }
 
 [features]
+default = ["memcached", "cluster"]
 memcached = ["dep:memcache"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode"]
 

@@ -48,12 +48,12 @@ Drop a `.cfconfig.json` at the webroot to configure datasources, mappings, mail,
 
 #### Distributed sessions
 
-RustCFML supports two pluggable session backends beyond the in-process default, both selected via `.cfconfig.json`:
+RustCFML supports two pluggable session backends beyond the in-process default, both built into the stock binary and selected via `.cfconfig.json`:
 
-- **Memcached** — sessions stored in an external Memcached cluster (build with `--features memcached`). Lucee-compatible config shape.
-- **Cluster** — gossip-based peer-to-peer replication across native RustCFML nodes using [memberlist](https://github.com/al8n/memberlist) for membership and [Automerge](https://automerge.org) CRDTs for conflict-free merging (build with `--features cluster`). Suitable for LAN or WAN deployments up to a few dozen nodes; no external store required.
+- **Memcached** — sessions stored in an external Memcached cluster. Lucee-compatible config shape.
+- **Cluster** — gossip-based peer-to-peer replication across native RustCFML nodes using [memberlist](https://github.com/al8n/memberlist) for membership and [Automerge](https://automerge.org) CRDTs for conflict-free merging. Suitable for LAN or WAN deployments up to a few dozen nodes; no external store required.
 
-Both backends share the same `sessionStorage` / `caches` keys in `.cfconfig.json` so the configuration shape carries across Lucee and BoxLang. See the **[`caches` and `sessionStorage` section of CFCONFIG.md](CFCONFIG.md#caches-and-sessionstorage)** for the full reference, a three-node walkthrough, and a troubleshooting table.
+Both backends share the same `sessionStorage` / `caches` keys in `.cfconfig.json` so the configuration shape carries across Lucee and BoxLang. Switching backends is a config-only change — no rebuild needed. See the **[`caches` and `sessionStorage` section of CFCONFIG.md](CFCONFIG.md#caches-and-sessionstorage)** for the full reference, a three-node walkthrough, and a troubleshooting table.
 
 #### URL Rewriting
 

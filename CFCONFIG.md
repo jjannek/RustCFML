@@ -225,8 +225,10 @@ First entry becomes cfmail's default when its tag attributes omit `server`.
 | `provider` | Description |
 |-----------|-------------|
 | `"memory"` | In-process store (default — no config needed) |
-| `"memcached"` | External Memcached cluster — requires `--features memcached` build flag |
-| `"cluster"` | Gossip-based multi-node replication via memberlist + Automerge CRDT — requires `--features cluster` build flag |
+| `"memcached"` | External Memcached cluster |
+| `"cluster"` | Gossip-based multi-node replication via memberlist + Automerge CRDT |
+
+All three providers are built into the stock `rustcfml` binary — there is nothing to enable at build time. Each provider is dormant until a cache definition with the matching `provider` value is referenced as session storage in `.cfconfig.json` (or `this.sessionStorage` in `Application.cfc`).
 
 **Example — Memcached (RustCFML native format):**
 ```json
@@ -290,8 +292,6 @@ Both Lucee Memcached class names are recognised:
     }
 }
 ```
-
-> **Build flag required.** The cluster provider is only available when `rustcfml` is built with `--features cluster` (`cargo build --release --features cluster`). The stock release binary does not include it; trying to use `provider: "cluster"` on a non-cluster build will log a warning and fall back to the in-process memory store.
 
 > **`storage: true` is required.** The cache must explicitly opt in to being used as session storage. Lucee enforces this; RustCFML warns if it is missing but uses the cache anyway.
 
@@ -371,7 +371,6 @@ Tested for native rustcfml server deployments up to a few dozen nodes on LAN or 
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `[session] Cluster provider requested but binary was not compiled with --features cluster — using memory store` | Wrong binary — stock release build was used. | Rebuild with `cargo build --release --features cluster` or use a cluster-enabled distribution. |
 | `[session/cluster] partial join — reached 0 seed(s); error: Connection refused` on every node | None of the seeds were running yet, **or** they aren't actually listening on `listenAddr`, **or** a firewall is blocking the port. | Start at least one seed first, double-check the `host:port` strings, open the port between the nodes. |
 | Session set on node A is never visible on node B | Almost always: `nodeName` collision (two nodes share the same name, so memberlist sees them as the same node and ignores one). Less commonly: `advertiseAddr` is set to a value the peer can't actually reach. | Give every node a unique `nodeName`. Verify each `advertiseAddr` resolves and is reachable from every other node. |
 | Sessions sometimes appear after a delay rather than immediately | Live `send_reliable` was dropped (network glitch). Anti-entropy will catch it on the next push/pull cycle (a few seconds). | Expected behaviour — the cluster is eventually consistent. If delays exceed ~10 s, investigate network or memberlist tuning. |
