@@ -9,6 +9,7 @@ members = [
     "crates/cfml-stdlib",
     "crates/cli",
     "crates/wasm",
+    "crates/cfml-worker",
 ]
 # Native modules under examples/ are standalone crates consumed only by
 # `rustcfml --build`. They must not be members of the rustcfml workspace,
