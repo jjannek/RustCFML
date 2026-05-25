@@ -9,9 +9,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
+pub mod application_store;
 mod java_shims;
 pub mod session_store;
 pub mod web;
+pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_collections, handle_java_concurrenthashmap, handle_java_concurrentlinkedqueue,
@@ -23,6 +25,7 @@ use java_shims::{
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 
 /// Persistent application state, keyed by app name.
+#[derive(Clone)]
 pub struct ApplicationState {
     pub name: String,
     pub variables: IndexMap<String, CfmlValue>,
@@ -398,7 +401,7 @@ pub fn compile_file_cached(
 /// Server-level state, persists across requests in --serve mode.
 #[derive(Clone)]
 pub struct ServerState {
-    pub applications: Arc<Mutex<HashMap<String, ApplicationState>>>,
+    pub applications: Arc<dyn ApplicationStore>,
     pub sessions: Arc<dyn SessionStore>,
     /// Named locks for cflock: name → RwLock (exclusive = write, readonly = read)
     pub named_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
@@ -433,7 +436,7 @@ impl ServerState {
         cfconfig: Arc<cfml_config::RustCfmlConfig>,
     ) -> Self {
         Self {
-            applications: Arc::new(Mutex::new(HashMap::new())),
+            applications: Arc::new(MemoryApplicationStore::new()),
             sessions: Arc::new(MemoryStore::new()),
             named_locks: Arc::new(Mutex::new(HashMap::new())),
             bytecode_cache: BytecodeCache::with_trust(production_mode),
@@ -10995,8 +10998,7 @@ impl CfmlVirtualMachine {
 
         // 4. Wire up application scope
         if let Some(ref server_state) = self.server_state.clone() {
-            let mut apps = server_state.applications.lock().unwrap();
-            if !apps.contains_key(&app_name) {
+            if !server_state.applications.contains(&app_name) {
                 // New application
                 let app_state = ApplicationState {
                     name: app_name.clone(),
@@ -11008,16 +11010,24 @@ impl CfmlVirtualMachine {
                     session_storage: app_session_storage.clone(),
                     app_caches: app_caches.clone(),
                 };
-                apps.insert(app_name.clone(), app_state);
+                server_state.applications.insert(&app_name, app_state);
             }
-            let app = apps.get_mut(&app_name).unwrap();
-            let scope = Arc::new(Mutex::new(app.variables.clone()));
+            let app_snapshot = server_state.applications.get(&app_name).unwrap();
+            let scope = Arc::new(Mutex::new(app_snapshot.variables.clone()));
             self.application_scope = Some(scope.clone());
 
             // 5. onApplicationStart (if not yet started)
-            if !app.started {
-                app.started = true;
-                drop(apps); // Release lock before calling lifecycle method
+            let already_started = app_snapshot.started;
+            if !already_started {
+                // Flip `started` first so concurrent requests don't re-fire
+                // onApplicationStart. Release any internal lock the store
+                // holds before calling the lifecycle method, since it may
+                // recursively touch the store.
+                server_state
+                    .applications
+                    .modify(&app_name, &mut |app| {
+                        app.started = true;
+                    });
 
                 // Record how many functions exist before onApplicationStart.
                 // Everything beyond this index was added by onApplicationStart
@@ -11030,13 +11040,15 @@ impl CfmlVirtualMachine {
                         let funcs_after = self.program.functions.len();
                         if funcs_after > funcs_before {
                             if let Some(ref server_state) = self.server_state.clone() {
-                                if let Ok(mut apps) = server_state.applications.lock() {
-                                    if let Some(app) = apps.get_mut(&app_name) {
-                                        app.cached_functions =
-                                            self.program.functions[funcs_before..].to_vec();
+                                let new_funcs: Vec<_> =
+                                    self.program.functions[funcs_before..].to_vec();
+                                server_state.applications.modify(
+                                    &app_name,
+                                    &mut |app| {
+                                        app.cached_functions = new_funcs.clone();
                                         app.cached_functions_original_offset = funcs_before;
-                                    }
-                                }
+                                    },
+                                );
                             }
                         }
                     }
@@ -11058,9 +11070,8 @@ impl CfmlVirtualMachine {
                 // refresh below). Append them to the current program (which
                 // already has the page's functions + Application.cfc functions
                 // from load_application_cfc).
-                let cached = app.cached_functions.clone();
-                let original_offset = app.cached_functions_original_offset;
-                drop(apps);
+                let cached = app_snapshot.cached_functions.clone();
+                let original_offset = app_snapshot.cached_functions_original_offset;
                 if !cached.is_empty() {
                     let new_offset = self.program.functions.len();
                     self.program.functions.extend(cached);
@@ -11219,20 +11230,19 @@ impl CfmlVirtualMachine {
         if let Some(ref server_state) = self.server_state.clone() {
             if let Some(ref app_scope) = self.application_scope {
                 if let Ok(scope) = app_scope.lock() {
-                    if let Ok(mut apps) = server_state.applications.lock() {
-                        if let Some(app) = apps.get_mut(&app_name) {
-                            app.variables = scope.clone();
-                            // Refresh cache from current program. Use the
-                            // original offset captured the first time
-                            // onApplicationStart ran; that anchor stays
-                            // constant for the lifetime of the application.
-                            let offset = app.cached_functions_original_offset;
-                            if offset > 0 && self.program.functions.len() > offset {
-                                app.cached_functions =
-                                    self.program.functions[offset..].to_vec();
-                            }
+                    let scope_snapshot = scope.clone();
+                    let program_functions = self.program.functions.clone();
+                    server_state.applications.modify(&app_name, &mut |app| {
+                        app.variables = scope_snapshot.clone();
+                        // Refresh cache from current program. Use the
+                        // original offset captured the first time
+                        // onApplicationStart ran; that anchor stays
+                        // constant for the lifetime of the application.
+                        let offset = app.cached_functions_original_offset;
+                        if offset > 0 && program_functions.len() > offset {
+                            app.cached_functions = program_functions[offset..].to_vec();
                         }
-                    }
+                    });
                 }
             }
         }
