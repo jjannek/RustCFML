@@ -78,10 +78,14 @@ pub async fn handle_fetch(
         None => (mint_session_id(), true),
     };
 
-    // Register D1 datasources for this request. The D1Driver impl lives in
-    // crate::d1_driver and is wired up in step 8.
-    if !config.d1_datasources.is_empty() {
-        // Placeholder: D1 driver implementation lands in step 8.
+    // Register D1 datasources for this request. The driver is a v1 stub —
+    // see crate::d1_driver for the async/sync gap that keeps cfquery
+    // against D1 from working end-to-end yet.
+    for (name, db) in &config.d1_datasources {
+        cfml_stdlib::register_dynamic_datasource(
+            name,
+            Arc::new(crate::d1_driver::D1Driver::new(name.clone(), Arc::clone(db))),
+        );
     }
 
     // Build ServerState with KV-backed stores when bindings are present.

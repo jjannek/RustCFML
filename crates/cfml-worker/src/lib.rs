@@ -17,9 +17,13 @@ pub mod embedded_vfs;
 pub mod scopes;
 
 #[cfg(target_arch = "wasm32")]
+pub mod d1_driver;
+#[cfg(target_arch = "wasm32")]
 pub mod handler;
 #[cfg(target_arch = "wasm32")]
 pub mod kv_stores;
+#[cfg(target_arch = "wasm32")]
+pub use d1_driver::D1Driver;
 #[cfg(target_arch = "wasm32")]
 pub use handler::handle_fetch;
 #[cfg(target_arch = "wasm32")]
@@ -63,8 +67,11 @@ pub struct WorkerConfig {
     /// Named D1 datasources to register before each request. The string is
     /// the cfquery `datasource="..."` name; the binding is registered via
     /// the dynamic-driver registry in `cfml-stdlib::db_driver`.
+    ///
+    /// `D1Database` is not `Clone`, so callers wrap their binding in an
+    /// `Arc` once and pass the shared handle.
     #[cfg(target_arch = "wasm32")]
-    pub d1_datasources: Vec<(String, worker::d1::D1Database)>,
+    pub d1_datasources: Vec<(String, std::sync::Arc<worker::d1::D1Database>)>,
 
     /// Production mode toggles bytecode cache invalidation off (cache trusts
     /// mtime stamps, never re-checks). Default `true` for Workers since
