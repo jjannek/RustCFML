@@ -37,6 +37,11 @@ body {
     align-items: center;
     gap: 16px;
 }
+.header img.logo {
+    width: 48px;
+    height: 48px;
+    flex-shrink: 0;
+}
 .header h1 {
     font-size: 1.5rem;
     font-weight: 600;
@@ -276,6 +281,7 @@ table.q td { color: var(--text); font-family: var(--font-mono); }
 </head>
 <body>
 <div class="header">
+    <img class="logo" src="https://rustcfml.github.io/RustCFML/demo/crab.svg" alt="RustCFML">
     <div>
         <h1>Rust<span>CFML</span> <span style="font-size: 0.85rem; color: var(--text-dim); font-weight: 400;">on Cloudflare Workers</span></h1>
         <div class="subtitle">#request.pageTitle#</div>
