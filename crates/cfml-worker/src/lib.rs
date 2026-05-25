@@ -21,6 +21,8 @@ pub mod d1_driver;
 #[cfg(target_arch = "wasm32")]
 pub mod handler;
 #[cfg(target_arch = "wasm32")]
+pub mod jspi;
+#[cfg(target_arch = "wasm32")]
 pub mod kv_stores;
 #[cfg(target_arch = "wasm32")]
 pub use d1_driver::D1Driver;
