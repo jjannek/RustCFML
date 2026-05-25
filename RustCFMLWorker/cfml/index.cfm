@@ -38,14 +38,6 @@
         <a class="go" href="/session.cfm">Open /session.cfm &rarr;</a>
     </div>
     <div class="card">
-        <h3>/db.cfm <span class="tag">D1 + JSPI</span></h3>
-        <div class="meta">cfquery via JSPI</div>
-        <p>A <code>&lt;cfquery datasource="main"&gt;</code> goes through the
-        D1 driver. JSPI suspends the wasm stack so CFML stays synchronous
-        while D1 awaits internally — same semantics as classic ColdFusion.</p>
-        <a class="go" href="/db.cfm">Open /db.cfm &rarr;</a>
-    </div>
-    <div class="card">
         <h3>/cfml.cfm <span class="tag">language</span></h3>
         <div class="meta">Engine sampler</div>
         <p>Quick rendering of the same examples shown in the wasm

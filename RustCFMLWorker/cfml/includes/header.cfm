@@ -291,7 +291,6 @@ table.q td { color: var(--text); font-family: var(--font-mono); }
         <span class="label">Demo pages:</span>
         <a class="nav-btn <cfif request.activeNav eq "static">active</cfif>" href="/static.cfm">/static — no cookie</a>
         <a class="nav-btn <cfif request.activeNav eq "session">active</cfif>" href="/session.cfm">/session — writes</a>
-        <a class="nav-btn <cfif request.activeNav eq "db">active</cfif>" href="/db.cfm">/db — D1 query</a>
         <a class="nav-btn <cfif request.activeNav eq "cfml">active</cfif>" href="/cfml.cfm">/cfml — language samples</a>
     </div>
 </cfif>

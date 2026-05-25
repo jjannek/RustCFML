@@ -28,10 +28,10 @@ class_name = "ApplicationScopeDO"
 tag = "v1"
 new_classes = ["ApplicationScopeDO"]
 
-[[d1_databases]]
-binding = "main"
-database_name = "rustcfml-demo"
-database_id = "b50415d3-3d92-43f5-9253-657027dd3420"
+# D1 binding intentionally not declared here. <cfquery> via JSPI is
+# wired in cfml-worker but does not function on the Cloudflare runtime
+# yet — see the commit history (Add RustCFMLWorker host template) for
+# the architectural blocker. Re-add when fixed.
 
 # ─── Cron triggers ─────────────────────────────────────────────────────
 # Sweep expired KV sessions on a schedule. Tighten this to match your

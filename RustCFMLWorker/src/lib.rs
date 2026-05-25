@@ -41,13 +41,11 @@ fn build_config(env: &Env) -> cfml_worker::WorkerConfig {
         config.do_application = Some(ns);
     }
 
-    // Register every D1 binding declared in wrangler.toml under the
-    // same name as a CFML datasource. CFML uses
-    // `<cfquery datasource="main">`, the worker looks up `env.main`
-    // via JSPI — keep both halves in sync.
-    if let Ok(d1) = env.d1("main") {
-        config.d1_datasources = vec![("main".to_string(), std::sync::Arc::new(d1))];
-    }
+    // D1 datasource registration is intentionally disabled. <cfquery>
+    // via JSPI is wired but currently hangs on the Cloudflare runtime
+    // because #[event(fetch)] (wasm-bindgen-futures) breaks the
+    // contiguous-wasm-stack requirement of WebAssembly.promising.
+    // Re-enable when the entry-point side is reworked.
     config
 }
 

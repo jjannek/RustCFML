@@ -4,12 +4,18 @@ Reference Cloudflare Workers host wiring for [`cfml-worker`](../crates/cfml-work
 
 Demonstrates:
 
-- `<cfquery>` against Cloudflare D1 (sync-from-wasm via JSPI).
-- KV-backed session storage.
+- Lazy session storage in Workers KV (`this.lazySessionCreation`).
 - Durable Object–backed application scope with strong consistency.
 - Cron-driven KV tidy-up that deletes expired session blobs on a
   configurable schedule (`onSessionEnd` is **not** supported in the
   Cloudflare host — see notes below).
+
+**Not yet working:** `<cfquery>` against Cloudflare D1. The driver and
+JSPI plumbing are in `cfml-worker` but the suspending import hangs at
+runtime because `#[event(fetch)]` / `wasm-bindgen-futures` breaks the
+contiguous-wasm-stack requirement of `WebAssembly.promising`. The D1
+binding is intentionally absent from `wrangler.toml` until the
+entry-point side is reworked.
 
 ## Layout
 
