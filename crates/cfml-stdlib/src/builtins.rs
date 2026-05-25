@@ -6237,6 +6237,14 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
             .map(|(_, v)| v.as_string()),
         _ => None,
     };
+
+    // Dynamic-driver fast path: if the literal datasource name is registered
+    // via cfml_stdlib::db_driver, hand off without touching the URL/enum
+    // pipeline. This is how cfml-worker plugs in Cloudflare D1.
+    let dynamic_driver = datasource_attr
+        .as_deref()
+        .and_then(crate::db_driver::lookup_dynamic_datasource);
+
     let datasource = match datasource_attr {
         Some(name) => resolve_datasource(&name),
         None => default_datasource().unwrap_or_else(|| ":memory:".to_string()),
@@ -6263,6 +6271,10 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         }
         _ => "query".to_string(),
     };
+
+    if let Some(driver) = dynamic_driver {
+        return driver.execute(&sql, &params_arg, &return_type);
+    }
 
     match parse_datasource(&datasource) {
         #[cfg(feature = "sqlite")]
@@ -7172,6 +7184,9 @@ enum TransactionConn {
 /// Begin a transaction — returns a type-erased connection in a Box<dyn Any>
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub fn txn_begin_boxed(datasource: &str) -> Result<Box<dyn std::any::Any>, CfmlError> {
+    if crate::db_driver::has_dynamic_datasource(datasource) {
+        return Err(crate::db_driver::dynamic_tx_unsupported(datasource));
+    }
     let conn = transaction_begin(datasource)?;
     Ok(Box::new(conn))
 }
