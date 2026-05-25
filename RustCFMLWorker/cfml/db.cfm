@@ -75,7 +75,7 @@
     <div class="panel-body">
         <p>With both fixes above the JSPI import is reachable, but the
         request still hangs. The reason is architectural:</p>
-        <p><code>#[event(fetch)]</code> generates an <em>async</em> Rust
+        <p><code>##[event(fetch)]</code> generates an <em>async</em> Rust
         handler. <code>wasm-bindgen-futures</code> converts that into a
         wasm function that returns a JS Promise <em>immediately</em>:</p>
         <pre class="code">JS event loop microtask
@@ -99,7 +99,7 @@
     <div class="panel-header">Possible fixes (none trivial)</div>
     <div class="panel-body">
         <p><strong>1. Sync wasm entry-point.</strong> Replace
-        <code>#[event(fetch)]</code> with a hand-rolled wasm export that
+        <code>##[event(fetch)]</code> with a hand-rolled wasm export that
         takes the request synchronously and uses JSPI for every I/O
         call. No <code>wasm-bindgen-futures</code> on the request path.
         All Workers async APIs (KV.get, R2.get, D1, DO fetch, env.var
@@ -127,7 +127,7 @@
         <p>Option 1 (sync wasm entry) is the right long-term answer —
         it unlocks JSPI for KV, R2, DO, Queues, the whole Workers API
         surface from synchronous CFML. The work is bounded: a custom
-        <code>#[export_name = "fetch"]</code> wasm export plus
+        <code>##[export_name = "fetch"]</code> wasm export plus
         Suspending imports for each Workers binding type. The KV-backed
         session prime + the DO-backed application prime would migrate
         from <code>.await</code> to the Suspending equivalents.</p>
