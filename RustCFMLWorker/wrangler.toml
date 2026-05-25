@@ -1,0 +1,41 @@
+name = "rustcfml-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-25"
+compatibility_flags = ["nodejs_compat"]
+
+# JSPI is enabled by default on the Workers runtime. No flag needed.
+
+[build]
+command = "cargo install -q worker-build && worker-build --release && node jspi-patch.mjs"
+
+# ─── KV namespaces ─────────────────────────────────────────────────────
+# Create these via `wrangler kv namespace create SESSIONS` and paste the
+# returned id. The "APP" namespace is only consulted if APP_DO is absent.
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "223c20eab7a6480d9fed2d75d4914c76"
+
+[[kv_namespaces]]
+binding = "APP"
+id = "e58be0bb9afc4909b064a75e689831a7"
+
+# ─── Durable Object (strong-consistency application scope) ────────────
+[[durable_objects.bindings]]
+name = "APP_DO"
+class_name = "ApplicationScopeDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ApplicationScopeDO"]
+
+[[d1_databases]]
+binding = "main"
+database_name = "rustcfml-demo"
+database_id = "b50415d3-3d92-43f5-9253-657027dd3420"
+
+# ─── Cron triggers ─────────────────────────────────────────────────────
+# Sweep expired KV sessions on a schedule. Tighten this to match your
+# session timeout if you care about prompt cleanup; loosen it (or remove
+# the trigger entirely) if you don't.
+[triggers]
+crons = ["*/30 * * * *"]

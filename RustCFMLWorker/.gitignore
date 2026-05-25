@@ -1,0 +1,12 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# worker-build output (wasm-bindgen + esbuild bundle)
+/build/
+
+# wrangler state (kv preview db, login token, cache)
+/.wrangler/
+
+# Node dependencies (worker-build can drag these in)
+/node_modules/
