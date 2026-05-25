@@ -1,95 +1,116 @@
-# cfml-worker JSPI shim
+# cfml-worker JSPI bridge
 
-These files are the JavaScript half of the cfml-worker JSPI bridge that lets
-`<cfquery datasource="my-d1">` in CFML talk to an async Cloudflare D1
-binding through a synchronous-looking call from the wasm VM.
-
-## What's in here
-
-| File | Role |
-|---|---|
-| `cfml-jspi-shim.mjs` | Reusable JS module — provides `jspiImports()`, `wrapWithPromising()`, `enterRequest()`, `leaveRequest()`. Copy into your worker project (or symlink from `node_modules`). |
-| `jspi-template-shim.mjs` | Drop-in `wrangler.toml main` candidate that demonstrates the full wiring. Copy + adjust paths. |
+Lets `<cfquery datasource="...">` and `queryExecute(...)` in CFML talk to an
+async Cloudflare D1 binding from inside the synchronous CFML VM, via the V8
+JSPI (JavaScript Promise Integration) feature.
 
 ## How it works
 
-JSPI (JavaScript Promise Integration) is a V8 WebAssembly feature, enabled
-by default on Cloudflare Workers. The deal:
+JSPI is a WebAssembly feature, enabled by default on Cloudflare Workers. The
+contract:
 
 - A wasm-imported JS function wrapped in `new WebAssembly.Suspending(...)`
-  can `await` internally. When wasm calls it, the wasm stack literally
-  suspends, the JS event loop resolves the Promise, then wasm resumes.
-- For wasm to be *allowed* to call a suspending import, its exported entry
-  point must be wrapped with `WebAssembly.promising(...)`.
+  can `await` internally. When wasm calls it, the wasm stack suspends, the
+  JS event loop resolves the Promise, then wasm resumes — looking sync to
+  wasm.
+- For wasm to be *allowed* to invoke a suspending import, the wasm export
+  that triggered the call must be reached through a wrapper produced by
+  `WebAssembly.promising(...)`.
 
 In cfml-worker:
 
-1. The Rust side declares `extern "C" fn cfml_jspi_d1_query(req_ptr, req_len) -> i64`
-   in [`src/jspi.rs`](../src/jspi.rs).
-2. This shim supplies the JS implementation, awaits the D1 call inside
-   `Suspending`, and packs the JSON response into a wasm-allocated buffer.
-3. The Rust [`D1Driver`](../src/d1_driver.rs) parses the JSON response and
-   returns a normal CFML query value.
-
-From the CFML programmer's view, `cfquery` blocks until the result is back —
-exactly the semantics CFML mandates.
-
-## Quick start
-
-1. Copy `cfml-jspi-shim.mjs` and `jspi-template-shim.mjs` into your worker
-   project's `src/` directory.
-2. In `wrangler.toml`, point `main` at the template:
-   ```toml
-   main = "src/jspi-shim.mjs"
-   ```
-   (Adjust the filename to taste — `jspi-template-shim.mjs` works too.)
-3. In your `wrangler.toml`, declare the D1 binding under whatever name you
-   want to use in CFML:
-   ```toml
-   [[d1_databases]]
-   binding = "MAIN"
-   database_name = "myapp"
-   database_id = "..."
-   ```
-4. In your worker's Rust entry, add the D1 datasource to `WorkerConfig`:
+1. The Rust side declares the import as a **wasm-bindgen snippet**:
    ```rust
-   if let Ok(db) = env.d1("MAIN") {
-       config.d1_datasources.push(("main".into(), std::sync::Arc::new(db)));
+   #[wasm_bindgen(module = "/src/cfml_jspi.js")]
+   extern "C" {
+       fn cfml_jspi_d1_query(
+           req_ptr: u32, req_len: u32,
+           resp_ptr: u32, resp_cap: u32,
+       ) -> i32;
    }
    ```
-   The string `"main"` is what CFML will reference as
-   `<cfquery datasource="main">`. The binding lookup is case-insensitive
-   (`MAIN`, `Main`, `main` all match the binding).
-5. Run your normal build (`worker-build --release` or equivalent). The
-   template shim imports the wasm directly from `build/worker/index.wasm`
-   — if your build outputs elsewhere, adjust the `wasmModule` import.
+   wasm-bindgen copies the JS file into its output `snippets/` directory at
+   build time and rewrites the import path so esbuild can resolve it. The
+   snippet exports `cfml_jspi_d1_query` as a `WebAssembly.Suspending`, and
+   wasm-bindgen passes the value through unchanged for primitive signatures
+   — the Suspending object lands directly in the wasm import object.
 
-## Limitations
+2. The snippet (`src/cfml_jspi.js`) reads the request JSON out of wasm
+   memory, awaits the D1 call, and writes the response JSON back into a
+   wasm buffer the Rust side pre-allocated. No alloc/free round-trip
+   required.
 
-- **wasm-bindgen JSPI support is in progress**
-  ([rustwasm/wasm-bindgen#3633](https://github.com/rustwasm/wasm-bindgen/issues/3633)).
-  We use raw `extern "C"` declarations rather than `#[wasm_bindgen]`. If
-  your wasm-bindgen-generated import set conflicts with our `env.*`
-  imports, you may need to namespace differently.
-- **Errors don't unwind cleanly across suspension**. A rejected D1 promise
-  is captured by the JS shim and surfaced as `{success: false, error}` in
-  the JSON response. Anything weirder (an exception inside the shim
-  itself) returns a null pointer; the Rust side maps both to a
-  `CfmlError`.
-- **Per-call overhead**. JSPI suspend/resume is real V8 machinery; not
-  free, but cheap compared to the latency of any actual DB call.
-- **Single in-flight request per isolate**. The shim stores the current
-  request env in a module-scoped variable. Workers' isolate model already
-  guarantees one request at a time, so this is fine.
+3. The Rust [`D1Driver`](../src/d1_driver.rs) decodes the response JSON and
+   returns a normal CFML query value to the VM.
 
-## Without a JSPI shim
+From the CFML programmer's view, `<cfquery>` blocks until the result is
+back — exactly the semantics CFML mandates.
 
-If `cfml-jspi-shim.mjs` is not wired into your entry, every D1 cfquery
-returns a `CfmlError`:
+## What the host worker still has to do
 
+The crate-side change handles import resolution and message marshalling.
+The **host worker entry point** still owns two responsibilities:
+
+### 1. Wrap the wasm fetch export with `WebAssembly.promising`
+
+JSPI refuses to suspend if the call did not enter through a promising
+wrapper. Concretely, your worker's `main` shim must:
+
+```js
+const instance = /* the wasm Instance from worker-build */;
+const promisingFetch = WebAssembly.promising(instance.exports.fetch);
+
+export default {
+  async fetch(request, env, ctx) {
+    // ... see step 2 ...
+    return await promisingFetch(request, env, ctx);
+  },
+};
 ```
-cfquery (D1 'main'): host JSPI shim returned null —
-check that the JS shim has been wired into wrangler.toml's main entry
+
+The exact plumbing depends on which version of `worker-build` you use and
+whether its generated shim exposes the raw wasm exports object. See the
+RustCFMLWorker template for a working reference.
+
+### 2. Register the active env before each fetch
+
+The suspending callback needs to look up the D1 binding on `env` by
+datasource name. Register it before invoking the wasm fetch:
+
+```js
+globalThis.__cfmlJspi.setEnv(env);
+try {
+  return await promisingFetch(request, env, ctx);
+} finally {
+  globalThis.__cfmlJspi.clearEnv();
+}
 ```
 
-That's the signal to come back here.
+`__cfmlJspi.setEnv` / `__cfmlJspi.clearEnv` are installed on `globalThis`
+by the snippet's wasm-bindgen `start` hook, so they are available as soon
+as the wasm module is instantiated.
+
+## Files
+
+| File | Role |
+|---|---|
+| `../src/jspi.rs` | Rust side — declares the wasm-bindgen extern + the sync wrapper `d1_query_sync()`. |
+| `../src/cfml_jspi.js` | The wasm-bindgen snippet — JS implementation of the Suspending import + globalThis env hooks. |
+
+There are no longer any "drop-in" JS files to copy into your worker
+project. The snippet ships with the crate and is bundled automatically by
+wasm-bindgen.
+
+## Limits & future work
+
+- **Single in-flight env**: `globalThis.__cfmlJspi.setEnv` is a singleton.
+  Workers' single-request-per-isolate model makes this safe today, but a
+  future refactor may switch to per-request context tracking.
+- **No streaming**: `stmt.all()` materialises the full result set before
+  returning. For result sets larger than ~64KB the response buffer is
+  retried once with a larger allocation; absurdly large queries should be
+  paginated by the CFML caller.
+- **D1 only for now**: the same Suspending pattern extends to any async
+  Workers binding (R2, Queues, fetch service bindings). Each gets its own
+  extern + Suspending callback; the snippet is the natural place to add
+  them.
