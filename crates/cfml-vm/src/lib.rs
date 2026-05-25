@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 mod java_shims;
 pub mod session_store;
+pub mod web;
 pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_collections, handle_java_concurrenthashmap, handle_java_concurrentlinkedqueue,
@@ -65,10 +66,7 @@ pub struct SessionData {
 /// Returns current Unix epoch seconds.
 #[inline]
 fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    cfml_common::clock::now_unix_secs()
 }
 
 /// A cached compiled bytecode program with its source file modification time.
@@ -545,7 +543,7 @@ pub struct CfmlVirtualMachine {
     /// Stack for nested body-mode custom tags
     custom_tag_stack: Vec<CustomTagState>,
     /// In-memory cache: key -> (value, optional expiry instant)
-    pub cache: HashMap<String, (CfmlValue, Option<std::time::Instant>)>,
+    pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
     pub enable_cfoutput_only: i32,
     /// Sandbox mode: blocks host filesystem access, routes reads through VFS
@@ -6385,7 +6383,7 @@ impl CfmlVirtualMachine {
                         };
 
                         // Acquire lock with timeout using try_lock in a spin loop
-                        let deadline = std::time::Instant::now()
+                        let deadline = cfml_common::clock::Monotonic::now()
                             + std::time::Duration::from_millis(timeout_ms);
                         let is_exclusive = lock_type != "readonly";
 
@@ -6399,7 +6397,7 @@ impl CfmlVirtualMachine {
                                     self.held_locks.push((lock_name, HeldLock::Write(guard)));
                                     break;
                                 }
-                                if std::time::Instant::now() >= deadline {
+                                if cfml_common::clock::Monotonic::now() >= deadline {
                                     return Err(CfmlError::runtime(
                                         format!("cflock timeout: could not acquire exclusive lock within {}ms", timeout_ms)
                                     ));
@@ -6414,7 +6412,7 @@ impl CfmlVirtualMachine {
                                     self.held_locks.push((lock_name, HeldLock::Read(guard)));
                                     break;
                                 }
-                                if std::time::Instant::now() >= deadline {
+                                if cfml_common::clock::Monotonic::now() >= deadline {
                                     return Err(CfmlError::runtime(
                                         format!("cflock timeout: could not acquire readonly lock within {}ms", timeout_ms)
                                     ));
@@ -6553,10 +6551,7 @@ impl CfmlVirtualMachine {
                                         let unique = dest_dir.join(format!(
                                             "{}_{}{}",
                                             stem,
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis(),
+                                            cfml_common::clock::now_unix_millis(),
                                             ext
                                         ));
                                         unique
@@ -6654,10 +6649,7 @@ impl CfmlVirtualMachine {
                                         let unique = dest_dir.join(format!(
                                             "{}_{}{}",
                                             stem,
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis(),
+                                            cfml_common::clock::now_unix_millis(),
                                             ext
                                         ));
                                         unique
@@ -6977,7 +6969,7 @@ impl CfmlVirtualMachine {
                         };
                         if secs > 0.0 {
                             Some(
-                                std::time::Instant::now()
+                                cfml_common::clock::Monotonic::now()
                                     + std::time::Duration::from_secs_f64(secs),
                             )
                         } else {
@@ -6991,7 +6983,7 @@ impl CfmlVirtualMachine {
                     let key = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     if let Some((val, expiry)) = self.cache.get(&key).cloned() {
                         if let Some(exp) = expiry {
-                            if std::time::Instant::now() > exp {
+                            if cfml_common::clock::Monotonic::now() > exp {
                                 self.cache.remove(&key);
                                 return Ok(CfmlValue::Null);
                             }
@@ -7043,7 +7035,7 @@ impl CfmlVirtualMachine {
                     let key = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     if let Some((_, expiry)) = self.cache.get(&key) {
                         if let Some(exp) = expiry {
-                            if std::time::Instant::now() > *exp {
+                            if cfml_common::clock::Monotonic::now() > *exp {
                                 self.cache.remove(&key);
                                 return Ok(CfmlValue::Bool(false));
                             }
@@ -7053,7 +7045,7 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Bool(false));
                 }
                 "cachecount" => {
-                    let now = std::time::Instant::now();
+                    let now = cfml_common::clock::Monotonic::now();
                     let count = self
                         .cache
                         .iter()
@@ -7062,7 +7054,7 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Int(count as i64));
                 }
                 "cachegetall" => {
-                    let now = std::time::Instant::now();
+                    let now = cfml_common::clock::Monotonic::now();
                     let mut result = IndexMap::new();
                     for (k, (v, exp)) in &self.cache {
                         if exp.map_or(true, |e| now <= e) {
@@ -7072,7 +7064,7 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::strukt(result));
                 }
                 "cachegetallids" => {
-                    let now = std::time::Instant::now();
+                    let now = cfml_common::clock::Monotonic::now();
                     let ids: Vec<CfmlValue> = self
                         .cache
                         .iter()
@@ -7204,7 +7196,7 @@ impl CfmlVirtualMachine {
                             .push(std::mem::take(&mut self.output_buffer));
 
                         // Track elapsed time
-                        let start_time = std::time::Instant::now();
+                        let start_time = cfml_common::clock::Monotonic::now();
 
                         // Execute thread body, catching errors
                         let result = self.call_function(&callback, vec![], parent_locals);

@@ -142,7 +142,7 @@ impl EmbeddedFs {
             files: normalized_files,
             dirs,
             base_dir,
-            mtime: SystemTime::now(),
+            mtime: crate::clock::now_system_time(),
         }
     }
 

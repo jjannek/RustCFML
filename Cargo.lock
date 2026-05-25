@@ -843,12 +843,14 @@ name = "cfml-common"
 version = "0.18.0"
 dependencies = [
  "indexmap",
+ "js-sys",
  "log",
  "num-traits",
  "parking_lot",
  "rustc-hash 1.1.0",
  "serde",
  "thiserror 1.0.69",
+ "wasm-bindgen",
 ]
 
 [[package]]

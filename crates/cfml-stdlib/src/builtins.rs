@@ -759,11 +759,7 @@ fn cfml_random() -> f64 {
             })
         } else {
             // Fallback: time-based pseudo-random (non-deterministic)
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let seed = cfml_common::clock::now_unix_nanos();
             let x = (seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) as u64;
             (x >> 11) as f64 / (1u64 << 53) as f64
         }
@@ -3530,27 +3526,12 @@ fn fn_get_tick_count(args: Vec<CfmlValue>) -> CfmlResult {
     let unit = args.first()
         .and_then(|v| if let CfmlValue::String(s) = v { Some(s.to_lowercase()) } else { None })
         .unwrap_or_else(|| "milli".to_string());
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let val = match unit.as_str() {
-            "nano" => duration.as_nanos() as i64,
-            "second" => duration.as_secs() as i64,
-            _ => duration.as_millis() as i64,
-        };
-        Ok(CfmlValue::Int(val))
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let ms = chrono::Utc::now().timestamp_millis();
-        let val = match unit.as_str() {
-            "nano" => ms * 1_000_000,
-            "second" => ms / 1000,
-            _ => ms,
-        };
-        Ok(CfmlValue::Int(val))
-    }
+    let val = match unit.as_str() {
+        "nano" => cfml_common::clock::now_unix_nanos() as i64,
+        "second" => cfml_common::clock::now_unix_secs() as i64,
+        _ => cfml_common::clock::now_unix_millis() as i64,
+    };
+    Ok(CfmlValue::Int(val))
 }
 
 fn fn_get_function_list(_args: Vec<CfmlValue>) -> CfmlResult {
@@ -4534,9 +4515,7 @@ fn fn_create_object(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_create_uuid(_args: Vec<CfmlValue>) -> CfmlResult {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let nanos = time.as_nanos() as u64;
+    let nanos = cfml_common::clock::now_unix_nanos() as u64;
     let random_bits = ((cfml_random() * u32::MAX as f64) as u64) << 32
                     | (cfml_random() * u32::MAX as f64) as u64;
     let mixed = nanos ^ random_bits;
@@ -4551,9 +4530,7 @@ fn fn_create_uuid(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_create_guid(_args: Vec<CfmlValue>) -> CfmlResult {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let nanos = time.as_nanos() as u64;
+    let nanos = cfml_common::clock::now_unix_nanos() as u64;
     let random_bits = ((cfml_random() * u32::MAX as f64) as u64) << 32
                     | (cfml_random() * u32::MAX as f64) as u64;
     let mixed = nanos ^ random_bits;
@@ -4980,8 +4957,7 @@ fn fn_get_temp_file(args: Vec<CfmlValue>) -> CfmlResult {
         get_str(&args, 0)
     };
     let prefix = if args.len() >= 2 { get_str(&args, 1) } else { "tmp".to_string() };
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let ts = cfml_common::clock::now_unix_nanos();
     let path = std::path::Path::new(&dir).join(format!("{}{}.tmp", prefix, ts));
     Ok(CfmlValue::String(path.to_string_lossy().to_string()))
 }
@@ -10143,10 +10119,10 @@ fn fn_file_set_last_modified(args: Vec<CfmlValue>) -> CfmlResult {
             let secs = dt.and_utc().timestamp();
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
         } else {
-            std::time::SystemTime::now()
+            cfml_common::clock::now_system_time()
         }
     } else {
-        std::time::SystemTime::now()
+        cfml_common::clock::now_system_time()
     };
     let file = std::fs::File::open(&path)
         .map_err(|e| CfmlError::runtime(format!("fileSetLastModified failed: {}", e)))?;

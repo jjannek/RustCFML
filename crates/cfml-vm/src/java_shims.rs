@@ -374,18 +374,10 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
             Ok(CfmlValue::strukt(shim))
         }
         "currenttimemillis" => {
-            let n = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0);
-            Ok(CfmlValue::Double(n))
+            Ok(CfmlValue::Double(cfml_common::clock::now_unix_millis() as f64))
         }
         "nanotime" => {
-            let n = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as f64)
-                .unwrap_or(0.0);
-            Ok(CfmlValue::Double(n))
+            Ok(CfmlValue::Double(cfml_common::clock::now_unix_nanos() as f64))
         }
         "getproperty" => {
             // Some callers pass the key as the first "real" arg, but member
@@ -1027,13 +1019,8 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
 fn rand_u128() -> u128 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
     let mut h = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .hash(&mut h);
+    cfml_common::clock::now_unix_nanos().hash(&mut h);
     0x12345678u64.hash(&mut h);
     h.finish() as u128
 }
