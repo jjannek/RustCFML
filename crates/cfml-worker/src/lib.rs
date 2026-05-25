@@ -25,11 +25,19 @@ pub mod jspi;
 #[cfg(target_arch = "wasm32")]
 pub mod kv_stores;
 #[cfg(target_arch = "wasm32")]
+pub mod do_application_store;
+#[cfg(target_arch = "wasm32")]
+pub mod scheduled;
+#[cfg(target_arch = "wasm32")]
 pub use d1_driver::D1Driver;
+#[cfg(target_arch = "wasm32")]
+pub use do_application_store::DoApplicationStore;
 #[cfg(target_arch = "wasm32")]
 pub use handler::handle_fetch;
 #[cfg(target_arch = "wasm32")]
 pub use kv_stores::{KvBackedApplicationStore, KvBackedSessionStore};
+#[cfg(target_arch = "wasm32")]
+pub use scheduled::handle_scheduled;
 
 #[cfg(target_arch = "wasm32")]
 use worker::kv::KvStore;
@@ -62,9 +70,21 @@ pub struct WorkerConfig {
 
     /// Optional KV namespace for application scope. When `None`, application
     /// scope lives in the per-isolate `MemoryApplicationStore` (and
-    /// onApplicationStart may fire on each new isolate).
+    /// onApplicationStart may fire on each new isolate). Ignored when
+    /// `do_application_binding` is set.
     #[cfg(target_arch = "wasm32")]
     pub kv_application: Option<KvStore>,
+
+    /// Optional Durable Object namespace handle that backs application
+    /// scope. When set, takes priority over `kv_application` and provides
+    /// strong consistency across isolates.
+    ///
+    /// The host project gets this via `env.durable_object("APP_DO")?`
+    /// in its `#[event(fetch)]` and passes the resulting `ObjectNamespace`.
+    /// The DO class must implement `GET /get` and `POST /put` — see
+    /// `DoApplicationStore` docs for the wire shape.
+    #[cfg(target_arch = "wasm32")]
+    pub do_application: Option<worker::ObjectNamespace>,
 
     /// Named D1 datasources to register before each request. The string is
     /// the cfquery `datasource="..."` name; the binding is registered via
@@ -104,6 +124,8 @@ impl WorkerConfig {
             kv_sessions: None,
             #[cfg(target_arch = "wasm32")]
             kv_application: None,
+            #[cfg(target_arch = "wasm32")]
+            do_application: None,
             #[cfg(target_arch = "wasm32")]
             d1_datasources: Vec::new(),
             production_mode: true,

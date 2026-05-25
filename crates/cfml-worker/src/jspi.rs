@@ -71,6 +71,16 @@ extern "C" {
         resp_ptr: u32,
         resp_cap: u32,
     ) -> i32;
+
+    /// Suspending import for Durable Object fetches. Same wire convention
+    /// as `cfml_jspi_d1_query` — JSON request + JSON response routed via
+    /// caller-allocated wasm buffers. Used by `DoApplicationStore`.
+    fn cfml_jspi_do_fetch(
+        req_ptr: u32,
+        req_len: u32,
+        resp_ptr: u32,
+        resp_cap: u32,
+    ) -> i32;
 }
 
 #[wasm_bindgen(start)]
@@ -128,6 +138,57 @@ pub(crate) fn d1_query_sync(request_json: &str) -> Result<String, CfmlError> {
     String::from_utf8(buf).map_err(|e| {
         CfmlError::runtime(format!(
             "cfquery (D1): host JSPI shim returned non-UTF-8 response: {}",
+            e
+        ))
+    })
+}
+
+/// Sync-from-wasm Durable Object fetch. `request_json` is shaped as
+/// `{binding, instance, path?, method?, body?}`; the returned String is
+/// the JSON the JS shim wrote (`{success, status, body, error?}`).
+pub(crate) fn do_fetch_sync(request_json: &str) -> Result<String, CfmlError> {
+    let req_bytes = request_json.as_bytes();
+    let mut buf: Vec<u8> = vec![0u8; INITIAL_RESPONSE_CAP];
+
+    let written = cfml_jspi_do_fetch(
+        req_bytes.as_ptr() as u32,
+        req_bytes.len() as u32,
+        buf.as_mut_ptr() as u32,
+        buf.len() as u32,
+    );
+
+    if written == 0 {
+        return Err(CfmlError::runtime(
+            "application scope (DO): host JSPI shim returned null — \
+             check that the worker entry point imports cfml-jspi-bootstrap"
+                .to_string(),
+        ));
+    }
+
+    let written = if written < 0 {
+        let required = (-written) as usize;
+        buf = vec![0u8; required];
+        let retry = cfml_jspi_do_fetch(
+            req_bytes.as_ptr() as u32,
+            req_bytes.len() as u32,
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        );
+        if retry <= 0 {
+            return Err(CfmlError::runtime(
+                "application scope (DO): retry with larger response buffer also failed"
+                    .to_string(),
+            ));
+        }
+        retry as usize
+    } else {
+        written as usize
+    };
+
+    buf.truncate(written);
+    String::from_utf8(buf).map_err(|e| {
+        CfmlError::runtime(format!(
+            "application scope (DO): host JSPI shim returned non-UTF-8 response: {}",
             e
         ))
     })

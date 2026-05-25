@@ -2,6 +2,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use crate::do_application_store::DoApplicationStore;
 use crate::embedded_vfs::EmbeddedVfs;
 use crate::kv_stores::{KvBackedApplicationStore, KvBackedSessionStore};
 use crate::scopes;
@@ -69,14 +70,15 @@ pub async fn handle_fetch(
             Err(e) => return Response::error(format!("scope build error: {e:?}"), 500),
         };
 
-    // Discover session id from the cookie scope built above; mint one if
-    // missing. The Set-Cookie header is added to the response below.
+    // Discover session id from the cookie scope. We DON'T mint a fresh
+    // one here — that's deferred until after the VM runs, and only
+    // happens if the VM actually created a session record. With
+    // `this.lazySessionCreation = true`, a request that never touches
+    // session scope produces no record and no `Set-Cookie`. With
+    // default (eager) sessionManagement, the VM itself mints + creates
+    // and we read it back from `vm.session_id` post-run.
     let cookie_struct = globals.get("cookie").cloned();
-    let session_id = extract_session_id(&cookie_struct, &config.session_cookie_name);
-    let (session_id, issued_new_session) = match session_id {
-        Some(id) => (id, false),
-        None => (mint_session_id(), true),
-    };
+    let cookie_session_id = extract_session_id(&cookie_struct, &config.session_cookie_name);
 
     // Register D1 datasources for this request. The driver is a v1 stub —
     // see crate::d1_driver for the async/sync gap that keeps cfquery
@@ -95,15 +97,29 @@ pub async fn handle_fetch(
         .kv_sessions
         .as_ref()
         .map(|kv| Arc::new(KvBackedSessionStore::new(kv.clone())));
-    let kv_app_store = config
-        .kv_application
-        .as_ref()
-        .map(|kv| Arc::new(KvBackedApplicationStore::new(kv.clone())));
 
-    if let Some(store) = kv_session_store.as_ref() {
-        let _ = store.prime(&session_id).await;
+    // Application scope: DO binding wins over KV, KV wins over memory.
+    let do_app_store = config
+        .do_application
+        .as_ref()
+        .map(|ns| Arc::new(DoApplicationStore::new(ns.clone())));
+    let kv_app_store = if do_app_store.is_some() {
+        None
+    } else {
+        config
+            .kv_application
+            .as_ref()
+            .map(|kv| Arc::new(KvBackedApplicationStore::new(kv.clone())))
+    };
+
+    if let (Some(store), Some(sid)) = (kv_session_store.as_ref(), cookie_session_id.as_ref()) {
+        let _ = store.prime(sid).await;
     }
-    if let Some(store) = kv_app_store.as_ref() {
+    if let Some(store) = do_app_store.as_ref() {
+        for name in &config.app_names {
+            let _ = store.prime(name).await;
+        }
+    } else if let Some(store) = kv_app_store.as_ref() {
         for name in &config.app_names {
             let _ = store.prime(name).await;
         }
@@ -114,9 +130,12 @@ pub async fn handle_fetch(
         Some(s) => s.clone() as Arc<dyn SessionStore>,
         None => Arc::new(MemoryStore::new()),
     };
-    server_state.applications = match &kv_app_store {
-        Some(a) => a.clone() as Arc<dyn ApplicationStore>,
-        None => Arc::new(MemoryApplicationStore::new()),
+    server_state.applications = if let Some(a) = &do_app_store {
+        a.clone() as Arc<dyn ApplicationStore>
+    } else if let Some(a) = &kv_app_store {
+        a.clone() as Arc<dyn ApplicationStore>
+    } else {
+        Arc::new(MemoryApplicationStore::new())
     };
 
     // Execute
@@ -126,11 +145,11 @@ pub async fn handle_fetch(
         globals,
         http_request_data,
         &server_state,
-        Some(session_id.clone()),
+        cookie_session_id.clone(),
     ) {
         Ok(r) => r,
         Err(msg) => {
-            let mut headers = Headers::new();
+            let headers = Headers::new();
             let _ = headers.set("Content-Type", "text/plain; charset=utf-8");
             return Ok(Response::ok(format!("CFML error:\n\n{msg}"))?
                 .with_status(500)
@@ -154,19 +173,27 @@ pub async fn handle_fetch(
         headers.append(&k, &v)?;
     }
 
-    if issued_new_session {
-        let cookie = format!(
-            "{}={}; Path=/; HttpOnly; SameSite=Lax",
-            config.session_cookie_name, session_id
-        );
-        headers.append("Set-Cookie", &cookie)?;
+    // Emit Set-Cookie only if the VM actually created a session record
+    // AND the incoming request had no cookie for us to echo. In lazy
+    // mode this means pages that never touched session pay no cookie
+    // round-trip overhead.
+    if response_data.session_record_created && cookie_session_id.is_none() {
+        if let Some(sid) = &response_data.session_id {
+            let cookie = format!(
+                "{}={}; Path=/; HttpOnly; SameSite=Lax",
+                config.session_cookie_name, sid
+            );
+            headers.append("Set-Cookie", &cookie)?;
+        }
     }
 
-    // Flush dirty state back to KV after the response is built.
+    // Flush dirty state back to KV/DO after the response is built.
     if let Some(store) = kv_session_store.as_ref() {
         store.flush(&ctx);
     }
-    if let Some(store) = kv_app_store.as_ref() {
+    if let Some(store) = do_app_store.as_ref() {
+        store.flush(&ctx);
+    } else if let Some(store) = kv_app_store.as_ref() {
         store.flush(&ctx);
     }
 
@@ -193,22 +220,20 @@ fn extract_session_id(
     None
 }
 
-fn mint_session_id() -> String {
-    // Use the clock module + a hashed PRNG seed via the existing UUID-like
-    // helper in stdlib? Simpler: hex-encode now + a random suffix from
-    // js_sys::Math::random.
-    let nanos = cfml_common::clock::now_unix_nanos();
-    let r1 = (js_sys::Math::random() * (u32::MAX as f64)) as u32;
-    let r2 = (js_sys::Math::random() * (u32::MAX as f64)) as u32;
-    format!("{:016X}{:08X}{:08X}", nanos as u64, r1, r2)
-}
-
 struct ResponseData {
     output: String,
     status: Option<u16>,
     content_type: Option<String>,
     headers: Vec<(String, String)>,
     redirect_url: Option<String>,
+    /// The session id the VM ended up using — either the cookie value
+    /// the request came in with, or one minted by the VM during the
+    /// session-lifecycle phase (eager mode) or first session write
+    /// (lazy mode).
+    session_id: Option<String>,
+    /// Set if the VM actually inserted a session record this request.
+    /// The handler uses this to decide whether to emit `Set-Cookie`.
+    session_record_created: bool,
 }
 
 fn run_cfml(
@@ -250,6 +275,12 @@ fn run_cfml(
         vm.builtins.insert(name, func);
     }
 
+    // Wire queryExecute to the dynamic-driver-only variant. The worker
+    // build of cfml-stdlib intentionally compiles without any per-engine
+    // DB feature (sqlite/mysql/etc); all queries go through the
+    // dynamic-driver registry that the D1 driver registered above.
+    vm.query_execute_fn = Some(cfml_stdlib::builtins::fn_query_execute_dynamic);
+
     vm.globals
         .entry("url".to_string())
         .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
@@ -282,6 +313,8 @@ fn run_cfml(
     let content_type = vm.response_content_type.clone();
     let headers = vm.response_headers.clone();
     let redirect_url = vm.redirect_url.clone();
+    let session_id = vm.session_id.clone();
+    let session_record_created = vm.session_record_created;
 
     match result {
         Ok(_) => Ok(ResponseData {
@@ -290,6 +323,8 @@ fn run_cfml(
             content_type,
             headers,
             redirect_url,
+            session_id,
+            session_record_created,
         }),
         Err(e) => Err(format!("{}\n\nOutput so far:\n{}", e, output)),
     }

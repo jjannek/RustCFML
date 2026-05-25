@@ -114,3 +114,83 @@ wasm-bindgen.
   Workers binding (R2, Queues, fetch service bindings). Each gets its own
   extern + Suspending callback; the snippet is the natural place to add
   them.
+
+## Durable Object–backed application scope
+
+A second Suspending import — `cfml_jspi_do_fetch` — supports the
+[`DoApplicationStore`](../src/do_application_store.rs). Set
+`WorkerConfig.do_application_binding = Some("APP_DO".into())` and
+declare a matching Durable Object binding in `wrangler.toml`. The DO
+class is the host project's responsibility; it only needs to implement
+two endpoints:
+
+| Method | Path   | Request body                      | Response                                |
+|--------|--------|-----------------------------------|-----------------------------------------|
+| `GET`  | `/get` | —                                 | `200 {"variables":{...},"started":bool}` or `404` |
+| `POST` | `/put` | `{"variables":{...},"started":bool}` | `204`                                |
+
+One DO instance per application name (`namespace.idFromName(<app_name>)`),
+so writes serialize at the DO and become globally visible immediately.
+
+A minimal Rust DO implementation, hand-rolled inside the host worker
+crate:
+
+```rust
+use worker::*;
+
+#[durable_object]
+pub struct ApplicationScopeDO {
+    state: State,
+}
+
+#[durable_object]
+impl DurableObject for ApplicationScopeDO {
+    fn new(state: State, _env: Env) -> Self { Self { state } }
+
+    async fn fetch(&mut self, req: Request) -> Result<Response> {
+        match (req.method(), req.path().as_str()) {
+            (Method::Get, "/get") => match self.state.storage().get::<String>("body").await {
+                Ok(s) => Response::ok(s),
+                Err(_) => Response::error("not found", 404),
+            },
+            (Method::Post, "/put") => {
+                let body = req.text().await?;
+                self.state.storage().put("body", body).await?;
+                Response::empty().map(|r| r.with_status(204))
+            }
+            _ => Response::error("not found", 404),
+        }
+    }
+}
+```
+
+The JS shim addresses this DO via the binding name registered in
+`globalThis.__cfmlJspi.setEnv(env)`, then calls
+`env[binding].idFromName(<app_name>).get().fetch(...)`. No host changes
+beyond declaring the binding + DO class.
+
+## Scheduled handler — onSessionEnd via cron trigger
+
+KV TTL silently evicts expired sessions, so `onSessionEnd` never fires
+from the inline request path. Wire a Cron Trigger in `wrangler.toml`:
+
+```toml
+[triggers]
+crons = ["* * * * *"]
+```
+
+Then delegate from `#[event(scheduled)]` to
+[`cfml_worker::handle_scheduled`](../src/scheduled.rs):
+
+```rust
+#[event(scheduled)]
+pub async fn scheduled(event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
+    let config = build_config(&env);
+    let _ = cfml_worker::handle_scheduled(event, env, ctx, &config).await;
+}
+```
+
+The cron handler lists the KV session namespace, deletes expired keys
+(before invoking the lifecycle method, so overlapping cron firings
+don't double-fire), then loads Application.cfc and calls
+`onSessionEnd(sessionScope, applicationScope)` per expired session.

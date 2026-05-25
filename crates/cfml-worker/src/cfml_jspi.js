@@ -132,3 +132,73 @@ export const cfml_jspi_d1_query = new WebAssembly.Suspending(
     return writeResponse(response, respPtr, respCap);
   },
 );
+
+/**
+ * Look up a Durable Object Namespace binding by name (case-insensitive),
+ * mint or rehydrate the named instance, and fetch a small JSON RPC at
+ * `req.path` (defaults to `/`). Wire shape:
+ *
+ *   { binding, instance, path?, method?, body? }
+ *
+ * Response:
+ *
+ *   { success: bool, status: int, body: string, error?: string }
+ *
+ * `body` is the raw response text (the Rust caller deserializes it).
+ */
+async function runDoFetch(req) {
+  if (!activeEnv) {
+    return {
+      success: false,
+      error:
+        "cfml-jspi: no active env — host did not call globalThis.__cfmlJspi.setEnv(env) before fetch",
+    };
+  }
+  const binding =
+    activeEnv[req.binding] ||
+    activeEnv[req.binding.toUpperCase()] ||
+    activeEnv[req.binding.toLowerCase()] ||
+    null;
+  if (!binding || typeof binding.idFromName !== "function") {
+    return {
+      success: false,
+      error: `cfml-jspi: no Durable Object namespace binding named "${req.binding}" on env`,
+    };
+  }
+  try {
+    const id = binding.idFromName(req.instance);
+    const stub = binding.get(id);
+    const url = `https://do.invalid${req.path || "/"}`;
+    const init = { method: req.method || "GET" };
+    if (typeof req.body === "string" && req.body.length > 0) {
+      init.body = req.body;
+      init.method = init.method === "GET" ? "POST" : init.method;
+    }
+    const resp = await stub.fetch(url, init);
+    const body = await resp.text();
+    return { success: resp.ok, status: resp.status, body };
+  } catch (e) {
+    return { success: false, error: String(e?.message ?? e) };
+  }
+}
+
+export const cfml_jspi_do_fetch = new WebAssembly.Suspending(
+  async (reqPtr, reqLen, respPtr, respCap) => {
+    if (!wasmMemory) {
+      return 0;
+    }
+    let request;
+    try {
+      const bytes = new Uint8Array(wasmMemory.buffer, reqPtr, reqLen);
+      request = JSON.parse(new TextDecoder().decode(bytes));
+    } catch (e) {
+      return writeResponse(
+        { success: false, error: `cfml-jspi: bad request JSON: ${e.message}` },
+        respPtr,
+        respCap,
+      );
+    }
+    const response = await runDoFetch(request);
+    return writeResponse(response, respPtr, respCap);
+  },
+);

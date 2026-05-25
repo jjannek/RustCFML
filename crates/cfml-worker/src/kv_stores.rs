@@ -59,6 +59,52 @@ impl KvBackedSessionStore {
         Ok(())
     }
 
+    /// Sweep KV for expired sessions, delete them, and return the
+    /// `(id, SessionData)` pairs so the caller can fire `onSessionEnd`
+    /// for each. Called from the scheduled (cron) handler — the inline
+    /// request path keeps `take_expired` returning empty because KV's
+    /// TTL handles eviction.
+    ///
+    /// Race safety: each expired key is deleted from KV *before* being
+    /// returned, so two overlapping cron firings will see at most one
+    /// successful delete per session.
+    pub async fn sweep_expired(&self, now_secs: u64) -> worker::Result<Vec<(String, SessionData)>> {
+        let mut expired = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut builder = self.kv.list();
+            if let Some(c) = cursor.as_ref() {
+                builder = builder.cursor(c.clone());
+            }
+            let resp = builder.execute().await.map_err(|e| worker::Error::RustError(format!("kv list: {e:?}")))?;
+            for key in resp.keys {
+                let bytes = match self.kv.get(&key.name).bytes().await? {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let Ok(data) = serde_json::from_slice::<SessionData>(&bytes) else {
+                    continue;
+                };
+                let age = now_secs.saturating_sub(data.last_accessed_secs);
+                if age > data.timeout_secs {
+                    // Delete first so concurrent sweeps don't double-fire.
+                    if self.kv.delete(&key.name).await.is_ok() {
+                        self.memory.remove(&key.name);
+                        expired.push((key.name, data));
+                    }
+                }
+            }
+            if resp.list_complete {
+                break;
+            }
+            cursor = resp.cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(expired)
+    }
+
     /// Persist every dirty session back to KV via `ctx.wait_until`. Called
     /// once per request after the VM returns.
     pub fn flush(&self, ctx: &Context) {

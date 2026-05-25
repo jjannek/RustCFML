@@ -598,6 +598,12 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // ---- Database functions ----
     #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
     f.insert("queryExecute".into(), fn_query_execute);
+    // No per-engine DB feature compiled in (e.g. the Cloudflare Workers
+    // build). Fall back to the dynamic-driver-only path so cfquery /
+    // queryExecute against an externally-registered driver (D1, etc.)
+    // still works.
+    #[cfg(not(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
+    f.insert("queryExecute".into(), fn_query_execute_dynamic);
 
     // ---- Security functions ----
     f.insert("hmac".into(), fn_hmac);
@@ -6189,6 +6195,52 @@ fn is_select_query(sql: &str) -> bool {
     let trimmed = sql.trim_start();
     (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("SELECT"))
         || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("CALL"))
+}
+
+/// Dynamic-driver-only `queryExecute` for builds that don't enable any
+/// of the per-engine DB features (e.g. the Cloudflare Workers host,
+/// which uses the dynamic-driver registry to plug in D1). Looks up
+/// `datasource` in [`crate::db_driver::lookup_dynamic_datasource`] and
+/// hands off to the registered driver. Errors out if the requested
+/// datasource isn't registered.
+pub fn fn_query_execute_dynamic(args: Vec<CfmlValue>) -> CfmlResult {
+    let sql = get_str(&args, 0);
+    if sql.is_empty() {
+        return Err(CfmlError::runtime(
+            "queryExecute: SQL string is required".to_string(),
+        ));
+    }
+
+    let raw_params = args.get(1).cloned().unwrap_or(CfmlValue::Null);
+    let options_arg = args.get(2).cloned().unwrap_or(CfmlValue::Null);
+
+    let datasource_attr: Option<String> = match &options_arg {
+        CfmlValue::Struct(opts) => opts
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
+            .map(|(_, v)| v.as_string()),
+        _ => None,
+    };
+    let ds_name = datasource_attr.unwrap_or_default();
+    let driver = crate::db_driver::lookup_dynamic_datasource(&ds_name).ok_or_else(|| {
+        CfmlError::runtime(format!(
+            "queryExecute: datasource '{}' is not registered with the dynamic-driver registry",
+            ds_name
+        ))
+    })?;
+
+    let return_type = match &options_arg {
+        CfmlValue::Struct(opts) => opts
+            .iter()
+            .find(|(k, _)| {
+                k.eq_ignore_ascii_case("returntype") || k.eq_ignore_ascii_case("returnType")
+            })
+            .map(|(_, v)| v.as_string().to_lowercase())
+            .unwrap_or_else(|| "query".to_string()),
+        _ => "query".to_string(),
+    };
+
+    driver.execute(&sql, &raw_params, &return_type)
 }
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
