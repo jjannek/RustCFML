@@ -534,6 +534,28 @@ pub struct CfmlVirtualMachine {
     pub query_execute_fn: Option<fn(Vec<CfmlValue>) -> CfmlResult>,
     /// Session ID for current request
     pub session_id: Option<String>,
+    /// Per-request flag: Application.cfc set `this.lazySessionCreation =
+    /// true`. When true, no session record is created at request start;
+    /// instead the record + `onSessionStart` fire on the first write to
+    /// the `session` scope.
+    pub lazy_session_creation: bool,
+    /// Set after the lifecycle's session phase if lazy mode is on AND
+    /// no existing record was hydrated. The next session-scope write
+    /// triggers [`lazy_init_session_if_pending`] which clears this.
+    pub session_lazy_pending: bool,
+    /// True after `lazy_init_session_if_pending` actually inserted a
+    /// new session record (i.e. the request touched the session scope).
+    /// Embedders (the Workers fetch handler, the `--serve` HTTP layer)
+    /// read this to decide whether to emit `Set-Cookie`.
+    pub session_record_created: bool,
+    /// Re-entry guard for `lazy_init_session_if_pending` so that
+    /// `onSessionStart`'s own session-scope writes don't recurse.
+    session_lazy_initializing: bool,
+    /// Application.cfc component struct, stashed by
+    /// `execute_with_lifecycle` so that
+    /// `lazy_init_session_if_pending` can fire `onSessionStart` from
+    /// inside a bytecode-op handler without re-loading the .cfc.
+    pub app_cfc_template: Option<CfmlValue>,
     /// Stack of held cflock guards (name, guard)
     held_locks: Vec<(String, HeldLock)>,
     /// Custom tag paths from this.customTagPaths in Application.cfc
@@ -666,6 +688,11 @@ impl CfmlVirtualMachine {
             txn_rollback: None,
             txn_execute: None,
             session_id: None,
+            lazy_session_creation: false,
+            session_lazy_pending: false,
+            session_record_created: false,
+            session_lazy_initializing: false,
+            app_cfc_template: None,
             query_execute_fn: None,
             held_locks: Vec::new(),
             custom_tag_paths: Vec::new(),
@@ -6767,6 +6794,8 @@ impl CfmlVirtualMachine {
                         .map(|r| r.trim().to_string())
                         .filter(|r| !r.is_empty())
                         .collect();
+                    // Treat login as a session write → lazy-init.
+                    self.lazy_init_session_if_pending();
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
                         let now = now_epoch_secs();
@@ -9168,6 +9197,69 @@ impl CfmlVirtualMachine {
         String::new()
     }
 
+    /// Lazy-init handler: when `this.lazySessionCreation = true` and
+    /// the request hasn't created a session record yet, the next write
+    /// to `session.X` (or session-affecting call like `cfloginuser`)
+    /// flows through this method first. It mints a session id if none
+    /// is set, inserts an empty record, fires `onSessionStart`
+    /// synchronously, and clears the pending flag.
+    ///
+    /// Reads of the session scope deliberately do NOT trigger this:
+    /// reading a non-existent key returns the default (empty / null)
+    /// without ever materialising a backing record. Only writes count,
+    /// matching the Preside-CMS session-storage pattern.
+    ///
+    /// A re-entry guard prevents recursion when `onSessionStart` itself
+    /// writes to session (which is the entire point of the lifecycle
+    /// hook).
+    /// Returns `true` if init actually ran on this call (so the
+    /// caller knows the session record now contains whatever
+    /// `onSessionStart` added and may need to merge rather than
+    /// replace). Returns `false` if there was nothing to do.
+    fn lazy_init_session_if_pending(&mut self) -> bool {
+        if !self.session_lazy_pending || self.session_lazy_initializing {
+            return false;
+        }
+        self.session_lazy_initializing = true;
+
+        let sid = match self.session_id.clone() {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                let new_sid = uuid::Uuid::new_v4().to_string();
+                self.session_id = Some(new_sid.clone());
+                new_sid
+            }
+        };
+
+        if let Some(state) = self.server_state.clone() {
+            let now = now_epoch_secs();
+            state.sessions.set(
+                &sid,
+                SessionData {
+                    variables: IndexMap::new(),
+                    created_secs: now,
+                    last_accessed_secs: now,
+                    auth_user: None,
+                    auth_roles: Vec::new(),
+                    timeout_secs: self.session_timeout_secs,
+                },
+            );
+        }
+        self.session_record_created = true;
+        self.session_lazy_pending = false;
+
+        // Fire onSessionStart using the stashed Application.cfc
+        // template. Any writes inside the lifecycle hook re-enter this
+        // method but bail at the initializing guard.
+        if let Some(mut tpl) = self.app_cfc_template.take() {
+            let _ = self.call_lifecycle_method(&mut tpl, "onSessionStart", vec![]);
+            self.app_cfc_template = Some(tpl);
+        }
+
+        self.session_lazy_initializing = false;
+        true
+    }
+
     /// Get the session scope for the current request
     fn get_session_scope(&self) -> CfmlValue {
         if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
@@ -9179,7 +9271,14 @@ impl CfmlVirtualMachine {
     }
 
     /// Set the session scope for the current request
-    fn set_session_scope(&self, vars: IndexMap<String, CfmlValue>) {
+    fn set_session_scope(&mut self, vars: IndexMap<String, CfmlValue>) {
+        // If lazy-init fires here, `onSessionStart` ran AFTER the user
+        // code loaded the (then-empty) session scope. Their `vars`
+        // snapshot doesn't contain any keys onSessionStart set, so we
+        // merge: existing keys (from onSessionStart) are preserved,
+        // and the user's writes overlay on top. Outside the lazy-init
+        // case we fall through to the historical full-replace.
+        let merge_with_existing = self.lazy_init_session_if_pending();
         if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
             let now = now_epoch_secs();
             let mut session = state.sessions.get(sid).unwrap_or_else(|| SessionData {
@@ -9190,7 +9289,13 @@ impl CfmlVirtualMachine {
                 auth_roles: Vec::new(),
                 timeout_secs: 1800,
             });
-            session.variables = vars;
+            if merge_with_existing {
+                for (k, v) in vars {
+                    session.variables.insert(k, v);
+                }
+            } else {
+                session.variables = vars;
+            }
             session.last_accessed_secs = now;
             state.sessions.set(sid, session);
         }
@@ -9198,7 +9303,8 @@ impl CfmlVirtualMachine {
 
     /// Update a single key in the session scope
     #[allow(dead_code)]
-    fn set_session_variable(&self, key: &str, value: CfmlValue) {
+    fn set_session_variable(&mut self, key: &str, value: CfmlValue) {
+        self.lazy_init_session_if_pending();
         if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
             let now = now_epoch_secs();
             let mut session = state.sessions.get(sid).unwrap_or_else(|| SessionData {
@@ -10895,7 +11001,7 @@ impl CfmlVirtualMachine {
         // 3. Extract config and mappings
         let (
             app_name,
-            _config,
+            config,
             mut mappings,
             session_management,
             session_timeout,
@@ -10904,6 +11010,24 @@ impl CfmlVirtualMachine {
             app_session_storage,
             app_caches,
         ) = Self::extract_app_config(&template);
+
+        // `this.lazySessionCreation = true` (alias `this.lazySessions`):
+        // Preside-style deferred session creation. When set, no session
+        // record is inserted at request start; instead a record + cookie
+        // + onSessionStart fire on the first write to `session`.
+        let lazy_session_creation = config
+            .get("lazysessioncreation")
+            .or_else(|| config.get("lazysessions"))
+            .map(|v| match v {
+                CfmlValue::Bool(b) => *b,
+                CfmlValue::String(s) => {
+                    let l = s.trim().to_ascii_lowercase();
+                    l == "true" || l == "yes" || l == "1"
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        self.lazy_session_creation = lazy_session_creation;
 
         // 3.0 Layer .cfconfig.json global mappings + customTagPaths underneath
         // the per-application ones, so Application.cfc wins on any conflict.
@@ -11004,7 +11128,7 @@ impl CfmlVirtualMachine {
                     name: app_name.clone(),
                     variables: IndexMap::new(),
                     started: false,
-                    config: _config.clone(),
+                    config: config.clone(),
                     cached_functions: Vec::new(),
                     cached_functions_original_offset: 0,
                     session_storage: app_session_storage.clone(),
@@ -11107,37 +11231,65 @@ impl CfmlVirtualMachine {
         }
 
         // 5b. Session lifecycle
+        //
+        // Default (eager) mode: a missing record is created up-front and
+        // `onSessionStart` fires immediately. Matches Lucee/ACF.
+        //
+        // Lazy mode (`this.lazySessionCreation = true`): a missing
+        // record is left missing. The next session-scope write triggers
+        // [`lazy_init_session_if_pending`] which creates the record and
+        // fires `onSessionStart` synchronously, so a CFML page that
+        // never touches `session` produces no record and no cookie.
+        self.session_record_created = false;
+        self.session_lazy_pending = false;
+        // Stash the loaded Application.cfc so
+        // `lazy_init_session_if_pending` can fire `onSessionStart`
+        // synchronously from inside a session-write bytecode op.
+        self.app_cfc_template = Some(template.clone());
         if session_management {
             if let Some(ref server_state) = self.server_state.clone() {
                 let sid = self.session_id.clone().unwrap_or_default();
-                if !sid.is_empty() {
-                    let is_new = !server_state.sessions.contains(&sid);
+                let has_sid = !sid.is_empty();
+                let record_exists = has_sid && server_state.sessions.contains(&sid);
 
-                    if is_new {
-                        // Create new session
-                        let now = now_epoch_secs();
-                        server_state.sessions.set(
-                            &sid,
-                            SessionData {
-                                variables: IndexMap::new(),
-                                created_secs: now,
-                                last_accessed_secs: now,
-                                auth_user: None,
-                                auth_roles: Vec::new(),
-                                timeout_secs: session_timeout,
-                            },
-                        );
-
-                        // Call onSessionStart
-                        let _ = self.call_lifecycle_method(&mut template, "onSessionStart", vec![]);
-                    } else {
-                        // Update last_accessed
-                        if let Some(mut session) = server_state.sessions.get(&sid) {
-                            session.last_accessed_secs = now_epoch_secs();
-                            session.timeout_secs = session_timeout;
-                            server_state.sessions.set(&sid, session);
-                        }
+                if record_exists {
+                    // Existing session: bump last_accessed, no lifecycle fire.
+                    if let Some(mut session) = server_state.sessions.get(&sid) {
+                        session.last_accessed_secs = now_epoch_secs();
+                        session.timeout_secs = session_timeout;
+                        server_state.sessions.set(&sid, session);
                     }
+                } else if lazy_session_creation {
+                    // Lazy: defer record creation + onSessionStart until
+                    // the first write to session scope. Keep any cookie
+                    // sid intact so a re-used cookie value sticks.
+                    self.session_lazy_pending = true;
+                } else {
+                    // Eager: create the record and fire onSessionStart now.
+                    // Mint a fresh id if the embedder didn't supply one
+                    // (e.g. a request with no CFID cookie). The embedder
+                    // reads `vm.session_id` back to emit Set-Cookie.
+                    let sid = if has_sid {
+                        sid
+                    } else {
+                        let new_sid = uuid::Uuid::new_v4().to_string();
+                        self.session_id = Some(new_sid.clone());
+                        new_sid
+                    };
+                    let now = now_epoch_secs();
+                    server_state.sessions.set(
+                        &sid,
+                        SessionData {
+                            variables: IndexMap::new(),
+                            created_secs: now,
+                            last_accessed_secs: now,
+                            auth_user: None,
+                            auth_roles: Vec::new(),
+                            timeout_secs: session_timeout,
+                        },
+                    );
+                    self.session_record_created = true;
+                    let _ = self.call_lifecycle_method(&mut template, "onSessionStart", vec![]);
                 }
             }
         }
@@ -11247,8 +11399,10 @@ impl CfmlVirtualMachine {
             }
         }
 
-        // 10. Clear request scope
+        // 10. Clear request scope + stashed Application.cfc template.
         self.request_scope.clear();
+        self.app_cfc_template = None;
+        self.session_lazy_pending = false;
 
         result
     }
