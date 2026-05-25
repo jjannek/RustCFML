@@ -19,7 +19,11 @@ pub mod scopes;
 #[cfg(target_arch = "wasm32")]
 pub mod handler;
 #[cfg(target_arch = "wasm32")]
+pub mod kv_stores;
+#[cfg(target_arch = "wasm32")]
 pub use handler::handle_fetch;
+#[cfg(target_arch = "wasm32")]
+pub use kv_stores::{KvBackedApplicationStore, KvBackedSessionStore};
 
 #[cfg(target_arch = "wasm32")]
 use worker::kv::KvStore;
@@ -66,6 +70,14 @@ pub struct WorkerConfig {
     /// mtime stamps, never re-checks). Default `true` for Workers since
     /// embedded files don't change mid-isolate.
     pub production_mode: bool,
+
+    /// Names of CFML applications (Application.cfc `this.name`) that should
+    /// be primed from `kv_application` at the start of each request. Without
+    /// this list, application scope only persists within a single isolate.
+    pub app_names: Vec<String>,
+
+    /// Cookie name to read/write the session id from. Defaults to `"CFID"`.
+    pub session_cookie_name: String,
 }
 
 impl WorkerConfig {
@@ -86,6 +98,8 @@ impl WorkerConfig {
             #[cfg(target_arch = "wasm32")]
             d1_datasources: Vec::new(),
             production_mode: true,
+            app_names: Vec::new(),
+            session_cookie_name: "CFID".into(),
         }
     }
 }

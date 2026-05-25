@@ -3,6 +3,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use crate::embedded_vfs::EmbeddedVfs;
+use crate::kv_stores::{KvBackedApplicationStore, KvBackedSessionStore};
 use crate::scopes;
 use crate::WorkerConfig;
 use cfml_codegen::compiler::CfmlCompiler;
@@ -11,7 +12,7 @@ use cfml_common::vfs::Vfs;
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
 use cfml_vm::web::resolve_file;
-use cfml_vm::{CfmlVirtualMachine, ServerState};
+use cfml_vm::{ApplicationStore, CfmlVirtualMachine, MemoryApplicationStore, MemoryStore, ServerState, SessionStore};
 use indexmap::IndexMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use worker::*;
 pub async fn handle_fetch(
     mut req: Request,
     _env: Env,
-    _ctx: Context,
+    ctx: Context,
     config: &WorkerConfig,
 ) -> Result<Response> {
     let vfs: Arc<dyn Vfs> = Arc::new(EmbeddedVfs::new(
@@ -68,20 +69,61 @@ pub async fn handle_fetch(
             Err(e) => return Response::error(format!("scope build error: {e:?}"), 500),
         };
 
+    // Discover session id from the cookie scope built above; mint one if
+    // missing. The Set-Cookie header is added to the response below.
+    let cookie_struct = globals.get("cookie").cloned();
+    let session_id = extract_session_id(&cookie_struct, &config.session_cookie_name);
+    let (session_id, issued_new_session) = match session_id {
+        Some(id) => (id, false),
+        None => (mint_session_id(), true),
+    };
+
     // Register D1 datasources for this request. The D1Driver impl lives in
     // crate::d1_driver and is wired up in step 8.
     if !config.d1_datasources.is_empty() {
         // Placeholder: D1 driver implementation lands in step 8.
     }
 
-    // ServerState lives per-isolate so application/session/bytecode caches
-    // survive within a single isolate. We don't currently reuse the same
-    // ServerState across `handle_fetch` calls in this isolate — see the
-    // module-level TODO; that's wired in step 7.
-    let server_state = ServerState::with_production(config.production_mode);
+    // Build ServerState with KV-backed stores when bindings are present.
+    // Sessions get primed from KV before the VM runs; applications get
+    // primed by name from `config.app_names`.
+    let kv_session_store = config
+        .kv_sessions
+        .as_ref()
+        .map(|kv| Arc::new(KvBackedSessionStore::new(kv.clone())));
+    let kv_app_store = config
+        .kv_application
+        .as_ref()
+        .map(|kv| Arc::new(KvBackedApplicationStore::new(kv.clone())));
+
+    if let Some(store) = kv_session_store.as_ref() {
+        let _ = store.prime(&session_id).await;
+    }
+    if let Some(store) = kv_app_store.as_ref() {
+        for name in &config.app_names {
+            let _ = store.prime(name).await;
+        }
+    }
+
+    let mut server_state = ServerState::with_production(config.production_mode);
+    server_state.sessions = match &kv_session_store {
+        Some(s) => s.clone() as Arc<dyn SessionStore>,
+        None => Arc::new(MemoryStore::new()),
+    };
+    server_state.applications = match &kv_app_store {
+        Some(a) => a.clone() as Arc<dyn ApplicationStore>,
+        None => Arc::new(MemoryApplicationStore::new()),
+    };
 
     // Execute
-    let response_data = match run_cfml(&file_path, vfs, globals, http_request_data, &server_state) {
+    let response_data = match run_cfml(
+        &file_path,
+        vfs,
+        globals,
+        http_request_data,
+        &server_state,
+        Some(session_id.clone()),
+    ) {
         Ok(r) => r,
         Err(msg) => {
             let mut headers = Headers::new();
@@ -108,9 +150,53 @@ pub async fn handle_fetch(
         headers.append(&k, &v)?;
     }
 
+    if issued_new_session {
+        let cookie = format!(
+            "{}={}; Path=/; HttpOnly; SameSite=Lax",
+            config.session_cookie_name, session_id
+        );
+        headers.append("Set-Cookie", &cookie)?;
+    }
+
+    // Flush dirty state back to KV after the response is built.
+    if let Some(store) = kv_session_store.as_ref() {
+        store.flush(&ctx);
+    }
+    if let Some(store) = kv_app_store.as_ref() {
+        store.flush(&ctx);
+    }
+
     Ok(Response::ok(response_data.output)?
         .with_status(status)
         .with_headers(headers))
+}
+
+fn extract_session_id(
+    cookie_struct: &Option<CfmlValue>,
+    cookie_name: &str,
+) -> Option<String> {
+    let CfmlValue::Struct(map) = cookie_struct.as_ref()? else {
+        return None;
+    };
+    for (k, v) in map.iter() {
+        if k.eq_ignore_ascii_case(cookie_name) {
+            let s = v.as_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn mint_session_id() -> String {
+    // Use the clock module + a hashed PRNG seed via the existing UUID-like
+    // helper in stdlib? Simpler: hex-encode now + a random suffix from
+    // js_sys::Math::random.
+    let nanos = cfml_common::clock::now_unix_nanos();
+    let r1 = (js_sys::Math::random() * (u32::MAX as f64)) as u32;
+    let r2 = (js_sys::Math::random() * (u32::MAX as f64)) as u32;
+    format!("{:016X}{:08X}{:08X}", nanos as u64, r1, r2)
 }
 
 struct ResponseData {
@@ -127,6 +213,7 @@ fn run_cfml(
     extra_globals: IndexMap<String, CfmlValue>,
     http_request_data: CfmlValue,
     server_state: &ServerState,
+    session_id: Option<String>,
 ) -> std::result::Result<ResponseData, String> {
     // Read source (compile path uses VFS via compile_file_cached, but we
     // also want the source for the first-compile path when the file isn't
@@ -176,9 +263,7 @@ fn run_cfml(
     vm.apply_cfconfig(&server_state.cfconfig);
     vm.server_state = Some(server_state.clone());
     vm.http_request_data = Some(http_request_data);
-
-    // Cookie-based session id (read from globals["cookie"]["cfid"]) — wired
-    // in step 7 alongside KvSessionStore.
+    vm.session_id = session_id;
 
     let result = vm.execute_with_lifecycle();
     let result = match result {
