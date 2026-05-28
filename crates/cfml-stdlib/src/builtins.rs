@@ -663,7 +663,63 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("metaphone".into(), fn_metaphone);
     f.insert("toScript".into(), fn_to_script);
 
+    // ---- S3 functions (gated on `s3` feature) ----
+    #[cfg(feature = "s3")]
+    {
+        f.insert("s3Read".into(), crate::s3_builtins::fn_s3_read);
+        f.insert("s3ReadBinary".into(), crate::s3_builtins::fn_s3_read_binary);
+        f.insert("s3Write".into(), crate::s3_builtins::fn_s3_write);
+        f.insert("s3Upload".into(), crate::s3_builtins::fn_s3_upload);
+        f.insert("s3Download".into(), crate::s3_builtins::fn_s3_download);
+        f.insert("s3ListBuckets".into(), crate::s3_builtins::fn_s3_list_buckets);
+        f.insert("s3ListBucket".into(), crate::s3_builtins::fn_s3_list_bucket);
+        f.insert("s3CreateBucket".into(), crate::s3_builtins::fn_s3_create_bucket);
+        f.insert("s3Delete".into(), crate::s3_builtins::fn_s3_delete);
+        f.insert("s3ClearBucket".into(), crate::s3_builtins::fn_s3_clear_bucket);
+        f.insert("s3Exists".into(), crate::s3_builtins::fn_s3_exists);
+        f.insert("s3Copy".into(), crate::s3_builtins::fn_s3_copy);
+        f.insert("s3Move".into(), crate::s3_builtins::fn_s3_move);
+        f.insert("s3GetMetaData".into(), crate::s3_builtins::fn_s3_get_metadata);
+        f.insert(
+            "s3GeneratePresignedURL".into(),
+            crate::s3_builtins::fn_s3_generate_presigned_url,
+        );
+        f.insert("s3GenerateURI".into(), crate::s3_builtins::fn_s3_generate_uri);
+        f.insert("storeGetMetadata".into(), crate::s3_builtins::fn_store_get_metadata);
+    }
+    #[cfg(not(feature = "s3"))]
+    {
+        for name in &[
+            "s3Read",
+            "s3ReadBinary",
+            "s3Write",
+            "s3Upload",
+            "s3Download",
+            "s3ListBuckets",
+            "s3ListBucket",
+            "s3CreateBucket",
+            "s3Delete",
+            "s3ClearBucket",
+            "s3Exists",
+            "s3Copy",
+            "s3Move",
+            "s3GetMetaData",
+            "s3GeneratePresignedURL",
+            "s3GenerateURI",
+            "storeGetMetadata",
+        ] {
+            f.insert((*name).into(), fn_s3_unavailable_stub);
+        }
+    }
+
     f
+}
+
+#[cfg(not(feature = "s3"))]
+fn fn_s3_unavailable_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime(
+        "S3 support not compiled in. Rebuild with `--features s3` on cfml-stdlib.".to_string(),
+    ))
 }
 
 fn create_builtin_func(name: &str) -> CfmlValue {

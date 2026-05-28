@@ -280,6 +280,7 @@ RustCFML covers a substantial portion of the CFML language:
 - **Web server** — Application.cfc lifecycle, sessions, cookies, authentication, URL rewriting, file uploads, component mappings
 - **Database** — `queryExecute` with SQLite, MySQL, PostgreSQL, MSSQL; connection pooling, `cfqueryparam`, `cftransaction`
 - **HTTP client** — `cfhttp`/`cfhttpparam` for GET/POST/PUT/DELETE/PATCH
+- **Object storage** — full AWS S3 + S3-compatible (Cloudflare R2, MinIO, DigitalOcean Spaces) support, both via explicit `S3*` functions and transparent `s3://` paths in `fileRead` / `fileWrite` / `directoryList` / etc. Key-prefix scoping and Application.cfc s3 mappings included. See [docs/s3.md](docs/s3.md)
 - **Email** — `cfmail`/`cfmailparam`/`cfmailpart` with SMTP sending
 - **Threading** — `cfthread` tag (sequential execution model)
 - **Closures** — scope capture with parent write-back, arrow functions, spread operator
@@ -333,6 +334,33 @@ for (name, func) in get_builtin_functions() { vm.builtins.insert(name, func); }
 vm.execute().unwrap();
 println!("{}", vm.output_buffer);
 ```
+
+## Object Storage (S3 / R2 / MinIO)
+
+```cfml
+// Explicit S3* functions
+s3Write("my-bucket", "logs/today.txt", "hello");
+s3Read("my-bucket", "logs/today.txt");
+
+// Transparent s3:// in normal file/directory functions
+fileWrite("s3://my-bucket/logs/today.txt", "hello");
+fileRead("s3://my-bucket/logs/today.txt");
+directoryList("s3://my-bucket/logs/");
+
+// Application.cfc — credentials, key-prefix scoping, and s3:// mappings
+this.s3 = {
+    accessKeyId:  "AKIA…",
+    awsSecretKey: "…",
+    defaultLocation: "us-east-1",      // "auto" for R2
+    host: "",                          // R2/MinIO endpoint, blank for AWS
+    keyPrefix: "myapp/"                // optional scope
+};
+this.mappings["/logs"] = "s3://KEY:SECRET@my-bucket/logs/";
+```
+
+Works with AWS S3, Cloudflare R2, MinIO, DigitalOcean Spaces, Backblaze B2, Wasabi, etc. Full documentation: [docs/s3.md](docs/s3.md).
+
+**Cloudflare Workers note:** S3 is not yet available in the WASM/Worker build — the AWS SDK uses tokio/hyper transport which doesn't compile on `wasm32-unknown-unknown`. For Workers, use the native R2 binding via [RustCFMLWorker](https://github.com/RustCFML/RustCFMLWorker)'s host config. A `fetch()`-backed S3 transport for the WASM target is on the roadmap — see [docs/s3.md](docs/s3.md#wasm--cloudflare-workers).
 
 ## Compiling to WebAssembly
 

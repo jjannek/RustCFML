@@ -25,9 +25,9 @@ cfml-common = { workspace = true }
 cfml-config = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-codegen = { workspace = true }
-cfml-vm = { workspace = true }
+cfml-vm = { workspace = true, features = ["s3"] }
 indexmap = { workspace = true }
-cfml-stdlib = { workspace = true, features = ["all-databases", "xml"] }
+cfml-stdlib = { workspace = true, features = ["all-databases", "xml", "s3"] }
 log = { workspace = true }
 env_logger = "0.11"
 clap = { version = "4.0", features = ["derive"] }

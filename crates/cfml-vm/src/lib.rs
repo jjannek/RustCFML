@@ -11,6 +11,8 @@ use std::time::SystemTime;
 
 pub mod application_store;
 mod java_shims;
+#[cfg(feature = "s3")]
+mod s3_vfs;
 pub mod session_store;
 pub mod web;
 pub use application_store::{ApplicationStore, MemoryApplicationStore};
@@ -4086,6 +4088,14 @@ impl CfmlVirtualMachine {
                     // Will be handled at the end of this function (needs VM access)
                 }
                 _ => {
+                    // S3 transparent VFS: intercept file/directory ops where the first
+                    // path argument is an `s3://` URL.
+                    #[cfg(feature = "s3")]
+                    {
+                        if let Some(result) = self.s3_intercept(&name_lower, &args) {
+                            return result;
+                        }
+                    }
                     // Sandbox mode: intercept file operations
                     if self.sandbox {
                         if let Some(result) = self.sandbox_intercept(&name_lower, &args) {

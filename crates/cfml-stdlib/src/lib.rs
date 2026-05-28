@@ -2,6 +2,10 @@
 
 pub mod builtins;
 pub mod db_driver;
+#[cfg(feature = "s3")]
+pub mod s3;
+#[cfg(feature = "s3")]
+pub mod s3_builtins;
 
 pub use builtins::*;
 pub use db_driver::{

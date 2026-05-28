@@ -26,6 +26,7 @@ all-databases = ["sqlite", "mysql_db", "postgres_db", "mssql_db"]
 xml = ["quick-xml"]
 html = ["scraper", "ego-tree"]
 zip_support = ["dep:zip"]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-credential-types", "dep:tokio", "tokio?/rt-multi-thread"]
 
 [dependencies]
 cfml-common = { workspace = true }
@@ -65,3 +66,6 @@ scraper = { version = "0.22", optional = true }
 ego-tree = { version = "0.10", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"], optional = true }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
+aws-config = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
+aws-credential-types = { version = "1", optional = true }

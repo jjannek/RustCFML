@@ -160,6 +160,11 @@ try { include "native/test_native_fn.cfm"; } catch (any e) { writeOutput("ERROR 
 try { include "native/test_native_class.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_class.cfm | " & e.message & chr(10)); }
 try { include "native/test_native_thread.cfm"; } catch (any e) { writeOutput("ERROR | native/test_native_thread.cfm | " & e.message & chr(10)); }
 try { include "native/test_cfc_extends_rust.cfm"; } catch (any e) { writeOutput("ERROR | native/test_cfc_extends_rust.cfm | " & e.message & chr(10)); }
+// S3 tests live under tests/s3/ but are excluded from the default runner —
+// they need live credentials (AWS / R2 / MinIO) to pass. Run the full S3
+// harness via /tmp/rustcfml-s3-harness/run_live.sh (see docs/s3.md), or
+// invoke a single file directly:
+//   cargo run -- tests/s3/test_s3_functions.cfm
 
 printSummary();
 </cfscript>

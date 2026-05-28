@@ -16,6 +16,7 @@ license.workspace = true
 cfml-common = { workspace = true }
 cfml-config = { workspace = true }
 cfml-compiler = { workspace = true }
+cfml-stdlib = { workspace = true, default-features = false, optional = true }
 indexmap = { workspace = true }
 cfml-codegen = { workspace = true }
 thiserror = { workspace = true }
@@ -37,3 +38,4 @@ cfml-stdlib = { workspace = true, default-features = false }
 [features]
 default = ["std"]
 std = []
+s3 = ["dep:cfml-stdlib", "cfml-stdlib/s3"]
