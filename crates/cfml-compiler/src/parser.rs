@@ -694,6 +694,42 @@ impl Parser {
             })));
         }
 
+        // Handle script-call-with-body forms for body-block tags:
+        //   cfsavecontent(variable="x") { body }
+        //   cflock(name="x", type="exclusive", timeout=10) { body }
+        //   cftransaction(...) { body }
+        //   cfmail(to="...", from="...", subject="...") { body }
+        // Plus the bare `transaction { body }` keyword form.
+        // These lower to the same bytecode as the angle-bracket tag forms.
+        if let Token::Identifier(ref nm) = self.peek(0).clone() {
+            let nlow = nm.to_lowercase();
+            let is_body_tag = matches!(nlow.as_str(),
+                "cfsavecontent" | "cflock" | "cftransaction" | "cfmail");
+            if is_body_tag && matches!(self.peek(1), Token::LParen) {
+                let saved = self.current;
+                self.advance(); // tag name
+                self.advance(); // (
+                let attrs = match self.parse_tag_call_attrs() {
+                    Ok(a) => a,
+                    Err(_) => { self.current = saved; Vec::new() }
+                };
+                if self.current != saved && self.check(&Token::RParen) {
+                    self.advance(); // )
+                    if self.check(&Token::LBrace) {
+                        let body = self.parse_block()?;
+                        return Ok(self.lower_script_body_tag(&nlow, attrs, body, stmt_loc));
+                    } else {
+                        self.current = saved;
+                    }
+                }
+            }
+            if nlow == "transaction" && matches!(self.peek(1), Token::LBrace) {
+                self.advance(); // consume 'transaction'
+                let body = self.parse_block()?;
+                return Ok(self.lower_script_body_tag("cftransaction", Vec::new(), body, stmt_loc));
+            }
+        }
+
         // Handle 'abort' keyword as __cfabort() call
         if matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "abort") {
             self.advance(); // consume 'abort'
@@ -1402,6 +1438,254 @@ impl Parser {
             else_branch: None,
             location: loc,
         })))
+    }
+
+    /// Parse a comma-separated `key = expr` list inside the parens of a
+    /// script-call-with-body tag invocation, e.g. `variable="x", timeout=10`.
+    /// Caller has already consumed the opening `(`; this stops at (but does
+    /// not consume) the matching `)`.
+    fn parse_tag_call_attrs(&mut self) -> Result<Vec<(String, Expression)>, ParseError> {
+        let mut attrs = Vec::new();
+        while !self.check(&Token::RParen) && !self.is_at_end() {
+            if !(self.is_identifier_like() && matches!(self.peek(1), Token::Equal)) {
+                return Err(ParseError {
+                    message: "expected key=value in tag call attributes".to_string(),
+                    line: 0, column: 0,
+                });
+            }
+            let key = self.extract_identifier()?;
+            self.consume(&Token::Equal)?;
+            let value = self.parse_expression()?;
+            attrs.push((key, value));
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(attrs)
+    }
+
+    /// Lower a script-call-with-body form (`cfsavecontent(...) { ... }`,
+    /// `cflock(...) { ... }`, `cftransaction(...) { ... }`, `cfmail(...) { ... }`)
+    /// into the same AST shape the angle-bracket tag forms produce.
+    fn lower_script_body_tag(
+        &self,
+        tag: &str,
+        attrs: Vec<(String, Expression)>,
+        body: Vec<Statement>,
+        loc: SourceLocation,
+    ) -> CfmlNode {
+        match tag {
+            "cfsavecontent" => {
+                let var_name = attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("variable"))
+                    .and_then(|(_, v)| match v {
+                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
+                        Expression::Identifier(id) => Some(id.name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "__savecontent_result".to_string());
+                let mut stmts = vec![Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cfsavecontent_start".to_string(),
+                            location: loc,
+                        })),
+                        arguments: vec![],
+                        location: loc,
+                    })),
+                    location: loc,
+                })];
+                stmts.extend(body);
+                stmts.push(Statement::Assignment(Assignment {
+                    target: AssignTarget::Variable(var_name),
+                    value: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cfsavecontent_end".to_string(),
+                            location: loc,
+                        })),
+                        arguments: vec![],
+                        location: loc,
+                    })),
+                    operator: AssignOp::Equal,
+                    location: loc,
+                }));
+                CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
+            }
+            "cflock" => {
+                let attrs_struct = Expression::Struct(Struct {
+                    pairs: attrs.iter().map(|(k, v)| (
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String(k.clone()),
+                            location: loc,
+                        }),
+                        v.clone(),
+                    )).collect(),
+                    ordered: false,
+                    location: loc,
+                });
+                let lock_name_expr = attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("name"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Expression::Literal(Literal {
+                        value: LiteralValue::String("default".to_string()),
+                        location: loc,
+                    }));
+                let lock_start = Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cflock_start".to_string(), location: loc,
+                        })),
+                        arguments: vec![attrs_struct],
+                        location: loc,
+                    })),
+                    location: loc,
+                });
+                let lock_end = Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cflock_end".to_string(), location: loc,
+                        })),
+                        arguments: vec![lock_name_expr],
+                        location: loc,
+                    })),
+                    location: loc,
+                });
+                let try_stmt = Statement::Try(Try {
+                    body,
+                    catches: vec![],
+                    finally_body: Some(vec![lock_end]),
+                    location: loc,
+                });
+                CfmlNode::Statement(Statement::Output(Output {
+                    body: vec![lock_start, try_stmt],
+                    location: loc,
+                }))
+            }
+            "cftransaction" => {
+                // __cftransaction_start("begin"); try { body; __cftransaction_commit(); }
+                // catch (any e) { __cftransaction_rollback(); throw e; }
+                let action_expr = attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("action"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Expression::Literal(Literal {
+                        value: LiteralValue::String("begin".to_string()),
+                        location: loc,
+                    }));
+                let start = Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cftransaction_start".to_string(), location: loc,
+                        })),
+                        arguments: vec![action_expr],
+                        location: loc,
+                    })),
+                    location: loc,
+                });
+                let commit = Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cftransaction_commit".to_string(), location: loc,
+                        })),
+                        arguments: vec![],
+                        location: loc,
+                    })),
+                    location: loc,
+                });
+                let rollback = Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cftransaction_rollback".to_string(), location: loc,
+                        })),
+                        arguments: vec![],
+                        location: loc,
+                    })),
+                    location: loc,
+                });
+                let rethrow = Statement::Throw(Throw {
+                    message: Some(Expression::Identifier(Identifier {
+                        name: "__txn_e".to_string(), location: loc,
+                    })),
+                    type_: None,
+                    location: loc,
+                });
+                let mut try_body = body;
+                try_body.push(commit);
+                let try_stmt = Statement::Try(Try {
+                    body: try_body,
+                    catches: vec![Catch {
+                        var_type: Some("any".to_string()),
+                        var_name: "__txn_e".to_string(),
+                        body: vec![rollback, rethrow],
+                    }],
+                    finally_body: None,
+                    location: loc,
+                });
+                CfmlNode::Statement(Statement::Output(Output {
+                    body: vec![start, try_stmt],
+                    location: loc,
+                }))
+            }
+            "cfmail" => {
+                // Capture the body text via savecontent, then call __cfmail({...attrs, body: captured}).
+                let capture_var = "__cfmail_body_capture".to_string();
+                let mut stmts: Vec<Statement> = Vec::new();
+                stmts.push(Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cfsavecontent_start".to_string(), location: loc,
+                        })),
+                        arguments: vec![],
+                        location: loc,
+                    })),
+                    location: loc,
+                }));
+                stmts.extend(body);
+                stmts.push(Statement::Assignment(Assignment {
+                    target: AssignTarget::Variable(capture_var.clone()),
+                    value: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cfsavecontent_end".to_string(), location: loc,
+                        })),
+                        arguments: vec![],
+                        location: loc,
+                    })),
+                    operator: AssignOp::Equal,
+                    location: loc,
+                }));
+                // Build {attrs..., body: __cfmail_body_capture}
+                let mut pairs: Vec<(Expression, Expression)> = attrs.iter().map(|(k, v)| (
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String(k.clone()),
+                        location: loc,
+                    }),
+                    v.clone(),
+                )).collect();
+                pairs.push((
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String("body".to_string()),
+                        location: loc,
+                    }),
+                    Expression::Identifier(Identifier {
+                        name: capture_var, location: loc,
+                    }),
+                ));
+                let opts_struct = Expression::Struct(Struct {
+                    pairs, ordered: false, location: loc,
+                });
+                stmts.push(Statement::Expression(ExpressionStatement {
+                    expr: Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "__cfmail".to_string(), location: loc,
+                        })),
+                        arguments: vec![opts_struct],
+                        location: loc,
+                    })),
+                    location: loc,
+                }));
+                CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
+            }
+            _ => unreachable!("unknown body tag: {}", tag),
+        }
     }
 
     fn parse_lock(&mut self, loc: SourceLocation) -> Result<CfmlNode, ParseError> {

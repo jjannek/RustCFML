@@ -47,10 +47,16 @@ function testNoLeak() {
     return true;
 }
 testNoLeak();
+// `var leakTest` is scoped to testNoLeak's local — at template scope it
+// must not be visible. Engines disagree on what happens when nothing has
+// been written to template-scope `local` yet: Lucee throws ("variable
+// [local] doesn't exist"), RustCFML returns an empty struct. Either way
+// the leak didn't happen.
 leaked = false;
 try {
-    check = local.leakTest;
-    leaked = true;
+    if (structKeyExists(local, "leakTest")) {
+        leaked = true;
+    }
 } catch (any e) {
     leaked = false;
 }

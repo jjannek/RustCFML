@@ -1182,9 +1182,12 @@ impl CfmlVirtualMachine {
                     } else {
                         name.as_str()
                     };
-                    let val = if name_lower == "local" && is_inside_function {
-                        // `local` is the function-local scope — always the locals map,
-                        // even inside a CFC method (where `variables` is separate).
+                    let val = if name_lower == "local" {
+                        // `local` is the function-local scope inside functions; at
+                        // template scope CFML engines (Lucee/ACF/BoxLang) treat it
+                        // as an auto-vivifying struct on first subscript write.
+                        // Return the locals struct view either way — StoreLocal
+                        // merges the result back.
                         let mut scope = locals.clone();
                         scope.shift_remove("__variables");
                         CfmlValue::strukt(scope)
@@ -1318,9 +1321,7 @@ impl CfmlVirtualMachine {
                 BytecodeOp::TryLoadLocal(name) => {
                     // Safe load: returns Null for undefined vars (used by Elvis, null-safe, isNull)
                     let name_lower = name.to_lowercase();
-                    let val = if name_lower == "variables"
-                        || (name_lower == "local" && is_inside_function)
-                    {
+                    let val = if name_lower == "variables" || name_lower == "local" {
                         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
                             CfmlValue::Struct(vars.clone())
                         } else {
@@ -1353,8 +1354,9 @@ impl CfmlVirtualMachine {
                 BytecodeOp::StoreLocal(name) => {
                     if let Some(val) = stack.pop() {
                         let name_lower = name.to_lowercase();
-                        if name_lower == "local" && is_inside_function {
-                            // `local.X = Y` — write back into the function's locals,
+                        if name_lower == "local" {
+                            // `local.X = Y` — write back into the function's locals
+                            // (or the template-scope locals when called outside a function),
                             // NOT __variables (which is the component scope in CFC methods).
                             if let CfmlValue::Struct(s) = val {
                                 // Preserve __variables if present; merge everything else.
@@ -6286,7 +6288,11 @@ impl CfmlVirtualMachine {
                         })
                         .unwrap_or_else(|| self.get_default_datasource(parent_locals));
                     if datasource.is_empty() {
-                        return Err(CfmlError::runtime("cftransaction: no datasource specified and no default datasource configured".to_string()));
+                        // Lucee/ACF defer transaction-connection setup until a query
+                        // actually runs — `transaction { ... }` around non-query code
+                        // is allowed. Commit/rollback are already no-ops without a
+                        // connection, so we mirror that behaviour here.
+                        return Ok(CfmlValue::Null);
                     }
                     if let Some(txn_begin) = self.txn_begin {
                         let conn = txn_begin(&datasource)?;
@@ -9579,6 +9585,19 @@ impl CfmlVirtualMachine {
                     "__source_file".to_string(),
                     CfmlValue::String(cfc_path.clone()),
                 );
+                // Anonymous `component { ... }` declarations get __name = "Anonymous"
+                // baked in by the parser. Override with the dotted path the caller
+                // used (e.g. "oop.Greeter") so getMetadata(cfc).name matches Lucee/ACF.
+                let needs_override = match s.get("__name") {
+                    Some(CfmlValue::String(n)) => n == "Anonymous",
+                    _ => true,
+                };
+                if needs_override {
+                    s.insert(
+                        "__name".to_string(),
+                        CfmlValue::String(class_name.to_string()),
+                    );
+                }
             }
             // Inject functions added by cfinclude inside the component body
             // These were registered in user_functions during execution but aren't
