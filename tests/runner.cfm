@@ -166,5 +166,15 @@ try { include "native/test_cfc_extends_rust.cfm"; } catch (any e) { writeOutput(
 // invoke a single file directly:
 //   cargo run -- tests/s3/test_s3_functions.cfm
 
+// --- Cross-engine compatibility (Wheels framework gaps) ---
+// These tests exercise CFML behaviors Wheels depends on that are currently
+// gaps in RustCFML but pass on Lucee 7. Registered last so the existing
+// suite runs uninterrupted: the script-tag-body test below triggers a
+// fatal parse error in RustCFML that the surrounding try/catch can't
+// catch (an include parse error escapes the try wrapper).
+try { include "core/test_local_at_template_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_at_template_scope.cfm | " & e.message & chr(10)); }
+try { include "oop/test_metadata_name_value.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_metadata_name_value.cfm | " & e.message & chr(10)); }
+try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_script_syntax_body.cfm | " & e.message & chr(10)); }
+
 printSummary();
 </cfscript>
