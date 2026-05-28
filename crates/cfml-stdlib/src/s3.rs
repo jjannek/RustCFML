@@ -48,6 +48,20 @@ fn err(msg: impl Into<String>) -> CfmlError {
     CfmlError::new(msg.into(), CfmlErrorType::Custom("S3".to_string()))
 }
 
+/// AWS SDK errors `Display` very tersely ("service error") and hide the real
+/// detail in the `.source()` chain. This walks the chain and concatenates
+/// every level so the resulting `CfmlError` is actually diagnosable.
+fn fmt_sdk_err<E: std::error::Error>(e: &E) -> String {
+    let mut out = e.to_string();
+    let mut current: Option<&dyn std::error::Error> = e.source();
+    while let Some(src) = current {
+        out.push_str(": ");
+        out.push_str(&src.to_string());
+        current = src.source();
+    }
+    out
+}
+
 // ---------- S3 URL parsing ----------
 
 #[derive(Debug, Clone)]
@@ -385,12 +399,12 @@ pub fn s3_get_object(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>
             .key(key)
             .send()
             .await
-            .map_err(|e| err(format!("GetObject {}/{} failed: {}", bucket, key, e)))?;
+            .map_err(|e| err(format!("GetObject {}/{} failed: {}", bucket, key, fmt_sdk_err(&e))))?;
         let bytes = resp
             .body
             .collect()
             .await
-            .map_err(|e| err(format!("GetObject {}/{} body read failed: {}", bucket, key, e)))?
+            .map_err(|e| err(format!("GetObject {}/{} body read failed: {}", bucket, key, fmt_sdk_err(&e))))?
             .into_bytes()
             .to_vec();
         Ok(bytes)
@@ -415,7 +429,7 @@ pub fn s3_put_object(
         }
         req.send()
             .await
-            .map_err(|e| err(format!("PutObject {}/{} failed: {}", bucket, key, e)))?;
+            .map_err(|e| err(format!("PutObject {}/{} failed: {}", bucket, key, fmt_sdk_err(&e))))?;
         Ok(())
     })
 }
@@ -429,7 +443,7 @@ pub fn s3_head_object(client: &Client, bucket: &str, key: &str) -> Result<bool, 
                 if s.contains("NotFound") || s.contains("404") {
                     Ok(false)
                 } else {
-                    Err(err(format!("HeadObject {}/{} failed: {}", bucket, key, e)))
+                    Err(err(format!("HeadObject {}/{} failed: {}", bucket, key, fmt_sdk_err(&e))))
                 }
             }
         }
@@ -445,7 +459,7 @@ pub fn s3_head_bucket(client: &Client, bucket: &str) -> Result<bool, CfmlError> 
                 if s.contains("NotFound") || s.contains("404") {
                     Ok(false)
                 } else {
-                    Err(err(format!("HeadBucket {} failed: {}", bucket, e)))
+                    Err(err(format!("HeadBucket {} failed: {}", bucket, fmt_sdk_err(&e))))
                 }
             }
         }
@@ -460,7 +474,7 @@ pub fn s3_delete_object(client: &Client, bucket: &str, key: &str) -> Result<(), 
             .key(key)
             .send()
             .await
-            .map_err(|e| err(format!("DeleteObject {}/{} failed: {}", bucket, key, e)))?;
+            .map_err(|e| err(format!("DeleteObject {}/{} failed: {}", bucket, key, fmt_sdk_err(&e))))?;
         Ok(())
     })
 }
@@ -481,7 +495,7 @@ pub fn s3_copy_object(
             .key(dst_key)
             .send()
             .await
-            .map_err(|e| err(format!("CopyObject {} -> {}/{} failed: {}", source, dst_bucket, dst_key, e)))?;
+            .map_err(|e| err(format!("CopyObject {} -> {}/{} failed: {}", source, dst_bucket, dst_key, fmt_sdk_err(&e))))?;
         Ok(())
     })
 }
@@ -517,7 +531,7 @@ pub fn s3_list_objects(
         let resp = req
             .send()
             .await
-            .map_err(|e| err(format!("ListObjectsV2 {} failed: {}", bucket, e)))?;
+            .map_err(|e| err(format!("ListObjectsV2 {} failed: {}", bucket, fmt_sdk_err(&e))))?;
 
         let mut out = Vec::new();
         for cp in resp.common_prefixes() {
@@ -564,7 +578,7 @@ pub fn s3_list_buckets(client: &Client) -> Result<Vec<S3BucketInfo>, CfmlError> 
             .list_buckets()
             .send()
             .await
-            .map_err(|e| err(format!("ListBuckets failed: {}", e)))?;
+            .map_err(|e| err(format!("ListBuckets failed: {}", fmt_sdk_err(&e))))?;
         let mut out = Vec::new();
         for b in resp.buckets() {
             out.push(S3BucketInfo {
@@ -596,7 +610,7 @@ pub fn s3_create_bucket(
         }
         req.send()
             .await
-            .map_err(|e| err(format!("CreateBucket {} failed: {}", bucket, e)))?;
+            .map_err(|e| err(format!("CreateBucket {} failed: {}", bucket, fmt_sdk_err(&e))))?;
         Ok(())
     })
 }
@@ -615,7 +629,7 @@ pub fn s3_delete_bucket(client: &Client, bucket: &str, force: bool) -> Result<()
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| err(format!("DeleteBucket {} failed: {}", bucket, e)))?;
+            .map_err(|e| err(format!("DeleteBucket {} failed: {}", bucket, fmt_sdk_err(&e))))?;
         Ok(())
     })
 }
@@ -640,7 +654,7 @@ pub fn s3_get_metadata(
             .key(key)
             .send()
             .await
-            .map_err(|e| err(format!("HeadObject {}/{} failed: {}", bucket, key, e)))?;
+            .map_err(|e| err(format!("HeadObject {}/{} failed: {}", bucket, key, fmt_sdk_err(&e))))?;
 
         let mut out = IndexMap::new();
         if let Some(ct) = resp.content_type() {
@@ -696,21 +710,21 @@ pub fn s3_generate_presigned_url(
                 .key(key)
                 .presigned(cfg)
                 .await
-                .map_err(|e| err(format!("presign PUT failed: {}", e)))?,
+                .map_err(|e| err(format!("presign PUT failed: {}", fmt_sdk_err(&e))))?,
             "DELETE" => client
                 .delete_object()
                 .bucket(bucket)
                 .key(key)
                 .presigned(cfg)
                 .await
-                .map_err(|e| err(format!("presign DELETE failed: {}", e)))?,
+                .map_err(|e| err(format!("presign DELETE failed: {}", fmt_sdk_err(&e))))?,
             _ => client
                 .get_object()
                 .bucket(bucket)
                 .key(key)
                 .presigned(cfg)
                 .await
-                .map_err(|e| err(format!("presign GET failed: {}", e)))?,
+                .map_err(|e| err(format!("presign GET failed: {}", fmt_sdk_err(&e))))?,
         };
         Ok(presigned.uri().to_string())
     })
