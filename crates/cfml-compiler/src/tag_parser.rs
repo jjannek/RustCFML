@@ -1834,10 +1834,40 @@ fn parse_cfloop_tag(
     } else if let Some(condition) = attrs.get("condition") {
         let condition = strip_hashes(condition);
         (format!("while ({}) {{\n", condition), consumed)
-    } else if let (Some(array), Some(index)) = (attrs.get("array"), attrs.get("index")) {
+    } else if let Some(array) = attrs.get("array") {
         let array = strip_hashes(array);
-        let index = strip_hashes(index);
-        (format!("for (var {} in {}) {{\n", index, array), consumed)
+        if let (Some(item), Some(index)) = (attrs.get("item"), attrs.get("index")) {
+            let item = strip_hashes(item);
+            let index = strip_hashes(index);
+            let array_var = format!("__cfloop_array_{}", consumed);
+            let index_var = format!("__cfloop_index_{}", consumed);
+            (
+                format!(
+                    "var {} = {};\nfor (var {} = 1; {} <= arrayLen({}); {} = {} + 1) {{\n{} = {};\n{} = {}[{}];\n",
+                    array_var,
+                    array,
+                    index_var,
+                    index_var,
+                    array_var,
+                    index_var,
+                    index_var,
+                    index,
+                    index_var,
+                    item,
+                    array_var,
+                    index_var
+                ),
+                consumed,
+            )
+        } else if let Some(item) = attrs.get("item").or_else(|| attrs.get("index")) {
+            let item = strip_hashes(item);
+            (format!("for (var {} in {}) {{\n", item, array), consumed)
+        } else {
+            (
+                "throw(\"cfloop array requires an item or index attribute.\");\n".to_string(),
+                consumed,
+            )
+        }
     } else if let (Some(list), Some(index)) = (attrs.get("list"), attrs.get("index")) {
         // If the list contains #expr#, strip hashes to get the expression.
         // Otherwise treat it as a string literal and quote it.
