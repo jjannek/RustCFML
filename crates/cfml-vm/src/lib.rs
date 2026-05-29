@@ -5611,7 +5611,16 @@ impl CfmlVirtualMachine {
 
                     // Canonicalize if it exists, otherwise return the joined path
                     let path_str = resolved.to_string_lossy().to_string();
-                    let result = self.vfs.canonicalize(&path_str).unwrap_or(path_str);
+                    let mut result = self.vfs.canonicalize(&path_str).unwrap_or(path_str);
+                    // Preserve a trailing slash from the input. Lucee/ACF/BoxLang
+                    // mirror the input's trailing slash on the output; canonicalize
+                    // strips it for existing paths, so reapply when the caller had one.
+                    if (rel.ends_with('/') || rel.ends_with('\\'))
+                        && !result.ends_with('/')
+                        && !result.ends_with('\\')
+                    {
+                        result.push('/');
+                    }
                     return Ok(CfmlValue::String(result));
                 }
                 "isdefined" => {
