@@ -5,7 +5,7 @@ use cfml_common::dynamic::CfmlValue;
 use cfml_common::vfs::{RealFs, Vfs};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
@@ -42,8 +42,12 @@ pub struct ApplicationState {
     /// Bytecode functions added during onApplicationStart (factory, resources, etc.).
     /// Only the delta (functions added after load_application_cfc) is cached.
     pub cached_functions: Vec<std::sync::Arc<cfml_codegen::compiler::BytecodeFunction>>,
-    /// The program.functions.len() at which cached_functions were originally inserted.
-    /// Used to compute index offsets when restoring on subsequent requests.
+    /// Original program indices for `cached_functions`.
+    /// Restoring app-scope CFCs has to remap each sparse original index to the
+    /// compact position where the cached functions are appended for a request.
+    pub cached_function_indices: Vec<usize>,
+    /// Legacy contiguous-cache anchor. Used only for application states created
+    /// before `cached_function_indices` existed in this process.
     pub cached_functions_original_offset: usize,
     /// Value of `this.sessionStorage` from Application.cfc — name of the cache to use
     /// for session storage. Overrides the server-wide `.cfconfig.json` setting.
@@ -9552,6 +9556,181 @@ impl CfmlVirtualMachine {
         }
     }
 
+    fn application_scope_function_indices(scope: &IndexMap<String, CfmlValue>) -> Vec<usize> {
+        let mut indices = Vec::new();
+        let mut seen_indices = HashSet::new();
+        let mut visited = HashSet::new();
+        for value in scope.values() {
+            Self::collect_function_indices(value, &mut indices, &mut seen_indices, &mut visited);
+        }
+        indices.sort_unstable();
+        indices
+    }
+
+    fn collect_function_indices(
+        value: &CfmlValue,
+        indices: &mut Vec<usize>,
+        seen_indices: &mut HashSet<usize>,
+        visited: &mut HashSet<(u8, usize)>,
+    ) {
+        match value {
+            CfmlValue::Function(function) => {
+                Self::collect_function_indices_from_function(
+                    function,
+                    indices,
+                    seen_indices,
+                    visited,
+                );
+            }
+            CfmlValue::Struct(values) => {
+                let ptr = values.backing_ptr();
+                if !visited.insert((1, ptr)) {
+                    return;
+                }
+                for (_, value) in values.iter() {
+                    Self::collect_function_indices(&value, indices, seen_indices, visited);
+                }
+            }
+            CfmlValue::Array(values) => {
+                let ptr = values.backing_ptr();
+                if !visited.insert((2, ptr)) {
+                    return;
+                }
+                for value in values.iter() {
+                    Self::collect_function_indices(&value, indices, seen_indices, visited);
+                }
+            }
+            CfmlValue::QueryColumn(values) => {
+                let ptr = Arc::as_ptr(values) as usize;
+                if !visited.insert((4, ptr)) {
+                    return;
+                }
+                for value in values.iter() {
+                    Self::collect_function_indices(value, indices, seen_indices, visited);
+                }
+            }
+            CfmlValue::Component(component) => {
+                for value in component.properties.values() {
+                    Self::collect_function_indices(value, indices, seen_indices, visited);
+                }
+                for function in component.methods.values() {
+                    Self::collect_function_indices_from_function(
+                        function,
+                        indices,
+                        seen_indices,
+                        visited,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_function_indices_from_function(
+        function: &cfml_common::dynamic::CfmlFunction,
+        indices: &mut Vec<usize>,
+        seen_indices: &mut HashSet<usize>,
+        visited: &mut HashSet<(u8, usize)>,
+    ) {
+        if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = function.body {
+            if let CfmlValue::Int(idx) = body.as_ref() {
+                let idx = *idx as usize;
+                if seen_indices.insert(idx) {
+                    indices.push(idx);
+                }
+            }
+        }
+        if let Some(shared_scope) = &function.captured_scope {
+            let ptr = Arc::as_ptr(shared_scope) as usize;
+            if !visited.insert((3, ptr)) {
+                return;
+            }
+            if let Ok(scope) = shared_scope.read() {
+                for value in scope.values() {
+                    Self::collect_function_indices(value, indices, seen_indices, visited);
+                }
+            }
+        }
+    }
+
+    fn remap_func_indices(
+        val: &mut CfmlValue,
+        index_map: &HashMap<usize, usize>,
+        visited: &mut HashSet<(u8, usize)>,
+    ) {
+        match val {
+            CfmlValue::Function(function) => {
+                if let cfml_common::dynamic::CfmlClosureBody::Expression(ref mut body) =
+                    function.body
+                {
+                    if let CfmlValue::Int(ref mut idx) = body.as_mut() {
+                        if let Some(new_idx) = index_map.get(&(*idx as usize)) {
+                            *idx = *new_idx as i64;
+                        }
+                    }
+                }
+                if let Some(shared_scope) = &function.captured_scope {
+                    let ptr = Arc::as_ptr(shared_scope) as usize;
+                    if !visited.insert((3, ptr)) {
+                        return;
+                    }
+                    if let Ok(mut scope) = shared_scope.write() {
+                        let keys: Vec<String> = scope.keys().cloned().collect();
+                        for key in keys {
+                            if let Some(value) = scope.get_mut(&key) {
+                                Self::remap_func_indices(value, index_map, visited);
+                            }
+                        }
+                    }
+                }
+            }
+            CfmlValue::Struct(values) => {
+                let ptr = values.backing_ptr();
+                if !visited.insert((1, ptr)) {
+                    return;
+                }
+                values.with_write(|m| {
+                    for value in m.values_mut() {
+                        Self::remap_func_indices(value, index_map, visited);
+                    }
+                });
+            }
+            CfmlValue::Array(values) => {
+                let ptr = values.backing_ptr();
+                if !visited.insert((2, ptr)) {
+                    return;
+                }
+                values.with_write(|items| {
+                    for value in items.iter_mut() {
+                        Self::remap_func_indices(value, index_map, visited);
+                    }
+                });
+            }
+            CfmlValue::QueryColumn(values) => {
+                let ptr = Arc::as_ptr(values) as usize;
+                if !visited.insert((4, ptr)) {
+                    return;
+                }
+                for value in Arc::make_mut(values).iter_mut() {
+                    Self::remap_func_indices(value, index_map, visited);
+                }
+            }
+            CfmlValue::Component(component) => {
+                for value in component.properties.values_mut() {
+                    Self::remap_func_indices(value, index_map, visited);
+                }
+                for function in component.methods.values_mut() {
+                    let mut value = CfmlValue::Function(Box::new(function.clone()));
+                    Self::remap_func_indices(&mut value, index_map, visited);
+                    if let CfmlValue::Function(updated) = value {
+                        *function = *updated;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Get default datasource from application scope or request scope
     fn get_default_datasource(&self, parent_locals: &IndexMap<String, CfmlValue>) -> String {
         // Check application scope for datasource config
@@ -11585,6 +11764,7 @@ impl CfmlVirtualMachine {
                     started: false,
                     config: config.clone(),
                     cached_functions: Vec::new(),
+                    cached_function_indices: Vec::new(),
                     cached_functions_original_offset: 0,
                     session_storage: app_session_storage.clone(),
                     app_caches: app_caches.clone(),
@@ -11621,13 +11801,12 @@ impl CfmlVirtualMachine {
                             if let Some(ref server_state) = self.server_state.clone() {
                                 let new_funcs: Vec<_> =
                                     self.program.functions[funcs_before..].to_vec();
-                                server_state.applications.modify(
-                                    &app_name,
-                                    &mut |app| {
-                                        app.cached_functions = new_funcs.clone();
-                                        app.cached_functions_original_offset = funcs_before;
-                                    },
-                                );
+                                server_state.applications.modify(&app_name, &mut |app| {
+                                    app.cached_functions = new_funcs.clone();
+                                    app.cached_function_indices =
+                                        (funcs_before..funcs_after).collect();
+                                    app.cached_functions_original_offset = funcs_before;
+                                });
                             }
                         }
                     }
@@ -11650,6 +11829,7 @@ impl CfmlVirtualMachine {
                 // already has the page's functions + Application.cfc functions
                 // from load_application_cfc).
                 let cached = app_snapshot.cached_functions.clone();
+                let cached_indices = app_snapshot.cached_function_indices.clone();
                 let original_offset = app_snapshot.cached_functions_original_offset;
                 if !cached.is_empty() {
                     let new_offset = self.program.functions.len();
@@ -11657,7 +11837,24 @@ impl CfmlVirtualMachine {
 
                     // If functions ended up at a different offset than originally,
                     // fix up function indices in the application scope values.
-                    if new_offset != original_offset {
+                    if !cached_indices.is_empty() {
+                        let index_map: HashMap<usize, usize> = cached_indices
+                            .iter()
+                            .enumerate()
+                            .map(|(position, original_idx)| (*original_idx, new_offset + position))
+                            .collect();
+                        if let Some(ref app_scope) = self.application_scope {
+                            if let Ok(mut scope) = app_scope.lock() {
+                                let keys: Vec<String> = scope.keys().cloned().collect();
+                                let mut visited = HashSet::new();
+                                for key in keys {
+                                    if let Some(val) = scope.get_mut(&key) {
+                                        Self::remap_func_indices(val, &index_map, &mut visited);
+                                    }
+                                }
+                            }
+                        }
+                    } else if new_offset != original_offset {
                         let index_delta = new_offset as i64 - original_offset as i64;
                         if let Some(ref app_scope) = self.application_scope {
                             if let Ok(mut scope) = app_scope.lock() {
@@ -11846,13 +12043,35 @@ impl CfmlVirtualMachine {
                     let program_functions = self.program.functions.clone();
                     server_state.applications.modify(&app_name, &mut |app| {
                         app.variables = scope_snapshot.clone();
-                        // Refresh cache from current program. Use the
-                        // original offset captured the first time
-                        // onApplicationStart ran; that anchor stays
-                        // constant for the lifetime of the application.
+                        // Refresh the function cache to the bytecode functions
+                        // still reachable from application scope. This keeps
+                        // long-lived CFCs/factories callable across requests
+                        // without retaining stale functions from app-scope
+                        // values that were overwritten during this request.
                         let offset = app.cached_functions_original_offset;
-                        if offset > 0 && program_functions.len() > offset {
-                            app.cached_functions = program_functions[offset..].to_vec();
+                        let function_indices = Self::application_scope_function_indices(
+                            &scope_snapshot,
+                        )
+                        .into_iter()
+                        .filter(|idx| offset == 0 || *idx >= offset)
+                        .collect::<Vec<_>>();
+                        if !function_indices.is_empty() {
+                            if offset == 0 {
+                                app.cached_functions_original_offset = function_indices[0];
+                            }
+                            app.cached_function_indices = function_indices
+                                .into_iter()
+                                .filter(|idx| *idx < program_functions.len())
+                                .collect();
+                            app.cached_functions = app
+                                .cached_function_indices
+                                .iter()
+                                .map(|idx| program_functions[*idx].clone())
+                                .collect();
+                        } else {
+                            app.cached_functions_original_offset = 0;
+                            app.cached_function_indices.clear();
+                            app.cached_functions.clear();
                         }
                     });
                 }

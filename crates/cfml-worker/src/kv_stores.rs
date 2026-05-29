@@ -218,6 +218,7 @@ impl KvBackedApplicationStore {
                         started: false,
                         config: indexmap::IndexMap::new(),
                         cached_functions: Vec::new(),
+                        cached_function_indices: Vec::new(),
                         cached_functions_original_offset: 0,
                         session_storage: None,
                         app_caches: indexmap::IndexMap::new(),
