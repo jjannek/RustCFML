@@ -1500,8 +1500,43 @@ impl CfmlCompiler {
         } else {
             for_in.variable.clone()
         };
-        instructions.push(BytecodeOp::DeclareLocal(loop_var_name.clone()));
-        instructions.push(BytecodeOp::StoreLocal(loop_var_name));
+        if loop_var_name.contains('.') {
+            // Member-path loop variable (e.g. `ctx.item`, `this.wheels.folder`).
+            // Lucee/ACF/BoxLang assign the iterated value through the path each
+            // iteration. Emit a struct write-back chain: load the deepest
+            // parent, set the leaf property, then propagate the modified
+            // struct back up to the root local.
+            let segments: Vec<String> =
+                loop_var_name.split('.').map(|s| s.to_string()).collect();
+            let root = segments[0].clone();
+            let leaf = segments[segments.len() - 1].clone();
+            let intermediate = &segments[1..segments.len() - 1];
+            // Stack on entry: [element_value]
+            // Load deepest parent: root[.intermediate[0]...intermediate[n]]
+            instructions.push(BytecodeOp::LoadLocal(root.clone()));
+            for seg in intermediate {
+                instructions.push(BytecodeOp::GetProperty(seg.clone()));
+            }
+            // Stack: [element_value, deepest_parent]
+            instructions.push(BytecodeOp::Swap);
+            instructions.push(BytecodeOp::SetProperty(leaf));
+            // Stack: [modified_deepest_parent]
+            // Unwind: for each intermediate level (deepest -> shallowest),
+            // reload its parent and SetProperty back in.
+            for i in (0..intermediate.len()).rev() {
+                instructions.push(BytecodeOp::LoadLocal(root.clone()));
+                for seg in &intermediate[..i] {
+                    instructions.push(BytecodeOp::GetProperty(seg.clone()));
+                }
+                instructions.push(BytecodeOp::Swap);
+                instructions.push(BytecodeOp::SetProperty(intermediate[i].clone()));
+            }
+            // Stack: [modified_root]
+            instructions.push(BytecodeOp::StoreLocal(root));
+        } else {
+            instructions.push(BytecodeOp::DeclareLocal(loop_var_name.clone()));
+            instructions.push(BytecodeOp::StoreLocal(loop_var_name));
+        }
 
         self.loop_stack.push((Vec::new(), Vec::new()));
 

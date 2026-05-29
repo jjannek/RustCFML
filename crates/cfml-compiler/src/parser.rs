@@ -974,11 +974,13 @@ impl Parser {
         // Lookahead to detect for-in: scan past a (possibly dotted) identifier to find 'in'
         {
             let mut la = 0;
-            // First token must be an identifier or soft keyword
+            // First token must be an identifier, soft keyword, or `this`
+            // (Wheels-style `for (this.x.y in arr)` writes through the
+            // component instance — Lucee/ACF/BoxLang all accept it.)
             let is_ident_start = matches!(self.peek(la), Token::Identifier(_) | Token::Local
                 | Token::Param | Token::Output | Token::Required | Token::Default
                 | Token::Include | Token::Import | Token::Property | Token::Abstract
-                | Token::Final | Token::Static | Token::Lock);
+                | Token::Final | Token::Static | Token::Lock | Token::This);
             if is_ident_start {
                 la += 1;
                 // Skip dotted parts: .ident .ident ...
@@ -990,7 +992,12 @@ impl Parser {
                 }
                 if matches!(self.peek(la), Token::In) {
                     // It's a for-in loop — consume the dotted name
-                    let mut name = self.extract_identifier()?;
+                    let mut name = if matches!(self.peek(0), Token::This) {
+                        self.advance();
+                        "this".to_string()
+                    } else {
+                        self.extract_identifier()?
+                    };
                     while self.match_token(&Token::Dot) {
                         let part = self.extract_identifier()?;
                         name.push('.');
