@@ -1,8 +1,9 @@
 # cfml-worker JSPI bridge
 
-Lets `<cfquery datasource="...">` and `queryExecute(...)` in CFML talk to an
-async Cloudflare D1 binding from inside the synchronous CFML VM, via the V8
-JSPI (JavaScript Promise Integration) feature.
+Lets `<cfquery datasource="...">` and `queryExecute(...)` in CFML talk to a
+Postgres or MySQL database (proxied through a Cloudflare Hyperdrive binding)
+from inside the synchronous CFML VM, via the V8 JSPI (JavaScript Promise
+Integration) feature.
 
 ## How it works
 
@@ -23,7 +24,7 @@ In cfml-worker:
    ```rust
    #[wasm_bindgen(module = "/src/cfml_jspi.js")]
    extern "C" {
-       fn cfml_jspi_d1_query(
+       fn cfml_jspi_hyperdrive_query(
            req_ptr: u32, req_len: u32,
            resp_ptr: u32, resp_cap: u32,
        ) -> i32;
@@ -31,17 +32,19 @@ In cfml-worker:
    ```
    wasm-bindgen copies the JS file into its output `snippets/` directory at
    build time and rewrites the import path so esbuild can resolve it. The
-   snippet exports `cfml_jspi_d1_query` as a `WebAssembly.Suspending`, and
-   wasm-bindgen passes the value through unchanged for primitive signatures
-   — the Suspending object lands directly in the wasm import object.
+   snippet exports `cfml_jspi_hyperdrive_query` as a `WebAssembly.Suspending`,
+   and wasm-bindgen passes the value through unchanged for primitive
+   signatures — the Suspending object lands directly in the wasm import
+   object.
 
 2. The snippet (`src/cfml_jspi.js`) reads the request JSON out of wasm
-   memory, awaits the D1 call, and writes the response JSON back into a
-   wasm buffer the Rust side pre-allocated. No alloc/free round-trip
-   required.
+   memory, sniffs the Hyperdrive binding's `connectionString` to decide
+   between `postgres` (postgres.js) and `mysql2/promise`, awaits the
+   query, and writes the response JSON back into a wasm buffer the Rust
+   side pre-allocated. No alloc/free round-trip required.
 
-3. The Rust [`D1Driver`](../src/d1_driver.rs) decodes the response JSON and
-   returns a normal CFML query value to the VM.
+3. The Rust [`HyperdriveDriver`](../src/hyperdrive_driver.rs) decodes the
+   response JSON and returns a normal CFML query value to the VM.
 
 From the CFML programmer's view, `<cfquery>` blocks until the result is
 back — exactly the semantics CFML mandates.
@@ -74,8 +77,8 @@ RustCFMLWorker template for a working reference.
 
 ### 2. Register the active env before each fetch
 
-The suspending callback needs to look up the D1 binding on `env` by
-datasource name. Register it before invoking the wasm fetch:
+The suspending callback needs to look up the Hyperdrive binding on `env`
+by datasource name. Register it before invoking the wasm fetch:
 
 ```js
 globalThis.__cfmlJspi.setEnv(env);
@@ -94,8 +97,8 @@ as the wasm module is instantiated.
 
 | File | Role |
 |---|---|
-| `../src/jspi.rs` | Rust side — declares the wasm-bindgen extern + the sync wrapper `d1_query_sync()`. |
-| `../src/cfml_jspi.js` | The wasm-bindgen snippet — JS implementation of the Suspending import + globalThis env hooks. |
+| `../src/jspi.rs` | Rust side — declares the wasm-bindgen extern + the sync wrapper `hyperdrive_query_sync()`. |
+| `../src/cfml_jspi.js` | The wasm-bindgen snippet — JS implementation of the Suspending import + globalThis env hooks. Imports `postgres` and `mysql2/promise`, which the host worker project must declare as npm dependencies. |
 
 There are no longer any "drop-in" JS files to copy into your worker
 project. The snippet ships with the crate and is bundled automatically by
@@ -106,14 +109,19 @@ wasm-bindgen.
 - **Single in-flight env**: `globalThis.__cfmlJspi.setEnv` is a singleton.
   Workers' single-request-per-isolate model makes this safe today, but a
   future refactor may switch to per-request context tracking.
-- **No streaming**: `stmt.all()` materialises the full result set before
+- **No streaming**: the driver materialises the full result set before
   returning. For result sets larger than ~64KB the response buffer is
   retried once with a larger allocation; absurdly large queries should be
   paginated by the CFML caller.
-- **D1 only for now**: the same Suspending pattern extends to any async
-  Workers binding (R2, Queues, fetch service bindings). Each gets its own
-  extern + Suspending callback; the snippet is the natural place to add
-  them.
+- **Hyperdrive + DO so far**: the same Suspending pattern extends to any
+  async Workers binding (R2, Queues, fetch service bindings). Each gets
+  its own extern + Suspending callback; the snippet is the natural place
+  to add them.
+- **npm runtime deps**: the snippet `import`s `postgres` and
+  `mysql2/promise`. The host worker project must list these in its
+  `package.json` so esbuild can resolve them at build time. The dynamic
+  drivers are only constructed on first query, so a worker that never
+  queries pays only the (small) bundle-size cost.
 
 ## Durable Object–backed application scope
 

@@ -1,6 +1,6 @@
 [package]
 name = "cfml-worker"
-description = "Cloudflare Workers host glue for RustCFML — request routing, scope population, Application.cfc lifecycle, and KV/D1 plug-points."
+description = "Cloudflare Workers host glue for RustCFML — request routing, scope population, Application.cfc lifecycle, and KV/Hyperdrive plug-points."
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -24,7 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-worker = { version = "0.8", features = ["d1"] }
+worker = "0.8"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

@@ -1,7 +1,7 @@
 //! Cloudflare Workers host glue for RustCFML.
 //!
 //! A Worker project depends on this crate, supplies its embedded CFML files
-//! plus any KV/D1 bindings, and calls [`handle_fetch`] from its
+//! plus any KV/Hyperdrive bindings, and calls [`handle_fetch`] from its
 //! `#[event(fetch)]` entry. The rest of the request lifecycle — routing,
 //! cgi/url/form/cookie scope population, Application.cfc onRequestStart /
 //! onRequest / onRequestEnd / onApplicationStart / onSessionStart, bytecode
@@ -17,7 +17,7 @@ pub mod embedded_vfs;
 pub mod scopes;
 
 #[cfg(target_arch = "wasm32")]
-pub mod d1_driver;
+pub mod hyperdrive_driver;
 #[cfg(target_arch = "wasm32")]
 pub mod handler;
 #[cfg(target_arch = "wasm32")]
@@ -29,7 +29,7 @@ pub mod do_application_store;
 #[cfg(target_arch = "wasm32")]
 pub mod scheduled;
 #[cfg(target_arch = "wasm32")]
-pub use d1_driver::D1Driver;
+pub use hyperdrive_driver::HyperdriveDriver;
 #[cfg(target_arch = "wasm32")]
 pub use do_application_store::DoApplicationStore;
 #[cfg(target_arch = "wasm32")]
@@ -45,7 +45,7 @@ use worker::kv::KvStore;
 /// Configuration passed to [`handle_fetch`] on every request.
 ///
 /// Build it once at the top of your `fetch` handler from environment
-/// bindings — `worker::Env::kv("FOO")`, `worker::Env::d1("BAR")`, etc.
+/// bindings — `worker::Env::kv("FOO")`, `worker::Env::hyperdrive("BAR")`, etc.
 pub struct WorkerConfig {
     /// Embedded CFML file table (path → bytes), typically produced by your
     /// `build.rs`.
@@ -86,14 +86,17 @@ pub struct WorkerConfig {
     #[cfg(target_arch = "wasm32")]
     pub do_application: Option<worker::ObjectNamespace>,
 
-    /// Named D1 datasources to register before each request. The string is
-    /// the cfquery `datasource="..."` name; the binding is registered via
-    /// the dynamic-driver registry in `cfml-stdlib::db_driver`.
+    /// Named Hyperdrive datasources to register before each request. The
+    /// string is the cfquery `datasource="..."` name; the JS shim looks the
+    /// binding up by the same name on `env` at query time.
     ///
-    /// `D1Database` is not `Clone`, so callers wrap their binding in an
-    /// `Arc` once and pass the shared handle.
+    /// `worker::Hyperdrive` is not `Clone`, so callers wrap their binding in
+    /// an `Arc` once and pass the shared handle. The Rust side holds the
+    /// binding alive for the duration of the request; the actual SQL is
+    /// dispatched through the JSPI shim (postgres.js / mysql2).
     #[cfg(target_arch = "wasm32")]
-    pub d1_datasources: Vec<(String, std::sync::Arc<worker::d1::D1Database>)>,
+    pub hyperdrive_datasources:
+        Vec<(String, std::sync::Arc<worker::Hyperdrive>)>,
 
     /// Production mode toggles bytecode cache invalidation off (cache trusts
     /// mtime stamps, never re-checks). Default `true` for Workers since
@@ -127,7 +130,7 @@ impl WorkerConfig {
             #[cfg(target_arch = "wasm32")]
             do_application: None,
             #[cfg(target_arch = "wasm32")]
-            d1_datasources: Vec::new(),
+            hyperdrive_datasources: Vec::new(),
             production_mode: true,
             app_names: Vec::new(),
             session_cookie_name: "CFID".into(),

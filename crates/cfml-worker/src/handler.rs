@@ -80,13 +80,17 @@ pub async fn handle_fetch(
     let cookie_struct = globals.get("cookie").cloned();
     let cookie_session_id = extract_session_id(&cookie_struct, &config.session_cookie_name);
 
-    // Register D1 datasources for this request. The driver is a v1 stub —
-    // see crate::d1_driver for the async/sync gap that keeps cfquery
-    // against D1 from working end-to-end yet.
-    for (name, db) in &config.d1_datasources {
+    // Register Hyperdrive datasources for this request. The dynamic registry
+    // is process-global; re-registering by name each request lets the JS
+    // shim resolve the datasource name → binding on the current request's
+    // env.
+    for (name, binding) in &config.hyperdrive_datasources {
         cfml_stdlib::register_dynamic_datasource(
             name,
-            Arc::new(crate::d1_driver::D1Driver::new(name.clone(), Arc::clone(db))),
+            Arc::new(crate::hyperdrive_driver::HyperdriveDriver::new(
+                name.clone(),
+                Arc::clone(binding),
+            )),
         );
     }
 
@@ -278,7 +282,7 @@ fn run_cfml(
     // Wire queryExecute to the dynamic-driver-only variant. The worker
     // build of cfml-stdlib intentionally compiles without any per-engine
     // DB feature (sqlite/mysql/etc); all queries go through the
-    // dynamic-driver registry that the D1 driver registered above.
+    // dynamic-driver registry that the Hyperdrive driver registered above.
     vm.query_execute_fn = Some(cfml_stdlib::builtins::fn_query_execute_dynamic);
 
     vm.globals

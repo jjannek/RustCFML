@@ -1,23 +1,24 @@
-//! Cloudflare D1 driver for the cfml-stdlib dynamic-driver registry.
+//! Cloudflare Hyperdrive driver for the cfml-stdlib dynamic-driver registry.
 //!
 //! End-to-end path:
 //! 1. CFML calls `<cfquery datasource="main">...</cfquery>` or
 //!    `queryExecute("...", [...], {datasource: "main"})`.
 //! 2. `cfml-stdlib::fn_query_execute` looks up the dynamic registry by
-//!    name, finds a `D1Driver` registered by `cfml_worker::handle_fetch`.
+//!    name, finds a `HyperdriveDriver` registered by
+//!    `cfml_worker::handle_fetch`.
 //! 3. We serialize `(name, sql, params)` to JSON and call the JSPI extern
-//!    [`crate::jspi::d1_query_sync`].
-//! 4. JSPI suspends wasm, the JS shim awaits `db.prepare(sql).bind(...).all()`
-//!    against the D1 binding bound to the same name, packs the response
-//!    JSON back into wasm memory, resumes us.
+//!    [`crate::jspi::hyperdrive_query_sync`].
+//! 4. JSPI suspends wasm, the JS shim resolves the `env[name]` Hyperdrive
+//!    binding, reads its `connectionString`, sniffs `postgres://` vs
+//!    `mysql://`, awaits the query through `postgres` (postgres.js) or
+//!    `mysql2/promise`, packs the response JSON back into wasm memory,
+//!    resumes us.
 //! 5. We parse the response and shape it into the CFML query value the rest
-//!    of the language expects (records IndexMap + columnList + recordCount
-//!    + metadata).
+//!    of the language expects.
 //!
 //! Failure modes:
 //! - Shim missing → user-friendly error mentioning the wiring step.
-//! - SQL error from D1 → propagated as `CfmlError` with the original message.
-//! - Type mismatch in row data → preserved as best-effort string.
+//! - SQL error → propagated as `CfmlError` with the original message.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -27,23 +28,22 @@ use cfml_stdlib::DynamicDbDriver;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use worker::d1::D1Database;
+use worker::Hyperdrive;
 
-pub struct D1Driver {
+pub struct HyperdriveDriver {
     name: String,
-    /// Kept on the struct so `cfml-worker`'s handler can keep the binding
-    /// alive across the duration of a request; the JS shim itself doesn't
-    /// receive this handle — it looks up the binding by `name` against the
-    /// `env` it captured at instantiation.
+    /// Kept on the struct so the handler can hold the binding alive across
+    /// the request. The JS shim itself looks up the binding by `name` on the
+    /// `env` it captured at request start.
     #[allow(dead_code)]
-    db: Arc<D1Database>,
+    binding: Arc<Hyperdrive>,
 }
 
-impl D1Driver {
-    pub fn new(name: impl Into<String>, db: Arc<D1Database>) -> Self {
+impl HyperdriveDriver {
+    pub fn new(name: impl Into<String>, binding: Arc<Hyperdrive>) -> Self {
         Self {
             name: name.into(),
-            db,
+            binding,
         }
     }
 }
@@ -55,9 +55,6 @@ struct WireRequest<'a> {
     params: Vec<WireParam>,
 }
 
-/// Wire-format param values. We deliberately keep this narrow so the JS
-/// shim has unambiguous behaviour — D1's param binding accepts numbers,
-/// strings, null, ArrayBuffer (BLOB), and booleans-as-integers.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum WireParam {
@@ -76,8 +73,6 @@ impl WireParam {
             CfmlValue::Int(i) => WireParam::Int(*i),
             CfmlValue::Double(d) => WireParam::Float(*d),
             CfmlValue::String(s) => WireParam::Str(s.clone()),
-            // Anything else stringifies (date/time, etc.). D1 is SQLite-flavoured
-            // and accepts ISO-8601 strings for date/time columns.
             other => WireParam::Str(other.as_string()),
         }
     }
@@ -99,16 +94,12 @@ struct WireMeta {
     #[serde(default)]
     duration: f64,
     #[serde(default)]
-    rows_read: i64,
+    rows_affected: i64,
     #[serde(default)]
-    rows_written: i64,
-    #[serde(default)]
-    changes: i64,
-    #[serde(default)]
-    last_row_id: i64,
+    last_insert_id: i64,
 }
 
-impl DynamicDbDriver for D1Driver {
+impl DynamicDbDriver for HyperdriveDriver {
     fn execute(&self, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
         let params = match params_arg {
             CfmlValue::Array(arr) => arr.iter().map(WireParam::from_cfml).collect(),
@@ -123,22 +114,22 @@ impl DynamicDbDriver for D1Driver {
         };
         let request_json = serde_json::to_string(&req).map_err(|e| {
             CfmlError::runtime(format!(
-                "cfquery (D1 '{}'): could not serialize request: {}",
+                "cfquery (Hyperdrive '{}'): could not serialize request: {}",
                 self.name, e
             ))
         })?;
 
-        let response_json = crate::jspi::d1_query_sync(&request_json)?;
+        let response_json = crate::jspi::hyperdrive_query_sync(&request_json)?;
         let response: WireResponse = serde_json::from_str(&response_json).map_err(|e| {
             CfmlError::runtime(format!(
-                "cfquery (D1 '{}'): malformed shim response: {}",
+                "cfquery (Hyperdrive '{}'): malformed shim response: {}",
                 self.name, e
             ))
         })?;
 
         if !response.success {
             return Err(CfmlError::runtime(format!(
-                "cfquery (D1 '{}'): {}",
+                "cfquery (Hyperdrive '{}'): {}",
                 self.name,
                 response.error.unwrap_or_else(|| "unknown error".into())
             )));
@@ -185,16 +176,10 @@ fn json_to_cfml(v: serde_json::Value) -> CfmlValue {
     }
 }
 
-/// Build a CFML query value the rest of the engine recognises:
-/// `{recordCount, columnList, columns, data, _meta?}`. The existing
-/// per-driver code in cfml-stdlib uses the same shape, so downstream code
-/// (queryGetRow, query column access, cfdump, etc.) all just works.
 fn rows_to_query(
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
     meta: &WireMeta,
 ) -> CfmlValue {
-    // Column order: union of keys, in the order they first appear. D1
-    // returns row objects with consistent key ordering, but be defensive.
     let mut columns: Vec<String> = Vec::new();
     for row in &rows {
         for k in row.keys() {
@@ -206,12 +191,10 @@ fn rows_to_query(
 
     let record_count = rows.len();
 
-    // Convert to records: Vec of IndexMap<col, value>
     let mut records: Vec<CfmlValue> = Vec::with_capacity(record_count);
     for row in rows {
         let mut rec = IndexMap::new();
         for col in &columns {
-            // case-insensitive lookup back into the json map
             let val = row
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(col))
@@ -223,27 +206,29 @@ fn rows_to_query(
     }
 
     let mut q = IndexMap::new();
+    q.insert("recordCount".into(), CfmlValue::Int(record_count as i64));
+    q.insert("columnList".into(), CfmlValue::String(columns.join(",")));
     q.insert(
-        "recordCount".into(),
-        CfmlValue::Int(record_count as i64),
+        "columns".into(),
+        CfmlValue::array(
+            columns
+                .iter()
+                .map(|c| CfmlValue::String(c.clone()))
+                .collect(),
+        ),
     );
-    q.insert(
-        "columnList".into(),
-        CfmlValue::String(columns.join(",")),
-    );
-    q.insert("columns".into(), CfmlValue::array(
-        columns.iter().map(|c| CfmlValue::String(c.clone())).collect(),
-    ));
     q.insert("data".into(), CfmlValue::array(records));
 
-    // Driver metadata — useful for INSERTs / UPDATEs where you want
-    // generatedKey or RECORDCOUNT for changed rows.
     let mut driver_meta = IndexMap::new();
     driver_meta.insert("duration_ms".into(), CfmlValue::Double(meta.duration));
-    driver_meta.insert("rows_read".into(), CfmlValue::Int(meta.rows_read));
-    driver_meta.insert("rows_written".into(), CfmlValue::Int(meta.rows_written));
-    driver_meta.insert("changes".into(), CfmlValue::Int(meta.changes));
-    driver_meta.insert("last_row_id".into(), CfmlValue::Int(meta.last_row_id));
+    driver_meta.insert(
+        "rows_affected".into(),
+        CfmlValue::Int(meta.rows_affected),
+    );
+    driver_meta.insert(
+        "last_insert_id".into(),
+        CfmlValue::Int(meta.last_insert_id),
+    );
     q.insert("_meta".into(), CfmlValue::strukt(driver_meta));
 
     CfmlValue::strukt(q)
