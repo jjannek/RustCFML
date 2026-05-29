@@ -167,14 +167,31 @@ try { include "native/test_cfc_extends_rust.cfm"; } catch (any e) { writeOutput(
 //   cargo run -- tests/s3/test_s3_functions.cfm
 
 // --- Cross-engine compatibility (Wheels framework gaps) ---
-// These tests exercise CFML behaviors Wheels depends on that are currently
-// gaps in RustCFML but pass on Lucee 7. Registered last so the existing
-// suite runs uninterrupted: the script-tag-body test below triggers a
-// fatal parse error in RustCFML that the surrounding try/catch can't
-// catch (an include parse error escapes the try wrapper).
+// These tests exercise CFML behaviors Wheels depends on that pass on Lucee
+// 7 but are (or were) gaps in RustCFML. Registered last as a cluster;
+// none of them aborts the run on RustCFML, so ordering here is not
+// load-bearing -- each one fails its own assertions in isolation and the
+// run still reaches printSummary().
+//
+//   - local_at_template_scope, metadata_name_value, script_syntax_body:
+//     parse/behavioral gaps that 0.20.x has since closed; kept as
+//     regression tests -- they pass on both engines now.
+//   - expandpath_trailing_slash: behavioral gap, still open on 0.20.2 --
+//     for an EXISTING path, expandPath canonicalizes and drops the trailing
+//     slash, so the Wheels "appDir & '../plugins'" shape fuses into a
+//     malformed path. Fails its assertions but does NOT abort the run.
+//   - forin_member_loop_var: two distinct for-in gaps on 0.20.2, both
+//     non-fatal here. (1) A plain member-path loop var (ctx.item) PARSES
+//     but never iterates -- the body is silently skipped. (2) A `this`-
+//     headed loop var fails to PARSE, but that parse error is CONTAINED
+//     inside a runtime-instantiated fixture CFC (ForInThisLoopFixture),
+//     which degrades to a non-object silently instead of aborting. Both
+//     modes fail their assertions without taking down the run.
 try { include "core/test_local_at_template_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_at_template_scope.cfm | " & e.message & chr(10)); }
 try { include "oop/test_metadata_name_value.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_metadata_name_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_script_syntax_body.cfm | " & e.message & chr(10)); }
+try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
+try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_member_loop_var.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
