@@ -3897,6 +3897,17 @@ impl CfmlVirtualMachine {
                 return Ok(CfmlValue::Null);
             }
 
+            if matches!(name_lower.as_str(), "cfdirectory" | "__cfdirectory") {
+                if let Some(CfmlValue::Struct(opts)) = args.first() {
+                    let action = Self::struct_get_ci(opts, "action")
+                        .map(|v| v.as_string().to_lowercase())
+                        .unwrap_or_else(|| "list".to_string());
+                    if action == "list" {
+                        return self.cfdirectory_list_from_opts(opts);
+                    }
+                }
+            }
+
             // queryAppend: mutates the first query in-place, returns boolean.
             if name_lower == "queryappend" {
                 if let (Some(CfmlValue::Query(q1)), Some(CfmlValue::Query(q2))) =
@@ -10325,13 +10336,7 @@ impl CfmlVirtualMachine {
                         .map(|(_, v)| v.as_string().to_lowercase())
                         .unwrap_or_else(|| "list".to_string());
                     match action.as_str() {
-                        "list" => {
-                            let dir = opts.iter()
-                                .find(|(k, _)| k.to_lowercase() == "directory")
-                                .map(|(_, v)| v.as_string())
-                                .unwrap_or_default();
-                            Some(self.sandbox_directory_list(&dir, false, "query"))
-                        }
+                        "list" => Some(self.cfdirectory_list_from_opts(opts)),
                         _ => Some(Err(CfmlError::runtime(format!(
                             "cfdirectory action='{}': filesystem writes are disabled in sandbox mode", action
                         )))),
@@ -10400,6 +10405,105 @@ impl CfmlVirtualMachine {
                     .collect(),
             ))
         }
+    }
+
+    fn cfdirectory_list_from_opts(&self, opts: &IndexMap<String, CfmlValue>) -> CfmlResult {
+        let dir = Self::struct_get_ci(opts, "directory")
+            .map(|v| v.as_string())
+            .unwrap_or_default();
+        let filter = Self::struct_get_ci(opts, "filter")
+            .map(|v| v.as_string())
+            .unwrap_or_else(|| "*".to_string());
+        let recurse = Self::struct_get_ci(opts, "recurse")
+            .map(|v| v.is_true())
+            .unwrap_or(false);
+        match self.resolve_directory_path_with_mappings(&dir) {
+            Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter),
+            None => Err(CfmlError::runtime(format!(
+                "cfdirectory: directory not found: {}",
+                dir
+            ))),
+        }
+    }
+
+    fn struct_get_ci<'a>(
+        s: &'a IndexMap<String, CfmlValue>,
+        key: &str,
+    ) -> Option<&'a CfmlValue> {
+        s.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v)
+    }
+
+    fn sandbox_cfdirectory_list(&self, path: &str, recurse: bool, filter: &str) -> CfmlResult {
+        let mut entries = Vec::new();
+        self.sandbox_collect_entries(path, recurse, &mut entries)?;
+        entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
+
+        let mut names = Vec::new();
+        let mut dirs = Vec::new();
+        let mut sizes = Vec::new();
+        let mut types = Vec::new();
+        let mut dates = Vec::new();
+        for (name, full_path, is_dir) in &entries {
+            names.push(CfmlValue::String(name.clone()));
+            let directory = std::path::Path::new(full_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string());
+            dirs.push(CfmlValue::String(directory));
+            sizes.push(CfmlValue::Int(0));
+            types.push(CfmlValue::String(if *is_dir {
+                "Dir".to_string()
+            } else {
+                "File".to_string()
+            }));
+            dates.push(CfmlValue::String(String::new()));
+        }
+
+        let mut columns = IndexMap::new();
+        columns.insert("name".to_string(), CfmlValue::array(names));
+        columns.insert("directory".to_string(), CfmlValue::array(dirs));
+        columns.insert("size".to_string(), CfmlValue::array(sizes));
+        columns.insert("type".to_string(), CfmlValue::array(types));
+        columns.insert("datelastmodified".to_string(), CfmlValue::array(dates));
+        let mut q = IndexMap::new();
+        q.insert("__type".to_string(), CfmlValue::String("query".to_string()));
+        q.insert("__columns".to_string(), CfmlValue::strukt(columns));
+        q.insert(
+            "recordcount".to_string(),
+            CfmlValue::Int(entries.len() as i64),
+        );
+        Ok(CfmlValue::strukt(q))
+    }
+
+    fn resolve_directory_path_with_mappings(&self, path: &str) -> Option<String> {
+        if self.vfs.exists(path) {
+            return Some(path.to_string());
+        }
+        if path.starts_with('/') {
+            return self.resolve_include_with_mappings(path);
+        }
+        if let Some(ref base) = self.base_template_path {
+            let base_dir = std::path::Path::new(base)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let candidate = base_dir.join(path).to_string_lossy().to_string();
+            if self.vfs.exists(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn matches_directory_filter(name: &str, pattern: &str) -> bool {
+        if pattern == "*" || pattern.is_empty() {
+            return true;
+        }
+        if let Some(ext) = pattern.strip_prefix("*.") {
+            return name.to_lowercase().ends_with(&format!(".{}", ext.to_lowercase()));
+        }
+        name.eq_ignore_ascii_case(pattern)
     }
 
     fn sandbox_collect_entries(
