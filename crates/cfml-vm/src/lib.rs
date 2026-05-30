@@ -26,6 +26,12 @@ use java_shims::{
 
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 
+/// Lower bound for a session timeout, in seconds. Matches Cloudflare KV's
+/// minimum `expiration_ttl`; clamping here guarantees a session never carries
+/// a 0/sub-minimum timeout that would make its KV write invalid or expire it
+/// immediately.
+const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
+
 /// Persistent application state, keyed by app name.
 #[derive(Clone)]
 pub struct ApplicationState {
@@ -11195,12 +11201,21 @@ impl CfmlVirtualMachine {
             .iter()
             .find(|(k, _)| k.to_lowercase() == "sessiontimeout")
             .and_then(|(_, v)| match v {
+                // `createTimeSpan(d,h,m,s)` returns a Double expressed in
+                // *days* (e.g. one hour = 1/24 ≈ 0.0417). It must be scaled
+                // to seconds — casting the day-fraction straight to u64
+                // truncated every sub-day timeout to 0, which yielded an
+                // invalid KV `expiration_ttl(0)` and made sessions instantly
+                // expirable (the root of "sessions never persist").
+                CfmlValue::Double(d) => Some((d * 86_400.0).round() as u64),
+                // A bare integer/string is taken as a literal seconds count.
                 CfmlValue::Int(i) => Some(i as u64),
-                CfmlValue::Double(d) => Some(d as u64),
                 CfmlValue::String(s) => s.parse::<u64>().ok(),
-                // createTimeSpan returns a double representing days
                 _ => None,
             })
+            // Never let a misconfigured/zero timeout through: clamp to KV's
+            // 60s TTL floor so the value is always a valid expiration.
+            .map(|secs| secs.max(MIN_SESSION_TIMEOUT_SECS))
             .unwrap_or(1800); // Default 30 minutes
 
         // Extract customTagPaths from this.customTagPaths (case-insensitive)
@@ -11687,6 +11702,11 @@ impl CfmlVirtualMachine {
         // synchronously from inside a session-write bytecode op.
         self.app_cfc_template = Some(template.clone());
         if session_management {
+            // Honour the Application.cfc timeout on the lazy-creation path
+            // too: `lazy_init_session_if_pending` stamps new records with
+            // `self.session_timeout_secs`, which otherwise keeps the 1800s
+            // default and ignores `this.sessionTimeout`.
+            self.session_timeout_secs = session_timeout;
             if let Some(ref server_state) = self.server_state.clone() {
                 let sid = self.session_id.clone().unwrap_or_default();
                 let has_sid = !sid.is_empty();

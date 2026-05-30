@@ -127,10 +127,14 @@ impl KvBackedSessionStore {
             let Some(data) = self.memory.get(&id) else { continue };
             let bytes = serde_json::to_vec(&data)
                 .map_err(|e| worker::Error::RustError(format!("session {id} serialize: {e}")))?;
+            // KV rejects an `expiration_ttl` below 60s. Defend against a
+            // stale/misconfigured `timeout_secs` (e.g. a 0 written by an
+            // older build) so the write can't silently fail again.
+            let ttl = data.timeout_secs.max(60);
             self.kv
                 .put_bytes(&id, &bytes)
                 .map_err(|e| worker::Error::RustError(format!("session {id} put: {e:?}")))?
-                .expiration_ttl(data.timeout_secs)
+                .expiration_ttl(ttl)
                 .execute()
                 .await
                 .map_err(|e| worker::Error::RustError(format!("session {id} flush: {e:?}")))?;

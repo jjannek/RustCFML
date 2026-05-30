@@ -190,6 +190,23 @@ fn existing_session_mutation_persists_on_second_request() {
 }
 
 #[test]
+fn createtimespan_session_timeout_is_seconds_not_zero() {
+    // `this.sessionTimeout = createTimeSpan(0, 1, 0, 0)` is one hour. That
+    // BIF returns a Double in *days* (1/24 ≈ 0.0417); a naive `as u64` cast
+    // truncated it to 0, producing an invalid KV TTL and instantly-expirable
+    // sessions. The stamped record must carry 3600 seconds.
+    let spy = Arc::new(SpyStore::new());
+    let sid = "sid-timeout";
+    run_request(spy.clone() as Arc<dyn SessionStore>, sid);
+
+    let data = spy.get(sid).expect("record created");
+    assert_eq!(
+        data.timeout_secs, 3600,
+        "createTimeSpan(0,1,0,0) must resolve to 3600s, not a day-fraction truncated to 0"
+    );
+}
+
+#[test]
 fn existing_session_refreshes_last_accessed() {
     let spy = Arc::new(SpyStore::new());
     let sid = "sid-sliding";
