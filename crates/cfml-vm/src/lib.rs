@@ -400,6 +400,23 @@ pub fn compile_file_cached(
     Ok(program)
 }
 
+/// Bound the `named_locks` map so long-lived `--serve` processes using
+/// dynamic lock names (e.g. `name="user_#id#"`) don't grow it unboundedly.
+/// When the map is at/over `cap` and `new_name` isn't already present, evict
+/// every entry whose `Arc::strong_count == 1`: only the map holds those, so no
+/// thread is holding or waiting on the lock and dropping the `RwLock` cannot
+/// invalidate a live `held_locks` guard. Entries with `strong_count > 1` (held
+/// or contended) are always kept.
+fn evict_idle_named_locks(
+    locks: &mut HashMap<String, Arc<RwLock<()>>>,
+    new_name: &str,
+    cap: usize,
+) {
+    if locks.len() >= cap && !locks.contains_key(new_name) {
+        locks.retain(|_, l| Arc::strong_count(l) > 1);
+    }
+}
+
 /// Server-level state, persists across requests in --serve mode.
 #[derive(Clone)]
 pub struct ServerState {
@@ -658,6 +675,15 @@ struct CallFrame {
 struct TryHandler {
     catch_ip: usize,
     stack_depth: usize,
+    /// Depth of `saved_output_buffers` when the try region was entered. On
+    /// unwind, any buffers pushed since (by an unterminated cfsavecontent /
+    /// cfsilent / custom-tag body) are popped back so `output_buffer` is
+    /// restored to the level it had at try-start.
+    saved_buffers_depth: usize,
+    /// Depth of `custom_tag_stack` when the try region was entered. On unwind,
+    /// stale entries from custom-tag bodies that threw before their end op are
+    /// truncated away.
+    custom_tag_depth: usize,
 }
 
 /// State for a body-mode custom tag execution
@@ -1053,6 +1079,23 @@ impl CfmlVirtualMachine {
         self.execute_function_with_args(&func, args, None)
     }
 
+    /// Restore output-capture state when an exception is caught by `handler`.
+    /// A cfsavecontent / cfsilent / custom-tag body that throws before its
+    /// matching end op leaves `saved_output_buffers` (and `custom_tag_stack`)
+    /// unbalanced and `output_buffer` pointing at the abandoned body buffer.
+    /// Popping back to the depths recorded at try-start discards the partial
+    /// body output and points `output_buffer` at the buffer that was active
+    /// when the try region was entered. A no-op for the common case (no
+    /// buffers pushed inside the try region).
+    fn restore_capture_state(&mut self, handler: &TryHandler) {
+        while self.saved_output_buffers.len() > handler.saved_buffers_depth {
+            self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
+        }
+        if self.custom_tag_stack.len() > handler.custom_tag_depth {
+            self.custom_tag_stack.truncate(handler.custom_tag_depth);
+        }
+    }
+
     fn execute_function_with_args(
         &mut self,
         func: &BytecodeFunction,
@@ -1323,6 +1366,7 @@ impl CfmlVirtualMachine {
                             exception
                                 .insert("detail".to_string(), CfmlValue::String(String::new()));
                             stack.truncate(handler.stack_depth);
+                            self.restore_capture_state(&handler);
                             let exc = CfmlValue::strukt(exception);
                             self.last_exception = Some(exc.clone());
                             locals.insert("cfcatch".to_string(), exc);
@@ -1760,6 +1804,7 @@ impl CfmlVirtualMachine {
                                 while stack.len() > handler.stack_depth {
                                     stack.pop();
                                 }
+                                self.restore_capture_state(&handler);
                                 stack.push(error_val);
                                 ip = handler.catch_ip;
                                 continue;
@@ -2119,6 +2164,7 @@ impl CfmlVirtualMachine {
                                     while stack.len() > handler.stack_depth {
                                         stack.pop();
                                     }
+                                    self.restore_capture_state(&handler);
                                     // Use last_exception only if it was set by this call
                                     // (e.g. an inner throw). Build from the CfmlError
                                     // otherwise, to avoid reusing a stale exception from
@@ -2293,6 +2339,7 @@ impl CfmlVirtualMachine {
                                     while stack.len() > handler.stack_depth {
                                         stack.pop();
                                     }
+                                    self.restore_capture_state(&handler);
                                     let error_val = self.resolve_catch_error_val(&e);
                                     stack.push(error_val);
                                     ip = handler.catch_ip;
@@ -2994,6 +3041,8 @@ impl CfmlVirtualMachine {
                     self.try_stack.push(TryHandler {
                         catch_ip: *catch_ip,
                         stack_depth: stack.len(),
+                        saved_buffers_depth: self.saved_output_buffers.len(),
+                        custom_tag_depth: self.custom_tag_stack.len(),
                     });
                 }
                 BytecodeOp::TryEnd => {
@@ -3009,6 +3058,7 @@ impl CfmlVirtualMachine {
                         while stack.len() > handler.stack_depth {
                             stack.pop();
                         }
+                        self.restore_capture_state(&handler);
                         stack.push(error_val);
                         ip = handler.catch_ip;
                     } else {
@@ -3024,6 +3074,7 @@ impl CfmlVirtualMachine {
                         while stack.len() > handler.stack_depth {
                             stack.pop();
                         }
+                        self.restore_capture_state(&handler);
                         stack.push(error_val);
                         ip = handler.catch_ip;
                     } else {
@@ -3144,6 +3195,7 @@ impl CfmlVirtualMachine {
                                 while stack.len() > handler.stack_depth {
                                     stack.pop();
                                 }
+                                self.restore_capture_state(&handler);
                                 let error_val = self.resolve_catch_error_val(&e);
                                 stack.push(error_val);
                                 ip = handler.catch_ip;
@@ -3520,6 +3572,7 @@ impl CfmlVirtualMachine {
                                     while stack.len() > handler.stack_depth {
                                         stack.pop();
                                     }
+                                    self.restore_capture_state(&handler);
                                     let mut err_struct = IndexMap::new();
                                     err_struct.insert(
                                         "message".to_string(),
@@ -3679,6 +3732,7 @@ impl CfmlVirtualMachine {
                                     while stack.len() > handler.stack_depth {
                                         stack.pop();
                                     }
+                                    self.restore_capture_state(&handler);
                                     let mut err_struct = IndexMap::new();
                                     err_struct.insert(
                                         "message".to_string(),
@@ -6529,6 +6583,8 @@ impl CfmlVirtualMachine {
                         // Get or create the named lock
                         let lock = {
                             let mut locks = server_state.named_locks.lock().unwrap();
+                            const NAMED_LOCK_CAP: usize = 1024;
+                            evict_idle_named_locks(&mut locks, lock_name.as_str(), NAMED_LOCK_CAP);
                             locks
                                 .entry(lock_name.clone())
                                 .or_insert_with(|| Arc::new(RwLock::new(())))
@@ -12050,4 +12106,69 @@ fn precision_evaluate_expr(expr: &str) -> Result<String, CfmlError> {
     // Normalize: remove trailing zeros for display
     let s = result.normalize().to_string();
     Ok(s)
+}
+
+#[cfg(test)]
+mod named_lock_tests {
+    use super::evict_idle_named_locks;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    fn lock() -> Arc<RwLock<()>> {
+        Arc::new(RwLock::new(()))
+    }
+
+    #[test]
+    fn evicts_idle_entries_when_over_cap() {
+        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        for i in 0..1024 {
+            locks.insert(format!("idle_{i}"), lock());
+        }
+        // A held/contended lock: a second Arc clone keeps strong_count > 1.
+        let held = lock();
+        let _held_clone = held.clone();
+        locks.insert("held".to_string(), held);
+
+        assert_eq!(locks.len(), 1025);
+        evict_idle_named_locks(&mut locks, "brand_new", 1024);
+
+        // All idle entries (strong_count == 1) are gone; the held one survives.
+        assert_eq!(locks.len(), 1, "idle entries should be evicted");
+        assert!(locks.contains_key("held"), "held lock must never be evicted");
+    }
+
+    #[test]
+    fn never_evicts_a_held_lock() {
+        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let held = lock();
+        let held_clone = held.clone();
+        let _guard = held_clone.write().unwrap(); // simulate a live held_locks guard
+        locks.insert("held".to_string(), held);
+        for i in 0..2000 {
+            locks.insert(format!("idle_{i}"), lock());
+        }
+        evict_idle_named_locks(&mut locks, "another", 1024);
+        assert!(locks.contains_key("held"));
+    }
+
+    #[test]
+    fn no_eviction_below_cap() {
+        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        for i in 0..10 {
+            locks.insert(format!("idle_{i}"), lock());
+        }
+        evict_idle_named_locks(&mut locks, "new", 1024);
+        assert_eq!(locks.len(), 10, "nothing evicted when under cap");
+    }
+
+    #[test]
+    fn no_eviction_when_name_already_present() {
+        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        for i in 0..1024 {
+            locks.insert(format!("idle_{i}"), lock());
+        }
+        // Re-locking an existing name must not trigger an eviction sweep.
+        evict_idle_named_locks(&mut locks, "idle_5", 1024);
+        assert_eq!(locks.len(), 1024);
+    }
 }
