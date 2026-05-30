@@ -722,24 +722,33 @@ impl CfmlCompiler {
                         if let AssignTarget::Variable(name) = &assign.target {
                             instructions.push(BytecodeOp::LoadLocal(name.clone()));
                         }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
+                        // Reorder to [target, rhs] with a RUNTIME swap. A
+                        // compile-time instruction swap would only be correct
+                        // when the RHS is a single push; for multi-op RHS like
+                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Add);
                     }
                     AssignOp::MinusEqual => {
                         if let AssignTarget::Variable(name) = &assign.target {
                             instructions.push(BytecodeOp::LoadLocal(name.clone()));
                         }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
+                        // Reorder to [target, rhs] with a RUNTIME swap. A
+                        // compile-time instruction swap would only be correct
+                        // when the RHS is a single push; for multi-op RHS like
+                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Sub);
                     }
                     AssignOp::StarEqual => {
                         if let AssignTarget::Variable(name) = &assign.target {
                             instructions.push(BytecodeOp::LoadLocal(name.clone()));
                         }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
+                        // Reorder to [target, rhs] with a RUNTIME swap. A
+                        // compile-time instruction swap would only be correct
+                        // when the RHS is a single push; for multi-op RHS like
+                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Mul);
                     }
                     AssignOp::SlashEqual => {
@@ -749,8 +758,11 @@ impl CfmlCompiler {
                             }
                             _ => {}
                         }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
+                        // Reorder to [target, rhs] with a RUNTIME swap. A
+                        // compile-time instruction swap would only be correct
+                        // when the RHS is a single push; for multi-op RHS like
+                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Div);
                     }
                     AssignOp::PercentEqual => {
@@ -760,16 +772,20 @@ impl CfmlCompiler {
                             }
                             _ => {}
                         }
-                        let len = instructions.len();
-                        instructions.swap(len - 2, len - 1);
+                        // Reorder to [target, rhs] with a RUNTIME swap. A
+                        // compile-time instruction swap would only be correct
+                        // when the RHS is a single push; for multi-op RHS like
+                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Mod);
                     }
                     AssignOp::ConcatEqual => {
                         match &assign.target {
                             AssignTarget::Variable(name) => {
                                 instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                                let len = instructions.len();
-                                instructions.swap(len - 2, len - 1);
+                                // Runtime swap → [target, rhs]; correct even when
+                                // the RHS compiled to multiple instructions.
+                                instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::Concat);
                             }
                             AssignTarget::StructAccess(obj, member) => {
