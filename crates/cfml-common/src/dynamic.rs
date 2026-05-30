@@ -549,3 +549,41 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
         Ok(CfmlValue::strukt(map))
     }
 }
+
+#[cfg(test)]
+mod size_probe {
+    //! PR-0 size probes (RustCFML performance plan). These print the live size
+    //! of the core value/runtime types and assert a non-regression *ceiling*.
+    //!
+    //! Run with: `cargo test -p cfml-common size_probe -- --nocapture`
+    //!
+    //! When an intentional shrink lands (e.g. boxing `Function`/`Query`,
+    //! `String(Arc<str>)`), tighten the ceiling here so the win is recorded and
+    //! protected against future regressions.
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn report_sizes() {
+        let cfml_value = size_of::<CfmlValue>();
+        eprintln!("size_of::<CfmlValue>()      = {cfml_value} B");
+        eprintln!("size_of::<CfmlFunction>()   = {} B", size_of::<CfmlFunction>());
+        eprintln!("size_of::<CfmlQuery>()      = {} B", size_of::<CfmlQuery>());
+        eprintln!("size_of::<CfmlComponent>()  = {} B", size_of::<CfmlComponent>());
+        eprintln!("size_of::<CfmlClosure>()    = {} B", size_of::<CfmlClosure>());
+
+        // Ceiling, not an exact match: catches accidental growth, tolerates
+        // shrinks. Lower this number whenever a planned shrink lands.
+        //
+        // Baseline as of PR-0 (2026-05-30): 112 B. The dominant driver is the
+        // inline `Function(CfmlFunction)` variant (112 B on its own) — boxing
+        // it (and `Query`, 72 B) is the T1.1 win and should drop this toward
+        // ~24 B. Note: the original plan said 88 B; the enum has since grown
+        // (the `QueryColumn` variant + a fatter `CfmlFunction`).
+        assert!(
+            cfml_value <= 112,
+            "CfmlValue grew to {cfml_value} B (ceiling 112 B) — a perf regression. \
+             If intentional, justify and raise the ceiling."
+        );
+    }
+}

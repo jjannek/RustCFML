@@ -2786,3 +2786,25 @@ impl Default for CfmlCompiler {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod size_probe {
+    //! PR-0 size probe (RustCFML performance plan). `BytecodeOp` is the icache
+    //! cost: a 500-instruction function body at 64 B is 32 KB; shrinking the op
+    //! (interned `u32` identifier ids instead of `String` payloads) targets L1.
+    //!
+    //! Run with: `cargo test -p cfml-codegen size_probe -- --nocapture`
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn report_sizes() {
+        let op = size_of::<BytecodeOp>();
+        eprintln!("size_of::<BytecodeOp>() = {op} B");
+        assert!(
+            op <= 64,
+            "BytecodeOp grew to {op} B (ceiling 64 B) — a perf regression. \
+             If intentional, justify and raise the ceiling."
+        );
+    }
+}
