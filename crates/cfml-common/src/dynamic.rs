@@ -388,8 +388,14 @@ pub enum CfmlValue {
     Struct(CfmlStruct),
     Closure(Box<CfmlClosure>),
     Component(Box<CfmlComponent>),
-    Function(CfmlFunction),
-    Query(CfmlQuery),
+    // Boxed (PR-A): inline these large variants pinned `CfmlValue` at 112 B —
+    // `CfmlFunction` is 112 B on its own and `CfmlQuery` 72 B. Boxing both makes
+    // them 8 B pointers and drops the enum to 32 B (String-dominated), shrinking
+    // the operand stack and every scope/struct map ~3.6×. Box deref-coerces, so
+    // field/method reads are unchanged; only construction (`Box::new`) and
+    // move-out destructures (`*b`) needed touching.
+    Function(Box<CfmlFunction>),
+    Query(Box<CfmlQuery>),
     Binary(Vec<u8>),
     /// Instance of a Rust-backed class registered via
     /// `CfmlVirtualMachine::register_native_class`. Method dispatch goes
@@ -956,7 +962,7 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                                 }
                             }
                         }
-                        return Ok(CfmlValue::Query(query));
+                        return Ok(CfmlValue::Query(Box::new(query)));
                     }
                 }
                 _ => {}
@@ -991,14 +997,14 @@ mod size_probe {
         // Ceiling, not an exact match: catches accidental growth, tolerates
         // shrinks. Lower this number whenever a planned shrink lands.
         //
-        // Baseline as of PR-0 (2026-05-30): 112 B. The dominant driver is the
-        // inline `Function(CfmlFunction)` variant (112 B on its own) — boxing
-        // it (and `Query`, 72 B) is the T1.1 win and should drop this toward
-        // ~24 B. Note: the original plan said 88 B; the enum has since grown
-        // (the `QueryColumn` variant + a fatter `CfmlFunction`).
+        // Baseline as of PR-0 (2026-05-30): 112 B. PR-A (T1.1) boxed the two
+        // large variants — `Function(CfmlFunction)` (112 B inline) and
+        // `Query(CfmlQuery)` (72 B) — dropping the enum to 32 B, now floored
+        // by `String(String)` (24 B) + discriminant. The next planned shrink
+        // (interning idents / `String(Arc<str>)`, PR-B) could take it to ~24 B.
         assert!(
-            cfml_value <= 112,
-            "CfmlValue grew to {cfml_value} B (ceiling 112 B) — a perf regression. \
+            cfml_value <= 32,
+            "CfmlValue grew to {cfml_value} B (ceiling 32 B) — a perf regression. \
              If intentional, justify and raise the ceiling."
         );
     }

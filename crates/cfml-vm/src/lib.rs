@@ -851,7 +851,7 @@ impl CfmlVirtualMachine {
         self.builtins.insert(name.to_string(), f);
         self.globals.insert(
             name.to_string(),
-            CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+            CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                 name: name.to_string(),
                 params: Vec::new(),
                 body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -860,7 +860,7 @@ impl CfmlVirtualMachine {
                 return_type: None,
                 access: cfml_common::dynamic::CfmlAccess::Public,
                 captured_scope: None,
-            }),
+            })),
         );
     }
 
@@ -1327,7 +1327,7 @@ impl CfmlVirtualMachine {
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
                         let scope = Arc::new(RwLock::new(filtered));
-                        CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                        CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                             name: bc_func.name.clone(),
                             params: bc_func
                                 .params
@@ -1350,7 +1350,7 @@ impl CfmlVirtualMachine {
                             return_type: None,
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: Some(scope),
-                        })
+                        }))
                     } else {
                         // Variable not found — check try_stack for error handler
                         if let Some(handler) = self.try_stack.pop() {
@@ -1666,7 +1666,7 @@ impl CfmlVirtualMachine {
                         } else {
                             (CfmlValue::Null, None)
                         };
-                        stack.push(CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                             name: name.clone(),
                             params,
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -1675,7 +1675,7 @@ impl CfmlVirtualMachine {
                             return_type: None,
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: scope,
-                        }));
+                        })));
                     } else if self.builtins.keys().any(|k| k.to_lowercase() == name_lower)
                         || self
                             .user_functions
@@ -1733,7 +1733,7 @@ impl CfmlVirtualMachine {
                         } else {
                             (CfmlValue::Null, None, canonical)
                         };
-                        stack.push(CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                             name: resolved_name,
                             params,
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -1742,7 +1742,7 @@ impl CfmlVirtualMachine {
                             return_type: None,
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: scope,
-                        }));
+                        })));
                     // 4. Check VM-intercepted function names (custom tags, etc.)
                     } else if matches!(
                         name_lower.as_str(),
@@ -1753,7 +1753,7 @@ impl CfmlVirtualMachine {
                             | "callstackdump"
                             | "precisionevaluate"
                     ) {
-                        stack.push(CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                             name: name.clone(),
                             params: Vec::new(),
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -1762,7 +1762,7 @@ impl CfmlVirtualMachine {
                             return_type: None,
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: None,
-                        }));
+                        })));
                     } else if matches!(
                         name_lower.as_str(),
                         "cfheader"
@@ -1776,7 +1776,7 @@ impl CfmlVirtualMachine {
                     ) {
                         // Script-style tag calls: `cfcontent(reset=true)` routes to `__cfcontent`.
                         let underscored = format!("__{}", name_lower);
-                        stack.push(CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                             name: underscored,
                             params: Vec::new(),
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -1785,7 +1785,7 @@ impl CfmlVirtualMachine {
                             return_type: None,
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: None,
-                        }));
+                        })));
                     } else {
                         return Err(self.wrap_error(CfmlError::runtime(format!(
                             "Variable '{}' is undefined",
@@ -3038,7 +3038,7 @@ impl CfmlVirtualMachine {
                     };
                     // Push function reference — encode func_idx in body for super dispatch
                     let bc_func_ref = &self.program.functions[func_idx];
-                    stack.push(CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                    stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                         name: func_name,
                         params: bc_func_ref
                             .params
@@ -3061,7 +3061,7 @@ impl CfmlVirtualMachine {
                         return_type: None,
                         access: cfml_common::dynamic::CfmlAccess::Public,
                         captured_scope: Some(Arc::clone(env)),
-                    }));
+                    })));
                 }
 
                 BytecodeOp::Increment(name) => {
@@ -10012,7 +10012,7 @@ impl CfmlVirtualMachine {
                             .iter()
                             .position(|f| f.name == *func_name)
                         {
-                            let cf = CfmlValue::Function(cfml_common::dynamic::CfmlFunction {
+                            let cf = CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                                 name: func_name.clone(),
                                 params: func_def
                                     .params
@@ -10035,7 +10035,7 @@ impl CfmlVirtualMachine {
                                 return_type: None,
                                 access: cfml_common::dynamic::CfmlAccess::Public,
                                 captured_scope: None,
-                            });
+                            }));
                             s.insert(func_name.clone(), cf);
                         }
                     }

@@ -722,14 +722,14 @@ fn fn_s3_unavailable_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn create_builtin_func(name: &str) -> CfmlValue {
-    CfmlValue::Function(CfmlFunction {
+    CfmlValue::Function(Box::new(CfmlFunction {
         name: name.to_string(),
         params: Vec::new(),
         body: CfmlClosureBody::Expression(Box::new(CfmlValue::Null)),
         return_type: None,
         access: CfmlAccess::Public,
         captured_scope: None,
-    })
+    }))
 }
 
 // ---- Helper functions ----
@@ -4023,7 +4023,7 @@ fn fn_is_json(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
     if args.is_empty() {
-        return Ok(CfmlValue::Query(CfmlQuery::new(Vec::new())));
+        return Ok(CfmlValue::Query(Box::new(CfmlQuery::new(Vec::new()))));
     }
     // queryNew("col1,col2") or queryNew(["col1","col2"])
     let columns: Vec<String> = match &args[0] {
@@ -4062,7 +4062,7 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
             }
         }
     }
-    Ok(CfmlValue::Query(query))
+    Ok(CfmlValue::Query(Box::new(query)))
 }
 
 fn fn_query_add_row(args: Vec<CfmlValue>) -> CfmlResult {
@@ -5044,7 +5044,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                         q.rows.push(row);
                     }
                 }
-                Ok(CfmlValue::Query(q))
+                Ok(CfmlValue::Query(Box::new(q)))
             } else {
                 let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
                     if let Entry::Scalar(v) = e { Some(v) } else { None }
@@ -7645,7 +7645,7 @@ fn build_query_result(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue
             rows,
             sql: Some(sql.to_string()),
         };
-        Ok(CfmlValue::Query(query))
+        Ok(CfmlValue::Query(Box::new(query)))
     }
 }
 
@@ -7898,7 +7898,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                 rows,
                 sql: None,
             };
-            Ok(CfmlValue::Query(query))
+            Ok(CfmlValue::Query(Box::new(query)))
         }
         "create" => {
             fs::create_dir_all(&directory).map_err(|e| {
@@ -9518,11 +9518,11 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
             } else {
                 Vec::new()
             };
-            Ok(CfmlValue::Query(CfmlQuery {
+            Ok(CfmlValue::Query(Box::new(CfmlQuery {
                 columns: q.columns.clone(),
                 rows: sliced_rows,
                 sql: None,
-            }))
+            })))
         }
         _ => Err(CfmlError::runtime("querySlice() requires a query".to_string())),
     }
@@ -10856,7 +10856,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 query.rows.push(row);
             }
 
-            Ok(CfmlValue::Query(query))
+            Ok(CfmlValue::Query(Box::new(query)))
         }
         "read" => {
             if file_path.is_empty() || entry_path.is_empty() {
