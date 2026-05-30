@@ -33,7 +33,7 @@ use worker::*;
 pub async fn handle_fetch(
     mut req: Request,
     _env: Env,
-    ctx: Context,
+    _ctx: Context,
     config: &WorkerConfig,
 ) -> Result<Response> {
     let vfs: Arc<dyn Vfs> = Arc::new(EmbeddedVfs::new(
@@ -209,14 +209,25 @@ pub async fn handle_fetch(
         }
     }
 
-    // Flush dirty state back to KV/DO after the response is built.
+    // Flush dirty state back to KV/DO after the response is built. These are
+    // awaited inline (not `ctx.wait_until`): deferred writes scheduled after
+    // the JSPI promising sync activation were silently dropped on requests
+    // that had already done an awaited KV read (`prime`), so existing-session
+    // and application-scope mutations never persisted. See
+    // `KvBackedSessionStore::flush`.
     if let Some(store) = kv_session_store.as_ref() {
-        store.flush(&ctx);
+        if let Err(e) = store.flush().await {
+            worker::console_error!("session store flush failed: {e:?}");
+        }
     }
     if let Some(store) = do_app_store.as_ref() {
-        store.flush(&ctx);
+        if let Err(e) = store.flush().await {
+            worker::console_error!("application (DO) store flush failed: {e:?}");
+        }
     } else if let Some(store) = kv_app_store.as_ref() {
-        store.flush(&ctx);
+        if let Err(e) = store.flush().await {
+            worker::console_error!("application (KV) store flush failed: {e:?}");
+        }
     }
 
     Ok(Response::ok(response_data.output)?

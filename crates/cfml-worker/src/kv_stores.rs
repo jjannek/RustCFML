@@ -23,7 +23,6 @@ use cfml_vm::{ApplicationState, SessionData};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use worker::kv::KvStore;
-use worker::Context;
 
 // ─────────────────────────────────────────────
 // Sessions
@@ -105,24 +104,38 @@ impl KvBackedSessionStore {
         Ok(expired)
     }
 
-    /// Persist every dirty session back to KV via `ctx.wait_until`. Called
-    /// once per request after the VM returns.
-    pub fn flush(&self, ctx: &Context) {
+    /// Persist every dirty session back to KV. Awaited inline by the handler
+    /// after the VM returns — deliberately *not* deferred via
+    /// `ctx.wait_until`.
+    ///
+    /// Why awaited: writes scheduled with `wait_until` after the JSPI
+    /// promising sync activation were observed to be silently dropped on any
+    /// request that had already performed an awaited KV read (the per-request
+    /// [`prime`](Self::prime)). The symptom was that an *existing* session's
+    /// mutations — user `session.X` writes and the framework's own
+    /// `last_accessed_secs` bump (which drives timeout sliding) — never
+    /// reached KV, so the session appeared frozen at creation. Awaiting here
+    /// runs in the same async context as `prime`, where KV operations are
+    /// proven to work, and guarantees the write lands before the response is
+    /// returned. Errors are propagated instead of swallowed.
+    pub async fn flush(&self) -> worker::Result<()> {
         let dirty: Vec<String> = {
             let mut g = self.dirty.lock().unwrap();
             g.drain().collect()
         };
         for id in dirty {
             let Some(data) = self.memory.get(&id) else { continue };
-            let Ok(bytes) = serde_json::to_vec(&data) else { continue };
-            let kv = self.kv.clone();
-            let ttl = data.timeout_secs;
-            ctx.wait_until(async move {
-                if let Ok(p) = kv.put_bytes(&id, &bytes) {
-                    let _ = p.expiration_ttl(ttl).execute().await;
-                }
-            });
+            let bytes = serde_json::to_vec(&data)
+                .map_err(|e| worker::Error::RustError(format!("session {id} serialize: {e}")))?;
+            self.kv
+                .put_bytes(&id, &bytes)
+                .map_err(|e| worker::Error::RustError(format!("session {id} put: {e:?}")))?
+                .expiration_ttl(data.timeout_secs)
+                .execute()
+                .await
+                .map_err(|e| worker::Error::RustError(format!("session {id} flush: {e:?}")))?;
         }
+        Ok(())
     }
 }
 
@@ -211,7 +224,12 @@ impl KvBackedApplicationStore {
         Ok(())
     }
 
-    pub fn flush(&self, ctx: &Context) {
+    /// Persist every dirty application back to KV. Awaited inline (not
+    /// `ctx.wait_until`) for the same reason as
+    /// [`KvBackedSessionStore::flush`]: deferred writes after the JSPI
+    /// promising activation are silently dropped once the request has done an
+    /// awaited KV read (`prime`).
+    pub async fn flush(&self) -> worker::Result<()> {
         let dirty: Vec<String> = {
             let mut g = self.dirty.lock().unwrap();
             g.drain().collect()
@@ -219,14 +237,16 @@ impl KvBackedApplicationStore {
         for name in dirty {
             let Some(state) = self.memory.get(&name) else { continue };
             let snap = PersistedApp { variables: state.variables.clone() };
-            let Ok(bytes) = serde_json::to_vec(&snap) else { continue };
-            let kv = self.kv.clone();
-            ctx.wait_until(async move {
-                if let Ok(p) = kv.put_bytes(&name, &bytes) {
-                    let _ = p.execute().await;
-                }
-            });
+            let bytes = serde_json::to_vec(&snap)
+                .map_err(|e| worker::Error::RustError(format!("app {name} serialize: {e}")))?;
+            self.kv
+                .put_bytes(&name, &bytes)
+                .map_err(|e| worker::Error::RustError(format!("app {name} put: {e:?}")))?
+                .execute()
+                .await
+                .map_err(|e| worker::Error::RustError(format!("app {name} flush: {e:?}")))?;
         }
+        Ok(())
     }
 }
 

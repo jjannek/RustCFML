@@ -47,7 +47,7 @@ use cfml_vm::ApplicationState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use worker::{Context, Method, ObjectNamespace, Request, RequestInit};
+use worker::{Method, ObjectNamespace, Request, RequestInit};
 
 #[derive(Clone)]
 pub struct DoApplicationStore {
@@ -104,9 +104,15 @@ impl DoApplicationStore {
         Ok(())
     }
 
-    /// Persist every dirty application back to the DO via
-    /// `ctx.wait_until`. Called once per request after the VM returns.
-    pub fn flush(&self, ctx: &Context) {
+    /// Persist every dirty application back to the DO. Awaited inline by the
+    /// handler after the VM returns — deliberately *not* deferred via
+    /// `ctx.wait_until`, for the same reason as
+    /// [`KvBackedSessionStore::flush`](crate::kv_stores::KvBackedSessionStore::flush):
+    /// writes scheduled with `wait_until` after the JSPI promising activation
+    /// are silently dropped once the request has performed an awaited
+    /// read (the per-request `prime`), so application-scope mutations never
+    /// reach the Durable Object. Awaiting here guarantees the write lands.
+    pub async fn flush(&self) -> worker::Result<()> {
         let dirty: Vec<String> = {
             let mut g = self.dirty.lock().unwrap();
             g.drain().collect()
@@ -117,20 +123,17 @@ impl DoApplicationStore {
                 variables: state.variables.clone(),
                 started: state.started,
             };
-            let Ok(body) = serde_json::to_string(&snap) else { continue };
-            let namespace = self.namespace.clone();
-            ctx.wait_until(async move {
-                let Ok(id) = namespace.id_from_name(&name) else { return };
-                let Ok(stub) = id.get_stub() else { return };
-                let mut init = RequestInit::new();
-                init.with_method(Method::Post)
-                    .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
-                let Ok(req) = Request::new_with_init("https://do.invalid/put", &init) else {
-                    return;
-                };
-                let _ = stub.fetch_with_request(req).await;
-            });
+            let body = serde_json::to_string(&snap)
+                .map_err(|e| worker::Error::RustError(format!("app {name} serialize: {e}")))?;
+            let id = self.namespace.id_from_name(&name)?;
+            let stub = id.get_stub()?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post)
+                .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
+            let req = Request::new_with_init("https://do.invalid/put", &init)?;
+            stub.fetch_with_request(req).await?;
         }
+        Ok(())
     }
 }
 
