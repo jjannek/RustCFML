@@ -102,7 +102,9 @@ struct WireMeta {
 impl DynamicDbDriver for HyperdriveDriver {
     fn execute(&self, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
         let params = match params_arg {
-            CfmlValue::Array(arr) => arr.iter().map(WireParam::from_cfml).collect(),
+            // CfmlArray::iter() yields owned CfmlValues (reference-typed array
+            // snapshot), so borrow each for WireParam::from_cfml(&CfmlValue).
+            CfmlValue::Array(arr) => arr.iter().map(|v| WireParam::from_cfml(&v)).collect(),
             CfmlValue::Null => Vec::new(),
             single => vec![WireParam::from_cfml(single)],
         };
