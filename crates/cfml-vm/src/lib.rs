@@ -2936,11 +2936,29 @@ impl CfmlVirtualMachine {
                         Some(ref env) => {
                             let mut m = env.write().unwrap();
                             for (k, v) in &locals {
-                                m.insert(k.clone(), v.clone());
+                                // Do NOT store Function values in the shared closure
+                                // env: each closure's captured_scope is an Arc clone
+                                // of this env, so an env-resident Function creates a
+                                // self-referential Arc cycle (env -> Function ->
+                                // captured_scope -> env) that leaks the whole env on
+                                // frame exit. Sibling closures resolve each other via
+                                // user_functions / by-name fast paths, and call sites
+                                // overlay caller-local Functions, so omitting them
+                                // here is observationally transparent.
+                                if !matches!(v, CfmlValue::Function(_)) {
+                                    m.insert(k.clone(), v.clone());
+                                }
                             }
                             env
                         }
-                        None => closure_env.insert(Arc::new(RwLock::new(locals.clone()))),
+                        None => {
+                            let seed: IndexMap<String, CfmlValue> = locals
+                                .iter()
+                                .filter(|(_, v)| !matches!(v, CfmlValue::Function(_)))
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            closure_env.insert(Arc::new(RwLock::new(seed)))
+                        }
                     };
                     // Push function reference — encode func_idx in body for super dispatch
                     let bc_func_ref = &self.program.functions[func_idx];
@@ -3947,6 +3965,25 @@ impl CfmlVirtualMachine {
 
         // Capture locals for component variables scope (for __main__ and __cfc_body__)
         if func.name == "__main__" || func.name == "__cfc_body__" {
+            // Strip captured_scope from any top-level Function values before
+            // snapshotting — CFC methods resolve via __variables, not closures.
+            for (_, v) in locals.iter_mut() {
+                if let CfmlValue::Function(ref mut f) = v {
+                    f.captured_scope = None;
+                }
+            }
+            // Break the closure-env reference cycle. The pseudo-constructor's
+            // shared `closure_env` holds scope structs (`this`, `variables`) that
+            // contain the just-defined methods, and each method's `captured_scope`
+            // is an Arc clone of this same env: env -> this(Struct) -> method(Fn)
+            // -> captured_scope -> env. That self-referential island is never
+            // collected by Arc refcounting, so it leaks per instantiation (and
+            // per repeated call to any closure-defining function). CFC methods
+            // never use this env (they use __variables injected at call time), so
+            // clearing it here severs the cycle without affecting behaviour.
+            if let Some(ref env) = closure_env {
+                env.write().unwrap().clear();
+            }
             self.captured_locals = Some(locals);
         }
 
@@ -8955,6 +8992,13 @@ impl CfmlVirtualMachine {
             if let Some(ref shared_env) = f.captured_scope {
                 let mut env = shared_env.write().unwrap();
                 for (k, v) in writeback {
+                    // Never store Function values in the shared env — that would
+                    // reintroduce the env -> Function -> captured_scope -> env
+                    // cycle that leaks the env (see DefineFunction). Non-Function
+                    // mutations propagate as normal.
+                    if matches!(v, CfmlValue::Function(_)) {
+                        continue;
+                    }
                     env.insert(k.clone(), v.clone());
                 }
             }
@@ -9903,6 +9947,10 @@ impl CfmlVirtualMachine {
                     s.insert("__variables".to_string(), CfmlValue::strukt(vars_scope));
                 }
             }
+            // Break the per-instantiation closure-env retention: clear captured
+            // scopes on every member function of the assembled instance. CFC
+            // members use __variables, not closures, so this is semantically inert
+            // and lets the closure env (heavily aliased across method copies) drop.
             return result;
         }
         None
