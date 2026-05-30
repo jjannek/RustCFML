@@ -690,9 +690,9 @@ pub fn handle_java_concurrentlinkedqueue(
                 if let Some(item) = args.first() {
                     let mut ns = shim.clone();
                     if let Some(CfmlValue::Array(q)) = ns.get("__queue").cloned() {
-                        let mut nq = q.clone();
-                        Arc::make_mut(&mut nq).push(item.clone());
-                        Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::Array(nq));
+                        let mut nq = q.snapshot();
+                        nq.push(item.clone());
+                        Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::array(nq));
                     }
                     Ok(CfmlValue::Struct(ns))
                 } else {
@@ -705,10 +705,11 @@ pub fn handle_java_concurrentlinkedqueue(
         "poll" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::Array(q)) = shim.get("__queue").cloned() {
-                    if !q.is_empty() {
+                    let qv = q.snapshot();
+                    if !qv.is_empty() {
                         let mut ns = shim.clone();
-                        let itm = q[0].clone();
-                        let mut nq = q[1..].to_vec();
+                        let _itm = qv[0].clone();
+                        let nq = qv[1..].to_vec();
                         Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::array(nq));
                         return Ok(CfmlValue::Struct(ns));
                     }
@@ -721,8 +722,8 @@ pub fn handle_java_concurrentlinkedqueue(
         "peek" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::Array(q)) = shim.get("__queue").cloned() {
-                    if !q.is_empty() {
-                        return Ok(q[0].clone());
+                    if let Some(first) = q.first() {
+                        return Ok(first);
                     }
                 }
                 Ok(CfmlValue::Null)
@@ -907,15 +908,16 @@ pub fn handle_java_collections(
             None => Ok(CfmlValue::strukt(IndexMap::new())),
         },
         "sort" => {
-            if let Some(CfmlValue::Array(mut a)) = args.into_iter().next() {
-                Arc::make_mut(&mut a).sort_by(|x, y| x.as_string().cmp(&y.as_string()));
+            if let Some(CfmlValue::Array(a)) = args.into_iter().next() {
+                // Collections.sort mutates the list in place (reference semantics).
+                a.with_write(|v| v.sort_by(|x, y| x.as_string().cmp(&y.as_string())));
                 return Ok(CfmlValue::Array(a));
             }
             Ok(CfmlValue::Null)
         }
         "reverse" => {
-            if let Some(CfmlValue::Array(mut a)) = args.into_iter().next() {
-                Arc::make_mut(&mut a).reverse();
+            if let Some(CfmlValue::Array(a)) = args.into_iter().next() {
+                a.with_write(|v| v.reverse());
                 return Ok(CfmlValue::Array(a));
             }
             Ok(CfmlValue::Null)

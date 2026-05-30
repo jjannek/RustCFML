@@ -19,7 +19,6 @@ use cfml_stdlib::s3::{
     S3AppConfig, S3Url,
 };
 use indexmap::IndexMap;
-use std::sync::Arc;
 
 fn err(msg: impl Into<String>) -> CfmlError {
     CfmlError::new(msg.into(), CfmlErrorType::Custom("S3".to_string()))
@@ -280,7 +279,7 @@ impl CfmlVirtualMachine {
                             url.bucket, visible
                         )));
                     }
-                    Ok(CfmlValue::Array(Arc::new(arr)))
+                    Ok(CfmlValue::array(arr))
                 }
             }
 

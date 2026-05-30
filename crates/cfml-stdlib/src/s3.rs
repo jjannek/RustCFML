@@ -751,7 +751,7 @@ pub fn objects_to_query_struct(objects: Vec<S3Object>) -> CfmlValue {
         s.insert("isDirectory".to_string(), CfmlValue::Bool(o.is_directory));
         arr.push(CfmlValue::Struct(Arc::new(s)));
     }
-    CfmlValue::Array(Arc::new(arr))
+    CfmlValue::array(arr)
 }
 
 pub fn buckets_to_array(buckets: Vec<S3BucketInfo>) -> CfmlValue {
@@ -765,7 +765,7 @@ pub fn buckets_to_array(buckets: Vec<S3BucketInfo>) -> CfmlValue {
         );
         arr.push(CfmlValue::Struct(Arc::new(s)));
     }
-    CfmlValue::Array(Arc::new(arr))
+    CfmlValue::array(arr)
 }
 
 // ---------- App config snapshot ----------

@@ -1691,26 +1691,32 @@ fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+// Reference semantics: the genuinely-mutating array builtins update args[0]'s
+// shared backing in place (so aliases — `b = a` — observe the change) and
+// return that same handle. Pure builtins below snapshot and build a new array.
 fn fn_array_append(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        let mut arr = match &args[0] {
-            CfmlValue::Array(a) => a.clone(),
-            _ => Arc::new(Vec::new()),
-        };
         // Optional 3rd arg `merge`: when true and the value is an array, its
         // elements are appended individually instead of as a single nested
         // element (Lucee/ACF semantics).
         let merge = args.get(2).map(|v| v.is_true()).unwrap_or(false);
-        match (&args[1], merge) {
-            (CfmlValue::Array(elems), true) => {
-                let elems = elems.clone();
-                Arc::make_mut(&mut arr).extend(elems.iter().cloned());
+        if let CfmlValue::Array(a) = &args[0] {
+            match (&args[1], merge) {
+                (CfmlValue::Array(elems), true) => {
+                    let elems = elems.snapshot();
+                    a.with_write(|v| v.extend(elems));
+                }
+                _ => a.push(args[1].clone()),
             }
-            _ => {
-                Arc::make_mut(&mut arr).push(args[1].clone());
-            }
+            return Ok(CfmlValue::Array(a.clone()));
         }
-        Ok(CfmlValue::Array(arr))
+        // Non-array first arg: build a fresh array (legacy coercion).
+        let mut v = Vec::new();
+        match (&args[1], merge) {
+            (CfmlValue::Array(elems), true) => v.extend(elems.snapshot()),
+            _ => v.push(args[1].clone()),
+        }
+        Ok(CfmlValue::array(v))
     } else {
         Ok(args.into_iter().next().unwrap_or(CfmlValue::array(Vec::new())))
     }
@@ -1718,12 +1724,11 @@ fn fn_array_append(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_prepend(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        let mut arr = match &args[0] {
-            CfmlValue::Array(a) => a.clone(),
-            _ => Arc::new(Vec::new()),
-        };
-        Arc::make_mut(&mut arr).insert(0, args[1].clone());
-        Ok(CfmlValue::Array(arr))
+        if let CfmlValue::Array(a) = &args[0] {
+            a.with_write(|v| v.insert(0, args[1].clone()));
+            return Ok(CfmlValue::Array(a.clone()));
+        }
+        Ok(CfmlValue::array(vec![args[1].clone()]))
     } else {
         Ok(args.into_iter().next().unwrap_or(CfmlValue::array(Vec::new())))
     }
@@ -1731,16 +1736,16 @@ fn fn_array_prepend(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        let mut arr = match &args[0] {
-            CfmlValue::Array(a) => a.clone(),
-            _ => return Ok(CfmlValue::Bool(false)),
-        };
-        let idx = (get_int(&args, 1) as usize).saturating_sub(1);
-        if idx < arr.len() {
-            Arc::make_mut(&mut arr).remove(idx);
-            Ok(CfmlValue::Array(arr))
+        if let CfmlValue::Array(a) = &args[0] {
+            let idx = (get_int(&args, 1) as usize).saturating_sub(1);
+            a.with_write(|v| {
+                if idx < v.len() {
+                    v.remove(idx);
+                }
+            });
+            Ok(CfmlValue::Array(a.clone()))
         } else {
-            Ok(CfmlValue::Array(arr))
+            Ok(CfmlValue::Bool(false))
         }
     } else {
         Ok(CfmlValue::Bool(false))
@@ -1749,15 +1754,17 @@ fn fn_array_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
-        let mut arr = match &args[0] {
-            CfmlValue::Array(a) => a.clone(),
-            _ => return Ok(CfmlValue::Bool(false)),
-        };
-        let idx = (get_int(&args, 1) as usize).saturating_sub(1);
-        if idx <= arr.len() {
-            Arc::make_mut(&mut arr).insert(idx, args[2].clone());
+        if let CfmlValue::Array(a) = &args[0] {
+            let idx = (get_int(&args, 1) as usize).saturating_sub(1);
+            a.with_write(|v| {
+                if idx <= v.len() {
+                    v.insert(idx, args[2].clone());
+                }
+            });
+            Ok(CfmlValue::Array(a.clone()))
+        } else {
+            Ok(CfmlValue::Bool(false))
         }
-        Ok(CfmlValue::Array(arr))
     } else {
         Ok(CfmlValue::Bool(false))
     }
@@ -1815,26 +1822,30 @@ fn fn_array_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_sort(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        let mut result = arr.clone();
         let sort_type = if args.len() > 1 { get_str(&args, 1).to_lowercase() } else { "text".to_string() };
         let sort_order = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "asc".to_string() };
-        match sort_type.as_str() {
-            "numeric" => {
-                Arc::make_mut(&mut result).sort_by(|a, b| {
-                    let fa = a.as_string().parse::<f64>().unwrap_or(0.0);
-                    let fb = b.as_string().parse::<f64>().unwrap_or(0.0);
-                    fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
-                });
+        // In-place sort on the shared handle (Lucee sorts the original array).
+        arr.with_write(|v| {
+            match sort_type.as_str() {
+                "numeric" => {
+                    v.sort_by(|a, b| {
+                        let fa = a.as_string().parse::<f64>().unwrap_or(0.0);
+                        let fb = b.as_string().parse::<f64>().unwrap_or(0.0);
+                        fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                "textnocase" => {
+                    v.sort_by(|a, b| a.as_string().to_lowercase().cmp(&b.as_string().to_lowercase()));
+                }
+                _ => {
+                    v.sort_by(|a, b| a.as_string().cmp(&b.as_string()));
+                }
             }
-            "textnocase" => {
-                Arc::make_mut(&mut result).sort_by(|a, b| a.as_string().to_lowercase().cmp(&b.as_string().to_lowercase()));
+            if sort_order == "desc" {
+                v.reverse();
             }
-            _ => {
-                Arc::make_mut(&mut result).sort_by(|a, b| a.as_string().cmp(&b.as_string()));
-            }
-        }
-        if sort_order == "desc" { Arc::make_mut(&mut result).reverse(); }
-        Ok(CfmlValue::Array(result))
+        });
+        Ok(CfmlValue::Array(arr.clone()))
     } else {
         Ok(CfmlValue::array(Vec::new()))
     }
@@ -1842,9 +1853,9 @@ fn fn_array_sort(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_reverse(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        let mut reversed = arr.clone();
-        Arc::make_mut(&mut reversed).reverse();
-        Ok(CfmlValue::Array(reversed))
+        // In-place reverse on the shared handle.
+        arr.with_write(|v| v.reverse());
+        Ok(CfmlValue::Array(arr.clone()))
     } else {
         Ok(CfmlValue::array(Vec::new()))
     }
@@ -1852,6 +1863,8 @@ fn fn_array_reverse(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Array(arr)) = args.first() {
+        // Pure: produces a new array.
+        let snap = arr.snapshot();
         let offset = get_int(&args, 1);
         let length = if args.len() >= 3 { Some(get_int(&args, 2) as usize) } else { None };
 
@@ -1860,19 +1873,19 @@ fn fn_array_slice(args: Vec<CfmlValue>) -> CfmlResult {
         } else {
             // Negative: count from end
             let from_end = (-offset) as usize;
-            if from_end > arr.len() { 0 } else { arr.len() - from_end }
+            if from_end > snap.len() { 0 } else { snap.len() - from_end }
         };
 
-        if start >= arr.len() {
+        if start >= snap.len() {
             return Ok(CfmlValue::array(Vec::new()));
         }
 
         let end = match length {
-            Some(len) => (start + len).min(arr.len()),
-            None => arr.len(),
+            Some(len) => (start + len).min(snap.len()),
+            None => snap.len(),
         };
 
-        Ok(CfmlValue::array(arr[start..end].to_vec()))
+        Ok(CfmlValue::array(snap[start..end].to_vec()))
     } else {
         Ok(CfmlValue::array(Vec::new()))
     }
@@ -1891,28 +1904,32 @@ fn fn_array_to_list(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_merge(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let (CfmlValue::Array(a), CfmlValue::Array(b)) = (&args[0], &args[1]) {
+            // Pure: produces a new array (does not mutate either operand).
             let leave_index = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+            let mut result = a.snapshot();
             if leave_index {
-                let mut result = a.clone();
                 for (i, item) in b.iter().enumerate() {
                     if i < result.len() {
-                        Arc::make_mut(&mut result)[i] = item.clone();
+                        result[i] = item;
                     } else {
-                        Arc::make_mut(&mut result).push(item.clone());
+                        result.push(item);
                     }
                 }
-                return Ok(CfmlValue::Array(result));
             } else {
-                let mut result = a.clone();
-                Arc::make_mut(&mut result).extend(b.iter().cloned());
-                return Ok(CfmlValue::Array(result));
+                result.extend(b.iter());
             }
+            return Ok(CfmlValue::array(result));
         }
     }
     Ok(CfmlValue::array(Vec::new()))
 }
 
-fn fn_array_clear(_args: Vec<CfmlValue>) -> CfmlResult {
+fn fn_array_clear(args: Vec<CfmlValue>) -> CfmlResult {
+    // In-place clear on the shared handle (aliases see the emptied array).
+    if let Some(CfmlValue::Array(a)) = args.first() {
+        a.with_write(|v| v.clear());
+        return Ok(CfmlValue::Array(a.clone()));
+    }
     Ok(CfmlValue::array(Vec::new()))
 }
 
@@ -1927,19 +1944,20 @@ fn fn_array_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_array_set(args: Vec<CfmlValue>) -> CfmlResult {
-    // arraySet(array, start, end, value)
+    // arraySet(array, start, end, value) — in-place on the shared handle.
     if args.len() >= 4 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let mut result = arr.clone();
             let start = (get_int(&args, 1) as usize).saturating_sub(1);
             let end = get_int(&args, 2) as usize;
-            while result.len() < end {
-                Arc::make_mut(&mut result).push(CfmlValue::Null);
-            }
-            for i in start..end.min(result.len()) {
-                Arc::make_mut(&mut result)[i]= args[3].clone();
-            }
-            return Ok(CfmlValue::Array(result));
+            arr.with_write(|v| {
+                while v.len() < end {
+                    v.push(CfmlValue::Null);
+                }
+                for i in start..end.min(v.len()) {
+                    v[i] = args[3].clone();
+                }
+            });
+            return Ok(CfmlValue::Array(arr.clone()));
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -1948,13 +1966,14 @@ fn fn_array_set(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_swap(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let mut result = arr.clone();
             let i = (get_int(&args, 1) as usize).saturating_sub(1);
             let j = (get_int(&args, 2) as usize).saturating_sub(1);
-            if i < result.len() && j < result.len() {
-                Arc::make_mut(&mut result).swap(i, j);
-            }
-            return Ok(CfmlValue::Array(result));
+            arr.with_write(|v| {
+                if i < v.len() && j < v.len() {
+                    v.swap(i, j);
+                }
+            });
+            return Ok(CfmlValue::Array(arr.clone()));
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -2035,11 +2054,14 @@ fn fn_array_delete(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
             let value_str = args[1].as_string().to_lowercase();
-            let mut result = arr.clone();
-            if let Some(pos) = result.iter().position(|v| v.as_string().to_lowercase() == value_str) {
-                Arc::make_mut(&mut result).remove(pos);
-            }
-            return Ok(CfmlValue::Array(result));
+            arr.with_write(|v| {
+                if let Some(pos) =
+                    v.iter().position(|x| x.as_string().to_lowercase() == value_str)
+                {
+                    v.remove(pos);
+                }
+            });
+            return Ok(CfmlValue::Array(arr.clone()));
         }
     }
     Ok(CfmlValue::array(Vec::new()))
@@ -2075,14 +2097,14 @@ fn fn_array_find_all_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_first(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        Some(CfmlValue::Array(arr)) => Ok(arr.first().cloned().unwrap_or(CfmlValue::Null)),
+        Some(CfmlValue::Array(arr)) => Ok(arr.first().unwrap_or(CfmlValue::Null)),
         _ => Err(CfmlError::runtime("arrayFirst: argument must be an array".to_string())),
     }
 }
 
 fn fn_array_last(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        Some(CfmlValue::Array(arr)) => Ok(arr.last().cloned().unwrap_or(CfmlValue::Null)),
+        Some(CfmlValue::Array(arr)) => Ok(arr.last().unwrap_or(CfmlValue::Null)),
         _ => Err(CfmlError::runtime("arrayLast: argument must be an array".to_string())),
     }
 }
@@ -2234,7 +2256,7 @@ fn struct_find_key_recursive(
         }
         if let CfmlValue::Array(arr) = v {
             for (i, item) in arr.iter().enumerate() {
-                if let CfmlValue::Struct(nested) = item {
+                if let CfmlValue::Struct(nested) = &item {
                     let arr_path = format!("{}[{}]", current_path, i + 1);
                     struct_find_key_recursive(nested, search_key, &arr_path, scope, results);
                     if scope == "one" && !results.is_empty() { return; }
@@ -2281,7 +2303,7 @@ fn struct_find_value_recursive(
         }
         if let CfmlValue::Array(arr) = v {
             for (i, item) in arr.iter().enumerate() {
-                if let CfmlValue::Struct(nested) = item {
+                if let CfmlValue::Struct(nested) = &item {
                     let arr_path = format!("{}[{}]", current_path, i + 1);
                     struct_find_value_recursive(nested, search_value, &arr_path, scope, results);
                     if scope == "one" && !results.is_empty() { return; }
@@ -3916,7 +3938,7 @@ fn serialize_value(val: &CfmlValue) -> String {
         CfmlValue::Double(d) => d.to_string(),
         CfmlValue::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")),
         CfmlValue::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(serialize_value).collect();
+            let items: Vec<String> = arr.iter().map(|v| serialize_value(&v)).collect();
             format!("[{}]", items.join(","))
         }
         CfmlValue::Struct(s) => {
@@ -4017,7 +4039,7 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
                         query.rows.push(row);
                     }
                     CfmlValue::Struct(s) => {
-                        query.rows.push((**s).clone());
+                        query.rows.push((*s).clone());
                     }
                     _ => {
                         // Single-column shortcut: wrap scalar in a row
@@ -4051,7 +4073,7 @@ fn fn_query_add_row(args: Vec<CfmlValue>) -> CfmlResult {
                 CfmlValue::Array(rows) => {
                     for item in rows.iter() {
                         if let CfmlValue::Struct(data) = item {
-                            result.rows.push((**data).clone());
+                            result.rows.push((*data).clone());
                         } else {
                             result.rows.push(IndexMap::new());
                         }
@@ -4361,7 +4383,12 @@ fn fn_iif(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_duplicate(args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(args.into_iter().next().unwrap_or(CfmlValue::Null))
+    // Deep copy: arrays/structs are reference-typed, so duplicate() must break
+    // all sharing and return a fully independent value.
+    Ok(args
+        .first()
+        .map(|v| v.deep_copy())
+        .unwrap_or(CfmlValue::Null))
 }
 
 fn fn_sleep(args: Vec<CfmlValue>) -> CfmlResult {
@@ -5399,11 +5426,10 @@ fn fn_list_reduce(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_pop(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        let mut result = arr.clone();
-        if let Some(last) = Arc::make_mut(&mut result).pop() {
-            Ok(last)
-        } else {
-            Err(CfmlError::runtime("Cannot pop from empty array".to_string()))
+        // In-place: removes the last element from the shared array.
+        match arr.with_write(|v| v.pop()) {
+            Some(last) => Ok(last),
+            None => Err(CfmlError::runtime("Cannot pop from empty array".to_string())),
         }
     } else {
         Err(CfmlError::runtime("arrayPop requires an array".to_string()))
@@ -5412,11 +5438,10 @@ fn fn_array_pop(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_shift(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Array(arr)) = args.first() {
-        let mut result = arr.clone();
-        if !result.is_empty() {
-            Ok(Arc::make_mut(&mut result).remove(0))
-        } else {
-            Err(CfmlError::runtime("Cannot shift from empty array".to_string()))
+        // In-place: removes the first element from the shared array.
+        match arr.with_write(|v| if v.is_empty() { None } else { Some(v.remove(0)) }) {
+            Some(first) => Ok(first),
+            None => Err(CfmlError::runtime("Cannot shift from empty array".to_string())),
         }
     } else {
         Err(CfmlError::runtime("arrayShift requires an array".to_string()))
@@ -6465,7 +6490,7 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<Vec<rusqlite
     match params_arg {
         CfmlValue::Null => Ok(vec![]),
         CfmlValue::Array(arr) => {
-            arr.iter().map(|v| Ok(cfml_to_sqlite(v))).collect()
+            arr.iter().map(|v| Ok(cfml_to_sqlite(&v))).collect()
         }
         CfmlValue::Struct(map) => {
             let mut result = Vec::new();
@@ -6545,7 +6570,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
 
     let params = match params_arg {
         CfmlValue::Array(arr) => {
-            let vals: Vec<mysql::Value> = arr.iter().map(cfml_to_mysql_value).collect();
+            let vals: Vec<mysql::Value> = arr.iter().map(|v| cfml_to_mysql_value(&v)).collect();
             Params::Positional(vals)
         }
         CfmlValue::Struct(map) => {
@@ -6762,7 +6787,7 @@ fn rewrite_params_for_postgres(sql: &str, params_arg: &CfmlValue) -> Result<(Str
                 }
                 i += 1;
             }
-            let params: Vec<PgParam> = arr.iter().map(cfml_to_pg_param).collect();
+            let params: Vec<PgParam> = arr.iter().map(|v| cfml_to_pg_param(&v)).collect();
             Ok((result, params))
         }
         CfmlValue::Struct(map) => {
@@ -6916,7 +6941,7 @@ fn postgres_row_to_cfml(row: &postgres::Row, col_idx: usize) -> CfmlValue {
     // (matches Lucee/BoxLang semantics: UUIDs canonical, JSON raw string,
     // numeric precision preserved as String, arrays as native CFML Array).
     fn arr<I: IntoIterator<Item = CfmlValue>>(it: I) -> CfmlValue {
-        CfmlValue::Array(Arc::new(it.into_iter().collect()))
+        CfmlValue::array(it.into_iter().collect())
     }
 
     match *col_type {
@@ -7493,7 +7518,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
 
     let params = match params_arg {
         CfmlValue::Array(arr) => {
-            let vals: Vec<mysql::Value> = arr.iter().map(cfml_to_mysql_value).collect();
+            let vals: Vec<mysql::Value> = arr.iter().map(|v| cfml_to_mysql_value(&v)).collect();
             Params::Positional(vals)
         }
         CfmlValue::Struct(map) => {
@@ -8434,7 +8459,7 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
             Ok(Event::End(_)) => {
                 if let Some(completed) = stack.pop() {
                     if let Some(parent) = stack.last_mut() {
-                        if let Some(children) = parent.get_mut("xmlChildren").and_then(|v| v.as_array_mut()) {
+                        if let Some(children) = parent.get_mut("xmlChildren").and_then(|v| v.as_cfml_array()) {
                             children.push(CfmlValue::strukt(completed));
                         }
                     } else {
@@ -8459,7 +8484,7 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 element.insert("xmlAttributes".to_string(), CfmlValue::strukt(attrs));
 
                 if let Some(parent) = stack.last_mut() {
-                    if let Some(children) = parent.get_mut("xmlChildren").and_then(|v| v.as_array_mut()) {
+                    if let Some(children) = parent.get_mut("xmlChildren").and_then(|v| v.as_cfml_array()) {
                         children.push(CfmlValue::strukt(element));
                     }
                 } else {
@@ -8533,7 +8558,7 @@ fn xml_search_descendants(node: &CfmlValue, tag_name: &str, results: &mut Vec<Cf
         }
         if let Some(CfmlValue::Array(ref children)) = s.get("xmlChildren") {
             for child in children.iter() {
-                xml_search_descendants(child, tag_name, results);
+                xml_search_descendants(&child, tag_name, results);
             }
         }
     }
@@ -8555,7 +8580,7 @@ fn xml_search_path(node: &CfmlValue, parts: &[&str], depth: usize, results: &mut
                     results.push(node.clone());
                 } else if let Some(CfmlValue::Array(ref children)) = s.get("xmlChildren") {
                     for child in children.iter() {
-                        xml_search_path(child, parts, depth + 1, results);
+                        xml_search_path(&child, parts, depth + 1, results);
                     }
                 }
             }
@@ -9053,7 +9078,7 @@ fn fn_to_script(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlValue::Array(arr) => {
             let mut lines = vec![format!("{}=new Array();", var_name)];
             for (i, item) in arr.iter().enumerate() {
-                let val_str = match item {
+                let val_str = match &item {
                     CfmlValue::String(s) => format!("\"{}\"", js_escape(s)),
                     CfmlValue::Int(n) => n.to_string(),
                     CfmlValue::Double(d) => d.to_string(),
@@ -9151,11 +9176,13 @@ fn fn_array_resize(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
             let size = get_int(&args, 1) as usize;
-            let mut new_arr = arr.clone();
-            while new_arr.len() < size {
-                Arc::make_mut(&mut new_arr).push(CfmlValue::String(String::new()));
-            }
-            Ok(CfmlValue::Array(new_arr))
+            // In-place grow on the shared handle.
+            arr.with_write(|v| {
+                while v.len() < size {
+                    v.push(CfmlValue::String(String::new()));
+                }
+            });
+            Ok(CfmlValue::Array(arr.clone()))
         }
         _ => Err(CfmlError::runtime("arrayResize() requires an array".to_string())),
     }
@@ -9167,7 +9194,7 @@ fn fn_array_median(args: Vec<CfmlValue>) -> CfmlResult {
             if arr.is_empty() {
                 return Err(CfmlError::runtime("Cannot get median of empty array".to_string()));
             }
-            let mut nums: Vec<f64> = arr.iter().map(|v| match v {
+            let mut nums: Vec<f64> = arr.iter().map(|v| match &v {
                 CfmlValue::Int(i) => *i as f64,
                 CfmlValue::Double(d) => *d,
                 CfmlValue::String(s) => s.parse().unwrap_or(0.0),
@@ -9189,13 +9216,14 @@ fn fn_array_median(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_mid(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
+            let snap = arr.snapshot();
             let start = (get_int(&args, 1) as usize).saturating_sub(1);
             let count = get_int(&args, 2) as usize;
-            let end = std::cmp::min(start + count, arr.len());
-            if start >= arr.len() {
+            let end = std::cmp::min(start + count, snap.len());
+            if start >= snap.len() {
                 return Ok(CfmlValue::array(Vec::new()));
             }
-            Ok(CfmlValue::array(arr[start..end].to_vec()))
+            Ok(CfmlValue::array(snap[start..end].to_vec()))
         }
         _ => Err(CfmlError::runtime("arrayMid() requires an array".to_string())),
     }
@@ -9205,22 +9233,31 @@ fn fn_array_splice(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
             let index = (get_int(&args, 1) as usize).saturating_sub(1);
-            let delete_count = if args.len() > 2 { get_int(&args, 2) as usize } else { arr.len() - index };
-            let mut new_arr = arr.clone();
-            let end = std::cmp::min(index + delete_count, new_arr.len());
-            let removed: Vec<CfmlValue> = if index < new_arr.len() {
-                Arc::make_mut(&mut new_arr).drain(index..end).collect()
+            let len = arr.len();
+            let delete_count = if args.len() > 2 {
+                get_int(&args, 2) as usize
             } else {
-                Vec::new()
+                len.saturating_sub(index)
             };
-            // Insert replacement elements if provided
-            if let Some(CfmlValue::Array(replacements)) = args.get(3) {
-                for (i, val) in replacements.iter().enumerate() {
-                    let pos = std::cmp::min(index + i, new_arr.len());
-                    Arc::make_mut(&mut new_arr).insert(pos, val.clone());
+            let replacements: Vec<CfmlValue> = match args.get(3) {
+                Some(CfmlValue::Array(r)) => r.snapshot(),
+                _ => Vec::new(),
+            };
+            // Reference semantics: splice the shared array in place and return
+            // the removed elements (matches Lucee/JS — the original is modified).
+            let removed = arr.with_write(|v| {
+                let end = std::cmp::min(index + delete_count, v.len());
+                let removed: Vec<CfmlValue> = if index < v.len() {
+                    v.drain(index..end).collect()
+                } else {
+                    Vec::new()
+                };
+                for (i, val) in replacements.into_iter().enumerate() {
+                    let pos = std::cmp::min(index + i, v.len());
+                    v.insert(pos, val);
                 }
-            }
-            // Return removed elements (mutating the original would require VM support)
+                removed
+            });
             Ok(CfmlValue::array(removed))
         }
         _ => Err(CfmlError::runtime("arraySplice() requires an array".to_string())),
@@ -9260,11 +9297,18 @@ fn fn_array_delete_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
             let target = get_str(&args, 1).to_lowercase();
-            let new_arr: Vec<CfmlValue> = arr.iter()
-                .filter(|v| v.as_string().to_lowercase() != target)
-                .cloned()
-                .collect();
-            let removed = arr.len() != new_arr.len();
+            // In-place: remove the first case-insensitive match from the shared
+            // array (consistent with the VM-intercepted arrayDelete path).
+            let removed = arr.with_write(|v| {
+                if let Some(pos) =
+                    v.iter().position(|x| x.as_string().to_lowercase() == target)
+                {
+                    v.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            });
             Ok(CfmlValue::Bool(removed))
         }
         _ => Err(CfmlError::runtime("arrayDeleteNoCase() requires an array".to_string())),
@@ -9524,25 +9568,23 @@ fn fn_query_current_row(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_value_list(args: Vec<CfmlValue>) -> CfmlResult {
     let arr = args.get(0).ok_or_else(|| CfmlError::runtime("valueList() requires a query column".to_string()))?;
     let delim = args.get(1).map(|v| v.as_string()).unwrap_or_else(|| ",".to_string());
-    match arr {
-        // valueList canonically iterates rows on Lucee — accept both Array and QueryColumn.
-        CfmlValue::Array(items) | CfmlValue::QueryColumn(items) => {
-            let result: Vec<String> = items.iter().map(|v| v.as_string()).collect();
-            Ok(CfmlValue::String(result.join(&delim)))
-        }
-        _ => Ok(CfmlValue::String(arr.as_string()))
+    // valueList canonically iterates rows on Lucee — accept both Array and QueryColumn.
+    if let Some(items) = arr.as_array_or_query_column() {
+        let result: Vec<String> = items.iter().map(|v| v.as_string()).collect();
+        Ok(CfmlValue::String(result.join(&delim)))
+    } else {
+        Ok(CfmlValue::String(arr.as_string()))
     }
 }
 
 fn fn_quoted_value_list(args: Vec<CfmlValue>) -> CfmlResult {
     let arr = args.get(0).ok_or_else(|| CfmlError::runtime("quotedValueList() requires a query column".to_string()))?;
     let delim = args.get(1).map(|v| v.as_string()).unwrap_or_else(|| ",".to_string());
-    match arr {
-        CfmlValue::Array(items) | CfmlValue::QueryColumn(items) => {
-            let result: Vec<String> = items.iter().map(|v| format!("'{}'", v.as_string())).collect();
-            Ok(CfmlValue::String(result.join(&delim)))
-        }
-        _ => Ok(CfmlValue::String(format!("'{}'", arr.as_string())))
+    if let Some(items) = arr.as_array_or_query_column() {
+        let result: Vec<String> = items.iter().map(|v| format!("'{}'", v.as_string())).collect();
+        Ok(CfmlValue::String(result.join(&delim)))
+    } else {
+        Ok(CfmlValue::String(format!("'{}'", arr.as_string())))
     }
 }
 

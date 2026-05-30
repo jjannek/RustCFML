@@ -274,7 +274,7 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
         .skip(1)
         .map(CfmlValue::String)
         .collect();
-    system.insert("arguments".to_string(), CfmlValue::Array(args.into()));
+    system.insert("arguments".to_string(), CfmlValue::array(args));
 
     info.insert("system".to_string(), CfmlValue::strukt(system));
 
@@ -1530,40 +1530,22 @@ impl CfmlVirtualMachine {
                 }
                 BytecodeOp::ArrayAppendLocal(name) => {
                     // Fused arrayAppend(<ident>, value). The value is on top of
-                    // the stack; the array lives in the named variable. Mutating
-                    // it in place keeps a loop of appends O(n) instead of O(n²):
-                    // the generic path clones the whole backing Vec on every call
-                    // because the array is aliased between the scope slot and the
-                    // working copy passed to the builtin.
+                    // the stack; the array lives in the named variable. With
+                    // reference-typed arrays the variable holds a shared handle,
+                    // so pushing in place is O(1) AND visible to every alias —
+                    // no clone, no store-back, no env sync needed. (Pre-reference
+                    // this had to fight Arc copy-on-write; that's all gone now.)
                     let value = stack.pop().unwrap_or(CfmlValue::Null);
 
-                    // Fast path: the array is held directly in this frame's locals
-                    // (exact case). StoreLocal writes plain identifiers back to
-                    // `locals` whenever `locals.contains_key(name)`, so an in-place
-                    // mutation here is observationally identical — but the slot's
-                    // Arc is typically unique, so `make_mut` appends without a clone.
-                    // Skip the fast path when a closure env shares this name, so the
-                    // env stays in sync (handled by the fallback's write-back).
-                    let env_shares = closure_env
-                        .as_ref()
-                        .map(|e| {
-                            e.read()
-                                .map(|m| m.contains_key(name.as_str()))
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-
-                    if !env_shares {
-                        if let Some(CfmlValue::Array(arr)) = locals.get_mut(name.as_str()) {
-                            Arc::make_mut(arr).push(value);
-                            continue;
-                        }
+                    // Fast path: array held directly in this frame's locals.
+                    if let Some(CfmlValue::Array(arr)) = locals.get(name.as_str()) {
+                        arr.push(value);
+                        continue;
                     }
 
-                    // Fallback: resolve through the full scope chain, append, and
-                    // write back to the correct scope. Mirrors LoadLocal + builtin
-                    // + StoreLocal for a plain identifier (CFC component scope,
-                    // case-insensitive matches, page-scope globals, env sync).
+                    // Resolve through the full scope chain; the returned handle
+                    // shares the backing with the scope slot, so a push is seen
+                    // by the original (globals/__variables/case-insensitive).
                     let name_lower_owned: String;
                     let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
                         name_lower_owned = name.to_lowercase();
@@ -1571,13 +1553,17 @@ impl CfmlVirtualMachine {
                     } else {
                         name.as_str()
                     };
-                    let mut arr = match self.lookup_name_in_scopes(name.as_str(), name_lower, &locals) {
-                        Some(CfmlValue::Array(a)) => a,
-                        _ => Arc::new(Vec::new()),
-                    };
-                    Arc::make_mut(&mut arr).push(value);
-                    let val = CfmlValue::Array(arr);
+                    if let Some(CfmlValue::Array(arr)) =
+                        self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
+                    {
+                        arr.push(value);
+                        continue;
+                    }
 
+                    // Not found (or not an array): create a fresh single-element
+                    // array and store it in the correct scope, mirroring how
+                    // StoreLocal routes a plain identifier.
+                    let val = CfmlValue::array(vec![value]);
                     if locals.contains_key("__variables")
                         && !declared_locals.contains(name.as_str())
                         && !declared_locals.contains(name_lower)
@@ -2560,16 +2546,22 @@ impl CfmlVirtualMachine {
                 BytecodeOp::GetIndex => {
                     let index = stack.pop().unwrap_or(CfmlValue::Null);
                     let collection = stack.pop().unwrap_or(CfmlValue::Null);
+                    let one_based_to_zero = |index: &CfmlValue| -> usize {
+                        let idx = match index {
+                            CfmlValue::Int(i) => *i as usize,
+                            CfmlValue::Double(d) => *d as usize,
+                            CfmlValue::String(s) => s.parse::<usize>().unwrap_or(0),
+                            _ => 0,
+                        };
+                        if idx > 0 { idx - 1 } else { 0 }
+                    };
                     match &collection {
-                        CfmlValue::Array(arr) | CfmlValue::QueryColumn(arr) => {
-                            let idx = match &index {
-                                CfmlValue::Int(i) => *i as usize,
-                                CfmlValue::Double(d) => *d as usize,
-                                CfmlValue::String(s) => s.parse::<usize>().unwrap_or(0),
-                                _ => 0,
-                            };
-                            // CFML arrays are 1-based
-                            let idx = if idx > 0 { idx - 1 } else { 0 };
+                        CfmlValue::Array(arr) => {
+                            let idx = one_based_to_zero(&index);
+                            stack.push(arr.get(idx).unwrap_or(CfmlValue::Null));
+                        }
+                        CfmlValue::QueryColumn(arr) => {
+                            let idx = one_based_to_zero(&index);
                             stack.push(arr.get(idx).cloned().unwrap_or(CfmlValue::Null));
                         }
                         CfmlValue::Struct(s) => {
@@ -2605,17 +2597,11 @@ impl CfmlVirtualMachine {
                             };
                             if one_based >= 1 {
                                 let idx = (one_based - 1) as usize;
-                                let backing = Arc::make_mut(arr);
-                                if idx < backing.len() {
-                                    backing[idx] = value;
-                                } else {
-                                    // Auto-grow: assigning past the end extends the
-                                    // array. Lucee grows the length but leaves the
-                                    // skipped slots as non-existent (null) holes —
-                                    // `a=[]; a[3]="x"` → len 3 with [1] and [2] null.
-                                    backing.resize(idx, CfmlValue::Null);
-                                    backing.push(value);
-                                }
+                                // Interior mutability on the shared handle: the
+                                // assignment is visible to every alias. Auto-grow
+                                // past the end leaves skipped slots as null holes
+                                // (Lucee): `a=[]; a[3]="x"` → len 3, [1]/[2] null.
+                                arr.set_or_grow(idx, value);
                             }
                         }
                         CfmlValue::Struct(s) => {
@@ -3888,9 +3874,12 @@ impl CfmlVirtualMachine {
                 BytecodeOp::ConcatArrays => {
                     let right = stack.pop().unwrap_or(CfmlValue::array(Vec::new()));
                     let left = stack.pop().unwrap_or(CfmlValue::array(Vec::new()));
-                    if let (CfmlValue::Array(mut a), CfmlValue::Array(b)) = (left, right) {
-                        Arc::make_mut(&mut a).extend(b.iter().cloned());
-                        stack.push(CfmlValue::Array(a));
+                    if let (CfmlValue::Array(a), CfmlValue::Array(b)) = (left, right) {
+                        // Concatenation produces a NEW array (not a mutation of
+                        // either operand), so snapshot both into a fresh Vec.
+                        let mut v = a.snapshot();
+                        v.extend(b.iter());
+                        stack.push(CfmlValue::array(v));
                     } else {
                         stack.push(CfmlValue::array(Vec::new()));
                     }
@@ -3913,13 +3902,13 @@ impl CfmlVirtualMachine {
                     // Stack: [func_ref, args_array]
                     let args_val = stack.pop().unwrap_or(CfmlValue::array(Vec::new()));
                     let func_ref = stack.pop().unwrap_or(CfmlValue::Null);
-                    let args = if let CfmlValue::Array(a) = args_val {
-                        a
+                    let args: Vec<CfmlValue> = if let CfmlValue::Array(a) = args_val {
+                        a.snapshot()
                     } else {
-                        Arc::new(vec![args_val])
+                        vec![args_val]
                     };
                     self.closure_parent_writeback = None;
-                    let result = self.call_function(&func_ref, (*args).clone(), &locals)?;
+                    let result = self.call_function(&func_ref, args, &locals)?;
                     // Write back mutations into the shared closure environment
                     if let Some(ref writeback) = self.closure_parent_writeback {
                         Self::write_back_to_captured_scope(&func_ref, writeback);
@@ -4251,12 +4240,11 @@ impl CfmlVirtualMachine {
                         (p, p.is_some())
                     };
                     if let Some(p) = pos {
-                        let mut new_arr = arr.clone();
-                        Arc::make_mut(&mut new_arr).remove(p);
-                        // Write back the mutated array to the source variable
-                        self.arg_ref_writeback = Some(vec![
-                            ("0".to_string(), CfmlValue::Array(new_arr)),
-                        ]);
+                        // Reference semantics: remove in place on the shared
+                        // handle so the caller's array reflects the deletion.
+                        arr.with_write(|v| {
+                            v.remove(p);
+                        });
                     }
                     return Ok(CfmlValue::Bool(found));
                 }
@@ -5788,7 +5776,7 @@ impl CfmlVirtualMachine {
                                 CfmlValue::Array(rows) => {
                                     for item in rows.iter() {
                                         if let CfmlValue::Struct(data) = item {
-                                            result.rows.push((**data).clone());
+                                            result.rows.push((*data).clone());
                                         } else {
                                             result.rows.push(IndexMap::new());
                                         }
@@ -8067,12 +8055,13 @@ impl CfmlVirtualMachine {
                     && java_class == "java.util.concurrent.concurrentlinkedqueue"
                 {
                     if let Some(CfmlValue::Array(q)) = s.get("__queue").cloned() {
-                        if q.is_empty() {
+                        let qv = q.snapshot();
+                        if qv.is_empty() {
                             return Ok(CfmlValue::Null);
                         }
-                        let head = q[0].clone();
+                        let head = qv[0].clone();
                         let mut ns = s.clone();
-                        Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::array(q[1..].to_vec()));
+                        Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::array(qv[1..].to_vec()));
                         self.method_this_writeback = Some(CfmlValue::Struct(ns));
                         return Ok(head);
                     }
@@ -8384,10 +8373,10 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Bool(true));
                 }
                 "first" => {
-                    return Ok(arr.first().cloned().unwrap_or(CfmlValue::Null));
+                    return Ok(arr.first().unwrap_or(CfmlValue::Null));
                 }
                 "last" => {
-                    return Ok(arr.last().cloned().unwrap_or(CfmlValue::Null));
+                    return Ok(arr.last().unwrap_or(CfmlValue::Null));
                 }
                 "isempty" => {
                     return Ok(CfmlValue::Bool(arr.is_empty()));
@@ -9009,6 +8998,10 @@ impl CfmlVirtualMachine {
             (CfmlValue::Double(a), CfmlValue::Double(b)) => a == b,
             (CfmlValue::String(a), CfmlValue::String(b)) => a == b,
             (CfmlValue::Array(a), CfmlValue::Array(b)) => {
+                if a.ptr_eq(b) {
+                    return true;
+                }
+                let (a, b) = (a.snapshot(), b.snapshot());
                 a.len() == b.len()
                     && a.iter()
                         .zip(b.iter())
@@ -9482,9 +9475,11 @@ impl CfmlVirtualMachine {
                 }
             }
             CfmlValue::Array(arr) => {
-                for item in Arc::make_mut(arr).iter_mut() {
-                    Self::adjust_func_indices(item, min_index, delta);
-                }
+                arr.with_write(|v| {
+                    for item in v.iter_mut() {
+                        Self::adjust_func_indices(item, min_index, delta);
+                    }
+                });
             }
             _ => {}
         }

@@ -2,9 +2,144 @@
 
 use crate::vm::CfmlResult;
 use indexmap::IndexMap;
+use parking_lot::RwLock as PlRwLock;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+
+/// Shared, interior-mutable backing for a CFML array — the basis of Lucee-style
+/// **reference semantics**. Cloning a `CfmlArray` bumps the `Arc` (it does NOT
+/// copy the elements), so `b = a` makes `a` and `b` two handles onto the *same*
+/// `Vec`; a mutation through either is visible through both. Contrast the old
+/// `Arc<Vec>` + copy-on-write model, which diverged aliases on first write.
+///
+/// All locking lives behind this type's methods so callers (especially
+/// `cfml-stdlib`, which doesn't depend on `parking_lot`) never hold a raw guard.
+/// Lock discipline: methods take a guard, do one thing, and drop it before
+/// returning — never call back into VM/user code while a guard is held, and
+/// never lock the same array twice on one thread (parking_lot locks are not
+/// reentrant). Anything that needs to iterate-then-call (higher-order fns,
+/// equality) must `snapshot()` first to release the lock.
+#[derive(Clone)]
+pub struct CfmlArray(Arc<PlRwLock<Vec<CfmlValue>>>);
+
+impl CfmlArray {
+    #[inline]
+    pub fn new(v: Vec<CfmlValue>) -> Self {
+        CfmlArray(Arc::new(PlRwLock::new(v)))
+    }
+
+    #[inline]
+    pub fn empty() -> Self {
+        CfmlArray::new(Vec::new())
+    }
+
+    /// Two handles onto the same backing store (reference identity).
+    #[inline]
+    pub fn ptr_eq(&self, other: &CfmlArray) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.read().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.read().is_empty()
+    }
+
+    /// Clone the element at a 0-based index, or `None` if out of range.
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<CfmlValue> {
+        self.0.read().get(idx).cloned()
+    }
+
+    #[inline]
+    pub fn first(&self) -> Option<CfmlValue> {
+        self.0.read().first().cloned()
+    }
+
+    #[inline]
+    pub fn last(&self) -> Option<CfmlValue> {
+        self.0.read().last().cloned()
+    }
+
+    /// Overwrite an existing 0-based index in place. Returns false if out of
+    /// range (no auto-grow — see `set_or_grow`).
+    #[inline]
+    pub fn set(&self, idx: usize, value: CfmlValue) -> bool {
+        let mut g = self.0.write();
+        if idx < g.len() {
+            g[idx] = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a 0-based index, growing the array (filling gaps with `Null`, Lucee
+    /// semantics) when `idx` is past the end.
+    pub fn set_or_grow(&self, idx: usize, value: CfmlValue) {
+        let mut g = self.0.write();
+        if idx < g.len() {
+            g[idx] = value;
+        } else {
+            g.resize(idx, CfmlValue::Null);
+            g.push(value);
+        }
+    }
+
+    #[inline]
+    pub fn push(&self, value: CfmlValue) {
+        self.0.write().push(value);
+    }
+
+    /// A point-in-time copy of the contents. Use this before iterating when the
+    /// loop body may call back into code that touches the same array (closures,
+    /// equality, dump) — it releases the lock so re-entrancy can't deadlock.
+    #[inline]
+    pub fn snapshot(&self) -> Vec<CfmlValue> {
+        self.0.read().clone()
+    }
+
+    /// Iterate a point-in-time **snapshot** of the elements (yields owned
+    /// `CfmlValue`s, not borrows). Iterating a snapshot — rather than holding
+    /// the lock across the loop — is what makes reference-typed arrays safe to
+    /// walk while the body may mutate the same array (and can't deadlock). This
+    /// is the reference-semantics analogue of `Vec::iter()`; it snapshots, so
+    /// avoid it on hot paths where `len()`/`get()` suffice.
+    #[inline]
+    pub fn iter(&self) -> std::vec::IntoIter<CfmlValue> {
+        self.snapshot().into_iter()
+    }
+
+    /// Alias for `snapshot()` — owned copy of the elements.
+    #[inline]
+    pub fn to_vec(&self) -> Vec<CfmlValue> {
+        self.snapshot()
+    }
+
+    /// Run a closure with exclusive (write) access to the backing `Vec`. The
+    /// closure MUST NOT touch this same array again (would deadlock).
+    #[inline]
+    pub fn with_write<R>(&self, f: impl FnOnce(&mut Vec<CfmlValue>) -> R) -> R {
+        f(&mut self.0.write())
+    }
+
+    /// Run a closure with shared (read) access. Same re-entrancy caveat.
+    #[inline]
+    pub fn with_read<R>(&self, f: impl FnOnce(&Vec<CfmlValue>) -> R) -> R {
+        f(&self.0.read())
+    }
+}
+
+impl FromIterator<CfmlValue> for CfmlArray {
+    fn from_iter<I: IntoIterator<Item = CfmlValue>>(iter: I) -> Self {
+        CfmlArray::new(iter.into_iter().collect())
+    }
+}
 
 /// Trait implemented by Rust types that want to be addressable as CFML
 /// objects (`new rust:MyClass()` / member-call dispatch).
@@ -54,7 +189,9 @@ pub enum CfmlValue {
     Int(i64),
     Double(f64),
     String(String),
-    Array(Arc<Vec<CfmlValue>>),
+    /// Reference-typed array (Lucee semantics): a shared, interior-mutable
+    /// handle. Aliases see each other's mutations. See `CfmlArray`.
+    Array(CfmlArray),
     /// Lucee-style query column proxy: behaves as Array for iteration/indexing/length,
     /// but stringifies to the first row's value (so `q.col & "x"` works) and reports
     /// `type_name()` as "Array" so `isArray()` is true. Produced by `query.colname`
@@ -82,7 +219,7 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Int(i) => f.debug_tuple("Int").field(i).finish(),
             CfmlValue::Double(d) => f.debug_tuple("Double").field(d).finish(),
             CfmlValue::String(s) => f.debug_tuple("String").field(s).finish(),
-            CfmlValue::Array(a) => f.debug_tuple("Array").field(&**a).finish(),
+            CfmlValue::Array(a) => f.debug_tuple("Array").field(&a.snapshot()).finish(),
             CfmlValue::QueryColumn(a) => f.debug_tuple("QueryColumn").field(&**a).finish(),
             CfmlValue::Struct(s) => f.debug_tuple("Struct").field(&**s).finish(),
             CfmlValue::Closure(c) => f.debug_tuple("Closure").field(c).finish(),
@@ -141,6 +278,7 @@ impl CfmlValue {
                 }
             }
             CfmlValue::Array(a) => !a.is_empty(),
+            // (CfmlArray::is_empty locks briefly.)
             // QueryColumn truthiness: first row's truthiness (Lucee proxies to first row).
             CfmlValue::QueryColumn(a) => a.first().map(|v| v.is_true()).unwrap_or(false),
             CfmlValue::Struct(s) => !s.is_empty(),
@@ -161,7 +299,8 @@ impl CfmlValue {
             CfmlValue::Double(d) => d.to_string(),
             CfmlValue::String(s) => s.clone(),
             CfmlValue::Array(a) => {
-                let items: Vec<String> = a.iter().map(|v| v.as_string()).collect();
+                let items: Vec<String> =
+                    a.snapshot().iter().map(|v| v.as_string()).collect();
                 format!("[{}]", items.join(", "))
             }
             // QueryColumn stringifies to the first row's value, matching Lucee's
@@ -189,7 +328,8 @@ impl CfmlValue {
     pub fn get(&self, key: &str) -> Option<CfmlValue> {
         match self {
             CfmlValue::Struct(s) => s.get(key).cloned(),
-            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => {
+            CfmlValue::Array(a) => key.parse::<usize>().ok().and_then(|idx| a.get(idx)),
+            CfmlValue::QueryColumn(a) => {
                 if let Ok(idx) = key.parse::<usize>() {
                     a.get(idx).cloned()
                 } else {
@@ -207,9 +347,9 @@ impl CfmlValue {
             }
             CfmlValue::Array(a) => {
                 if let Ok(idx) = key.parse::<usize>() {
-                    if idx < a.len() {
-                        Arc::make_mut(a)[idx] = value;
-                    }
+                    // Interior mutability: no `&mut`/make_mut needed; the shared
+                    // backing is updated so aliases observe the write.
+                    a.set(idx, value);
                 }
             }
             _ => {}
@@ -221,7 +361,7 @@ impl CfmlValue {
     /// Array-producing builtin across crate boundaries.
     #[inline]
     pub fn array(v: Vec<CfmlValue>) -> Self {
-        CfmlValue::Array(Arc::new(v))
+        CfmlValue::Array(CfmlArray::new(v))
     }
 
     /// Construct a `CfmlValue::Struct` from an owned `IndexMap`, wrapping in
@@ -231,9 +371,20 @@ impl CfmlValue {
         CfmlValue::Struct(Arc::new(m))
     }
 
-    pub fn as_array(&self) -> Option<&Vec<CfmlValue>> {
+    /// Borrow the shared array handle (no copy). Mutating through it is visible
+    /// to all aliases. Returns `None` for non-arrays (QueryColumn excluded).
+    pub fn as_cfml_array(&self) -> Option<&CfmlArray> {
         match self {
             CfmlValue::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// A point-in-time copy of the array's elements. Returns `None` for
+    /// non-arrays. (A snapshot, not a borrow — the backing is behind a lock.)
+    pub fn as_array(&self) -> Option<Vec<CfmlValue>> {
+        match self {
+            CfmlValue::Array(a) => Some(a.snapshot()),
             _ => None,
         }
     }
@@ -243,9 +394,10 @@ impl CfmlValue {
     /// which canonically iterates rows on Lucee). Most array consumers
     /// should stay on `as_array` so that `arrayLen(q.col)` etc. cleanly
     /// reject the value, matching Lucee@7.
-    pub fn as_array_or_query_column(&self) -> Option<&Vec<CfmlValue>> {
+    pub fn as_array_or_query_column(&self) -> Option<Vec<CfmlValue>> {
         match self {
-            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => Some(a),
+            CfmlValue::Array(a) => Some(a.snapshot()),
+            CfmlValue::QueryColumn(a) => Some((**a).clone()),
             _ => None,
         }
     }
@@ -257,10 +409,22 @@ impl CfmlValue {
         }
     }
 
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<CfmlValue>> {
+    /// Recursively copy a value, breaking all shared references. Arrays and
+    /// structs get fresh backing stores with deep-copied elements, so the
+    /// result is fully independent of the source (this is what `duplicate()`
+    /// must do now that arrays are reference-typed — a plain `clone()` only
+    /// shares the handle). Scalars/immutable variants fall back to `clone()`.
+    /// NOTE: does not yet break cycles (e.g. an array appended to itself); such
+    /// self-referential structures would recurse without bound.
+    pub fn deep_copy(&self) -> CfmlValue {
         match self {
-            CfmlValue::Array(a) => Some(Arc::make_mut(a)),
-            _ => None,
+            CfmlValue::Array(a) => {
+                CfmlValue::array(a.snapshot().iter().map(|v| v.deep_copy()).collect())
+            }
+            CfmlValue::Struct(s) => CfmlValue::strukt(
+                s.iter().map(|(k, v)| (k.clone(), v.deep_copy())).collect(),
+            ),
+            other => other.clone(),
         }
     }
 
@@ -285,14 +449,33 @@ impl CfmlValue {
             (CfmlValue::String(a), CfmlValue::String(b)) => a.to_lowercase() == b.to_lowercase(),
             (CfmlValue::Int(a), CfmlValue::Double(b)) => *a as f64 == *b,
             (CfmlValue::Double(a), CfmlValue::Int(b)) => *a == *b as f64,
-            (
-                CfmlValue::Array(a) | CfmlValue::QueryColumn(a),
-                CfmlValue::Array(b) | CfmlValue::QueryColumn(b),
-            ) => {
-                if a.len() != b.len() {
-                    return false;
+            (CfmlValue::Array(a), CfmlValue::Array(b)) => {
+                // Identity short-circuit avoids locking the same array twice
+                // (and terminates self-referential structures).
+                if a.ptr_eq(b) {
+                    return true;
                 }
-                a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
+                // Snapshot to release the locks before the (possibly recursive)
+                // element comparison — prevents re-entrant lock deadlocks.
+                let (a, b) = (a.snapshot(), b.snapshot());
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
+            }
+            (
+                CfmlValue::Array(a),
+                CfmlValue::QueryColumn(b),
+            ) => {
+                let a = a.snapshot();
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
+            }
+            (
+                CfmlValue::QueryColumn(a),
+                CfmlValue::Array(b),
+            ) => {
+                let b = b.snapshot();
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
+            }
+            (CfmlValue::QueryColumn(a), CfmlValue::QueryColumn(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
             }
             (CfmlValue::Struct(a), CfmlValue::Struct(b)) => {
                 if a.len() != b.len() {
@@ -417,7 +600,15 @@ impl serde::Serialize for CfmlValue {
             CfmlValue::Int(i) => s.serialize_i64(*i),
             CfmlValue::Double(d) => s.serialize_f64(*d),
             CfmlValue::String(st) => s.serialize_str(st),
-            CfmlValue::Array(a) | CfmlValue::QueryColumn(a) => {
+            CfmlValue::Array(a) => {
+                let snap = a.snapshot();
+                let mut seq = s.serialize_seq(Some(snap.len()))?;
+                for v in snap.iter() {
+                    seq.serialize_element(v)?;
+                }
+                seq.end()
+            }
+            CfmlValue::QueryColumn(a) => {
                 let mut seq = s.serialize_seq(Some(a.len()))?;
                 for v in a.iter() {
                     seq.serialize_element(v)?;
@@ -531,12 +722,12 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                 "query" => {
                     if let Some(CfmlValue::Array(cols)) = map.get("columns") {
                         let columns: Vec<String> =
-                            cols.iter().map(|v| v.as_string()).collect();
+                            cols.snapshot().iter().map(|v| v.as_string()).collect();
                         let mut query = CfmlQuery::new(columns.clone());
                         if let Some(CfmlValue::Array(rows)) = map.get("rows") {
-                            for row_val in rows.iter() {
+                            for row_val in rows.snapshot() {
                                 if let CfmlValue::Struct(row_map) = row_val {
-                                    query.rows.push((**row_map).clone());
+                                    query.rows.push((*row_map).clone());
                                 }
                             }
                         }
