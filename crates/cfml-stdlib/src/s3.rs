@@ -749,7 +749,7 @@ pub fn objects_to_query_struct(objects: Vec<S3Object>) -> CfmlValue {
             CfmlValue::String(o.storage_class),
         );
         s.insert("isDirectory".to_string(), CfmlValue::Bool(o.is_directory));
-        arr.push(CfmlValue::Struct(Arc::new(s)));
+        arr.push(CfmlValue::strukt(s));
     }
     CfmlValue::array(arr)
 }
@@ -763,7 +763,7 @@ pub fn buckets_to_array(buckets: Vec<S3BucketInfo>) -> CfmlValue {
             "creationDate".to_string(),
             CfmlValue::String(b.creation_date),
         );
-        arr.push(CfmlValue::Struct(Arc::new(s)));
+        arr.push(CfmlValue::strukt(s));
     }
     CfmlValue::array(arr)
 }

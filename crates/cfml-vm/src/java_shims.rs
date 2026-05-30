@@ -3,7 +3,6 @@
 use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::CfmlResult;
 use indexmap::IndexMap;
-use std::sync::Arc;
 
 pub fn handle_java_messagedigest(
     method: &str,
@@ -40,12 +39,12 @@ pub fn handle_java_messagedigest(
                     Some(v) => v.as_string(),
                     None => String::new(),
                 };
-                let mut new_shim = shim.clone();
-                Arc::make_mut(&mut new_shim).insert(
+                let mut new_shim = shim.snapshot();
+                new_shim.insert(
                     "__data".to_string(),
                     CfmlValue::String(format!("{}{}", current, input)),
                 );
-                Ok(CfmlValue::Struct(new_shim))
+                Ok(CfmlValue::strukt(new_shim))
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -70,9 +69,9 @@ pub fn handle_java_messagedigest(
         }
         "reset" => {
             if let CfmlValue::Struct(ref shim) = object {
-                let mut new_shim = shim.clone();
-                Arc::make_mut(&mut new_shim).insert("__data".to_string(), CfmlValue::String(String::new()));
-                Ok(CfmlValue::Struct(new_shim))
+                let mut new_shim = shim.snapshot();
+                new_shim.insert("__data".to_string(), CfmlValue::String(String::new()));
+                Ok(CfmlValue::strukt(new_shim))
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -131,7 +130,6 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
             return match method {
                 "getname" => Ok(shim
                     .get("__name")
-                    .cloned()
                     .unwrap_or(CfmlValue::String("main".to_string()))),
                 _ => Ok(CfmlValue::Null),
             };
@@ -152,7 +150,6 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
             if let CfmlValue::Struct(ref shim) = object {
                 Ok(shim
                     .get("__name")
-                    .cloned()
                     .unwrap_or(CfmlValue::String("main".to_string())))
             } else {
                 Ok(CfmlValue::String("main".to_string()))
@@ -231,7 +228,6 @@ pub fn handle_java_inetaddress(
                 };
                 Ok(shim
                     .get(key)
-                    .cloned()
                     .unwrap_or(CfmlValue::String("localhost".to_string())))
             } else {
                 Ok(CfmlValue::String("localhost".to_string()))
@@ -259,7 +255,6 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             if let CfmlValue::Struct(ref shim) = object {
                 return Ok(shim
                     .get("__path")
-                    .cloned()
                     .unwrap_or(CfmlValue::String(String::new())));
             }
             Ok(CfmlValue::String(String::new()))
@@ -267,7 +262,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "getabsolute_path" | "getabsolutepath" | "getcanonicalpath" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    let p = std::path::Path::new(path);
+                    let p = std::path::Path::new(&path);
                     if p.is_absolute() {
                         return Ok(CfmlValue::String(path.clone()));
                     }
@@ -283,7 +278,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "isabsolute" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    return Ok(CfmlValue::Bool(std::path::Path::new(path).is_absolute()));
+                    return Ok(CfmlValue::Bool(std::path::Path::new(&path).is_absolute()));
                 }
             }
             Ok(CfmlValue::Bool(false))
@@ -291,7 +286,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "exists" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    return Ok(CfmlValue::Bool(std::path::Path::new(path).exists()));
+                    return Ok(CfmlValue::Bool(std::path::Path::new(&path).exists()));
                 }
             }
             Ok(CfmlValue::Bool(false))
@@ -299,7 +294,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "isfile" | "is_directory" | "isdirectory" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    let p = std::path::Path::new(path);
+                    let p = std::path::Path::new(&path);
                     return Ok(CfmlValue::Bool(if method == "isfile" {
                         p.is_file()
                     } else {
@@ -312,9 +307,9 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "getname" | "lastmodified" | "length" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    if let Ok(meta) = std::fs::metadata(path) {
+                    if let Ok(meta) = std::fs::metadata(&path) {
                         if method == "getname" {
-                            if let Some(n) = std::path::Path::new(path).file_name() {
+                            if let Some(n) = std::path::Path::new(&path).file_name() {
                                 return Ok(CfmlValue::String(n.to_string_lossy().to_string()));
                             }
                         } else if method == "lastmodified" {
@@ -456,12 +451,12 @@ pub fn handle_java_stringbuilder(
                     .map(|b| b.as_string())
                     .unwrap_or_default();
                 let app = args.first().map(|a| a.as_string()).unwrap_or_default();
-                let mut ns = shim.clone();
-                Arc::make_mut(&mut ns).insert(
+                let mut ns = shim.snapshot();
+                ns.insert(
                     "__buffer".to_string(),
                     CfmlValue::String(format!("{}{}", cur, app)),
                 );
-                Ok(CfmlValue::Struct(ns))
+                Ok(CfmlValue::strukt(ns))
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -470,7 +465,6 @@ pub fn handle_java_stringbuilder(
             if let CfmlValue::Struct(ref shim) = object {
                 Ok(shim
                     .get("__buffer")
-                    .cloned()
                     .unwrap_or(CfmlValue::String(String::new())))
             } else {
                 Ok(CfmlValue::String(String::new()))
@@ -489,9 +483,9 @@ pub fn handle_java_stringbuilder(
         }
         "clear" => {
             if let CfmlValue::Struct(ref shim) = object {
-                let mut ns = shim.clone();
-                Arc::make_mut(&mut ns).insert("__buffer".to_string(), CfmlValue::String(String::new()));
-                Ok(CfmlValue::Struct(ns))
+                let mut ns = shim.snapshot();
+                ns.insert("__buffer".to_string(), CfmlValue::String(String::new()));
+                Ok(CfmlValue::strukt(ns))
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -520,9 +514,9 @@ pub fn handle_java_treemap(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
         "put" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some((k, v)) = args.get(0).zip(args.get(1)) {
-                    let mut ns = shim.clone();
-                    Arc::make_mut(&mut ns).insert(k.as_string(), v.clone());
-                    Ok(CfmlValue::Struct(ns))
+                    let mut ns = shim.snapshot();
+                    ns.insert(k.as_string(), v.clone());
+                    Ok(CfmlValue::strukt(ns))
                 } else {
                     Ok(object.clone())
                 }
@@ -549,7 +543,7 @@ pub fn handle_java_treemap(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(key) = args.first() {
                     let k = key.as_string();
-                    return Ok(shim.get(&k).cloned().unwrap_or(CfmlValue::Null));
+                    return Ok(shim.get(&k).unwrap_or(CfmlValue::Null));
                 }
             }
             Ok(CfmlValue::Null)
@@ -615,7 +609,7 @@ pub fn handle_java_linkedhashmap(
         "get" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(k)) = args.first() {
-                    Ok(shim.get(k).cloned().unwrap_or(CfmlValue::Null))
+                    Ok(shim.get(k).unwrap_or(CfmlValue::Null))
                 } else {
                     Ok(CfmlValue::Null)
                 }
@@ -646,9 +640,9 @@ pub fn handle_java_linkedhashmap(
         "put" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some((k, v)) = args.get(0).zip(args.get(1)) {
-                    let mut ns = shim.clone();
-                    Arc::make_mut(&mut ns).insert(k.as_string(), v.clone());
-                    Ok(CfmlValue::Struct(ns))
+                    let mut ns = shim.snapshot();
+                    ns.insert(k.as_string(), v.clone());
+                    Ok(CfmlValue::strukt(ns))
                 } else {
                     Ok(object.clone())
                 }
@@ -688,13 +682,13 @@ pub fn handle_java_concurrentlinkedqueue(
         "offer" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(item) = args.first() {
-                    let mut ns = shim.clone();
+                    let mut ns = shim.snapshot();
                     if let Some(CfmlValue::Array(q)) = ns.get("__queue").cloned() {
                         let mut nq = q.snapshot();
                         nq.push(item.clone());
-                        Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::array(nq));
+                        ns.insert("__queue".to_string(), CfmlValue::array(nq));
                     }
-                    Ok(CfmlValue::Struct(ns))
+                    Ok(CfmlValue::strukt(ns))
                 } else {
                     Ok(object.clone())
                 }
@@ -704,14 +698,14 @@ pub fn handle_java_concurrentlinkedqueue(
         }
         "poll" => {
             if let CfmlValue::Struct(ref shim) = object {
-                if let Some(CfmlValue::Array(q)) = shim.get("__queue").cloned() {
+                if let Some(CfmlValue::Array(q)) = shim.get("__queue") {
                     let qv = q.snapshot();
                     if !qv.is_empty() {
-                        let mut ns = shim.clone();
+                        let mut ns = shim.snapshot();
                         let _itm = qv[0].clone();
                         let nq = qv[1..].to_vec();
-                        Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::array(nq));
-                        return Ok(CfmlValue::Struct(ns));
+                        ns.insert("__queue".to_string(), CfmlValue::array(nq));
+                        return Ok(CfmlValue::strukt(ns));
                     }
                 }
                 Ok(CfmlValue::Null)
@@ -721,7 +715,7 @@ pub fn handle_java_concurrentlinkedqueue(
         }
         "peek" => {
             if let CfmlValue::Struct(ref shim) = object {
-                if let Some(CfmlValue::Array(q)) = shim.get("__queue").cloned() {
+                if let Some(CfmlValue::Array(q)) = shim.get("__queue") {
                     if let Some(first) = q.first() {
                         return Ok(first);
                     }
@@ -733,7 +727,7 @@ pub fn handle_java_concurrentlinkedqueue(
         }
         "size" | "len" => {
             if let CfmlValue::Struct(ref shim) = object {
-                if let Some(CfmlValue::Array(q)) = shim.get("__queue").cloned() {
+                if let Some(CfmlValue::Array(q)) = shim.get("__queue") {
                     Ok(CfmlValue::Int(q.len() as i64))
                 } else {
                     Ok(CfmlValue::Int(0))
@@ -744,7 +738,7 @@ pub fn handle_java_concurrentlinkedqueue(
         }
         "isempty" => {
             if let CfmlValue::Struct(ref shim) = object {
-                if let Some(CfmlValue::Array(q)) = shim.get("__queue").cloned() {
+                if let Some(CfmlValue::Array(q)) = shim.get("__queue") {
                     return Ok(CfmlValue::Bool(q.is_empty()));
                 }
                 Ok(CfmlValue::Bool(true))
@@ -783,9 +777,9 @@ pub fn handle_java_concurrenthashmap(
                     if method == "putifabsent" && shim.contains_key(&key) {
                         return Ok(object.clone());
                     }
-                    let mut ns = shim.clone();
-                    Arc::make_mut(&mut ns).insert(key, v.clone());
-                    return Ok(CfmlValue::Struct(ns));
+                    let mut ns = shim.snapshot();
+                    ns.insert(key, v.clone());
+                    return Ok(CfmlValue::strukt(ns));
                 }
                 return Ok(object.clone());
             }
@@ -794,7 +788,7 @@ pub fn handle_java_concurrenthashmap(
         "get" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(k) = args.first() {
-                    return Ok(shim.get(&k.as_string()).cloned().unwrap_or(CfmlValue::Null));
+                    return Ok(shim.get(&k.as_string()).unwrap_or(CfmlValue::Null));
                 }
             }
             Ok(CfmlValue::Null)
@@ -953,7 +947,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
         "getparent" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    if let Some(p) = std::path::Path::new(path).parent() {
+                    if let Some(p) = std::path::Path::new(&path).parent() {
                         let mut ps = IndexMap::new();
                         ps.insert(
                             "__java_class".to_string(),
@@ -975,7 +969,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
         "isabsolute" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    return Ok(CfmlValue::Bool(std::path::Path::new(path).is_absolute()));
+                    return Ok(CfmlValue::Bool(std::path::Path::new(&path).is_absolute()));
                 }
                 Ok(CfmlValue::Bool(false))
             } else {
@@ -986,7 +980,6 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
             if let CfmlValue::Struct(ref shim) = object {
                 Ok(shim
                     .get("__path")
-                    .cloned()
                     .unwrap_or(CfmlValue::String(String::new())))
             } else {
                 Ok(CfmlValue::String(String::new()))
@@ -995,18 +988,18 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
         "toabsolute" | "toabsolutepath" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    let p = std::path::Path::new(path);
+                    let p = std::path::Path::new(&path);
                     if p.is_absolute() {
-                        return Ok(shim.get("__path").cloned().unwrap_or(CfmlValue::Null));
+                        return Ok(shim.get("__path").unwrap_or(CfmlValue::Null));
                     }
                     if let Ok(cwd) = std::env::current_dir() {
                         let full = cwd.join(path);
-                        let mut ns = shim.clone();
-                        Arc::make_mut(&mut ns).insert(
+                        let mut ns = shim.snapshot();
+                        ns.insert(
                             "__path".to_string(),
                             CfmlValue::String(full.to_string_lossy().to_string()),
                         );
-                        return Ok(CfmlValue::Struct(ns));
+                        return Ok(CfmlValue::strukt(ns));
                     }
                 }
                 Ok(CfmlValue::Null)

@@ -50,7 +50,7 @@ impl CfmlVirtualMachine {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("s3"))
             .map(|(_, v)| v)?;
-        S3AppConfig::from_value(s3v)
+        S3AppConfig::from_value(&s3v)
     }
 
     /// If `path` matches an `s3://`-targeted CFML mapping, rewrite it to the

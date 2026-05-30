@@ -21,7 +21,6 @@ use cfml_common::{
     dynamic::CfmlValue,
     vm::{CfmlError, CfmlErrorType, CfmlResult},
 };
-use std::sync::Arc;
 
 fn err(msg: impl Into<String>) -> CfmlError {
     CfmlError::new(msg.into(), CfmlErrorType::Custom("S3".to_string()))
@@ -300,7 +299,7 @@ pub fn fn_s3_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
             )?;
             let client = global_clients().get_or_create(&cfg);
             let meta = s3_get_metadata(&client, &url.bucket, &key)?;
-            return Ok(CfmlValue::Struct(Arc::new(meta)));
+            return Ok(CfmlValue::strukt(meta));
         }
     }
     // Path B: bucket, object, [creds]
@@ -309,7 +308,7 @@ pub fn fn_s3_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
     let (k, s, h) = cred_args(&args, 2);
     let (client, cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
     let meta = s3_get_metadata(&client, &bucket, &cfg.full_key(&object))?;
-    Ok(CfmlValue::Struct(Arc::new(meta)))
+    Ok(CfmlValue::strukt(meta))
 }
 
 /// S3GeneratePresignedURL(bucket, object [, expires=60, method="GET", accessKeyId, secretKey, host])
@@ -390,5 +389,5 @@ pub fn fn_store_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
     let url = S3Url::parse(&raw)?;
     let (client, cfg) = client_and_config_for_url(&url, None)?;
     let meta = s3_get_metadata(&client, &url.bucket, &cfg.full_key(&url.key))?;
-    Ok(CfmlValue::Struct(Arc::new(meta)))
+    Ok(CfmlValue::strukt(meta))
 }

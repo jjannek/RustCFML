@@ -76,5 +76,20 @@ g2 = [1, 2];
 arrayAppend(g2, 3);
 assert("distinct literals are independent", arrayLen(g1), 2);
 
+// --- In-place mutation through a function parameter propagates (reference) ---
+function mutateArg(a) { a[1] = 99; arrayAppend(a, "added"); }
+fnArg = [1, 2];
+mutateArg(fnArg);
+assert("fn-arg index-set propagates", fnArg[1], 99);
+assert("fn-arg append propagates", arrayLen(fnArg), 3);
+
+// --- REASSIGNING a parameter does NOT affect the caller (Lucee semantics) ---
+// The argument is passed by reference, but rebinding the local parameter to a
+// new array is scoped to the function — the caller keeps its array.
+function reassignArg(a) { a = [9, 9, 9]; }
+keepMe = [1];
+reassignArg(keepMe);
+assert("param reassignment does not leak to caller", arrayLen(keepMe), 1);
+
 suiteEnd();
 </cfscript>

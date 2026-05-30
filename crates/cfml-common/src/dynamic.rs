@@ -40,6 +40,13 @@ impl CfmlArray {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Stable identity of the shared backing store, for cycle detection in
+    /// recursive walks (reference-typed arrays can alias / form cycles).
+    #[inline]
+    pub fn backing_ptr(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.0.read().len()
@@ -141,6 +148,184 @@ impl FromIterator<CfmlValue> for CfmlArray {
     }
 }
 
+/// Shared, interior-mutable backing for a CFML struct — the struct analogue of
+/// [`CfmlArray`], giving structs Lucee-style **reference semantics**. Cloning a
+/// `CfmlStruct` bumps the `Arc` (it does NOT copy the entries), so `b = a` makes
+/// `a` and `b` two handles onto the *same* `IndexMap`; a mutation through either
+/// (and through any CFC instance that shares the handle) is visible through both.
+///
+/// All locking lives behind this type's methods so callers (especially
+/// `cfml-stdlib`, which doesn't depend on `parking_lot`) never hold a raw guard.
+/// Lock discipline (critical — parking_lot is NOT reentrant): a method takes a
+/// guard, does one thing, drops it. Never call back into VM/user code while a
+/// guard is held, and never lock the same struct twice on one thread. Anything
+/// iterate-then-call (higher-order struct fns, equality, dump, CFC method
+/// dispatch) must `snapshot()` / `iter()` first to release the lock.
+#[derive(Clone)]
+pub struct CfmlStruct(Arc<PlRwLock<IndexMap<String, CfmlValue>>>);
+
+impl CfmlStruct {
+    #[inline]
+    pub fn new(m: IndexMap<String, CfmlValue>) -> Self {
+        CfmlStruct(Arc::new(PlRwLock::new(m)))
+    }
+
+    #[inline]
+    pub fn empty() -> Self {
+        CfmlStruct::new(IndexMap::new())
+    }
+
+    /// Two handles onto the same backing store (reference identity).
+    #[inline]
+    pub fn ptr_eq(&self, other: &CfmlStruct) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Stable identity of the shared backing store, for cycle detection in
+    /// recursive struct walks (reference-typed structs can alias / form cycles).
+    #[inline]
+    pub fn backing_ptr(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.read().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.read().is_empty()
+    }
+
+    /// Clone the value for `key` (case-sensitive), or `None`.
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<CfmlValue> {
+        self.0.read().get(key).cloned()
+    }
+
+    /// Clone the value for `key`, matching keys case-insensitively (CFML keys
+    /// are case-insensitive). Returns the first matching entry's value.
+    pub fn get_ci(&self, key: &str) -> Option<CfmlValue> {
+        let g = self.0.read();
+        if let Some(v) = g.get(key) {
+            return Some(v.clone());
+        }
+        g.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.clone())
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.0.read().contains_key(key)
+    }
+
+    /// Case-insensitive key presence check.
+    pub fn contains_key_ci(&self, key: &str) -> bool {
+        let g = self.0.read();
+        g.contains_key(key) || g.keys().any(|k| k.eq_ignore_ascii_case(key))
+    }
+
+    /// Insert (interior mutability — visible to all aliases). Returns the
+    /// previous value if the key already existed.
+    #[inline]
+    pub fn insert(&self, key: String, value: CfmlValue) -> Option<CfmlValue> {
+        self.0.write().insert(key, value)
+    }
+
+    /// Remove a key (case-sensitive), returning its value if present. Uses
+    /// `shift_remove` to preserve insertion order of the remaining entries.
+    #[inline]
+    pub fn remove(&self, key: &str) -> Option<CfmlValue> {
+        self.0.write().shift_remove(key)
+    }
+
+    /// Remove a key case-insensitively, returning its value if present.
+    pub fn remove_ci(&self, key: &str) -> Option<CfmlValue> {
+        let mut g = self.0.write();
+        if g.contains_key(key) {
+            return g.shift_remove(key);
+        }
+        let found = g.keys().find(|k| k.eq_ignore_ascii_case(key)).cloned();
+        found.and_then(|k| g.shift_remove(&k))
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        self.0.write().clear();
+    }
+
+    #[inline]
+    pub fn keys(&self) -> Vec<String> {
+        self.0.read().keys().cloned().collect()
+    }
+
+    /// A point-in-time copy of the contents. Use this before iterating when the
+    /// loop body may call back into code that touches the same struct — it
+    /// releases the lock so re-entrancy can't deadlock.
+    #[inline]
+    pub fn snapshot(&self) -> IndexMap<String, CfmlValue> {
+        self.0.read().clone()
+    }
+
+    /// Iterate a point-in-time **snapshot** of the entries (yields owned
+    /// `(String, CfmlValue)` pairs, not borrows). Iterating a snapshot — rather
+    /// than holding the lock across the loop — is what makes reference-typed
+    /// structs safe to walk while the body may mutate the same struct (and
+    /// can't deadlock). Snapshots, so avoid on hot paths where `get()`/`len()`
+    /// suffice.
+    #[inline]
+    pub fn iter(&self) -> indexmap::map::IntoIter<String, CfmlValue> {
+        self.snapshot().into_iter()
+    }
+
+    /// Alias for `snapshot()` — owned copy of the entries.
+    #[inline]
+    pub fn to_indexmap(&self) -> IndexMap<String, CfmlValue> {
+        self.snapshot()
+    }
+
+    /// Run a closure with exclusive (write) access to the backing map. The
+    /// closure MUST NOT touch this same struct again (would deadlock).
+    #[inline]
+    pub fn with_write<R>(&self, f: impl FnOnce(&mut IndexMap<String, CfmlValue>) -> R) -> R {
+        f(&mut self.0.write())
+    }
+
+    /// Run a closure with shared (read) access. Same re-entrancy caveat.
+    #[inline]
+    pub fn with_read<R>(&self, f: impl FnOnce(&IndexMap<String, CfmlValue>) -> R) -> R {
+        f(&self.0.read())
+    }
+
+    /// Get the value at `key` as a shared struct handle, inserting a fresh
+    /// empty struct if the key is absent (or holds a non-struct). Returns the
+    /// handle so the caller can mutate it (visible to all aliases). Holds the
+    /// write guard only for the get-or-insert — never calls user code — so it
+    /// can't deadlock. The replacement template for the old
+    /// `entry(..).or_insert_with(..)` + `as_struct_mut()` idiom.
+    pub fn get_or_insert_struct(&self, key: &str) -> CfmlStruct {
+        let mut g = self.0.write();
+        let entry = g
+            .entry(key.to_string())
+            .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        if let CfmlValue::Struct(s) = entry {
+            s.clone()
+        } else {
+            let s = CfmlStruct::empty();
+            *entry = CfmlValue::Struct(s.clone());
+            s
+        }
+    }
+}
+
+impl FromIterator<(String, CfmlValue)> for CfmlStruct {
+    fn from_iter<I: IntoIterator<Item = (String, CfmlValue)>>(iter: I) -> Self {
+        CfmlStruct::new(iter.into_iter().collect())
+    }
+}
+
 /// Trait implemented by Rust types that want to be addressable as CFML
 /// objects (`new rust:MyClass()` / member-call dispatch).
 ///
@@ -197,7 +382,10 @@ pub enum CfmlValue {
     /// `type_name()` as "Array" so `isArray()` is true. Produced by `query.colname`
     /// member-access on a Query. Payload is the column's row values.
     QueryColumn(Arc<Vec<CfmlValue>>),
-    Struct(Arc<IndexMap<String, CfmlValue>>),
+    /// Reference-typed struct (Lucee semantics): a shared, interior-mutable
+    /// handle. Aliases (and CFC instances sharing it) see each other's
+    /// mutations. See `CfmlStruct`.
+    Struct(CfmlStruct),
     Closure(Box<CfmlClosure>),
     Component(Box<CfmlComponent>),
     Function(CfmlFunction),
@@ -221,7 +409,7 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::String(s) => f.debug_tuple("String").field(s).finish(),
             CfmlValue::Array(a) => f.debug_tuple("Array").field(&a.snapshot()).finish(),
             CfmlValue::QueryColumn(a) => f.debug_tuple("QueryColumn").field(&**a).finish(),
-            CfmlValue::Struct(s) => f.debug_tuple("Struct").field(&**s).finish(),
+            CfmlValue::Struct(s) => f.debug_tuple("Struct").field(&s.snapshot()).finish(),
             CfmlValue::Closure(c) => f.debug_tuple("Closure").field(c).finish(),
             CfmlValue::Component(c) => f.debug_tuple("Component").field(c).finish(),
             CfmlValue::Function(fun) => f.debug_tuple("Function").field(fun).finish(),
@@ -327,7 +515,7 @@ impl CfmlValue {
 
     pub fn get(&self, key: &str) -> Option<CfmlValue> {
         match self {
-            CfmlValue::Struct(s) => s.get(key).cloned(),
+            CfmlValue::Struct(s) => s.get(key),
             CfmlValue::Array(a) => key.parse::<usize>().ok().and_then(|idx| a.get(idx)),
             CfmlValue::QueryColumn(a) => {
                 if let Ok(idx) = key.parse::<usize>() {
@@ -343,7 +531,7 @@ impl CfmlValue {
     pub fn set(&mut self, key: String, value: CfmlValue) {
         match self {
             CfmlValue::Struct(s) => {
-                Arc::make_mut(s).insert(key, value);
+                s.insert(key, value);
             }
             CfmlValue::Array(a) => {
                 if let Ok(idx) = key.parse::<usize>() {
@@ -368,7 +556,7 @@ impl CfmlValue {
     /// the shared Arc layer. Named `strukt` because `struct` is a keyword.
     #[inline]
     pub fn strukt(m: IndexMap<String, CfmlValue>) -> Self {
-        CfmlValue::Struct(Arc::new(m))
+        CfmlValue::Struct(CfmlStruct::new(m))
     }
 
     /// Borrow the shared array handle (no copy). Mutating through it is visible
@@ -402,9 +590,20 @@ impl CfmlValue {
         }
     }
 
-    pub fn as_struct(&self) -> Option<&IndexMap<String, CfmlValue>> {
+    /// Borrow the shared struct handle (no copy). Mutating through it is visible
+    /// to all aliases. Returns `None` for non-structs.
+    pub fn as_cfml_struct(&self) -> Option<&CfmlStruct> {
         match self {
             CfmlValue::Struct(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// A point-in-time copy of the struct's entries. Returns `None` for
+    /// non-structs. (A snapshot, not a borrow — the backing is behind a lock.)
+    pub fn as_struct(&self) -> Option<IndexMap<String, CfmlValue>> {
+        match self {
+            CfmlValue::Struct(s) => Some(s.snapshot()),
             _ => None,
         }
     }
@@ -412,26 +611,43 @@ impl CfmlValue {
     /// Recursively copy a value, breaking all shared references. Arrays and
     /// structs get fresh backing stores with deep-copied elements, so the
     /// result is fully independent of the source (this is what `duplicate()`
-    /// must do now that arrays are reference-typed — a plain `clone()` only
-    /// shares the handle). Scalars/immutable variants fall back to `clone()`.
-    /// NOTE: does not yet break cycles (e.g. an array appended to itself); such
-    /// self-referential structures would recurse without bound.
+    /// must do now that arrays/structs are reference-typed — a plain `clone()`
+    /// only shares the handle). Scalars/immutable variants fall back to
+    /// `clone()`. Cycles (a struct/array reachable from itself) are broken: on
+    /// revisiting an already-seen backing store, the shared handle is reused
+    /// rather than recursing without bound.
     pub fn deep_copy(&self) -> CfmlValue {
-        match self {
-            CfmlValue::Array(a) => {
-                CfmlValue::array(a.snapshot().iter().map(|v| v.deep_copy()).collect())
-            }
-            CfmlValue::Struct(s) => CfmlValue::strukt(
-                s.iter().map(|(k, v)| (k.clone(), v.deep_copy())).collect(),
-            ),
-            other => other.clone(),
-        }
+        let mut visited: Vec<usize> = Vec::new();
+        self.deep_copy_guarded(&mut visited)
     }
 
-    pub fn as_struct_mut(&mut self) -> Option<&mut IndexMap<String, CfmlValue>> {
+    fn deep_copy_guarded(&self, visited: &mut Vec<usize>) -> CfmlValue {
         match self {
-            CfmlValue::Struct(s) => Some(Arc::make_mut(s)),
-            _ => None,
+            CfmlValue::Array(a) => {
+                let ptr = a.backing_ptr();
+                if visited.contains(&ptr) {
+                    return self.clone();
+                }
+                visited.push(ptr);
+                let out = CfmlValue::array(
+                    a.snapshot().iter().map(|v| v.deep_copy_guarded(visited)).collect(),
+                );
+                visited.pop();
+                out
+            }
+            CfmlValue::Struct(s) => {
+                let ptr = s.backing_ptr();
+                if visited.contains(&ptr) {
+                    return self.clone();
+                }
+                visited.push(ptr);
+                let out = CfmlValue::strukt(
+                    s.iter().map(|(k, v)| (k, v.deep_copy_guarded(visited))).collect(),
+                );
+                visited.pop();
+                out
+            }
+            other => other.clone(),
         }
     }
 
@@ -478,6 +694,14 @@ impl CfmlValue {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.eq(y))
             }
             (CfmlValue::Struct(a), CfmlValue::Struct(b)) => {
+                // Identity short-circuit avoids locking the same struct twice
+                // (and terminates self-referential structures).
+                if a.ptr_eq(b) {
+                    return true;
+                }
+                // Snapshot both sides to release the locks before the (possibly
+                // recursive) value comparison — prevents re-entrant deadlocks.
+                let (a, b) = (a.snapshot(), b.snapshot());
                 if a.len() != b.len() {
                     return false;
                 }
@@ -616,8 +840,9 @@ impl serde::Serialize for CfmlValue {
                 seq.end()
             }
             CfmlValue::Struct(m) => {
-                let mut map = s.serialize_map(Some(m.len()))?;
-                for (k, v) in m.iter() {
+                let snap = m.snapshot();
+                let mut map = s.serialize_map(Some(snap.len()))?;
+                for (k, v) in snap.iter() {
                     map.serialize_entry(k, v)?;
                 }
                 map.end()
@@ -727,7 +952,7 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                         if let Some(CfmlValue::Array(rows)) = map.get("rows") {
                             for row_val in rows.snapshot() {
                                 if let CfmlValue::Struct(row_map) = row_val {
-                                    query.rows.push((*row_map).clone());
+                                    query.rows.push(row_map.snapshot());
                                 }
                             }
                         }

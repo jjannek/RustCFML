@@ -14,10 +14,9 @@
 //! - Query functions
 //! - System functions
 
-use cfml_common::dynamic::{CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlValue};
+use cfml_common::dynamic::{CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlStruct, CfmlValue};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use std::collections::HashMap;
-use std::sync::Arc;
 use indexmap::IndexMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
@@ -770,12 +769,17 @@ fn get_delimiter(args: &[CfmlValue], idx: usize) -> String {
 }
 
 /// Case-insensitive key lookup for CFML structs. Returns the actual key in the IndexMap.
-fn struct_find_key_ci<'a>(s: &'a IndexMap<String, CfmlValue>, key: &str) -> Option<&'a str> {
-    if s.contains_key(key) {
-        return Some(s.keys().find(|k| *k == key).unwrap());
-    }
-    let key_lower = key.to_lowercase();
-    s.keys().find(|k| k.to_lowercase() == key_lower).map(|k| k.as_str())
+/// Find the actual (case-preserving) key in a struct matching `key`
+/// case-insensitively. Returns an owned `String` because the backing map is
+/// behind a lock and can't be borrowed out.
+fn struct_find_key_ci(s: &CfmlStruct, key: &str) -> Option<String> {
+    s.with_read(|m| {
+        if m.contains_key(key) {
+            return Some(key.to_string());
+        }
+        let key_lower = key.to_lowercase();
+        m.keys().find(|k| k.to_lowercase() == key_lower).cloned()
+    })
 }
 
 /// CFML list splitting: each character in `delimiters` is a separate delimiter.
@@ -1684,7 +1688,7 @@ fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
         // Arguments scope is a struct but arrayLen should return count of positional entries
         Some(CfmlValue::Struct(s)) => {
             // Count entries with numeric keys (1-based positional args)
-            let count = s.keys().filter(|k| k.parse::<usize>().is_ok()).count();
+            let count = s.keys().into_iter().filter(|k| k.parse::<usize>().is_ok()).count();
             Ok(CfmlValue::Int(count as i64))
         }
         _ => Ok(CfmlValue::Int(0)),
@@ -2147,7 +2151,7 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_key_list(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let delimiter = get_delimiter(&args, 1);
-        let keys: Vec<String> = s.keys().cloned().collect();
+        let keys: Vec<String> = s.keys();
         Ok(CfmlValue::String(keys.join(&delimiter)))
     } else {
         Ok(CfmlValue::String(String::new()))
@@ -2156,7 +2160,7 @@ fn fn_struct_key_list(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_key_array(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Struct(s)) = args.first() {
-        let keys: Vec<CfmlValue> = s.keys().map(|k| CfmlValue::String(k.clone())).collect();
+        let keys: Vec<CfmlValue> = s.keys().into_iter().map(CfmlValue::String).collect();
         Ok(CfmlValue::array(keys))
     } else {
         Ok(CfmlValue::array(Vec::new()))
@@ -2166,13 +2170,11 @@ fn fn_struct_key_array(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Struct(s) = &args[0] {
-            let mut result = s.clone();
+            // Mutate the shared handle in place (Lucee reference semantics):
+            // aliases of the struct observe the deletion.
             let key = args[1].as_string();
-            if let Some(actual_key) = struct_find_key_ci(&result, &key) {
-                let owned_key = actual_key.to_string();
-                Arc::make_mut(&mut result).shift_remove(&owned_key);
-            }
-            return Ok(CfmlValue::Struct(result));
+            s.remove_ci(&key);
+            return Ok(CfmlValue::Struct(s.clone()));
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -2181,22 +2183,20 @@ fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_insert(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Struct(s) = &args[0] {
-            let mut result = s.clone();
+            // Mutate the shared handle in place (Lucee reference semantics).
             let key = args[1].as_string();
             let allow_overwrite = if args.len() >= 4 { args[3].is_true() } else { true };
-            if !allow_overwrite {
-                if struct_find_key_ci(&result, &key).is_some() {
+            if let Some(actual_key) = struct_find_key_ci(s, &key) {
+                if !allow_overwrite {
                     return Err(CfmlError::runtime(format!("Key '{}' already exists in struct. Use allowOverwrite=true to overwrite.", key)));
                 }
-            }
-            if let Some(actual_key) = struct_find_key_ci(&result, &key) {
+                // Replace an existing case-variant key so the new casing wins.
                 if actual_key != key {
-                    let owned_key = actual_key.to_string();
-                    Arc::make_mut(&mut result).shift_remove(&owned_key);
+                    s.remove(&actual_key);
                 }
             }
-            Arc::make_mut(&mut result).insert(key, args[2].clone());
-            return Ok(CfmlValue::Struct(result));
+            s.insert(key, args[2].clone());
+            return Ok(CfmlValue::Struct(s.clone()));
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -2211,7 +2211,7 @@ fn fn_struct_find(args: Vec<CfmlValue>) -> CfmlResult {
         if let CfmlValue::Struct(s) = &args[0] {
             let key = args[1].as_string();
             if let Some(actual_key) = struct_find_key_ci(s, &key) {
-                return Ok(s.get(actual_key).cloned().unwrap_or(CfmlValue::Null));
+                return Ok(s.get(&actual_key).unwrap_or(CfmlValue::Null));
             }
             return Ok(CfmlValue::Null);
         }
@@ -2233,28 +2233,28 @@ fn fn_struct_find_key(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn struct_find_key_recursive(
-    s: &IndexMap<String, CfmlValue>,
+    s: &CfmlStruct,
     search_key: &str,
     path: &str,
     scope: &str,
     results: &mut Vec<CfmlValue>,
 ) {
     let search_lower = search_key.to_lowercase();
-    for (k, v) in s {
+    for (k, v) in s.iter() {
         let current_path = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
         if k.to_lowercase() == search_lower {
             let mut result_struct = IndexMap::new();
-            result_struct.insert("owner".to_string(), CfmlValue::strukt(s.clone()));
+            result_struct.insert("owner".to_string(), CfmlValue::Struct(s.clone()));
             result_struct.insert("path".to_string(), CfmlValue::String(current_path.clone()));
             result_struct.insert("value".to_string(), v.clone());
             results.push(CfmlValue::strukt(result_struct));
             if scope == "one" { return; }
         }
-        if let CfmlValue::Struct(nested) = v {
+        if let CfmlValue::Struct(nested) = &v {
             struct_find_key_recursive(nested, search_key, &current_path, scope, results);
             if scope == "one" && !results.is_empty() { return; }
         }
-        if let CfmlValue::Array(arr) = v {
+        if let CfmlValue::Array(arr) = &v {
             for (i, item) in arr.iter().enumerate() {
                 if let CfmlValue::Struct(nested) = &item {
                     let arr_path = format!("{}[{}]", current_path, i + 1);
@@ -2280,28 +2280,28 @@ fn fn_struct_find_value(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn struct_find_value_recursive(
-    s: &IndexMap<String, CfmlValue>,
+    s: &CfmlStruct,
     search_value: &str,
     path: &str,
     scope: &str,
     results: &mut Vec<CfmlValue>,
 ) {
     let search_lower = search_value.to_lowercase();
-    for (k, v) in s {
+    for (k, v) in s.iter() {
         let current_path = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
         if v.as_string().to_lowercase() == search_lower {
             let mut result_struct = IndexMap::new();
-            result_struct.insert("owner".to_string(), CfmlValue::strukt(s.clone()));
+            result_struct.insert("owner".to_string(), CfmlValue::Struct(s.clone()));
             result_struct.insert("path".to_string(), CfmlValue::String(current_path.clone()));
             result_struct.insert("key".to_string(), CfmlValue::String(k.clone()));
             results.push(CfmlValue::strukt(result_struct));
             if scope == "one" { return; }
         }
-        if let CfmlValue::Struct(nested) = v {
+        if let CfmlValue::Struct(nested) = &v {
             struct_find_value_recursive(nested, search_value, &current_path, scope, results);
             if scope == "one" && !results.is_empty() { return; }
         }
-        if let CfmlValue::Array(arr) = v {
+        if let CfmlValue::Array(arr) = &v {
             for (i, item) in arr.iter().enumerate() {
                 if let CfmlValue::Struct(nested) = &item {
                     let arr_path = format!("{}[{}]", current_path, i + 1);
@@ -2313,13 +2313,19 @@ fn struct_find_value_recursive(
     }
 }
 
-fn fn_struct_clear(_args: Vec<CfmlValue>) -> CfmlResult {
+fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
+    // Empty the shared handle in place (Lucee reference semantics).
+    if let Some(CfmlValue::Struct(s)) = args.first() {
+        s.clear();
+        return Ok(CfmlValue::Struct(s.clone()));
+    }
     Ok(CfmlValue::strukt(IndexMap::new()))
 }
 
 fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
+    // Shallow copy: a fresh top-level struct over the same (shared) values.
     match args.first() {
-        Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Struct(s.clone())),
+        Some(CfmlValue::Struct(s)) => Ok(CfmlValue::strukt(s.snapshot())),
         _ => Ok(CfmlValue::strukt(IndexMap::new())),
     }
 }
@@ -2327,14 +2333,14 @@ fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (&args[0], &args[1]) {
+            // Mutate the first struct's shared handle in place (Lucee semantics).
             let overwrite = if args.len() >= 3 { args[2].is_true() } else { true };
-            let mut result = a.clone();
             for (k, v) in b.iter() {
-                if overwrite || struct_find_key_ci(&result, k).is_none() {
-                    Arc::make_mut(&mut result).insert(k.clone(), v.clone());
+                if overwrite || struct_find_key_ci(a, &k).is_none() {
+                    a.insert(k, v);
                 }
             }
-            return Ok(CfmlValue::Struct(result));
+            return Ok(CfmlValue::Struct(a.clone()));
         }
     }
     Ok(args.into_iter().next().unwrap_or(CfmlValue::strukt(IndexMap::new())))
@@ -2351,7 +2357,7 @@ fn fn_struct_sort(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let sort_type = if args.len() > 1 { get_str(&args, 1).to_lowercase() } else { "text".to_string() };
         let sort_order = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "asc".to_string() };
-        let mut keys: Vec<String> = s.keys().cloned().collect();
+        let mut keys: Vec<String> = s.keys();
         match sort_type.as_str() {
             "numeric" => {
                 keys.sort_by(|a, b| {
@@ -2389,20 +2395,23 @@ fn fn_struct_get(args: Vec<CfmlValue>) -> CfmlResult {
         s.insert(part.to_string(), current);
         current = CfmlValue::strukt(s);
     }
-    let mut result = &current;
+    let mut result = current;
     for part in &parts {
-        if let CfmlValue::Struct(s) = result {
-            if let Some(v) = s.get(*part) {
-                result = v;
-            }
+        let next = if let CfmlValue::Struct(s) = &result {
+            s.get(*part)
+        } else {
+            None
+        };
+        if let Some(v) = next {
+            result = v;
         }
     }
-    Ok(result.clone())
+    Ok(result)
 }
 
 fn fn_struct_value_array(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Struct(s)) = args.first() {
-        let values: Vec<CfmlValue> = s.values().cloned().collect();
+        let values: Vec<CfmlValue> = s.iter().map(|(_, v)| v).collect();
         Ok(CfmlValue::array(values))
     } else {
         Ok(CfmlValue::array(Vec::new()))
@@ -2414,16 +2423,16 @@ fn fn_struct_equals(args: Vec<CfmlValue>) -> CfmlResult {
         if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (&args[0], &args[1]) {
             if a.len() != b.len() { return Ok(CfmlValue::Bool(false)); }
             for (k, v) in a.iter() {
-                match b.get(k) {
+                match b.get(&k) {
                     Some(bv) => {
                         if v.as_string() != bv.as_string() {
                             return Ok(CfmlValue::Bool(false));
                         }
                     }
                     None => {
-                        match struct_find_key_ci(b, k) {
+                        match struct_find_key_ci(b, &k) {
                             Some(actual) => {
-                                if v.as_string() != b.get(actual).unwrap().as_string() {
+                                if v.as_string() != b.get(&actual).unwrap().as_string() {
                                     return Ok(CfmlValue::Bool(false));
                                 }
                             }
@@ -3942,7 +3951,7 @@ fn serialize_value(val: &CfmlValue) -> String {
             format!("[{}]", items.join(","))
         }
         CfmlValue::Struct(s) => {
-            let items: Vec<String> = s.iter().map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(v))).collect();
+            let items: Vec<String> = s.iter().map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(&v))).collect();
             format!("{{{}}}", items.join(","))
         }
         CfmlValue::Query(q) => {
@@ -4039,7 +4048,7 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
                         query.rows.push(row);
                     }
                     CfmlValue::Struct(s) => {
-                        query.rows.push((*s).clone());
+                        query.rows.push(s.snapshot());
                     }
                     _ => {
                         // Single-column shortcut: wrap scalar in a row
@@ -4073,7 +4082,7 @@ fn fn_query_add_row(args: Vec<CfmlValue>) -> CfmlResult {
                 CfmlValue::Array(rows) => {
                     for item in rows.iter() {
                         if let CfmlValue::Struct(data) = item {
-                            result.rows.push((*data).clone());
+                            result.rows.push(data.snapshot());
                         } else {
                             result.rows.push(IndexMap::new());
                         }
@@ -4254,11 +4263,11 @@ fn fn_query_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
                     position + 1, result.rows.len()
                 )));
             }
-            let row_data = match &args[1] {
-                CfmlValue::Struct(data) => data.clone(),
-                _ => Arc::new(IndexMap::new()),
+            let row_data: IndexMap<String, CfmlValue> = match &args[1] {
+                CfmlValue::Struct(data) => data.snapshot(),
+                _ => IndexMap::new(),
             };
-            result.rows.insert(position, (*row_data).clone());
+            result.rows.insert(position, row_data);
             return Ok(CfmlValue::Query(result));
         }
     }
@@ -4329,11 +4338,11 @@ fn fn_query_set_row(args: Vec<CfmlValue>) -> CfmlResult {
                     row_idx + 1, result.rows.len()
                 )));
             }
-            let row_data = match &args[2] {
-                CfmlValue::Struct(data) => data.clone(),
-                _ => Arc::new(IndexMap::new()),
+            let row_data: IndexMap<String, CfmlValue> = match &args[2] {
+                CfmlValue::Struct(data) => data.snapshot(),
+                _ => IndexMap::new(),
             };
-            result.rows[row_idx] = (*row_data).clone();
+            result.rows[row_idx] = row_data;
             return Ok(CfmlValue::Query(result));
         }
     }
@@ -5538,7 +5547,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             };
             let timeout = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("timeout"))
-                .map(|(_, v)| match v { CfmlValue::Int(i) => *i as u64, CfmlValue::Double(d) => *d as u64, CfmlValue::String(s) => s.parse().unwrap_or(30), _ => 30 })
+                .map(|(_, v)| match v { CfmlValue::Int(i) => i as u64, CfmlValue::Double(d) => d as u64, CfmlValue::String(s) => s.parse().unwrap_or(30), _ => 30 })
                 .unwrap_or(30);
 
             // username/password -> Basic Auth
@@ -5568,7 +5577,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let throw_on_error = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("throwonerror"))
                 .map(|(_, v)| match v {
-                    CfmlValue::Bool(b) => *b,
+                    CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
                     _ => false,
                 })
@@ -5578,7 +5587,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let follow_redirects = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("redirect"))
                 .map(|(_, v)| match v {
-                    CfmlValue::Bool(b) => *b,
+                    CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no"),
                     _ => true,
                 })
@@ -5588,7 +5597,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let encode_url = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("encodeurl"))
                 .map(|(_, v)| match v {
-                    CfmlValue::Bool(b) => *b,
+                    CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no"),
                     _ => true,
                 })
@@ -5598,8 +5607,8 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let port = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("port"))
                 .and_then(|(_, v)| match v {
-                    CfmlValue::Int(i) => Some(*i as u16),
-                    CfmlValue::Double(d) => Some(*d as u16),
+                    CfmlValue::Int(i) => Some(i as u16),
+                    CfmlValue::Double(d) => Some(d as u16),
                     CfmlValue::String(s) => s.parse::<u16>().ok(),
                     _ => None,
                 });
@@ -5611,8 +5620,8 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let proxy_port = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("proxyport"))
                 .and_then(|(_, v)| match v {
-                    CfmlValue::Int(i) => Some(*i as u16),
-                    CfmlValue::Double(d) => Some(*d as u16),
+                    CfmlValue::Int(i) => Some(i as u16),
+                    CfmlValue::Double(d) => Some(d as u16),
                     CfmlValue::String(s) => s.parse::<u16>().ok(),
                     _ => None,
                 });
@@ -6100,7 +6109,7 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
                                 .find(|(k, _)| k.eq_ignore_ascii_case("null"))
                                 .map(|(_, v)| {
                                     match v {
-                                        CfmlValue::Bool(b) => *b,
+                                        CfmlValue::Bool(b) => b,
                                         CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
                                         _ => false,
                                     }
@@ -6116,7 +6125,7 @@ fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String
                                 .find(|(k, _)| k.eq_ignore_ascii_case("list"))
                                 .map(|(_, v)| {
                                     match v {
-                                        CfmlValue::Bool(b) => *b,
+                                        CfmlValue::Bool(b) => b,
                                         CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
                                         _ => false,
                                     }
@@ -6170,7 +6179,7 @@ fn get_list_placeholder_counts(params_arg: &CfmlValue) -> Vec<usize> {
                         .find(|(k, _)| k.eq_ignore_ascii_case("list"))
                         .map(|(_, v)| {
                             match v {
-                                CfmlValue::Bool(b) => *b,
+                                CfmlValue::Bool(b) => b,
                                 CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
                                 _ => false,
                             }
@@ -6509,8 +6518,8 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<Vec<rusqlite
                         let val = map.iter()
                             .find(|(k, _)| k.eq_ignore_ascii_case(&param_name))
                             .map(|(_, v)| v)
-                            .unwrap_or(&CfmlValue::Null);
-                        result.push(cfml_to_sqlite(val));
+                            .unwrap_or(CfmlValue::Null);
+                        result.push(cfml_to_sqlite(&val));
                         i = end;
                         continue;
                     }
@@ -6576,7 +6585,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
         CfmlValue::Struct(map) => {
             let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
             for (k, v) in map.iter() {
-                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(v));
+                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&v));
             }
             Params::Named(named)
         }
@@ -6837,8 +6846,8 @@ fn rewrite_params_for_postgres(sql: &str, params_arg: &CfmlValue) -> Result<(Str
                 let val = map.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case(name))
                     .map(|(_, v)| v)
-                    .unwrap_or(&CfmlValue::Null);
-                cfml_to_pg_param(val)
+                    .unwrap_or(CfmlValue::Null);
+                cfml_to_pg_param(&val)
             }).collect();
             Ok((result, params))
         }
@@ -7524,7 +7533,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
         CfmlValue::Struct(map) => {
             let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
             for (k, v) in map.iter() {
-                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(v));
+                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&v));
             }
             Params::Named(named)
         }
@@ -7767,14 +7776,8 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
     };
 
     // Case-insensitive key lookup helper
-    fn get_ci<'a>(s: &'a IndexMap<String, CfmlValue>, key: &str) -> Option<&'a CfmlValue> {
-        let key_lower = key.to_lowercase();
-        for (k, v) in s {
-            if k.to_lowercase() == key_lower {
-                return Some(v);
-            }
-        }
-        None
+    fn get_ci(s: &CfmlStruct, key: &str) -> Option<CfmlValue> {
+        s.get_ci(key)
     }
 
     let action = get_ci(opts, "action")
@@ -7792,7 +7795,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                 .unwrap_or_else(|| "*".into());
             let recurse = get_ci(opts, "recurse")
                 .map(|v| match v {
-                    CfmlValue::Bool(b) => *b,
+                    CfmlValue::Bool(b) => b,
                     CfmlValue::String(s) => {
                         let l = s.to_lowercase();
                         l == "true" || l == "yes"
@@ -9093,10 +9096,10 @@ fn fn_to_script(args: Vec<CfmlValue>) -> CfmlResult {
             let mut lines = vec![format!("{}=new Object();", var_name)];
             for (k, v) in s.iter() {
                 let val_str = match v {
-                    CfmlValue::String(s) => format!("\"{}\"", js_escape(s)),
+                    CfmlValue::String(s) => format!("\"{}\"", js_escape(&s)),
                     CfmlValue::Int(n) => n.to_string(),
                     CfmlValue::Double(d) => d.to_string(),
-                    CfmlValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+                    CfmlValue::Bool(b) => if b { "true".to_string() } else { "false".to_string() },
                     _ => format!("\"{}\"", js_escape(&v.as_string())),
                 };
                 lines.push(format!("{}.{}={};", var_name, k, val_str));
@@ -9320,7 +9323,7 @@ fn fn_array_delete_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_to_sorted(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Struct(s)) => {
-            let mut keys: Vec<String> = s.keys().cloned().collect();
+            let mut keys: Vec<String> = s.keys();
             let sort_type = get_str(&args, 1).to_lowercase();
             if sort_type == "textnocase" {
                 keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
@@ -9369,7 +9372,7 @@ fn fn_struct_to_query_string(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::Struct(s)) => {
             let delim = if args.len() > 1 { get_str(&args, 1) } else { "&".to_string() };
             let pairs: Vec<String> = s.iter()
-                .map(|(k, v)| format!("{}={}", url_enc(k), url_enc(&v.as_string())))
+                .map(|(k, v)| format!("{}={}", url_enc(&k), url_enc(&v.as_string())))
                 .collect();
             Ok(CfmlValue::String(pairs.join(&delim)))
         }
@@ -9863,7 +9866,7 @@ fn fn_file_read_line(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::Struct(handle)) => {
             let path = handle.get("path").map(|v| v.as_string()).unwrap_or_default();
             let line_num = handle.get("line").map(|v| match v {
-                CfmlValue::Int(i) => *i as usize,
+                CfmlValue::Int(i) => i as usize,
                 _ => 0,
             }).unwrap_or(0);
             match std::fs::read_to_string(&path) {
@@ -9905,7 +9908,7 @@ fn fn_file_is_eof(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::Struct(handle)) => {
             let path = handle.get("path").map(|v| v.as_string()).unwrap_or_default();
             let line_num = handle.get("line").map(|v| match v {
-                CfmlValue::Int(i) => *i as usize,
+                CfmlValue::Int(i) => i as usize,
                 _ => 0,
             }).unwrap_or(0);
             match std::fs::read_to_string(&path) {
@@ -10457,7 +10460,7 @@ fn fn_ls_day_of_week(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_exception_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
     if let (Some(CfmlValue::Struct(s)), Some(key)) = (args.get(0), args.get(1)) {
         let key_str = key.as_string().to_lowercase();
-        let exists = s.keys().any(|k| k.to_lowercase() == key_str);
+        let exists = s.keys().iter().any(|k| k.to_lowercase() == key_str);
         Ok(CfmlValue::Bool(exists))
     } else {
         Ok(CfmlValue::Bool(false))

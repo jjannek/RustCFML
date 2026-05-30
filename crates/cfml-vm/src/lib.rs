@@ -944,7 +944,7 @@ impl CfmlVirtualMachine {
         let matched = matches!(
             self.last_exception.as_ref(),
             Some(CfmlValue::Struct(s))
-                if matches!(s.get("message"), Some(CfmlValue::String(msg)) if msg == &e.message)
+                if matches!(s.get("message"), Some(CfmlValue::String(msg)) if msg == e.message)
         );
         if matched {
             // last_exception already holds the right value; clone once for the stack
@@ -1004,7 +1004,7 @@ impl CfmlVirtualMachine {
                             None
                         }
                     })
-                    .cloned();
+                    ;
                 if let Some(v) = val {
                     return v;
                 }
@@ -1444,19 +1444,19 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "request" {
                             if let CfmlValue::Struct(s) = &val {
-                                self.request_scope = (**s).clone();
+                                self.request_scope = s.snapshot();
                             }
                         } else if name_lower == "application" {
                             if let CfmlValue::Struct(s) = &val {
                                 if let Some(ref app_scope) = self.application_scope {
                                     if let Ok(mut scope) = app_scope.lock() {
-                                        *scope = (**s).clone();
+                                        *scope = s.snapshot();
                                     }
                                 }
                             }
                         } else if name_lower == "session" {
                             if let CfmlValue::Struct(s) = &val {
-                                self.set_session_scope((**s).clone());
+                                self.set_session_scope(s.snapshot());
                             }
                         } else if name_lower == "thread" && self.globals.contains_key("thread") {
                             self.globals.insert("thread".to_string(), val);
@@ -1492,7 +1492,7 @@ impl CfmlVirtualMachine {
                             // In modern localmode this branch is skipped and the write
                             // falls through to the locals-insert branch below.
                             if let Some(vars) =
-                                locals.get_mut("__variables").and_then(|v| v.as_struct_mut())
+                                locals.get_mut("__variables").and_then(|v| v.as_cfml_struct())
                             {
                                 vars.insert(name.clone(), val);
                             }
@@ -1512,7 +1512,7 @@ impl CfmlVirtualMachine {
                                 )
                             {
                                 if let Some(args) =
-                                    locals.get_mut("arguments").and_then(|v| v.as_struct_mut())
+                                    locals.get_mut("arguments").and_then(|v| v.as_cfml_struct())
                                 {
                                     args.insert(name.clone(), val.clone());
                                 }
@@ -1572,7 +1572,7 @@ impl CfmlVirtualMachine {
                     {
                         // CFC method, classic localmode: component (variables) scope.
                         if let Some(vars) =
-                            locals.get_mut("__variables").and_then(|v| v.as_struct_mut())
+                            locals.get_mut("__variables").and_then(|v| v.as_cfml_struct())
                         {
                             vars.insert(name.clone(), val);
                         }
@@ -1582,7 +1582,7 @@ impl CfmlVirtualMachine {
                             && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                         {
                             if let Some(args) =
-                                locals.get_mut("arguments").and_then(|v| v.as_struct_mut())
+                                locals.get_mut("arguments").and_then(|v| v.as_cfml_struct())
                             {
                                 args.insert(name.clone(), val.clone());
                             }
@@ -1609,7 +1609,7 @@ impl CfmlVirtualMachine {
                     // 1b. Check __variables scope for CFC methods
                     } else if let Some(val) = locals.get("__variables").and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
-                            vars.get(name.as_str()).cloned().or_else(|| {
+                            vars.get(name.as_str()).or_else(|| {
                                 vars.iter()
                                     .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                                     .map(|(_, v)| v.clone())
@@ -2437,23 +2437,21 @@ impl CfmlVirtualMachine {
                             if let (CfmlValue::Struct(top_s), CfmlValue::Struct(this_s)) =
                                 (top, this_val)
                             {
-                                if Arc::ptr_eq(top_s, this_s) && !vars.is_empty() {
-                                    let mut updated = top_s.clone();
-                                    let updated_mut = Arc::make_mut(&mut updated);
-                                    let merged_vars = vars.clone();
-                                    updated_mut.insert(
+                                if top_s.ptr_eq(this_s) && !vars.is_empty() {
+                                    let mut updated = top_s.snapshot();
+                                    updated.insert(
                                         "__variables".to_string(),
-                                        CfmlValue::Struct(merged_vars),
+                                        CfmlValue::Struct(vars.clone()),
                                     );
                                     let last_idx = stack.len() - 1;
-                                    stack[last_idx] = CfmlValue::Struct(updated);
+                                    stack[last_idx] = CfmlValue::strukt(updated);
                                 }
                             }
                         }
                         // Save variables scope mutations for component write-back
                         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
                             if !vars.is_empty() {
-                                self.method_variables_writeback = Some((**vars).clone());
+                                self.method_variables_writeback = Some(vars.snapshot());
                             }
                         } else {
                             let mut vars_wb = IndexMap::new();
@@ -2576,7 +2574,7 @@ impl CfmlVirtualMachine {
                                         .find(|(k, _)| k.to_lowercase() == key_lower)
                                         .map(|(_, v)| v)
                                 })
-                                .cloned()
+                                
                                 .unwrap_or(CfmlValue::Null);
                             stack.push(val);
                         }
@@ -2625,14 +2623,12 @@ impl CfmlVirtualMachine {
                                         false
                                     };
                                 if is_declared {
-                                    if let Some(vars) =
-                                        Arc::make_mut(s).get_mut("__variables").and_then(|v| v.as_struct_mut())
-                                    {
+                                    if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
                                         vars.insert(key.clone(), value.clone());
                                     }
                                 }
                             }
-                            Arc::make_mut(s).insert(key, value);
+                            s.insert(key, value);
                         }
                         _ => {}
                     }
@@ -2682,7 +2678,7 @@ impl CfmlVirtualMachine {
                             // setter first; None defers to the CFC struct.
                             if let CfmlValue::Struct(ref s) = *obj {
                                 if let Some(CfmlValue::NativeObject(parent)) =
-                                    s.get("__super").cloned()
+                                    s.get("__super")
                                 {
                                     let handled = {
                                         let mut guard = parent.write().map_err(|_| {
@@ -2698,7 +2694,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            if let Some(s) = obj.as_struct_mut() {
+                            if let Some(s) = obj.as_cfml_struct() {
                                 s.insert(prop_name.clone(), value);
                             } else {
                                 return Err(CfmlError::runtime(format!(
@@ -2744,7 +2740,7 @@ impl CfmlVirtualMachine {
                                             None
                                         }
                                     })
-                                    .cloned();
+                                    ;
                                 let val = match val {
                                     Some(v) => v,
                                     None => {
@@ -2834,7 +2830,7 @@ impl CfmlVirtualMachine {
                             // parent returns None to defer to the CFC.
                             if let CfmlValue::Struct(ref s) = obj {
                                 if let Some(CfmlValue::NativeObject(parent)) =
-                                    s.get("__super").cloned()
+                                    s.get("__super")
                                 {
                                     let handled = {
                                         let mut guard = parent.write().map_err(|_| {
@@ -2854,7 +2850,7 @@ impl CfmlVirtualMachine {
                             // If setting on a CFC struct with declared properties,
                             // also update __variables for properties declared via
                             // `property name="x"` so they're accessible unscoped in methods.
-                            if let Some(s) = obj.as_struct_mut() {
+                            if let Some(s) = obj.as_cfml_struct() {
                                 if s.contains_key("__variables") && s.contains_key("__properties") {
                                     let name_lower = name.to_lowercase();
                                     let is_declared = if let Some(CfmlValue::Array(props)) =
@@ -2875,8 +2871,8 @@ impl CfmlVirtualMachine {
                                         false
                                     };
                                     if is_declared {
-                                        if let Some(vars) =
-                                            s.get_mut("__variables").and_then(|v| v.as_struct_mut())
+                                        if let Some(CfmlValue::Struct(vars)) =
+                                            s.get("__variables")
                                         {
                                             vars.insert(name.clone(), value.clone());
                                         }
@@ -2920,15 +2916,15 @@ impl CfmlVirtualMachine {
 
                         // Validate interface implementation and collect transitive interfaces
                         let instance = if let CfmlValue::Struct(ref s) = instance {
-                            let all_ifaces = self.validate_interface_implementation(s, &locals)?;
+                            let all_ifaces = self.validate_interface_implementation(&s.snapshot(), &locals)?;
                             if !all_ifaces.is_empty() {
-                                let mut s = s.clone();
+                                let mut m = s.snapshot();
                                 let chain: Vec<CfmlValue> = all_ifaces
                                     .into_iter()
                                     .map(|name| CfmlValue::String(name))
                                     .collect();
-                                Arc::make_mut(&mut s).insert("__implements_chain".to_string(), CfmlValue::array(chain));
-                                CfmlValue::Struct(s)
+                                m.insert("__implements_chain".to_string(), CfmlValue::array(chain));
+                                CfmlValue::strukt(m)
                             } else {
                                 instance
                             }
@@ -2942,7 +2938,7 @@ impl CfmlVirtualMachine {
                                 .get("init")
                                 .or_else(|| s.get("INIT"))
                                 .or_else(|| s.get("Init"))
-                                .cloned();
+                                ;
                             if let Some(ref init_func) = has_init {
                                 if matches!(init_func, CfmlValue::Function(_)) {
                                     // Build init scope from the component's own scope,
@@ -2963,7 +2959,7 @@ impl CfmlVirtualMachine {
                                         self.closure_parent_writeback = None;
                                         // Apply variables scope writeback from init() to the component
                                         let vars_wb = self.method_variables_writeback.take();
-                                        let mut final_obj = if let Some(modified_this) =
+                                        let final_obj = if let Some(modified_this) =
                                             self.method_this_writeback.take()
                                         {
                                             modified_this
@@ -2974,7 +2970,7 @@ impl CfmlVirtualMachine {
                                         };
                                         // Merge init()'s __variables mutations back into the component
                                         if let Some(vars) = vars_wb {
-                                            if let Some(s) = final_obj.as_struct_mut() {
+                                            if let Some(s) = final_obj.as_cfml_struct() {
                                                 s.insert(
                                                     "__variables".to_string(),
                                                     CfmlValue::strukt(vars),
@@ -3353,19 +3349,19 @@ impl CfmlVirtualMachine {
                                 );
                                 let merged = if is_cfc {
                                     match (existing, modified_this) {
-                                        (Some(CfmlValue::Struct(mut cur)), CfmlValue::Struct(snap)) => {
-                                            let cur_mut = Arc::make_mut(&mut cur);
-                                            let preserved_vars = cur_mut.get("__variables").cloned();
+                                        (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap)) => {
+                                            let mut cur_map = cur.snapshot();
+                                            let preserved_vars = cur_map.get("__variables").cloned();
                                             for (k, v) in snap.iter() {
                                                 if k == "__variables" {
                                                     continue;
                                                 }
-                                                cur_mut.insert(k.clone(), v.clone());
+                                                cur_map.insert(k, v);
                                             }
                                             if let Some(vars) = preserved_vars {
-                                                cur_mut.insert("__variables".to_string(), vars);
+                                                cur_map.insert("__variables".to_string(), vars);
                                             }
-                                            CfmlValue::Struct(cur)
+                                            CfmlValue::strukt(cur_map)
                                         }
                                         (_, snap) => snap,
                                     }
@@ -3405,14 +3401,10 @@ impl CfmlVirtualMachine {
                                         comp_obj = comp_obj.get(part).unwrap_or(CfmlValue::Null);
                                     }
                                 }
-                                if let Some(s) = comp_obj.as_struct_mut() {
-                                    let vars = s
-                                        .entry("__variables".to_string())
-                                        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
-                                    if let Some(vs) = vars.as_struct_mut() {
-                                        for (k, v) in vars_wb {
-                                            vs.insert(k, v);
-                                        }
+                                if let Some(s) = comp_obj.as_cfml_struct() {
+                                    let vs = s.get_or_insert_struct("__variables");
+                                    for (k, v) in vars_wb {
+                                        vs.insert(k, v);
                                     }
                                 }
                                 // Store back
@@ -3451,7 +3443,7 @@ impl CfmlVirtualMachine {
                         match val {
                             CfmlValue::Struct(s) => {
                                 let keys: Vec<CfmlValue> =
-                                    s.keys().map(|k| CfmlValue::String(k.clone())).collect();
+                                    s.keys().into_iter().map(CfmlValue::String).collect();
                                 stack.push(CfmlValue::array(keys));
                             }
                             CfmlValue::String(s) => {
@@ -3888,11 +3880,12 @@ impl CfmlVirtualMachine {
                 BytecodeOp::MergeStructs => {
                     let right = stack.pop().unwrap_or(CfmlValue::strukt(IndexMap::new()));
                     let left = stack.pop().unwrap_or(CfmlValue::strukt(IndexMap::new()));
-                    if let (CfmlValue::Struct(mut a), CfmlValue::Struct(b)) = (left, right) {
+                    if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (left, right) {
+                        let mut m = a.snapshot();
                         for (k, v) in b.iter() {
-                            Arc::make_mut(&mut a).insert(k.clone(), v.clone());
+                            m.insert(k, v);
                         }
-                        stack.push(CfmlValue::Struct(a));
+                        stack.push(CfmlValue::strukt(m));
                     } else {
                         stack.push(CfmlValue::strukt(IndexMap::new()));
                     }
@@ -3941,7 +3934,7 @@ impl CfmlVirtualMachine {
                             "super(...) called outside of a CFC method".to_string(),
                         )
                     })?;
-                    let mut this_struct = match this_val {
+                    let this_struct = match this_val {
                         CfmlValue::Struct(s) => s,
                         _ => {
                             return Err(CfmlError::runtime(
@@ -3966,7 +3959,7 @@ impl CfmlVirtualMachine {
                         ))
                     })?;
                     let parent = ctor(ctor_args)?;
-                    Arc::make_mut(&mut this_struct).insert("__super".to_string(), parent);
+                    this_struct.insert("__super".to_string(), parent);
                     let new_this = CfmlValue::Struct(this_struct);
                     locals.insert("this".to_string(), new_this.clone());
                     self.method_this_writeback = Some(new_this);
@@ -3987,7 +3980,7 @@ impl CfmlVirtualMachine {
             if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
                 // With dedicated __variables scope, just pass it through
                 if !vars.is_empty() {
-                    self.method_variables_writeback = Some((**vars).clone());
+                    self.method_variables_writeback = Some(vars.snapshot());
                 }
             } else {
                 // Non-CFC or legacy path: collect from locals
@@ -5608,13 +5601,13 @@ impl CfmlVirtualMachine {
                                     Self::write_back_to_captured_scope(&callback, wb);
                                 }
                                 if let CfmlValue::Struct(s) = mapped {
-                                    new_rows.push(s);
+                                    new_rows.push(s.snapshot());
                                 } else {
-                                    new_rows.push(Arc::new(row.clone()));
+                                    new_rows.push(row.clone());
                                 }
                             }
                             let mut result = q.clone();
-                            result.rows = new_rows.into_iter().map(|a| (*a).clone()).collect();
+                            result.rows = new_rows;
                             self.arg_ref_writeback = None;
                             return Ok(CfmlValue::Query(result));
                         }
@@ -5771,12 +5764,12 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 CfmlValue::Struct(data) => {
-                                    result.rows.push((**data).clone());
+                                    result.rows.push(data.snapshot());
                                 }
                                 CfmlValue::Array(rows) => {
                                     for item in rows.iter() {
                                         if let CfmlValue::Struct(data) = item {
-                                            result.rows.push((*data).clone());
+                                            result.rows.push(data.snapshot());
                                         } else {
                                             result.rows.push(IndexMap::new());
                                         }
@@ -6028,8 +6021,8 @@ impl CfmlVirtualMachine {
                                     let fmeta_key = format!("__funcmeta_{}", k);
                                     if let Some(CfmlValue::Struct(fm)) = s.get(&fmeta_key) {
                                         for (mk, mv) in fm.iter() {
-                                            if !func_meta.contains_key(mk) {
-                                                func_meta.insert(mk.clone(), mv.clone());
+                                            if !func_meta.contains_key(&mk) {
+                                                func_meta.insert(mk, mv);
                                             }
                                         }
                                     }
@@ -6050,7 +6043,7 @@ impl CfmlVirtualMachine {
                     if let Some(arg) = args.get(0) {
                         // If the argument is already a struct (component instance), extract metadata directly
                         if let CfmlValue::Struct(ref s) = arg {
-                            return Ok(extract_component_meta(s, ""));
+                            return Ok(extract_component_meta(&s.snapshot(), ""));
                         }
                         // Otherwise treat as a component name/path to look up
                         let comp_name = arg.as_string();
@@ -6059,7 +6052,7 @@ impl CfmlVirtualMachine {
                         {
                             let resolved = self.resolve_inheritance(template, parent_locals);
                             if let CfmlValue::Struct(ref s) = resolved {
-                                return Ok(extract_component_meta(s, &comp_name));
+                                return Ok(extract_component_meta(&s.snapshot(), &comp_name));
                             }
                             return Ok(resolved);
                         }
@@ -6256,9 +6249,9 @@ impl CfmlVirtualMachine {
                             .iter()
                             .find(|(k, _)| k.to_lowercase() == "statuscode")
                             .map(|(_, v)| match v {
-                                CfmlValue::Int(n) => *n as u16,
+                                CfmlValue::Int(n) => n as u16,
                                 CfmlValue::String(s) => s.parse::<u16>().unwrap_or(302),
-                                CfmlValue::Double(d) => *d as u16,
+                                CfmlValue::Double(d) => d as u16,
                                 _ => 302,
                             })
                             .unwrap_or(302);
@@ -6665,8 +6658,8 @@ impl CfmlVirtualMachine {
                                 .iter()
                                 .find(|(k, _)| k.to_lowercase() == "timeout")
                                 .and_then(|(_, v)| match v {
-                                    CfmlValue::Int(i) => Some(*i as u64 * 1000),
-                                    CfmlValue::Double(d) => Some((*d * 1000.0) as u64),
+                                    CfmlValue::Int(i) => Some(i as u64 * 1000),
+                                    CfmlValue::Double(d) => Some((d * 1000.0) as u64),
                                     CfmlValue::String(s) => {
                                         s.parse::<f64>().ok().map(|d| (d * 1000.0) as u64)
                                     }
@@ -6890,12 +6883,12 @@ impl CfmlVirtualMachine {
                                 match std::fs::copy(&temp_path, &final_path) {
                                     Ok(_) => {
                                         let _ = std::fs::remove_file(&temp_path);
-                                        let mut result = file_info.clone();
-                                        Arc::make_mut(&mut result).insert(
+                                        let mut result = file_info.snapshot();
+                                        result.insert(
                                             "serverDirectory".to_string(),
                                             CfmlValue::String(destination),
                                         );
-                                        Arc::make_mut(&mut result).insert(
+                                        result.insert(
                                             "serverFile".to_string(),
                                             CfmlValue::String(
                                                 final_path
@@ -6905,11 +6898,11 @@ impl CfmlVirtualMachine {
                                                     .to_string(),
                                             ),
                                         );
-                                        Arc::make_mut(&mut result).insert(
+                                        result.insert(
                                             "fileWasSaved".to_string(),
                                             CfmlValue::Bool(true),
                                         );
-                                        return Ok(CfmlValue::Struct(result));
+                                        return Ok(CfmlValue::strukt(result));
                                     }
                                     Err(e) => {
                                         return Err(CfmlError::runtime(format!(
@@ -6987,12 +6980,12 @@ impl CfmlVirtualMachine {
 
                                 if let Ok(_) = std::fs::copy(&temp_path, &final_path) {
                                     let _ = std::fs::remove_file(&temp_path);
-                                    let mut result = file_info.clone();
-                                    Arc::make_mut(&mut result).insert(
+                                    let mut result = file_info.snapshot();
+                                    result.insert(
                                         "serverDirectory".to_string(),
                                         CfmlValue::String(destination.clone()),
                                     );
-                                    Arc::make_mut(&mut result).insert(
+                                    result.insert(
                                         "serverFile".to_string(),
                                         CfmlValue::String(
                                             final_path
@@ -7002,9 +6995,9 @@ impl CfmlVirtualMachine {
                                                 .to_string(),
                                         ),
                                     );
-                                    Arc::make_mut(&mut result)
+                                    result
                                         .insert("fileWasSaved".to_string(), CfmlValue::Bool(true));
-                                    results.push(CfmlValue::Struct(result));
+                                    results.push(CfmlValue::strukt(result));
                                 }
                             }
                         }
@@ -7427,7 +7420,7 @@ impl CfmlVirtualMachine {
                             .iter()
                             .find(|(k, _)| k.to_lowercase() == "variable")
                             .map(|(_, v)| match v {
-                                CfmlValue::Bool(b) => *b,
+                                CfmlValue::Bool(b) => b,
                                 CfmlValue::String(s) => s.to_lowercase() == "true",
                                 _ => false,
                             })
@@ -7544,7 +7537,7 @@ impl CfmlVirtualMachine {
 
                         // Collect thread scope variables
                         if let Some(CfmlValue::Struct(ts)) = self.globals.shift_remove("thread") {
-                            thread_vars = (*ts).clone();
+                            thread_vars = ts.snapshot();
                         }
                     }
 
@@ -7568,7 +7561,7 @@ impl CfmlVirtualMachine {
 
                     // Store in cfthread scope
                     let thread_struct = self.get_or_create_cfthread_scope();
-                    if let Some(ts) = thread_struct.as_struct_mut() {
+                    if let Some(ts) = thread_struct.as_cfml_struct() {
                         ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(thread_meta));
                     }
                     return Ok(CfmlValue::Null);
@@ -7661,8 +7654,8 @@ impl CfmlVirtualMachine {
                         if let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") {
                             let mut wb = IndexMap::new();
                             for (k, v) in modified_caller.iter() {
-                                if let Some(orig) = caller_snapshot.get(k) {
-                                    if !Self::values_equal_shallow(v, orig) {
+                                if let Some(orig) = caller_snapshot.get(&k) {
+                                    if !Self::values_equal_shallow(&v, orig) {
                                         wb.insert(k.clone(), v.clone());
                                     }
                                 } else {
@@ -7713,8 +7706,8 @@ impl CfmlVirtualMachine {
                         if let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") {
                             let mut wb = IndexMap::new();
                             for (k, v) in modified_caller.iter() {
-                                if let Some(orig) = caller_snapshot.get(k) {
-                                    if !Self::values_equal_shallow(v, orig) {
+                                if let Some(orig) = caller_snapshot.get(&k) {
+                                    if !Self::values_equal_shallow(&v, orig) {
                                         wb.insert(k.clone(), v.clone());
                                     }
                                 } else {
@@ -7781,7 +7774,7 @@ impl CfmlVirtualMachine {
                             if let Some(CfmlValue::String(content)) =
                                 tag_info.get("generatedcontent")
                             {
-                                self.output_buffer.push_str(content);
+                                self.output_buffer.push_str(&content);
                             }
                         }
                     }
@@ -7791,8 +7784,8 @@ impl CfmlVirtualMachine {
                         if let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") {
                             let mut wb = IndexMap::new();
                             for (k, v) in modified_caller.iter() {
-                                if let Some(orig) = caller_snapshot.get(k) {
-                                    if !Self::values_equal_shallow(v, orig) {
+                                if let Some(orig) = caller_snapshot.get(&k) {
+                                    if !Self::values_equal_shallow(&v, orig) {
                                         wb.insert(k.clone(), v.clone());
                                     }
                                 } else {
@@ -7857,10 +7850,12 @@ impl CfmlVirtualMachine {
             root.set(path[0].clone(), value);
             return;
         }
-        // Recurse into the nested struct
-        if let Some(s) = root.as_struct_mut() {
-            if let Some(child) = s.get_mut(&path[0]) {
-                Self::deep_set(child, &path[1..], value);
+        // Recurse into the nested struct. The child is fetched as an owned
+        // handle; because structs/arrays are reference-typed, mutating through
+        // it propagates back into `root` without a write-back.
+        if let Some(s) = root.as_cfml_struct() {
+            if let Some(mut child) = s.get(&path[0]) {
+                Self::deep_set(&mut child, &path[1..], value);
             }
         }
     }
@@ -8000,13 +7995,13 @@ impl CfmlVirtualMachine {
             if let CfmlValue::Struct(s) = &val {
                 if let Some(ref app_scope) = self.application_scope {
                     if let Ok(mut scope) = app_scope.lock() {
-                        *scope = (**s).clone();
+                        *scope = s.snapshot();
                     }
                 }
             }
         } else if name_lower == "request" {
             if let CfmlValue::Struct(s) = &val {
-                self.request_scope = (**s).clone();
+                self.request_scope = s.snapshot();
             }
         } else if locals.contains_key(name) {
             locals.insert(name.to_string(), val);
@@ -8054,15 +8049,15 @@ impl CfmlVirtualMachine {
                 if method_lower == "poll"
                     && java_class == "java.util.concurrent.concurrentlinkedqueue"
                 {
-                    if let Some(CfmlValue::Array(q)) = s.get("__queue").cloned() {
+                    if let Some(CfmlValue::Array(q)) = s.get("__queue") {
                         let qv = q.snapshot();
                         if qv.is_empty() {
                             return Ok(CfmlValue::Null);
                         }
                         let head = qv[0].clone();
-                        let mut ns = s.clone();
-                        Arc::make_mut(&mut ns).insert("__queue".to_string(), CfmlValue::array(qv[1..].to_vec()));
-                        self.method_this_writeback = Some(CfmlValue::Struct(ns));
+                        let mut ns = s.snapshot();
+                        ns.insert("__queue".to_string(), CfmlValue::array(qv[1..].to_vec()));
+                        self.method_this_writeback = Some(CfmlValue::strukt(ns));
                         return Ok(head);
                     }
                     return Ok(CfmlValue::Null);
@@ -8082,10 +8077,10 @@ impl CfmlVirtualMachine {
                         .first()
                         .map(|a| a.as_string())
                         .unwrap_or_default();
-                    let old = s.get(&key).cloned().unwrap_or(CfmlValue::Null);
-                    let mut ns = s.clone();
-                    Arc::make_mut(&mut ns).shift_remove(&key);
-                    self.method_this_writeback = Some(CfmlValue::Struct(ns));
+                    let old = s.get(&key).unwrap_or(CfmlValue::Null);
+                    let mut ns = s.snapshot();
+                    ns.shift_remove(&key);
+                    self.method_this_writeback = Some(CfmlValue::strukt(ns));
                     return Ok(old);
                 }
 
@@ -8569,13 +8564,13 @@ impl CfmlVirtualMachine {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
                             if let CfmlValue::Struct(s) = mapped {
-                                new_rows.push(s);
+                                new_rows.push(s.snapshot());
                             } else {
-                                new_rows.push(Arc::new(row.clone()));
+                                new_rows.push(row.clone());
                             }
                         }
                         let mut result = q.clone();
-                        result.rows = new_rows.into_iter().map(|a| (*a).clone()).collect();
+                        result.rows = new_rows;
                         return Ok(CfmlValue::Query(result));
                     }
                     return Ok(object.clone());
@@ -8819,12 +8814,12 @@ impl CfmlVirtualMachine {
                 if method_lower.starts_with("set") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
                     if let Some(value) = extra_args.first() {
-                        let mut modified = object.clone();
-                        if let Some(ms) = modified.as_struct_mut() {
+                        let modified = object.clone();
+                        if let Some(ms) = modified.as_cfml_struct() {
                             let actual_key = ms
-                                .keys()
+                                .keys().into_iter()
                                 .find(|k| k.to_lowercase() == prop_name.to_lowercase())
-                                .cloned()
+                                
                                 .unwrap_or_else(|| prop_name.to_string());
                             ms.insert(actual_key, value.clone());
                         }
@@ -8841,7 +8836,7 @@ impl CfmlVirtualMachine {
         // merges parent methods into the child — the Rust parent isn't
         // merged, so it needs an explicit fall-through.
         if let CfmlValue::Struct(ref s) = object {
-            if let Some(CfmlValue::NativeObject(parent_obj)) = s.get("__super").cloned() {
+            if let Some(CfmlValue::NativeObject(parent_obj)) = s.get("__super") {
                 let args: Vec<CfmlValue> = extra_args.drain(..).collect();
                 let mut guard = parent_obj.write().map_err(|_| {
                     CfmlError::runtime("NativeObject lock poisoned".to_string())
@@ -9008,6 +9003,10 @@ impl CfmlVirtualMachine {
                         .all(|(x, y)| Self::values_equal_shallow_depth(x, y, depth + 1))
             }
             (CfmlValue::Struct(a), CfmlValue::Struct(b)) => {
+                if a.ptr_eq(b) {
+                    return true;
+                }
+                let (a, b) = (a.snapshot(), b.snapshot());
                 a.len() == b.len()
                     && a.iter().all(|(k, v)| {
                         b.get(k)
@@ -9055,10 +9054,14 @@ impl CfmlVirtualMachine {
         for (i, param_name) in func.params.iter().enumerate() {
             if let Some(val) = locals.get(param_name.as_str()) {
                 match val {
-                    CfmlValue::Struct(_)
-                    | CfmlValue::Array(_)
-                    | CfmlValue::Query(_)
-                    | CfmlValue::Component(_) => {
+                    // Arrays and structs are reference-typed now: in-place
+                    // mutations through the parameter already propagate to the
+                    // caller via the shared handle, so writing the parameter's
+                    // value back is unnecessary — and WRONG when the parameter
+                    // was *reassigned* (`a = [9]`), which CFML scopes to the
+                    // local only. Only the still-value-typed Query/Component
+                    // need the simulated pass-by-reference.
+                    CfmlValue::Query(_) | CfmlValue::Component(_) => {
                         writeback.push((i.to_string(), val.clone()));
                     }
                     _ => {}
@@ -9358,35 +9361,45 @@ impl CfmlVirtualMachine {
     fn fixup_func_indices_inner(val: &mut CfmlValue, offset: usize, fixed_scopes: &mut Vec<usize>) {
         match val {
             CfmlValue::Struct(s) => {
-                // We need to collect keys first, then mutate
-                let keys: Vec<String> = s.keys().cloned().collect();
-                for key in keys {
-                    if let Some(v) = Arc::make_mut(s).get_mut(&key) {
-                        match v {
-                            CfmlValue::Function(ref mut f) => {
-                                // Update the func_idx stored in the body
-                                if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                    ref mut body,
-                                ) = f.body
-                                {
-                                    if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                        *idx += offset as i64;
+                // Cycle guard: reference-typed structs can reference themselves
+                // (CFC instance ↔ `__variables`). `fixed_scopes` doubles as the
+                // visited set — struct and captured-scope Arc addresses can't
+                // collide while both are live.
+                let ptr = s.backing_ptr();
+                if fixed_scopes.contains(&ptr) {
+                    return;
+                }
+                fixed_scopes.push(ptr);
+                s.with_write(|m| {
+                    let keys: Vec<String> = m.keys().cloned().collect();
+                    for key in keys {
+                        if let Some(v) = m.get_mut(&key) {
+                            match v {
+                                CfmlValue::Function(ref mut f) => {
+                                    // Update the func_idx stored in the body
+                                    if let cfml_common::dynamic::CfmlClosureBody::Expression(
+                                        ref mut body,
+                                    ) = f.body
+                                    {
+                                        if let CfmlValue::Int(ref mut idx) = body.as_mut() {
+                                            *idx += offset as i64;
+                                        }
                                     }
-                                }
-                                // Also fix up func_idx values inside the captured scope
-                                if let Some(ref shared_env) = f.captured_scope {
-                                    let ptr = Arc::as_ptr(shared_env) as usize;
-                                    if !fixed_scopes.contains(&ptr) {
-                                        fixed_scopes.push(ptr);
-                                        if let Ok(mut env) = shared_env.write() {
-                                            let env_keys: Vec<String> =
-                                                env.keys().cloned().collect();
-                                            for ek in env_keys {
-                                                if let Some(ev) = env.get_mut(&ek) {
-                                                    if let CfmlValue::Function(ref mut ef) = ev {
-                                                        if let cfml_common::dynamic::CfmlClosureBody::Expression(ref mut body) = ef.body {
-                                                            if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                                                *idx += offset as i64;
+                                    // Also fix up func_idx values inside the captured scope
+                                    if let Some(ref shared_env) = f.captured_scope {
+                                        let ptr = Arc::as_ptr(shared_env) as usize;
+                                        if !fixed_scopes.contains(&ptr) {
+                                            fixed_scopes.push(ptr);
+                                            if let Ok(mut env) = shared_env.write() {
+                                                let env_keys: Vec<String> =
+                                                    env.keys().cloned().collect();
+                                                for ek in env_keys {
+                                                    if let Some(ev) = env.get_mut(&ek) {
+                                                        if let CfmlValue::Function(ref mut ef) = ev {
+                                                            if let cfml_common::dynamic::CfmlClosureBody::Expression(ref mut body) = ef.body {
+                                                                if let CfmlValue::Int(ref mut idx) = body.as_mut() {
+                                                                    *idx += offset as i64;
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -9395,14 +9408,14 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                 }
+                                CfmlValue::Struct(_) => {
+                                    Self::fixup_func_indices_inner(v, offset, fixed_scopes);
+                                }
+                                _ => {}
                             }
-                            CfmlValue::Struct(_) => {
-                                Self::fixup_func_indices_inner(v, offset, fixed_scopes);
-                            }
-                            _ => {}
                         }
                     }
-                }
+                });
             }
             _ => {}
         }
@@ -9413,32 +9426,57 @@ impl CfmlVirtualMachine {
     /// base_idx + (i - 1) in the merged program.
     fn fixup_included_func_indices(val: &mut CfmlValue, base_idx: usize, sub_func_count: usize) {
         match val {
+            CfmlValue::Struct(_) => {
+                // Reference-typed structs can form cycles (a CFC instance and its
+                // `__variables` reference each other); guard against unbounded
+                // recursion with a visited-pointer set.
+                let mut visited: Vec<usize> = Vec::new();
+                Self::fixup_included_func_indices_inner(val, base_idx, sub_func_count, &mut visited);
+            }
+            _ => {}
+        }
+    }
+
+    fn fixup_included_func_indices_inner(
+        val: &mut CfmlValue,
+        base_idx: usize,
+        sub_func_count: usize,
+        visited: &mut Vec<usize>,
+    ) {
+        match val {
             CfmlValue::Struct(s) => {
-                let keys: Vec<String> = s.keys().cloned().collect();
-                for key in keys {
-                    if let Some(v) = Arc::make_mut(s).get_mut(&key) {
-                        match v {
-                            CfmlValue::Function(ref mut f) => {
-                                if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                    ref mut body,
-                                ) = f.body
-                                {
-                                    if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                        let i = *idx as usize;
-                                        // Only fix indices that belong to the sub-program
-                                        if i > 0 && i < sub_func_count {
-                                            *idx = (base_idx + i - 1) as i64;
+                let ptr = s.backing_ptr();
+                if visited.contains(&ptr) {
+                    return;
+                }
+                visited.push(ptr);
+                s.with_write(|m| {
+                    let keys: Vec<String> = m.keys().cloned().collect();
+                    for key in keys {
+                        if let Some(v) = m.get_mut(&key) {
+                            match v {
+                                CfmlValue::Function(ref mut f) => {
+                                    if let cfml_common::dynamic::CfmlClosureBody::Expression(
+                                        ref mut body,
+                                    ) = f.body
+                                    {
+                                        if let CfmlValue::Int(ref mut idx) = body.as_mut() {
+                                            let i = *idx as usize;
+                                            // Only fix indices that belong to the sub-program
+                                            if i > 0 && i < sub_func_count {
+                                                *idx = (base_idx + i - 1) as i64;
+                                            }
                                         }
                                     }
                                 }
+                                CfmlValue::Struct(_) => {
+                                    Self::fixup_included_func_indices_inner(v, base_idx, sub_func_count, visited);
+                                }
+                                _ => {}
                             }
-                            CfmlValue::Struct(_) => {
-                                Self::fixup_included_func_indices(v, base_idx, sub_func_count);
-                            }
-                            _ => {}
                         }
                     }
-                }
+                });
             }
             _ => {}
         }
@@ -9448,36 +9486,59 @@ impl CfmlVirtualMachine {
     /// Used when restoring cached functions at a different program offset
     /// than where they were originally inserted.
     fn adjust_func_indices(val: &mut CfmlValue, min_index: usize, delta: i64) {
+        // Reference-typed structs/arrays can form cycles; guard the walk.
+        let mut visited: Vec<usize> = Vec::new();
+        Self::adjust_func_indices_inner(val, min_index, delta, &mut visited);
+    }
+
+    fn adjust_func_indices_inner(
+        val: &mut CfmlValue,
+        min_index: usize,
+        delta: i64,
+        visited: &mut Vec<usize>,
+    ) {
         match val {
             CfmlValue::Struct(s) => {
-                let keys: Vec<String> = s.keys().cloned().collect();
-                for key in keys {
-                    if let Some(v) = Arc::make_mut(s).get_mut(&key) {
-                        match v {
-                            CfmlValue::Function(ref mut f) => {
-                                if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                    ref mut body,
-                                ) = f.body
-                                {
-                                    if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                        if *idx >= min_index as i64 {
-                                            *idx += delta;
+                let ptr = s.backing_ptr();
+                if visited.contains(&ptr) {
+                    return;
+                }
+                visited.push(ptr);
+                s.with_write(|m| {
+                    let keys: Vec<String> = m.keys().cloned().collect();
+                    for key in keys {
+                        if let Some(v) = m.get_mut(&key) {
+                            match v {
+                                CfmlValue::Function(ref mut f) => {
+                                    if let cfml_common::dynamic::CfmlClosureBody::Expression(
+                                        ref mut body,
+                                    ) = f.body
+                                    {
+                                        if let CfmlValue::Int(ref mut idx) = body.as_mut() {
+                                            if *idx >= min_index as i64 {
+                                                *idx += delta;
+                                            }
                                         }
                                     }
                                 }
+                                CfmlValue::Struct(_) | CfmlValue::Array(_) => {
+                                    Self::adjust_func_indices_inner(v, min_index, delta, visited);
+                                }
+                                _ => {}
                             }
-                            CfmlValue::Struct(_) | CfmlValue::Array(_) => {
-                                Self::adjust_func_indices(v, min_index, delta);
-                            }
-                            _ => {}
                         }
                     }
-                }
+                });
             }
             CfmlValue::Array(arr) => {
+                let ptr = arr.backing_ptr();
+                if visited.contains(&ptr) {
+                    return;
+                }
+                visited.push(ptr);
                 arr.with_write(|v| {
                     for item in v.iter_mut() {
-                        Self::adjust_func_indices(item, min_index, delta);
+                        Self::adjust_func_indices_inner(item, min_index, delta, visited);
                     }
                 });
             }
@@ -9799,7 +9860,7 @@ impl CfmlVirtualMachine {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals);
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         if let Some(CfmlValue::Struct(parent_vars)) = ps.get("__variables") {
-                            (**parent_vars).clone()
+                            parent_vars.snapshot()
                         } else {
                             IndexMap::new()
                         }
@@ -9871,6 +9932,12 @@ impl CfmlVirtualMachine {
             // Fix up func_idx in the component struct stored in globals
             // Sub-program functions were at indices [0..N), now at [base_idx..base_idx+N)
             let short_name = class_name.split('.').last().unwrap_or(class_name);
+            // Deep-copy the cached template into an independent instance. Now
+            // that structs are reference-typed, a plain handle clone would let
+            // the in-place `fixup_func_indices` below mutate the *cached
+            // template* (corrupting later instantiations) and would alias state
+            // across instances. The deep copy restores the per-instance
+            // independence the old value-type copy-on-write gave implicitly.
             let mut result = self
                 .globals
                 .get(class_name)
@@ -9883,7 +9950,8 @@ impl CfmlVirtualMachine {
                         .find(|(k, _)| k.to_lowercase() == lower)
                         .map(|(_, v)| v.clone())
                 })
-                .or_else(|| self.globals.get("Anonymous").cloned());
+                .or_else(|| self.globals.get("Anonymous").cloned())
+                .map(|v| v.deep_copy());
             // Adjust func_idx in all function values.
             // Sub-program had __main__ at index 0 which was skipped during merge.
             // So sub-program func at index i is now at base_idx + (i - 1).
@@ -9898,15 +9966,17 @@ impl CfmlVirtualMachine {
             // context where DefineFunction attaches a captured scope, but that scope
             // carries stale/unfixed data.  CFC method scope resolution should use
             // __variables (injected at call time), not captured scopes.
-            if let Some(s) = result.as_mut().and_then(|v| v.as_struct_mut()) {
-                for (_, v) in s.iter_mut() {
-                    if let CfmlValue::Function(ref mut f) = v {
-                        f.captured_scope = None;
+            if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
+                s.with_write(|m| {
+                    for (_, v) in m.iter_mut() {
+                        if let CfmlValue::Function(f) = v {
+                            f.captured_scope = None;
+                        }
                     }
-                }
+                });
             }
             // Store the CFC source path for parent resolution during inheritance
-            if let Some(s) = result.as_mut().and_then(|v| v.as_struct_mut()) {
+            if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 s.insert(
                     "__source_file".to_string(),
                     CfmlValue::String(cfc_path.clone()),
@@ -9928,9 +9998,9 @@ impl CfmlVirtualMachine {
             // Inject functions added by cfinclude inside the component body
             // These were registered in user_functions during execution but aren't
             // in the component struct (which was built at compile time)
-            if let Some(s) = result.as_mut().and_then(|v| v.as_struct_mut()) {
+            if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 let existing_keys: std::collections::HashSet<String> =
-                    s.keys().map(|k| k.to_lowercase()).collect();
+                    s.keys().into_iter().map(|k| k.to_lowercase()).collect();
                 for (func_name, func_def) in &self.user_functions {
                     if !pre_exec_func_names.contains(func_name)
                         && !existing_keys.contains(&func_name.to_lowercase())
@@ -9974,7 +10044,7 @@ impl CfmlVirtualMachine {
             // Store component body variables + all methods as __variables
             // In CFML, component methods live in the variables scope so
             // unqualified calls inside methods resolve via the normal scope chain.
-            if let Some(s) = result.as_mut().and_then(|v| v.as_struct_mut()) {
+            if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 let mut vars_scope: IndexMap<String, CfmlValue> = IndexMap::new();
                 // Add component body variables (non-function values from pseudo-constructor)
                 // Functions from component_variables have sub-program indices that need
@@ -10027,8 +10097,8 @@ impl CfmlVirtualMachine {
                 // defaults for properties not set during pseudo-constructor are preserved.
                 if let Some(CfmlValue::Struct(ref compiled_vars)) = s.get("__variables") {
                     for (k, v) in compiled_vars.iter() {
-                        if !vars_scope.contains_key(k) {
-                            vars_scope.insert(k.clone(), v.clone());
+                        if !vars_scope.contains_key(&k) {
+                            vars_scope.insert(k, v);
                         }
                     }
                 }
@@ -10280,11 +10350,11 @@ impl CfmlVirtualMachine {
         // for createObject to construct, and record the prefixed name in the
         // extends chain so isInstanceOf("rust:X") works.
         if let Some(rust_class) = parent_name.strip_prefix("rust:") {
-            let mut child_map = match child {
+            let child_map = match child {
                 CfmlValue::Struct(s) => s,
                 other => return other,
             };
-            Arc::make_mut(&mut child_map).insert(
+            child_map.insert(
                 "__rust_extends".to_string(),
                 CfmlValue::String(rust_class.to_string()),
             );
@@ -10294,7 +10364,7 @@ impl CfmlVirtualMachine {
                     chain.push(item.clone());
                 }
             }
-            Arc::make_mut(&mut child_map)
+            child_map
                 .insert("__extends_chain".to_string(), CfmlValue::array(chain));
             return CfmlValue::Struct(child_map);
         }
@@ -10346,8 +10416,11 @@ impl CfmlVirtualMachine {
             CfmlValue::Struct(s) => s,
             _ => return parent,
         };
-        let mut parent_map = match parent {
-            CfmlValue::Struct(s) => s,
+        // Snapshot the parent into an owned map so the merge never mutates the
+        // shared parent template (preserves the old `Arc::make_mut` copy-on-write
+        // behaviour now that structs are reference-typed).
+        let mut parent_map: IndexMap<String, CfmlValue> = match parent {
+            CfmlValue::Struct(s) => s.snapshot(),
             _ => return CfmlValue::Struct(child_map),
         };
 
@@ -10360,32 +10433,20 @@ impl CfmlVirtualMachine {
         }
 
         // Merge __variables from parent and child (child overrides parent)
-        let parent_vars = parent_map
+        let parent_vars: IndexMap<String, CfmlValue> = parent_map
             .get("__variables")
-            .and_then(|v| {
-                if let CfmlValue::Struct(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+            .and_then(|v| v.as_struct())
             .unwrap_or_default();
-        let child_vars = child_map
+        let child_vars: IndexMap<String, CfmlValue> = child_map
             .get("__variables")
-            .and_then(|v| {
-                if let CfmlValue::Struct(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
+            .and_then(|v| v.as_struct())
             .unwrap_or_default();
         if !parent_vars.is_empty() || !child_vars.is_empty() {
             let mut merged_vars = parent_vars;
-            for (k, v) in child_vars.iter() {
-                Arc::make_mut(&mut merged_vars).insert(k.clone(), v.clone());
+            for (k, v) in child_vars {
+                merged_vars.insert(k, v);
             }
-            Arc::make_mut(&mut parent_map).insert("__variables".to_string(), CfmlValue::Struct(merged_vars));
+            parent_map.insert("__variables".to_string(), CfmlValue::strukt(merged_vars));
         }
 
         // Layer child on top of parent (child overrides parent)
@@ -10393,11 +10454,11 @@ impl CfmlVirtualMachine {
             if k == "__extends" || k == "__variables" {
                 continue; // Already merged above; don't overwrite
             }
-            Arc::make_mut(&mut parent_map).insert(k.clone(), v.clone());
+            parent_map.insert(k.clone(), v.clone());
             // Also update __variables when child overrides a method, so
             // unqualified calls within CFC methods resolve to the override
             if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
-                if let Some(vars) = Arc::make_mut(&mut parent_map).get_mut("__variables").and_then(|v| v.as_struct_mut()) {
+                if let Some(vars) = parent_map.get_mut("__variables").and_then(|v| v.as_cfml_struct()) {
                     vars.insert(k.clone(), v.clone());
                 }
             }
@@ -10406,7 +10467,7 @@ impl CfmlVirtualMachine {
         // Add __super struct with marker for dispatch detection
         if !super_methods.is_empty() {
             super_methods.insert("__is_super".to_string(), CfmlValue::Bool(true));
-            Arc::make_mut(&mut parent_map).insert("__super".to_string(), CfmlValue::strukt(super_methods));
+            parent_map.insert("__super".to_string(), CfmlValue::strukt(super_methods));
         }
 
         // Build __extends_chain for isInstanceOf
@@ -10417,7 +10478,7 @@ impl CfmlVirtualMachine {
                 chain.push(item.clone());
             }
         }
-        Arc::make_mut(&mut parent_map).insert("__extends_chain".to_string(), CfmlValue::array(chain));
+        parent_map.insert("__extends_chain".to_string(), CfmlValue::array(chain));
 
         // Propagate __implements through inheritance: aggregate child + parent interfaces
         let mut all_implements = std::collections::HashSet::new();
@@ -10443,10 +10504,10 @@ impl CfmlVirtualMachine {
                 .into_iter()
                 .map(|s| CfmlValue::String(s))
                 .collect();
-            Arc::make_mut(&mut parent_map).insert("__implements_chain".to_string(), CfmlValue::array(chain));
+            parent_map.insert("__implements_chain".to_string(), CfmlValue::array(chain));
         }
 
-        CfmlValue::Struct(parent_map)
+        CfmlValue::strukt(parent_map)
     }
 
     /// If `instance` was marked with `__rust_extends` by resolve_inheritance_chain,
@@ -10454,7 +10515,7 @@ impl CfmlVirtualMachine {
     /// resulting NativeObject under `__super`. Errors if the named class is
     /// not registered. Idempotent: returns early if `__super` is already set.
     fn attach_native_parent(&mut self, instance: CfmlValue) -> CfmlResult {
-        let mut s = match instance {
+        let s = match instance {
             CfmlValue::Struct(s) => s,
             other => return Ok(other),
         };
@@ -10473,7 +10534,7 @@ impl CfmlVirtualMachine {
             ))
         })?;
         let parent = ctor(Vec::new())?;
-        Arc::make_mut(&mut s).insert("__super".to_string(), parent);
+        s.insert("__super".to_string(), parent);
         Ok(CfmlValue::Struct(s))
     }
 
@@ -10559,7 +10620,7 @@ impl CfmlVirtualMachine {
                     let line_num = handle
                         .get("line")
                         .and_then(|v| match v {
-                            CfmlValue::Int(i) => Some(*i as usize),
+                            CfmlValue::Int(i) => Some(i as usize),
                             _ => None,
                         })
                         .unwrap_or(0);
@@ -10591,7 +10652,7 @@ impl CfmlVirtualMachine {
                     let line_num = handle
                         .get("line")
                         .and_then(|v| match v {
-                            CfmlValue::Int(i) => Some(*i as usize),
+                            CfmlValue::Int(i) => Some(i as usize),
                             _ => None,
                         })
                         .unwrap_or(0);
@@ -10950,7 +11011,7 @@ impl CfmlVirtualMachine {
                     && matches!(v, CfmlValue::Struct(_))
                     && if let CfmlValue::Struct(s) = v {
                         s.contains_key("__name")
-                            || s.values().any(|v| matches!(v, CfmlValue::Function(_)))
+                            || s.with_read(|m| m.values().any(|v| matches!(v, CfmlValue::Function(_))))
                     } else {
                         false
                     }
@@ -10963,7 +11024,7 @@ impl CfmlVirtualMachine {
                     .find(|(_, v)| {
                         if let CfmlValue::Struct(s) = v {
                             s.contains_key("__name")
-                                || s.values().any(|val| matches!(val, CfmlValue::Function(_)))
+                                || s.with_read(|m| m.values().any(|val| matches!(val, CfmlValue::Function(_))))
                         } else {
                             false
                         }
@@ -10993,7 +11054,7 @@ impl CfmlVirtualMachine {
                 vars_scope.insert(k.clone(), v.clone());
             }
             if !vars_scope.is_empty() {
-                if let Some(s) = template.as_struct_mut() {
+                if let Some(s) = template.as_cfml_struct() {
                     s.insert("__variables".to_string(), CfmlValue::strukt(vars_scope));
                 }
             }
@@ -11124,7 +11185,7 @@ impl CfmlVirtualMachine {
             .iter()
             .find(|(k, _)| k.to_lowercase() == "sessionmanagement")
             .map(|(_, v)| match v {
-                CfmlValue::Bool(b) => *b,
+                CfmlValue::Bool(b) => b,
                 CfmlValue::String(s) => s.to_lowercase() == "true" || s.to_lowercase() == "yes",
                 _ => false,
             })
@@ -11134,8 +11195,8 @@ impl CfmlVirtualMachine {
             .iter()
             .find(|(k, _)| k.to_lowercase() == "sessiontimeout")
             .and_then(|(_, v)| match v {
-                CfmlValue::Int(i) => Some(*i as u64),
-                CfmlValue::Double(d) => Some(*d as u64),
+                CfmlValue::Int(i) => Some(i as u64),
+                CfmlValue::Double(d) => Some(d as u64),
                 CfmlValue::String(s) => s.parse::<u64>().ok(),
                 // createTimeSpan returns a double representing days
                 _ => None,
@@ -11179,7 +11240,7 @@ impl CfmlVirtualMachine {
                     "classic" | "update" | "false" => Some(false),
                     _ => None,
                 },
-                CfmlValue::Bool(b) => Some(*b),
+                CfmlValue::Bool(b) => Some(b),
                 _ => None,
             });
 
@@ -11236,12 +11297,12 @@ impl CfmlVirtualMachine {
                                     "nodename" => props.node_name = pv.as_string(),
                                     "maxobjects" => {
                                         if let CfmlValue::Int(i) = pv {
-                                            props.max_objects = *i as u64;
+                                            props.max_objects = i as u64;
                                         }
                                     }
                                     "defaulttimeout" => {
                                         if let CfmlValue::Int(i) = pv {
-                                            props.default_timeout = *i as u64;
+                                            props.default_timeout = i as u64;
                                         }
                                     }
                                     _ => {}
@@ -11309,21 +11370,17 @@ impl CfmlVirtualMachine {
 
                 // Propagate variables scope mutations back into __variables
                 if let Some(vars_wb) = self.method_variables_writeback.take() {
-                    if let Some(ts) = template.as_struct_mut() {
-                        let vars = ts
-                            .entry("__variables".to_string())
-                            .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
-                        if let Some(vs) = vars.as_struct_mut() {
-                            for (k, v) in vars_wb {
-                                vs.insert(k, v);
-                            }
+                    if let Some(ts) = template.as_cfml_struct() {
+                        let vs = ts.get_or_insert_struct("__variables");
+                        for (k, v) in vars_wb {
+                            vs.insert(k, v);
                         }
                     }
                 }
 
                 // Propagate this modifications back into template
                 if let Some(modified_this) = self.method_this_writeback.take() {
-                    if let Some(ts) = template.as_struct_mut() {
+                    if let Some(ts) = template.as_cfml_struct() {
                         if let CfmlValue::Struct(ref modified_s) = modified_this {
                             for (k, v) in modified_s.iter() {
                                 if k != "__variables" && k != "__extends" {
