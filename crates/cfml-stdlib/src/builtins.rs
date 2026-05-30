@@ -1697,7 +1697,19 @@ fn fn_array_append(args: Vec<CfmlValue>) -> CfmlResult {
             CfmlValue::Array(a) => a.clone(),
             _ => Arc::new(Vec::new()),
         };
-        Arc::make_mut(&mut arr).push(args[1].clone());
+        // Optional 3rd arg `merge`: when true and the value is an array, its
+        // elements are appended individually instead of as a single nested
+        // element (Lucee/ACF semantics).
+        let merge = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+        match (&args[1], merge) {
+            (CfmlValue::Array(elems), true) => {
+                let elems = elems.clone();
+                Arc::make_mut(&mut arr).extend(elems.iter().cloned());
+            }
+            _ => {
+                Arc::make_mut(&mut arr).push(args[1].clone());
+            }
+        }
         Ok(CfmlValue::Array(arr))
     } else {
         Ok(args.into_iter().next().unwrap_or(CfmlValue::array(Vec::new())))

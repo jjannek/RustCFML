@@ -1528,6 +1528,87 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
+                BytecodeOp::ArrayAppendLocal(name) => {
+                    // Fused arrayAppend(<ident>, value). The value is on top of
+                    // the stack; the array lives in the named variable. Mutating
+                    // it in place keeps a loop of appends O(n) instead of O(n²):
+                    // the generic path clones the whole backing Vec on every call
+                    // because the array is aliased between the scope slot and the
+                    // working copy passed to the builtin.
+                    let value = stack.pop().unwrap_or(CfmlValue::Null);
+
+                    // Fast path: the array is held directly in this frame's locals
+                    // (exact case). StoreLocal writes plain identifiers back to
+                    // `locals` whenever `locals.contains_key(name)`, so an in-place
+                    // mutation here is observationally identical — but the slot's
+                    // Arc is typically unique, so `make_mut` appends without a clone.
+                    // Skip the fast path when a closure env shares this name, so the
+                    // env stays in sync (handled by the fallback's write-back).
+                    let env_shares = closure_env
+                        .as_ref()
+                        .map(|e| {
+                            e.read()
+                                .map(|m| m.contains_key(name.as_str()))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+
+                    if !env_shares {
+                        if let Some(CfmlValue::Array(arr)) = locals.get_mut(name.as_str()) {
+                            Arc::make_mut(arr).push(value);
+                            continue;
+                        }
+                    }
+
+                    // Fallback: resolve through the full scope chain, append, and
+                    // write back to the correct scope. Mirrors LoadLocal + builtin
+                    // + StoreLocal for a plain identifier (CFC component scope,
+                    // case-insensitive matches, page-scope globals, env sync).
+                    let name_lower_owned: String;
+                    let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                        name_lower_owned = name.to_lowercase();
+                        &name_lower_owned
+                    } else {
+                        name.as_str()
+                    };
+                    let mut arr = match self.lookup_name_in_scopes(name.as_str(), name_lower, &locals) {
+                        Some(CfmlValue::Array(a)) => a,
+                        _ => Arc::new(Vec::new()),
+                    };
+                    Arc::make_mut(&mut arr).push(value);
+                    let val = CfmlValue::Array(arr);
+
+                    if locals.contains_key("__variables")
+                        && !declared_locals.contains(name.as_str())
+                        && !declared_locals.contains(name_lower)
+                        && !locals.contains_key(name.as_str())
+                        && !effective_local_mode_modern
+                    {
+                        // CFC method, classic localmode: component (variables) scope.
+                        if let Some(vars) =
+                            locals.get_mut("__variables").and_then(|v| v.as_struct_mut())
+                        {
+                            vars.insert(name.clone(), val);
+                        }
+                    } else {
+                        locals.insert(name.clone(), val.clone());
+                        if is_inside_function
+                            && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
+                        {
+                            if let Some(args) =
+                                locals.get_mut("arguments").and_then(|v| v.as_struct_mut())
+                            {
+                                args.insert(name.clone(), val.clone());
+                            }
+                        }
+                        if let Some(ref env) = closure_env {
+                            let mut m = env.write().unwrap();
+                            if m.contains_key(name.as_str()) {
+                                m.insert(name.clone(), val);
+                            }
+                        }
+                    }
+                }
                 BytecodeOp::LoadGlobal(name) => {
                     let name_lower = name.to_lowercase();
                     // 1. Check locals (exact, then CI)
@@ -2516,12 +2597,25 @@ impl CfmlVirtualMachine {
                     let value = stack.pop().unwrap_or(CfmlValue::Null);
                     match &mut collection {
                         CfmlValue::Array(arr) => {
-                            let idx = match &index {
-                                CfmlValue::Int(i) => (*i as usize).saturating_sub(1), // 1-based
-                                _ => 0,
+                            // 1-based index; accept Int or numeric Double/String.
+                            let one_based: i64 = match &index {
+                                CfmlValue::Int(i) => *i,
+                                CfmlValue::Double(d) => *d as i64,
+                                other => other.as_string().trim().parse::<i64>().unwrap_or(0),
                             };
-                            if idx < arr.len() {
-                                Arc::make_mut(arr)[idx] = value;
+                            if one_based >= 1 {
+                                let idx = (one_based - 1) as usize;
+                                let backing = Arc::make_mut(arr);
+                                if idx < backing.len() {
+                                    backing[idx] = value;
+                                } else {
+                                    // Auto-grow: assigning past the end extends the
+                                    // array. Lucee grows the length but leaves the
+                                    // skipped slots as non-existent (null) holes —
+                                    // `a=[]; a[3]="x"` → len 3 with [1] and [2] null.
+                                    backing.resize(idx, CfmlValue::Null);
+                                    backing.push(value);
+                                }
                             }
                         }
                         CfmlValue::Struct(s) => {
@@ -11885,6 +11979,8 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         }
         // Variable stores: push 0, pop 1
         BytecodeOp::StoreLocal(_) | BytecodeOp::StoreGlobal(_) => (0, 1),
+        // Fused in-place append: pops the value, pushes nothing
+        BytecodeOp::ArrayAppendLocal(_) => (0, 1),
         // Stack ops
         BytecodeOp::Pop => (0, 1),
         BytecodeOp::Dup => (1, 0),  // net +1 (peeks and pushes copy)

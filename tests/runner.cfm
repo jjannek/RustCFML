@@ -36,6 +36,7 @@ try { include "types/test_boolean.cfm"; } catch (any e) { writeOutput("ERROR | t
 try { include "types/test_numeric.cfm"; } catch (any e) { writeOutput("ERROR | types/test_numeric.cfm | " & e.message & chr(10)); }
 try { include "types/test_string.cfm"; } catch (any e) { writeOutput("ERROR | types/test_string.cfm | " & e.message & chr(10)); }
 try { include "types/test_array.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array.cfm | " & e.message & chr(10)); }
+try { include "types/test_array_append_grow.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array_append_grow.cfm | " & e.message & chr(10)); }
 try { include "types/test_struct.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct.cfm | " & e.message & chr(10)); }
 try { include "types/test_nested_writeback.cfm"; } catch (any e) { writeOutput("ERROR | types/test_nested_writeback.cfm | " & e.message & chr(10)); }
 try { include "types/test_query.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query.cfm | " & e.message & chr(10)); }

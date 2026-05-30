@@ -137,6 +137,12 @@ pub enum BytecodeOp {
     // Variables
     LoadLocal(String),
     StoreLocal(String),
+    /// Fused arrayAppend(<ident>, value): pops the value off the stack and
+    /// appends it to the array held in the named variable, in place. Avoids the
+    /// LoadLocal/clone + builtin call + StoreLocal round-trip whose Arc aliasing
+    /// makes a loop of appends O(n²) (every `make_mut` deep-clones the backing
+    /// Vec). Emitted only for a 2-arg call with a simple, non-scope identifier.
+    ArrayAppendLocal(String),
     LoadGlobal(String),
     StoreGlobal(String),
 
@@ -450,6 +456,35 @@ impl CfmlCompiler {
         false
     }
 
+    /// True when `expr` is exactly `arrayAppend(<ident>, value)` — a two-arg
+    /// append whose first argument is the given simple identifier and which is
+    /// not a reserved scope name. These compile to the fused `ArrayAppendLocal`
+    /// op for an O(1) in-place append. The merge form (`arrayAppend(a, b, true)`)
+    /// and member-access targets keep the generic clone+store path.
+    fn is_inplace_array_append(expr: &Expression, ident: &Identifier) -> bool {
+        if let Expression::FunctionCall(call) = expr {
+            if let Expression::Identifier(name) = &*call.name {
+                if name.name.eq_ignore_ascii_case("arrayappend")
+                    && call.arguments.len() == 2
+                    && !call.arguments.iter().any(|a| matches!(a, Expression::NamedArgument(_)))
+                    && !Self::is_reserved_scope_name(&ident.name)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Scope keywords that must never be treated as plain mutable variables.
+    fn is_reserved_scope_name(name: &str) -> bool {
+        matches!(name.to_lowercase().as_str(),
+            "local" | "variables" | "arguments" | "this" | "super" | "request" |
+            "application" | "session" | "server" | "cgi" | "url" | "form" |
+            "cookie" | "client" | "thread"
+        )
+    }
+
     /// Get the first argument expression of a function call (for mutating write-back).
     fn mutating_call_first_arg(expr: &Expression) -> Option<&Expression> {
         if let Expression::FunctionCall(call) = expr {
@@ -614,6 +649,18 @@ impl CfmlCompiler {
                 else if Self::is_mutating_standalone_call(&expr_stmt.expr) {
                     if let Some(first_arg) = Self::mutating_call_first_arg(&expr_stmt.expr) {
                         match first_arg {
+                            Expression::Identifier(ident)
+                                if Self::is_inplace_array_append(&expr_stmt.expr, ident) =>
+                            {
+                                // Hot path: arrayAppend(<ident>, value) with exactly two
+                                // args. Push the value, then append in place via the fused
+                                // op — no array clone, no StoreLocal round-trip. This turns
+                                // a quadratic append loop linear.
+                                if let Expression::FunctionCall(call) = &expr_stmt.expr {
+                                    self.compile_expression(&call.arguments[1], instructions);
+                                }
+                                instructions.push(BytecodeOp::ArrayAppendLocal(ident.name.clone()));
+                            }
                             Expression::Identifier(ident) => {
                                 // Simple: structAppend(a, b) → compile call → StoreLocal(a)
                                 self.compile_expression(&expr_stmt.expr, instructions);
