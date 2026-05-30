@@ -13,7 +13,21 @@ cargo run -- tests/runner.cfm        # Run all tests (~1181 assertions, 89 suite
 cargo run --release -- file.cfm      # Run a CFML file
 cargo run --release -- --serve       # Start web server on port 8500
 cargo test                           # Rust unit tests (tag_parser, etc.)
+
+# Wasm-target members — NOT built by the commands above (see warning below):
+cargo build -p cfml-worker -p rustcfml-wasm --target wasm32-unknown-unknown
 ```
+
+> ⚠️ **A plain `cargo build` does NOT compile the wasm32-only workspace members
+> (`cfml-worker`, `rustcfml-wasm`).** They only target `wasm32-unknown-unknown`,
+> so host builds silently skip them. Any change touching `CfmlValue`/`CfmlArray`/
+> `CfmlStruct` (or any shared type) MUST also be verified with the
+> `--target wasm32-unknown-unknown` build above before tagging — otherwise the
+> Cloudflare worker build breaks for downstream consumers even though `cargo
+> build`, `cargo test`, and `tests/runner.cfm` are all green. (This bit us in
+> v0.33.0/v0.34.0: `CfmlArray::iter()` yielding owned values broke
+> `cfml-worker`'s HyperdriveDriver; fixed in v0.34.1.) Requires the target:
+> `rustup target add wasm32-unknown-unknown`.
 
 Tests are CFML-based, not Rust-based. The test runner (`tests/runner.cfm`) includes all test files and uses the harness (`tests/harness.cfm`) which provides `assert()`, `assertTrue()`, `assertFalse()`, `assertNull()`, `assertThrows()`, `suiteBegin()`, `suiteEnd()`.
 
