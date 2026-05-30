@@ -243,6 +243,24 @@ async function runDoFetch(req) {
   }
 }
 
+/**
+ * Dispatch the sync VM activation. The post-build patch installs
+ * `globalThis.__cfmlJspi.runSync` as a `WebAssembly.promising` wrapper
+ * around the wasm-exported sync runner. This helper awaits that wrapper —
+ * the Rust side (`jspi::invoke_run_sync`) imports this function as a
+ * normal async JS call, so wasm-bindgen-futures drives the await while a
+ * separate contiguous wasm activation runs the VM under JSPI.
+ */
+export async function __cfml_invoke_run_sync() {
+  const fn = globalThis.__cfmlJspi && globalThis.__cfmlJspi.runSync;
+  if (typeof fn !== "function") {
+    throw new Error(
+      "cfml-jspi: globalThis.__cfmlJspi.runSync not installed (build patch missing)",
+    );
+  }
+  await fn();
+}
+
 export const cfml_jspi_do_fetch = new WebAssembly.Suspending(
   async (reqPtr, reqLen, respPtr, respCap) => {
     if (!wasmMemory) {

@@ -81,6 +81,26 @@ extern "C" {
         resp_ptr: u32,
         resp_cap: u32,
     ) -> i32;
+
+    /// JS-side dispatcher: invokes a `WebAssembly.promising(wasm.cfml_worker_run_sync)`
+    /// wrapper installed by the host's post-build patch. From Rust this looks
+    /// like a normal async JS call; the work happens in a *separate*
+    /// contiguous wasm activation under the promising wrapper, which is
+    /// what makes JSPI suspending imports inside the VM execution work.
+    ///
+    /// Resolves with no value — results are passed back via
+    /// `sync_runner::take_result()` (thread-local).
+    #[wasm_bindgen(catch)]
+    async fn __cfml_invoke_run_sync() -> Result<JsValue, JsValue>;
+}
+
+/// Rust-callable entry to dispatch the sync VM activation. Used by
+/// `handle_fetch` after staging the `RunContext`.
+pub(crate) async fn invoke_run_sync() -> Result<(), String> {
+    __cfml_invoke_run_sync()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("invoke_run_sync: {:?}", e))
 }
 
 #[wasm_bindgen(start)]

@@ -569,6 +569,22 @@ pub struct CfmlVirtualMachine {
     pub app_local_mode_modern: bool,
     /// Stack for nested body-mode custom tags
     custom_tag_stack: Vec<CustomTagState>,
+    /// Dedup cache for the per-request function-table merge performed on CFC
+    /// instantiation and cfinclude. Maps a resolved source-file path to the
+    /// `program.functions` base offset where that file's functions were first
+    /// merged. Subsequent instantiations/includes of the same file reuse the
+    /// offset instead of re-appending the functions, which otherwise grows
+    /// `program.functions` unbounded within a request (see CFC `new`/include
+    /// in a loop).
+    merged_file_offsets: HashMap<String, usize>,
+    /// Number of nested program swaps currently active (CFC load, include,
+    /// custom-tag template, Application.cfc). A merge may only consult/populate
+    /// `merged_file_offsets` when this is 1 — i.e. the program being merged
+    /// into is the request's top-level program. Merges performed deeper in the
+    /// stack (e.g. a parent CFC resolved while loading a child) target a
+    /// temporary sub-program, so their offsets are not stable and must not be
+    /// cached.
+    program_swap_depth: usize,
     /// In-memory cache: key -> (value, optional expiry instant)
     pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
@@ -700,6 +716,8 @@ impl CfmlVirtualMachine {
             custom_tag_paths: Vec::new(),
             app_local_mode_modern: false,
             custom_tag_stack: Vec::new(),
+            merged_file_offsets: HashMap::new(),
+            program_swap_depth: 0,
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
             sandbox: false,
@@ -2499,9 +2517,32 @@ impl CfmlVirtualMachine {
                     // dispatch and the stack push/pop of the struct itself.
                     // Only emitted when the receiver is a plain identifier
                     // and access is non-null-safe (hot-path struct read).
-                    let val = locals
+                    //
+                    // Resolve the receiver through the full scope chain, not
+                    // just `locals`: at page scope (template top-level), user
+                    // variables live in `globals`. Falling back through
+                    // `lookup_name_in_scopes` matches the semantics of plain
+                    // `LoadLocal` so `p.foo` reads agree with `p["foo"]`.
+                    let name_lower_owned: String;
+                    let name_lower: &str =
+                        if local_name.bytes().any(|b| b.is_ascii_uppercase()) {
+                            name_lower_owned = local_name.to_lowercase();
+                            &name_lower_owned
+                        } else {
+                            local_name.as_str()
+                        };
+                    let receiver = locals
                         .get(local_name.as_str())
-                        .map(|obj| Self::lookup_property(obj, prop_name))
+                        .cloned()
+                        .or_else(|| {
+                            self.lookup_name_in_scopes(
+                                local_name.as_str(),
+                                name_lower,
+                                &locals,
+                            )
+                        });
+                    let val = receiver
+                        .map(|obj| Self::lookup_property(&obj, prop_name))
                         .unwrap_or(CfmlValue::Null);
                     stack.push(val);
                 }
@@ -3341,6 +3382,7 @@ impl CfmlVirtualMachine {
                     match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
                         Ok(sub_program) => {
                             let mut old_program = std::mem::replace(&mut self.program, sub_program);
+                            self.program_swap_depth += 1;
                             let old_source = self.source_file.clone();
                             self.source_file = Some(resolved.clone());
                             let main_idx = self
@@ -3387,19 +3429,46 @@ impl CfmlVirtualMachine {
                             }
                             // Merge included sub-program's non-main functions into old_program
                             // so that func_idx references (from DefineFunction) remain valid.
+                            // The same included file is merged only once per request: on the
+                            // first include its functions are appended at `base_idx` and the
+                            // offset is cached. Re-including the same file reuses the cached
+                            // offset instead of re-appending (which would otherwise grow
+                            // `program.functions` linearly with the include count). The cache
+                            // is only consulted at the top level (program_swap_depth == 1);
+                            // a nested include merges into a temporary sub-program, so its
+                            // offset is not stable and must not be cached or reused.
+                            let use_cache = self.program_swap_depth == 1;
                             let sub_func_count = self.program.functions.len();
-                            let base_idx = old_program.functions.len();
-                            for i in 0..sub_func_count {
-                                if self.program.functions[i].name != "__main__" {
-                                    old_program
-                                        .functions
-                                        .push(self.program.functions[i].clone());
+                            let cached_base = if use_cache {
+                                self.merged_file_offsets.get(&resolved).copied()
+                            } else {
+                                None
+                            };
+                            let first_merge = cached_base.is_none();
+                            let base_idx = match cached_base {
+                                Some(b) => b,
+                                None => {
+                                    let base = old_program.functions.len();
+                                    for i in 0..sub_func_count {
+                                        if self.program.functions[i].name != "__main__" {
+                                            old_program
+                                                .functions
+                                                .push(self.program.functions[i].clone());
+                                        }
+                                    }
+                                    if use_cache {
+                                        self.merged_file_offsets.insert(resolved.clone(), base);
+                                    }
+                                    base
                                 }
-                            }
+                            };
                             // Fix func_idx in any CfmlFunction values stored in locals
                             // that were created by DefineFunction in the include.
                             // Sub-program index i → old_program index (base_idx + i - 1)
-                            // (subtract 1 because __main__ at index 0 was skipped)
+                            // (subtract 1 because __main__ at index 0 was skipped).
+                            // This runs on every include because the include body produces
+                            // fresh sub-program-relative Function values in locals/globals
+                            // each time; the offset is stable thanks to the merge cache.
                             if base_idx > 0 && sub_func_count > 1 {
                                 let offset = base_idx - 1; // -1 because __main__ was skipped
                                 for (_, v) in locals.iter_mut() {
@@ -3408,33 +3477,39 @@ impl CfmlVirtualMachine {
                                 for (_, v) in self.globals.iter_mut() {
                                     Self::fixup_included_func_indices(v, base_idx, sub_func_count);
                                 }
-                                // Also fix DefineFunction bytecode instructions inside the
-                                // merged functions — they still reference sub-program indices.
-                                for fi in base_idx..old_program.functions.len() {
-                                    let func = Arc::make_mut(&mut old_program.functions[fi]);
-                                    for op in func.instructions.iter_mut() {
-                                        if let BytecodeOp::DefineFunction(ref mut idx) = op {
-                                            if *idx > 0 && *idx < sub_func_count {
-                                                *idx += offset;
+                                // The DefineFunction bytecode inside the merged functions and
+                                // the user_functions Arc rewiring only need fixing once, when
+                                // the functions are first appended.
+                                if first_merge {
+                                    // Also fix DefineFunction bytecode instructions inside the
+                                    // merged functions — they still reference sub-program indices.
+                                    for fi in base_idx..old_program.functions.len() {
+                                        let func = Arc::make_mut(&mut old_program.functions[fi]);
+                                        for op in func.instructions.iter_mut() {
+                                            if let BytecodeOp::DefineFunction(ref mut idx) = op {
+                                                if *idx > 0 && *idx < sub_func_count {
+                                                    *idx += offset;
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                // Update user_functions entries — they shared the
-                                // sub-program's Arcs, which still have pre-fixup indices.
-                                // Point them at the fixed Arcs from old_program so that
-                                // subsequent calls see the corrected DefineFunction indices.
-                                for fi in base_idx..old_program.functions.len() {
-                                    let name = old_program.functions[fi].name.clone();
-                                    if self.user_functions.contains_key(&name) {
-                                        self.user_functions.insert(
-                                            name,
-                                            Arc::clone(&old_program.functions[fi]),
-                                        );
+                                    // Update user_functions entries — they shared the
+                                    // sub-program's Arcs, which still have pre-fixup indices.
+                                    // Point them at the fixed Arcs from old_program so that
+                                    // subsequent calls see the corrected DefineFunction indices.
+                                    for fi in base_idx..old_program.functions.len() {
+                                        let name = old_program.functions[fi].name.clone();
+                                        if self.user_functions.contains_key(&name) {
+                                            self.user_functions.insert(
+                                                name,
+                                                Arc::clone(&old_program.functions[fi]),
+                                            );
+                                        }
                                     }
                                 }
                             }
                             self.program = old_program;
+                            self.program_swap_depth -= 1;
                             self.source_file = old_source;
                             // Propagate include errors through try-catch
                             if let Err(e) = result {
@@ -3498,6 +3573,7 @@ impl CfmlVirtualMachine {
                     match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
                         Ok(sub_program) => {
                             let mut old_program = std::mem::replace(&mut self.program, sub_program);
+                            self.program_swap_depth += 1;
                             let old_source = self.source_file.clone();
                             self.source_file = Some(resolved.clone());
                             let main_idx = self
@@ -3530,15 +3606,34 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
+                            // Same merge-dedup as the static-include path: cache the
+                            // merge offset per file at the top level so repeated dynamic
+                            // includes of the same file don't grow program.functions.
+                            let use_cache = self.program_swap_depth == 1;
                             let sub_func_count = self.program.functions.len();
-                            let base_idx = old_program.functions.len();
-                            for i in 0..sub_func_count {
-                                if self.program.functions[i].name != "__main__" {
-                                    old_program
-                                        .functions
-                                        .push(self.program.functions[i].clone());
+                            let cached_base = if use_cache {
+                                self.merged_file_offsets.get(&resolved).copied()
+                            } else {
+                                None
+                            };
+                            let first_merge = cached_base.is_none();
+                            let base_idx = match cached_base {
+                                Some(b) => b,
+                                None => {
+                                    let base = old_program.functions.len();
+                                    for i in 0..sub_func_count {
+                                        if self.program.functions[i].name != "__main__" {
+                                            old_program
+                                                .functions
+                                                .push(self.program.functions[i].clone());
+                                        }
+                                    }
+                                    if use_cache {
+                                        self.merged_file_offsets.insert(resolved.clone(), base);
+                                    }
+                                    base
                                 }
-                            }
+                            };
                             if base_idx > 0 && sub_func_count > 1 {
                                 let offset = base_idx - 1;
                                 for (_, v) in locals.iter_mut() {
@@ -3547,31 +3642,34 @@ impl CfmlVirtualMachine {
                                 for (_, v) in self.globals.iter_mut() {
                                     Self::fixup_included_func_indices(v, base_idx, sub_func_count);
                                 }
-                                // Fix DefineFunction bytecode indices in merged functions
-                                for fi in base_idx..old_program.functions.len() {
-                                    let func = Arc::make_mut(&mut old_program.functions[fi]);
-                                    for op in func.instructions.iter_mut() {
-                                        if let BytecodeOp::DefineFunction(ref mut idx) = op {
-                                            if *idx > 0 && *idx < sub_func_count {
-                                                *idx += offset;
+                                if first_merge {
+                                    // Fix DefineFunction bytecode indices in merged functions
+                                    for fi in base_idx..old_program.functions.len() {
+                                        let func = Arc::make_mut(&mut old_program.functions[fi]);
+                                        for op in func.instructions.iter_mut() {
+                                            if let BytecodeOp::DefineFunction(ref mut idx) = op {
+                                                if *idx > 0 && *idx < sub_func_count {
+                                                    *idx += offset;
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                // Update user_functions entries with fixed bytecode.
-                                // Share the Arc with the (now fixed) old_program entry
-                                // rather than deep-cloning.
-                                for fi in base_idx..old_program.functions.len() {
-                                    let name = old_program.functions[fi].name.clone();
-                                    if self.user_functions.contains_key(&name) {
-                                        self.user_functions.insert(
-                                            name,
-                                            Arc::clone(&old_program.functions[fi]),
-                                        );
+                                    // Update user_functions entries with fixed bytecode.
+                                    // Share the Arc with the (now fixed) old_program entry
+                                    // rather than deep-cloning.
+                                    for fi in base_idx..old_program.functions.len() {
+                                        let name = old_program.functions[fi].name.clone();
+                                        if self.user_functions.contains_key(&name) {
+                                            self.user_functions.insert(
+                                                name,
+                                                Arc::clone(&old_program.functions[fi]),
+                                            );
+                                        }
                                     }
                                 }
                             }
                             self.program = old_program;
+                            self.program_swap_depth -= 1;
                             self.source_file = old_source;
                             if let Err(e) = result {
                                 if Self::is_control_flow_error(&e) {
@@ -9037,6 +9135,7 @@ impl CfmlVirtualMachine {
         let sub_program = compile_file_cached(template_path, cache, self.vfs.as_ref())?;
 
         let old_program = std::mem::replace(&mut self.program, sub_program);
+        self.program_swap_depth += 1;
         let old_source = self.source_file.clone();
         self.source_file = Some(template_path.to_string());
 
@@ -9052,6 +9151,7 @@ impl CfmlVirtualMachine {
         let result = self.execute_function_with_args(&tag_func, Vec::new(), Some(tag_locals));
         self.try_stack = saved_try_stack;
         self.program = old_program;
+        self.program_swap_depth -= 1;
         self.source_file = old_source;
 
         result.map(|_| ())
@@ -9474,6 +9574,7 @@ impl CfmlVirtualMachine {
         let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
         if let Ok(sub_program) = compile_file_cached(&cfc_path, cache, self.vfs.as_ref()) {
             let old_program = std::mem::replace(&mut self.program, sub_program);
+            self.program_swap_depth += 1;
             // Set source_file to CFC path so parent resolution works relative to CFC
             let old_source_file = self.source_file.clone();
             self.source_file = Some(cfc_path.clone());
@@ -9538,19 +9639,46 @@ impl CfmlVirtualMachine {
             self.source_file = old_source_file;
             // Capture component body variables
             let component_variables = self.captured_locals.take().unwrap_or_default();
-            // Merge sub-program functions — track base offset for func_idx fixup
-            let sub_funcs = self.program.functions.clone();
+            // Merge sub-program functions — track base offset for func_idx fixup.
+            // The same CFC file is merged only once per request: on the first
+            // instantiation its functions are appended at `base_idx` and the
+            // offset is cached. Subsequent `new`s of the same file reuse the
+            // cached offset rather than re-appending (which would grow
+            // `program.functions` linearly with the instantiation count). The
+            // cache is only used at the top level (program_swap_depth == 1); a
+            // CFC resolved as a parent while loading a child merges into a
+            // temporary sub-program, so its offset is not stable.
+            let use_cache = self.program_swap_depth == 1;
+            let cached_base = if use_cache {
+                self.merged_file_offsets.get(&cfc_path).copied()
+            } else {
+                None
+            };
+            let sub_funcs = if cached_base.is_none() {
+                Some(self.program.functions.clone())
+            } else {
+                None
+            };
             self.program = old_program;
-            let base_idx = self.program.functions.len();
-            for func in sub_funcs {
-                if func.name != "__main__" {
-                    self.program.functions.push(Arc::clone(&func));
-                    if self.user_functions.contains_key(&func.name) {
-                        self.user_functions
-                            .insert(func.name.clone(), Arc::clone(&func));
+            self.program_swap_depth -= 1;
+            let base_idx = if let Some(sub_funcs) = sub_funcs {
+                let base = self.program.functions.len();
+                for func in sub_funcs {
+                    if func.name != "__main__" {
+                        self.program.functions.push(Arc::clone(&func));
+                        if self.user_functions.contains_key(&func.name) {
+                            self.user_functions
+                                .insert(func.name.clone(), Arc::clone(&func));
+                        }
                     }
                 }
-            }
+                if use_cache {
+                    self.merged_file_offsets.insert(cfc_path.clone(), base);
+                }
+                base
+            } else {
+                cached_base.unwrap()
+            };
             // Fix up func_idx in the component struct stored in globals
             // Sub-program functions were at indices [0..N), now at [base_idx..base_idx+N)
             let short_name = class_name.split('.').last().unwrap_or(class_name);
@@ -10588,6 +10716,7 @@ impl CfmlVirtualMachine {
 
         // Save current program, swap in sub-program
         let old_program = std::mem::replace(&mut self.program, sub_program);
+        self.program_swap_depth += 1;
         let main_idx = self
             .program
             .functions
@@ -10608,6 +10737,7 @@ impl CfmlVirtualMachine {
         // Merge sub-program functions into main program
         let sub_funcs = self.program.functions.clone();
         self.program = old_program;
+        self.program_swap_depth -= 1;
         let base_idx = self.program.functions.len();
         for func in sub_funcs {
             if func.name != "__main__" {

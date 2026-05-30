@@ -142,20 +142,38 @@ pub async fn handle_fetch(
         Arc::new(MemoryApplicationStore::new())
     };
 
-    // Execute
-    let response_data = match run_cfml(
-        &file_path,
+    // Execute the VM inside a separate sync wasm activation wrapped in
+    // `WebAssembly.promising`. The async outer fetch can't host the JSPI
+    // suspends directly (wasm-bindgen-futures breaks contiguity); the sync
+    // runner gives JSPI a clean stack to suspend on for `<cfquery>`.
+    crate::sync_runner::stash_context(crate::sync_runner::RunContext {
+        file_path: file_path.clone(),
         vfs,
-        globals,
+        extra_globals: globals,
         http_request_data,
-        &server_state,
-        cookie_session_id.clone(),
-    ) {
-        Ok(r) => r,
-        Err(msg) => {
+        server_state: server_state.clone(),
+        session_id: cookie_session_id.clone(),
+    });
+    if let Err(msg) = crate::jspi::invoke_run_sync().await {
+        let headers = Headers::new();
+        let _ = headers.set("Content-Type", "text/plain; charset=utf-8");
+        return Ok(Response::ok(format!("CFML dispatch error:\n\n{msg}"))?
+            .with_status(500)
+            .with_headers(headers));
+    }
+    let response_data = match crate::sync_runner::take_result() {
+        Some(Ok(r)) => r,
+        Some(Err(msg)) => {
             let headers = Headers::new();
             let _ = headers.set("Content-Type", "text/plain; charset=utf-8");
             return Ok(Response::ok(format!("CFML error:\n\n{msg}"))?
+                .with_status(500)
+                .with_headers(headers));
+        }
+        None => {
+            let headers = Headers::new();
+            let _ = headers.set("Content-Type", "text/plain; charset=utf-8");
+            return Ok(Response::ok("CFML error: sync runner produced no result")?
                 .with_status(500)
                 .with_headers(headers));
         }
@@ -224,23 +242,23 @@ fn extract_session_id(
     None
 }
 
-struct ResponseData {
-    output: String,
-    status: Option<u16>,
-    content_type: Option<String>,
-    headers: Vec<(String, String)>,
-    redirect_url: Option<String>,
+pub(crate) struct ResponseData {
+    pub(crate) output: String,
+    pub(crate) status: Option<u16>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) redirect_url: Option<String>,
     /// The session id the VM ended up using — either the cookie value
     /// the request came in with, or one minted by the VM during the
     /// session-lifecycle phase (eager mode) or first session write
     /// (lazy mode).
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     /// Set if the VM actually inserted a session record this request.
     /// The handler uses this to decide whether to emit `Set-Cookie`.
-    session_record_created: bool,
+    pub(crate) session_record_created: bool,
 }
 
-fn run_cfml(
+pub(crate) fn run_cfml(
     file_path: &str,
     vfs: Arc<dyn Vfs>,
     extra_globals: IndexMap<String, CfmlValue>,
