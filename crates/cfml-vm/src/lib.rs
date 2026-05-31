@@ -2709,10 +2709,13 @@ impl CfmlVirtualMachine {
                                 )));
                             }
                         } else {
-                            return Err(CfmlError::runtime(format!(
-                                "Local variable '{}' not found",
-                                local_name
-                            )));
+                            // Auto-vivification: assigning to a member path of a
+                            // variable that does not yet exist creates that variable
+                            // as a struct, matching Lucee/ACF/BoxLang. e.g.
+                            // `initArgs.path = "x"` where initArgs was never declared.
+                            let mut s = IndexMap::new();
+                            s.insert(prop_name.clone(), value);
+                            locals.insert(local_name.clone(), CfmlValue::strukt(s));
                         }
                     }
                 }

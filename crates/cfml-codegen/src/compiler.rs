@@ -2267,7 +2267,22 @@ impl CfmlCompiler {
                             instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
                         }
                         Expression::MemberAccess(access) => {
-                            // Stack has [value]. SetProperty needs [obj, value].
+                            // Stack has [value]. When the object is a bare,
+                            // non-scope identifier, use the fused StoreLocalProperty
+                            // op, which auto-vivifies the local as a struct if it
+                            // does not yet exist (Lucee/ACF/BoxLang semantics).
+                            // Loading the object directly would throw "Variable
+                            // 'x' is undefined" for an undeclared base.
+                            if let Expression::Identifier(ref ident) = *access.object {
+                                if !is_reserved_scope_name(&ident.name) {
+                                    instructions.push(BytecodeOp::StoreLocalProperty(
+                                        ident.name.clone(),
+                                        access.member.clone(),
+                                    ));
+                                    return;
+                                }
+                            }
+                            // SetProperty needs [obj, value].
                             self.compile_expression(&access.object, instructions);
                             instructions.push(BytecodeOp::Swap);
                             instructions.push(BytecodeOp::SetProperty(access.member.clone()));
