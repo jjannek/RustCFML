@@ -26,4 +26,10 @@
 <cf_ltlocal outVar="ltLocalOut" />
 <cfscript>assert("custom tag template has local scope", ltLocalOut, "ok");</cfscript>
 
+<!--- Start-phase cfreturn still preserves attributes/locals for the end phase. --->
+<cfsavecontent variable="ltReturnOut"><cf_ltreturn>body</cf_ltreturn></cfsavecontent>
+<cfscript>
+    assert("body tag start cfreturn preserves start attributes", trim(ltReturnOut), '<main class="px-5 py-5">body</main>');
+</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
