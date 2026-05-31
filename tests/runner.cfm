@@ -200,5 +200,15 @@ try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOu
 try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
 try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_member_loop_var.cfm | " & e.message & chr(10)); }
 
+// --- v0.34.3 round: Wheels now parses, constructs, and boots its full app
+//     lifecycle + DI on RustCFML. This is the remaining language gap found
+//     on the way to serving a request. ---
+//   - undefined_var_autovivify: assigning to a member path of an UNDECLARED
+//     variable (initArgs.path = "wheels" in Application.cfc.onApplicationStart)
+//     must auto-create it as a struct. RustCFML throws "Variable is undefined"
+//     for everything except the `local` scope. Wrapped in try/catch so the
+//     throw fails its assertions without aborting the run.
+try { include "core/test_undefined_var_autovivify.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undefined_var_autovivify.cfm | " & e.message & chr(10)); }
+
 printSummary();
 </cfscript>
