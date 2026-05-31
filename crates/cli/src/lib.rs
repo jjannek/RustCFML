@@ -967,6 +967,14 @@ async fn async_run_server(
         eprintln!("Failed to start server on 0.0.0.0:{}: {}", port, e);
         exit(1);
     });
+    // Disable Nagle's algorithm on accepted connections. For a request/response
+    // HTTP server, Nagle adds latency by holding small writes, and can stall on
+    // the classic Nagle + delayed-ACK interaction. axum::serve does not set this
+    // by default, so opt in via tap_io. (Go net/http, nginx, Node all default on.)
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp_stream| {
+        let _ = tcp_stream.set_nodelay(true);
+    });
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }
 
