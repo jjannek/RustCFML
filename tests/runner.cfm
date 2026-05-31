@@ -210,6 +210,16 @@ try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutp
 //     for everything except the `local` scope. Wrapped in try/catch so the
 //     throw fails its assertions without aborting the run.
 try { include "core/test_undefined_var_autovivify.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undefined_var_autovivify.cfm | " & e.message & chr(10)); }
+//   - multiword_operators: RustCFML rejects multi-word comparison operators
+//     (IS NOT, DOES NOT CONTAIN, GREATER THAN, ...) while accepting all
+//     single-word forms. A CFC using one fails to parse -> non-object.
+//     wheels.Global uses IS NOT and DOES NOT CONTAIN on the boot path.
+//   - mapping_include: RustCFML does not resolve this.mappings for cfinclude
+//     template paths (reads the literal "/tags/..." -> ENOENT). wheels.Global's
+//     pseudo-constructor does `include "/app/global/functions.cfm"`, so it
+//     throws at instantiation -> non-object -> empty dispatch.
+try { include "core/test_multiword_operators.cfm"; } catch (any e) { writeOutput("ERROR | core/test_multiword_operators.cfm | " & e.message & chr(10)); }
+try { include "tags/test_mapping_include.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_mapping_include.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
