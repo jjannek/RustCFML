@@ -10041,7 +10041,27 @@ impl CfmlVirtualMachine {
         let cfc_path = {
             // If class_name is already an absolute path or has .cfc extension, use directly
             let as_path = std::path::Path::new(class_name);
-            if as_path.is_absolute() || class_name.to_lowercase().ends_with(".cfc") {
+            if class_name.starts_with('/') {
+                // A CFML leading-slash component path ("/oop/Widget") is
+                // webroot/mapping-relative, NOT OS-absolute. Resolve it the same
+                // way as a leading-slash include: configured mappings, then the
+                // serve-mode webroot, then the entry template's parent directory.
+                // Only fall back to treating it as a literal filesystem path when
+                // none of those produce an existing file (preserving the case
+                // where a genuinely OS-absolute .cfc is passed).
+                let with_ext = if class_name.to_lowercase().ends_with(".cfc") {
+                    class_name.to_string()
+                } else {
+                    format!("{}.cfc", class_name)
+                };
+                if self.vfs.exists(&with_ext) {
+                    with_ext
+                } else if let Some(resolved) = self.resolve_leading_slash_include(&with_ext) {
+                    resolved
+                } else {
+                    with_ext
+                }
+            } else if as_path.is_absolute() || class_name.to_lowercase().ends_with(".cfc") {
                 let p = if class_name.to_lowercase().ends_with(".cfc") {
                     class_name.to_string()
                 } else {
