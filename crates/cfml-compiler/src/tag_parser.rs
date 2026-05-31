@@ -1921,7 +1921,9 @@ fn parse_cfloop_tag(
     } else if let Some(collection) = attrs.get("collection") {
         let collection = strip_hashes(collection);
         let item = attrs.get("item").cloned().unwrap_or("item".to_string());
-        let key = attrs.get("key");
+        // `index` is a Lucee alias for `key` in collection loops: it names the
+        // loop key while `item` names the value. (`item` alone iterates keys.)
+        let key = attrs.get("key").or_else(|| attrs.get("index"));
         if let Some(key) = key {
             (
                 format!("for (var {} in structKeyArray({})) {{ var {} = {}[{}];\n", key, collection, item, collection, key),
