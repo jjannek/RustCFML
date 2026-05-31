@@ -485,6 +485,22 @@ impl CfmlCompiler {
         )
     }
 
+    /// Compile the base collection of an index-assignment target (`base[idx] = v`).
+    /// A bare, non-scope identifier is loaded with TryLoadLocal so an undefined
+    /// variable yields Null — which SetIndex then auto-vivifies into a struct or
+    /// array (Lucee/ACF/BoxLang) — instead of throwing "Variable is undefined".
+    /// Member/index bases (`a.b[k]`, `a[i][k]`) already read missing links as
+    /// Null via GetProperty/GetIndex, so they use the normal compile path.
+    fn compile_index_assign_base(&mut self, base: &Expression, instructions: &mut Vec<BytecodeOp>) {
+        if let Expression::Identifier(ident) = base {
+            if !Self::is_reserved_scope_name(&ident.name) {
+                instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                return;
+            }
+        }
+        self.compile_expression(base, instructions);
+    }
+
     /// Get the first argument expression of a function call (for mutating write-back).
     fn mutating_call_first_arg(expr: &Expression) -> Option<&Expression> {
         if let Expression::FunctionCall(call) = expr {
@@ -813,7 +829,7 @@ impl CfmlCompiler {
                         instructions.push(BytecodeOp::StoreLocal(name.clone()));
                     }
                     AssignTarget::ArrayAccess(arr, idx) => {
-                        self.compile_expression(arr, instructions);
+                        self.compile_index_assign_base(arr, instructions);
                         self.compile_expression(idx, instructions);
                         instructions.push(BytecodeOp::SetIndex);
                         // SetIndex leaves modified collection on stack; write it back
@@ -2290,7 +2306,7 @@ impl CfmlCompiler {
                             Self::emit_nested_writeback(&access.object, instructions);
                         }
                         Expression::ArrayAccess(access) => {
-                            self.compile_expression(&access.array, instructions);
+                            self.compile_index_assign_base(&access.array, instructions);
                             self.compile_expression(&access.index, instructions);
                             instructions.push(BytecodeOp::SetIndex);
                             // SetIndex leaves modified collection on stack; write it back

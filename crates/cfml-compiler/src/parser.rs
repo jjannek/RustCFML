@@ -94,6 +94,25 @@ impl Parser {
         None
     }
 
+    /// True if the token at `offset` is an identifier equal (case-insensitive)
+    /// to `word`. Used to recognise the verbose, multi-word comparison operators
+    /// (GREATER THAN, DOES NOT CONTAIN, EQUAL, ...) whose words are NOT reserved
+    /// keywords — they lex as identifiers so they remain usable as variable names.
+    fn peek_word(&self, offset: usize, word: &str) -> bool {
+        matches!(self.peek(offset), Token::Identifier(s) if s.eq_ignore_ascii_case(word))
+    }
+
+    /// Consume an identifier matching `word` (case-insensitive); returns whether
+    /// it was consumed.
+    fn match_word(&mut self, word: &str) -> bool {
+        if self.peek_word(0, word) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     fn parse_error(&self, message: &str) -> ParseError {
         let loc = self.current_location();
         ParseError {
@@ -2729,7 +2748,12 @@ impl Parser {
         let mut left = self.parse_comparison()?;
 
         loop {
-            if self.match_token(&Token::EqualEqual) || self.match_token(&Token::EqKeyword) || self.match_token(&Token::IsKeyword) {
+            // `EQUAL` / `EQUALS` (verbose alias for EQ) and `==`/`EQ`.
+            if self.match_token(&Token::EqualEqual)
+                || self.match_token(&Token::EqKeyword)
+                || self.match_word("equal")
+                || self.match_word("equals")
+            {
                 let right = Box::new(self.parse_comparison()?);
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
@@ -2737,7 +2761,36 @@ impl Parser {
                     right,
                     location: self.current_location(),
                 }));
+            } else if self.match_token(&Token::IsKeyword) {
+                // `IS NOT` is the verbose alias for NEQ; bare `IS` is EQ.
+                let operator = if self.match_token(&Token::NotKeyword) {
+                    BinaryOpType::NotEqual
+                } else {
+                    BinaryOpType::Equal
+                };
+                let right = Box::new(self.parse_comparison()?);
+                left = Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(left),
+                    operator,
+                    right,
+                    location: self.current_location(),
+                }));
             } else if self.match_token(&Token::BangEqual) || self.match_token(&Token::NeqKeyword) {
+                let right = Box::new(self.parse_comparison()?);
+                left = Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(left),
+                    operator: BinaryOpType::NotEqual,
+                    right,
+                    location: self.current_location(),
+                }));
+            } else if matches!(self.peek(0), Token::NotKeyword)
+                && (self.peek_word(1, "equal") || self.peek_word(1, "equals"))
+            {
+                // `NOT EQUAL` / `NOT EQUALS` — verbose alias for NEQ. Only consume
+                // the `NOT` once the following word confirms the operator, so a
+                // leading unary `NOT` elsewhere is untouched.
+                self.advance(); // NOT
+                self.advance(); // EQUAL / EQUALS
                 let right = Box::new(self.parse_comparison()?);
                 left = Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(left),
@@ -2789,12 +2842,63 @@ impl Parser {
                     right,
                     location: self.current_location(),
                 }));
+            } else if self.peek_word(0, "greater") && self.peek_word(1, "than") {
+                // `GREATER THAN` (GT) and `GREATER THAN OR EQUAL TO` (GTE).
+                self.advance(); // greater
+                self.advance(); // than
+                let operator = self.match_or_equal_to_suffix(
+                    BinaryOpType::Greater,
+                    BinaryOpType::GreaterEqual,
+                );
+                let right = Box::new(self.parse_contains()?);
+                left = Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(left),
+                    operator,
+                    right,
+                    location: self.current_location(),
+                }));
+            } else if self.peek_word(0, "less") && self.peek_word(1, "than") {
+                // `LESS THAN` (LT) and `LESS THAN OR EQUAL TO` (LTE).
+                self.advance(); // less
+                self.advance(); // than
+                let operator = self.match_or_equal_to_suffix(
+                    BinaryOpType::Less,
+                    BinaryOpType::LessEqual,
+                );
+                let right = Box::new(self.parse_contains()?);
+                left = Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(left),
+                    operator,
+                    right,
+                    location: self.current_location(),
+                }));
             } else {
                 break;
             }
         }
 
         Ok(left)
+    }
+
+    /// After a `GREATER THAN` / `LESS THAN`, consume an optional `OR EQUAL TO`
+    /// suffix. Returns `with_suffix` if it was present, else `base`. (`OR` lexes
+    /// as the logical-or keyword; `equal`/`to` are plain identifiers.)
+    fn match_or_equal_to_suffix(
+        &mut self,
+        base: BinaryOpType,
+        with_suffix: BinaryOpType,
+    ) -> BinaryOpType {
+        if matches!(self.peek(0), Token::OrKeyword)
+            && self.peek_word(1, "equal")
+            && self.peek_word(2, "to")
+        {
+            self.advance(); // or
+            self.advance(); // equal
+            self.advance(); // to
+            with_suffix
+        } else {
+            base
+        }
     }
 
     fn parse_contains(&mut self) -> Result<Expression, ParseError> {
@@ -2805,6 +2909,25 @@ impl Parser {
             left = Expression::BinaryOp(Box::new(BinaryOp {
                 left: Box::new(left),
                 operator: BinaryOpType::Contains,
+                right,
+                location: self.current_location(),
+            }));
+        } else if self.peek_word(0, "does")
+            && matches!(self.peek(1), Token::NotKeyword)
+            && (self.peek_word(2, "contain")
+                || self.peek_word(2, "contains")
+                || matches!(self.peek(2), Token::Contains))
+        {
+            // `DOES NOT CONTAIN` — verbose negated CONTAINS. The positive form is
+            // the `CONTAINS` keyword, but the negated form's `CONTAIN` (singular)
+            // lexes as a plain identifier.
+            self.advance(); // does
+            self.advance(); // not
+            self.advance(); // contain(s)
+            let right = Box::new(self.parse_concatenation()?);
+            left = Expression::BinaryOp(Box::new(BinaryOp {
+                left: Box::new(left),
+                operator: BinaryOpType::DoesNotContain,
                 right,
                 location: self.current_location(),
             }));

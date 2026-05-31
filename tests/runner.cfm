@@ -19,6 +19,7 @@ try { include "core/test_compound_assignment.cfm"; } catch (any e) { writeOutput
 try { include "core/test_struct_method_sequential.cfm"; } catch (any e) { writeOutput("ERROR | core/test_struct_method_sequential.cfm | " & e.message & chr(10)); }
 try { include "core/test_include_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_include_scope_capture.cfm | " & e.message & chr(10)); }
 try { include "core/test_operators.cfm"; } catch (any e) { writeOutput("ERROR | core/test_operators.cfm | " & e.message & chr(10)); }
+try { include "core/test_subscript_autovivify.cfm"; } catch (any e) { writeOutput("ERROR | core/test_subscript_autovivify.cfm | " & e.message & chr(10)); }
 try { include "core/test_control_flow.cfm"; } catch (any e) { writeOutput("ERROR | core/test_control_flow.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_handling.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_handling.cfm | " & e.message & chr(10)); }
 try { include "core/test_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_functions.cfm | " & e.message & chr(10)); }

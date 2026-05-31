@@ -2640,6 +2640,29 @@ impl CfmlVirtualMachine {
                             }
                             s.insert(key, value);
                         }
+                        CfmlValue::Null => {
+                            // Auto-vivification: subscript-assigning into a variable
+                            // (or member) that does not yet exist creates it, matching
+                            // Lucee/ACF/BoxLang. A genuine numeric index creates an
+                            // Array; any other key creates a Struct. e.g.
+                            // `this.mappings["/app"] = x` where this.mappings is unset.
+                            let numeric_idx = match &index {
+                                CfmlValue::Int(i) => Some(*i),
+                                CfmlValue::Double(d) => Some(*d as i64),
+                                _ => None,
+                            };
+                            if let Some(i) = numeric_idx {
+                                let arr = cfml_common::dynamic::CfmlArray::empty();
+                                if i >= 1 {
+                                    arr.set_or_grow((i - 1) as usize, value);
+                                }
+                                collection = CfmlValue::Array(arr);
+                            } else {
+                                let mut s = IndexMap::new();
+                                s.insert(index.as_string(), value);
+                                collection = CfmlValue::strukt(s);
+                            }
+                        }
                         _ => {}
                     }
                     stack.push(collection);
