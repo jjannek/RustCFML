@@ -271,8 +271,9 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
         );
         (result, close_end - start)
     } else {
-        // Self-closing
-        let result = format!("__cfcustomtag({}, {});\n", path_expr, attrs_expr);
+        // XML-style self-closing custom tags still run the end phase.
+        let run_end = is_self_closing_tag(chars, tag_end);
+        let result = format!("__cfcustomtag({}, {}, {});\n", path_expr, attrs_expr, run_end);
         (result, tag_end - start)
     }
 }
@@ -1120,8 +1121,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 );
                 (result, close_end - start)
             } else {
-                // Self-closing
-                let result = format!("__cfcustomtag({}, {});\n", path_expr, attrs_expr);
+                // XML-style self-closing custom tags still run the end phase.
+                let run_end = is_self_closing_tag(chars, tag_end);
+                let result = format!("__cfcustomtag({}, {}, {});\n", path_expr, attrs_expr, run_end);
                 (result, tag_end - start)
             }
         }
@@ -1386,8 +1388,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     );
                     (result, close_end - start)
                 } else {
-                    // Self-closing
-                    let result = format!("__cfcustomtag({}, {});\n", path_expr, attrs_expr);
+                    // XML-style self-closing custom tags still run the end phase.
+                    let run_end = is_self_closing_tag(chars, tag_end);
+                    let result = format!("__cfcustomtag({}, {}, {});\n", path_expr, attrs_expr, run_end);
                     (result, tag_end - start)
                 }
             } else {
@@ -1417,6 +1420,18 @@ fn find_tag_end(chars: &[char], start: usize, len: usize) -> usize {
         i += 1;
     }
     len
+}
+
+fn is_self_closing_tag(chars: &[char], tag_end: usize) -> bool {
+    let mut i = tag_end.saturating_sub(1);
+    while i > 0 {
+        i -= 1;
+        if chars[i].is_whitespace() {
+            continue;
+        }
+        return chars[i] == '/';
+    }
+    false
 }
 
 fn parse_tag_attributes(

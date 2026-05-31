@@ -701,6 +701,7 @@ struct TryHandler {
 struct CustomTagState {
     template_path: String,
     attributes: CfmlValue,
+    start_locals: IndexMap<String, CfmlValue>,
 }
 
 impl CfmlVirtualMachine {
@@ -7661,6 +7662,7 @@ impl CfmlVirtualMachine {
                         .get(1)
                         .cloned()
                         .unwrap_or(CfmlValue::strukt(IndexMap::new()));
+                    let run_end_phase = args.get(2).map(|v| v.is_true()).unwrap_or(false);
 
                     let resolved = self.resolve_custom_tag_path(&path_spec)?;
                     let mut this_tag = IndexMap::new();
@@ -7668,7 +7670,7 @@ impl CfmlVirtualMachine {
                         "executionmode".to_string(),
                         CfmlValue::String("start".to_string()),
                     );
-                    this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(false));
+                    this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(run_end_phase));
                     this_tag.insert(
                         "generatedcontent".to_string(),
                         CfmlValue::String(String::new()),
@@ -7676,7 +7678,7 @@ impl CfmlVirtualMachine {
 
                     let caller_snapshot = parent_locals.clone();
                     let mut tag_locals = IndexMap::new();
-                    tag_locals.insert("attributes".to_string(), attrs_val);
+                    tag_locals.insert("attributes".to_string(), attrs_val.clone());
                     tag_locals.insert(
                         "caller".to_string(),
                         CfmlValue::strukt(caller_snapshot.clone()),
@@ -7685,22 +7687,69 @@ impl CfmlVirtualMachine {
 
                     self.execute_custom_tag_template(&resolved, &tag_locals)?;
 
-                    // Caller write-back: read modified caller from captured_locals
-                    if let Some(ref captured) = self.captured_locals {
-                        if let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") {
-                            let mut wb = IndexMap::new();
-                            for (k, v) in modified_caller.iter() {
-                                if let Some(orig) = caller_snapshot.get(&k) {
-                                    if !Self::values_equal_shallow(&v, orig) {
-                                        wb.insert(k.clone(), v.clone());
-                                    }
-                                } else {
-                                    wb.insert(k.clone(), v.clone());
+                    let start_locals = self.captured_locals.clone().unwrap_or_default();
+
+                    if run_end_phase {
+                        let caller_for_end = if let Some(CfmlValue::Struct(modified_caller)) =
+                            start_locals.get("caller")
+                        {
+                            modified_caller.snapshot()
+                        } else {
+                            caller_snapshot.clone()
+                        };
+
+                        let mut this_tag = IndexMap::new();
+                        this_tag.insert(
+                            "executionmode".to_string(),
+                            CfmlValue::String("end".to_string()),
+                        );
+                        this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(true));
+                        this_tag.insert(
+                            "generatedcontent".to_string(),
+                            CfmlValue::String(String::new()),
+                        );
+
+                        let mut end_locals = start_locals;
+                        if !end_locals
+                            .keys()
+                            .any(|key| key.eq_ignore_ascii_case("attributes"))
+                        {
+                            end_locals.insert("attributes".to_string(), attrs_val);
+                        }
+                        end_locals.insert("caller".to_string(), CfmlValue::strukt(caller_for_end));
+                        end_locals.insert("thistag".to_string(), CfmlValue::strukt(this_tag));
+
+                        let outer_output = std::mem::take(&mut self.output_buffer);
+                        self.execute_custom_tag_template(&resolved, &end_locals)?;
+                        let end_output = std::mem::take(&mut self.output_buffer);
+                        self.output_buffer = outer_output;
+
+                        if let Some(ref captured) = self.captured_locals {
+                            if let Some(CfmlValue::Struct(tag_info)) = captured
+                                .iter()
+                                .rev()
+                                .find(|(key, _)| key.eq_ignore_ascii_case("thistag"))
+                                .map(|(_, value)| value)
+                            {
+                                if let Some(CfmlValue::String(content)) = tag_info
+                                    .iter()
+                                    .rev()
+                                    .find(|(key, _)| key.eq_ignore_ascii_case("generatedcontent"))
+                                    .map(|(_, value)| value)
+                                {
+                                    self.output_buffer.push_str(&content);
                                 }
                             }
-                            if !wb.is_empty() {
-                                self.closure_parent_writeback = Some(wb);
-                            }
+                        }
+                        self.output_buffer.push_str(&end_output);
+                    }
+
+                    // Caller write-back: read modified caller from captured_locals.
+                    if let Some(ref captured) = self.captured_locals {
+                        if let Some(wb) =
+                            Self::caller_writeback_from_captured(captured, &caller_snapshot)
+                        {
+                            self.closure_parent_writeback = Some(wb);
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -7737,22 +7786,14 @@ impl CfmlVirtualMachine {
 
                     self.execute_custom_tag_template(&resolved, &tag_locals)?;
 
+                    let start_locals = self.captured_locals.clone().unwrap_or_default();
+
                     // Caller write-back from start execution
                     if let Some(ref captured) = self.captured_locals {
-                        if let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") {
-                            let mut wb = IndexMap::new();
-                            for (k, v) in modified_caller.iter() {
-                                if let Some(orig) = caller_snapshot.get(&k) {
-                                    if !Self::values_equal_shallow(&v, orig) {
-                                        wb.insert(k.clone(), v.clone());
-                                    }
-                                } else {
-                                    wb.insert(k.clone(), v.clone());
-                                }
-                            }
-                            if !wb.is_empty() {
-                                self.closure_parent_writeback = Some(wb);
-                            }
+                        if let Some(wb) =
+                            Self::caller_writeback_from_captured(captured, &caller_snapshot)
+                        {
+                            self.closure_parent_writeback = Some(wb);
                         }
                     }
 
@@ -7760,6 +7801,7 @@ impl CfmlVirtualMachine {
                     self.custom_tag_stack.push(CustomTagState {
                         template_path: resolved,
                         attributes: attrs_val,
+                        start_locals,
                     });
 
                     // Push output buffer to capture body content (like savecontent)
@@ -7793,44 +7835,57 @@ impl CfmlVirtualMachine {
                         CfmlValue::String(body_content),
                     );
 
+                    let CustomTagState {
+                        template_path,
+                        attributes,
+                        start_locals,
+                    } = state;
+
                     let caller_snapshot = parent_locals.clone();
-                    let mut tag_locals = IndexMap::new();
-                    tag_locals.insert("attributes".to_string(), state.attributes);
+                    let mut tag_locals = start_locals;
+                    if !tag_locals
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case("attributes"))
+                    {
+                        tag_locals.insert("attributes".to_string(), attributes);
+                    }
                     tag_locals.insert(
                         "caller".to_string(),
                         CfmlValue::strukt(caller_snapshot.clone()),
                     );
                     tag_locals.insert("thistag".to_string(), CfmlValue::strukt(this_tag));
 
-                    self.execute_custom_tag_template(&state.template_path, &tag_locals)?;
+                    let outer_output = std::mem::take(&mut self.output_buffer);
+                    self.execute_custom_tag_template(&template_path, &tag_locals)?;
+                    let end_output = std::mem::take(&mut self.output_buffer);
+                    self.output_buffer = outer_output;
 
                     // Read back generatedContent and append to output
                     if let Some(ref captured) = self.captured_locals {
-                        if let Some(CfmlValue::Struct(tag_info)) = captured.get("thistag") {
-                            if let Some(CfmlValue::String(content)) =
-                                tag_info.get("generatedcontent")
+                        if let Some(CfmlValue::Struct(tag_info)) = captured
+                            .iter()
+                            .rev()
+                            .find(|(key, _)| key.eq_ignore_ascii_case("thistag"))
+                            .map(|(_, value)| value)
+                        {
+                            if let Some(CfmlValue::String(content)) = tag_info
+                                .iter()
+                                .rev()
+                                .find(|(key, _)| key.eq_ignore_ascii_case("generatedcontent"))
+                                .map(|(_, value)| value)
                             {
                                 self.output_buffer.push_str(&content);
                             }
                         }
                     }
+                    self.output_buffer.push_str(&end_output);
 
                     // Caller write-back from end execution
                     if let Some(ref captured) = self.captured_locals {
-                        if let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") {
-                            let mut wb = IndexMap::new();
-                            for (k, v) in modified_caller.iter() {
-                                if let Some(orig) = caller_snapshot.get(&k) {
-                                    if !Self::values_equal_shallow(&v, orig) {
-                                        wb.insert(k.clone(), v.clone());
-                                    }
-                                } else {
-                                    wb.insert(k.clone(), v.clone());
-                                }
-                            }
-                            if !wb.is_empty() {
-                                self.closure_parent_writeback = Some(wb);
-                            }
+                        if let Some(wb) =
+                            Self::caller_writeback_from_captured(captured, &caller_snapshot)
+                        {
+                            self.closure_parent_writeback = Some(wb);
                         }
                     }
 
@@ -9013,6 +9068,32 @@ impl CfmlVirtualMachine {
     /// scopes (which could cause infinite recursion with shared environments).
     fn values_equal_shallow(a: &CfmlValue, b: &CfmlValue) -> bool {
         Self::values_equal_shallow_depth(a, b, 0)
+    }
+
+    fn caller_writeback_from_captured(
+        captured: &IndexMap<String, CfmlValue>,
+        caller_snapshot: &IndexMap<String, CfmlValue>,
+    ) -> Option<IndexMap<String, CfmlValue>> {
+        let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") else {
+            return None;
+        };
+
+        let mut writeback = IndexMap::new();
+        for (key, value) in modified_caller.iter() {
+            if let Some(original) = caller_snapshot.get(&key) {
+                if !Self::values_equal_shallow(&value, original) {
+                    writeback.insert(key.clone(), value.clone());
+                }
+            } else {
+                writeback.insert(key.clone(), value.clone());
+            }
+        }
+
+        if writeback.is_empty() {
+            None
+        } else {
+            Some(writeback)
+        }
     }
 
     fn values_equal_shallow_depth(a: &CfmlValue, b: &CfmlValue, depth: usize) -> bool {
