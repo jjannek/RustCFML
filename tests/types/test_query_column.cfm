@@ -40,6 +40,14 @@ assert("for-in yields first row only", collected, "Alice,");
 assert("valueList iterates rows", valueList(q.name), "Alice,Bob");
 assert("quotedValueList iterates rows", quotedValueList(q.name), "'Alice','Bob'");
 
+// --- QueryColumn scalar proxy should coerce to the first row value ---
+qScalar = queryNew("times,iterations,name", "integer,integer,varchar", [
+    { times = 3, iterations = 120000, name = "index.cfc" }
+]);
+assert("query column coerces to number for builtin argument", repeatString("x", qScalar.times), "xxx");
+assert("query column scalar compares against first row", qScalar.name EQ "INDEX.CFC", true);
+assert("query column scalar reversed compare uses first row", "index.cfc" NEQ qScalar.name, false);
+
 // --- elvis: q.col stringifies to first row ---
 val = q.name ?: "fallback";
 assert("elvis yields proxy (stringified)", val & "", "Alice");
