@@ -2620,6 +2620,11 @@ mod tests {
     fn test_cfloop_index() {
         let input = r#"<cfloop from="1" to="10" index="i">body</cfloop>"#;
         let result = tags_to_script(input);
-        assert!(result.contains("for (var i = 1; i <= 10; i = i + 1)"));
+        // cfloop chooses its direction at runtime from the sign of the step
+        // (matching Lucee), so the step is hoisted into a temp and the loop
+        // condition branches on it rather than emitting a fixed `i <= to`.
+        assert!(result.contains("for (var i = 1; ("));
+        assert!(result.contains("i >= 10 : i <= 10"));
+        assert!(result.contains("i = i + __cfloop_step_"));
     }
 }

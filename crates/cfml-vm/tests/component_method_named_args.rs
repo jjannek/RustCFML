@@ -19,7 +19,7 @@ fn compile_page(vfs: &Arc<dyn Vfs>, path: &str) -> BytecodeProgram {
     CfmlCompiler::new().compile(ast)
 }
 
-fn run_page(source: &str) -> String {
+fn build_vm(source: &str) -> CfmlVirtualMachine {
     let mut files = HashMap::new();
     files.insert("index.cfm".to_string(), source.as_bytes().to_vec());
     files.insert(
@@ -56,7 +56,11 @@ fn run_page(source: &str) -> String {
     for (name, func) in get_builtin_functions() {
         vm.builtins.insert(name, func);
     }
+    vm
+}
 
+fn run_page(source: &str) -> String {
+    let mut vm = build_vm(source);
     vm.execute().unwrap();
     vm.get_output().trim().to_string()
 }
@@ -71,6 +75,23 @@ fn component_methods_bind_named_arguments_by_parameter_name() {
     );
 
     assert_eq!("ABC", output);
+}
+
+#[test]
+fn mixing_positional_and_named_method_args_is_rejected() {
+    // Matches Lucee: once any argument is named, all must be named.
+    let mut vm = build_vm(
+        r##"
+<cfset widget = CreateObject("component", "/lib/widget") />
+<cfoutput>#widget.combine("A", second="B", third="C")#</cfoutput>
+"##,
+    );
+    let err = vm.execute().expect_err("mixed positional + named args should error");
+    assert!(
+        err.message.contains("all parameters must be named"),
+        "unexpected error message: {}",
+        err.message
+    );
 }
 
 #[test]

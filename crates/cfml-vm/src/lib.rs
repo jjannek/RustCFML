@@ -2360,7 +2360,12 @@ impl CfmlVirtualMachine {
                         } else {
                             Some(std::mem::take(&mut self.try_stack))
                         };
-                        let call_result = self.call_function(&func_ref, args, effective_locals);
+                        // CFML forbids mixing positional and named arguments.
+                        let call_result = if let Err(e) = Self::validate_named_args(names) {
+                            Err(e)
+                        } else {
+                            self.call_function(&func_ref, args, effective_locals)
+                        };
                         if let Some(saved) = saved_try_stack {
                             self.try_stack = saved;
                         }
@@ -3247,8 +3252,13 @@ impl CfmlVirtualMachine {
                     // Isolate try-stack so throws inside the callee
                     // don't consume the caller's handlers
                     let saved_try_stack_method = std::mem::take(&mut self.try_stack);
+                    // CFML forbids mixing positional and named arguments.
+                    let named_args_check =
+                        method_arg_names.map_or(Ok(()), Self::validate_named_args);
                     let method_result: Result<CfmlValue, CfmlError> =
-                        if let CfmlValue::Struct(ref s) = object {
+                        if let Err(e) = named_args_check {
+                            Err(e)
+                        } else if let CfmlValue::Struct(ref s) = object {
                             if s.contains_key("__is_super") {
                                 // Super dispatch — find the parent's function by stored index
                                 let prop = object.get(&method_name).unwrap_or(CfmlValue::Null);
@@ -8140,6 +8150,28 @@ impl CfmlVirtualMachine {
         } else {
             locals.insert(name.to_string(), val);
         }
+    }
+
+    /// Reject calls that mix positional and named arguments.
+    ///
+    /// CFML (matching Lucee) requires that once any argument is named, every
+    /// argument must be named — `f(a, name=b)` is an error, not a lenient
+    /// best-effort bind. `names` carries one entry per call-site argument: an
+    /// empty string marks a positional argument, a non-empty string a named one.
+    /// Returns an `Expression` error when both kinds are present.
+    fn validate_named_args(names: &[String]) -> Result<(), CfmlError> {
+        let any_named = names.iter().any(|n| !n.is_empty());
+        let any_positional = names.iter().any(|n| n.is_empty());
+        if any_named && any_positional {
+            return Err(CfmlError::new(
+                "When using named parameters to a function, all parameters must be named. \
+                 Either name all arguments (e.g., argumentName=value) or use positional \
+                 arguments only."
+                    .to_string(),
+                CfmlErrorType::Expression,
+            ));
+        }
+        Ok(())
     }
 
     /// Rebind call-site method arguments to a function's parameters by name.
