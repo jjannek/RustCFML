@@ -21,6 +21,15 @@ assertTrue("log text/type parsed", true);
 log text="Debug message" type="debug" file="testlog";
 assertTrue("log with file parsed", true);
 
+logMessage = "dynamic";
+logError = "";
+try {
+    cflog text="cfml_literal_#logMessage#" type="information";
+} catch (any e) {
+    logError = e.message;
+}
+assert("cflog quoted attribute hash interpolation error", logError, "");
+
 // ============================================================
 // thread (cfthread) — run/join/terminate actions
 // ============================================================
