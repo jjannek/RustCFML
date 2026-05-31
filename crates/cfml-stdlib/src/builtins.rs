@@ -857,6 +857,9 @@ fn write_dump(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_len(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
         Some(CfmlValue::String(s)) => Ok(CfmlValue::Int(s.len() as i64)),
+        Some(CfmlValue::Bool(_)) | Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) => Ok(
+            CfmlValue::Int(args.first().unwrap().as_string().chars().count() as i64),
+        ),
         Some(CfmlValue::Array(a)) => Ok(CfmlValue::Int(a.len() as i64)),
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Int(s.len() as i64)),
         Some(CfmlValue::Binary(b)) => Ok(CfmlValue::Int(b.len() as i64)),
