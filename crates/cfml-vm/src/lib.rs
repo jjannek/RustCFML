@@ -8294,8 +8294,11 @@ impl CfmlVirtualMachine {
                 "listcontains" => Some("listContains"),
                 "listappend" => Some("listAppend"),
                 "refind" => Some("reFind"),
+                "refindnocase" => Some("reFindNoCase"),
                 "rereplace" => Some("reReplace"),
+                "rereplacenocase" => Some("reReplaceNoCase"),
                 "rematch" => Some("reMatch"),
+                "rematchnocase" => Some("reMatchNoCase"),
                 "wrap" => Some("wrap"),
                 "tojson" | "serializejson" => Some("serializeJSON"),
                 "tonumeric" | "val" => Some("val"),
@@ -8815,11 +8818,14 @@ impl CfmlVirtualMachine {
 
             // For string member functions where the standalone signature has the
             // "main" string as the second arg (e.g., find(substring, string),
-            // insert(substring, string, pos)), swap the first two args so the
-            // object (which the member was called on) becomes the second arg.
+            // insert(substring, string, pos), reFind(pattern, string)), swap the
+            // first two args so the object (which the member was called on)
+            // becomes the second arg. Note reReplace(string, pattern, replace)
+            // is string-first and intentionally NOT swapped.
             if matches!(object, CfmlValue::String(_)) && args.len() >= 2 {
                 match name {
-                    "find" | "findNoCase" | "insert" => {
+                    "find" | "findNoCase" | "insert" | "reFind" | "reFindNoCase"
+                    | "reMatch" | "reMatchNoCase" => {
                         args.swap(0, 1);
                     }
                     _ => {}
