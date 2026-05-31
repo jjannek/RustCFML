@@ -304,7 +304,15 @@ impl Parser {
             })));
         }
 
-        if self.match_token(&Token::Component) {
+        // `component` is a SOFT keyword: it introduces a CFC only when it actually
+        // begins a declaration (`component {`, `component Name ...`, `component
+        // extends=...`, `component output="false" ...`). Used anywhere else — a
+        // bare `component = x` assignment, `component.foo`, `component[1]`, or as
+        // the `component` attribute of a script-statement cfinvoke — it is an
+        // ordinary identifier and must fall through to expression parsing. This
+        // matches Lucee/ACF/BoxLang, which all treat `component` as soft.
+        if self.check(&Token::Component) && self.is_component_declaration() {
+            self.advance(); // consume `component`
             return Ok(CfmlNode::Statement(Statement::ComponentDecl(
                 ComponentDecl {
                     component: self.parse_component()?,
@@ -491,6 +499,169 @@ impl Parser {
                 operator: AssignOp::Equal,
                 location: stmt_loc,
             })));
+        }
+
+        // Handle 'cfinvoke'/'invoke' as a CFScript STATEMENT (the tag-in-script
+        // form), e.g.
+        //     cfinvoke component="Svc" method="m" returnvariable="r" arg=1;
+        //     cfinvoke component=obj method="m" { invokeargument name="a" value=1; }
+        // -> [<r> =] __cfinvoke(<component>, "<method>", <argStruct-or-collection>)
+        // The function-CALL form `cfinvoke(component=...)` (peek(1) == LParen) is
+        // NOT matched here and keeps parsing as an ordinary call. `component`,
+        // `method`, etc. lex as keyword tokens, hence is_identifier_like_at.
+        if matches!(self.peek(0), Token::Identifier(ref s)
+                if s.eq_ignore_ascii_case("cfinvoke") || s.eq_ignore_ascii_case("invoke"))
+            && self.is_identifier_like_at(1)
+            && matches!(self.peek(2), Token::Equal)
+        {
+            self.advance(); // consume 'cfinvoke' / 'invoke'
+
+            let mut component_expr: Option<Expression> = None;
+            let mut method_expr: Option<Expression> = None;
+            let mut return_var_expr: Option<Expression> = None;
+            let mut arg_collection: Option<Expression> = None;
+            let mut extra_pairs: Vec<(Expression, Expression)> = Vec::new();
+
+            while !self.check(&Token::LBrace) && !self.check(&Token::Semicolon) && !self.is_at_end() {
+                if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                    let key = self.extract_identifier()?.to_lowercase();
+                    self.advance(); // consume =
+                    let value = self.parse_expression()?;
+                    match key.as_str() {
+                        "component" => component_expr = Some(value),
+                        "method" => method_expr = Some(value),
+                        "returnvariable" => return_var_expr = Some(value),
+                        "argumentcollection" => arg_collection = Some(value),
+                        _ => extra_pairs.push((
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(key),
+                                location: stmt_loc.clone(),
+                            }),
+                            value,
+                        )),
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Optional body of `invokeargument`/`cfinvokeargument name=.. value=..;`
+            if self.check(&Token::LBrace) {
+                self.advance(); // consume {
+                while !self.check(&Token::RBrace) && !self.is_at_end() {
+                    if matches!(self.peek(0), Token::Identifier(ref s)
+                            if s.eq_ignore_ascii_case("invokeargument")
+                                || s.eq_ignore_ascii_case("cfinvokeargument"))
+                    {
+                        self.advance(); // consume keyword
+                        let mut arg_name: Option<Expression> = None;
+                        let mut arg_value: Option<Expression> = None;
+                        while !self.check(&Token::Semicolon) && !self.check(&Token::RBrace) && !self.is_at_end() {
+                            if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                                let k = self.extract_identifier()?.to_lowercase();
+                                self.advance(); // consume =
+                                let v = self.parse_expression()?;
+                                if k == "name" {
+                                    arg_name = Some(v);
+                                } else if k == "value" {
+                                    arg_value = Some(v);
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        self.match_token(&Token::Semicolon);
+                        if let (Some(n), Some(v)) = (arg_name, arg_value) {
+                            extra_pairs.push((n, v));
+                        }
+                    } else {
+                        self.advance(); // skip unknown tokens inside the block
+                    }
+                }
+                self.consume(&Token::RBrace)?;
+            } else {
+                self.match_token(&Token::Semicolon);
+            }
+
+            let str_lit = |s: &str| Expression::Literal(Literal {
+                value: LiteralValue::String(s.to_string()),
+                location: stmt_loc.clone(),
+            });
+
+            // Third arg: an explicit argumentcollection wins; otherwise a struct
+            // of the remaining attributes + any invokeargument entries.
+            let third_arg = arg_collection.unwrap_or_else(|| Expression::Struct(Struct {
+                pairs: extra_pairs,
+                ordered: false,
+                location: stmt_loc.clone(),
+            }));
+
+            let call = Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: "__cfinvoke".to_string(),
+                    location: stmt_loc.clone(),
+                })),
+                arguments: vec![
+                    component_expr.unwrap_or_else(|| str_lit("")),
+                    method_expr.unwrap_or_else(|| str_lit("")),
+                    third_arg,
+                ],
+                location: stmt_loc.clone(),
+            }));
+
+            // Bind the result if a returnVariable was given.
+            match return_var_expr {
+                None => {
+                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                        expr: call,
+                        location: stmt_loc,
+                    })));
+                }
+                Some(rv) => {
+                    // A STATIC name -> a real lvalue, reusing the normal assignment
+                    // path so `local.rv` / `variables.x` / dotted paths all work.
+                    let static_name = match &rv {
+                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
+                        Expression::Identifier(id) => Some(id.name.clone()),
+                        _ => None,
+                    };
+                    if let Some(name) = static_name {
+                        if !name.is_empty() {
+                            if let Some(lvalue) = self.returnvar_lvalue(&name) {
+                                return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                                    expr: Expression::BinaryOp(Box::new(BinaryOp {
+                                        left: Box::new(lvalue),
+                                        operator: BinaryOpType::Assign,
+                                        right: Box::new(call),
+                                        location: stmt_loc.clone(),
+                                    })),
+                                    location: stmt_loc,
+                                })));
+                            }
+                        }
+                        // Empty/unusable static name: just invoke, drop the result.
+                        return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                            expr: call,
+                            location: stmt_loc,
+                        })));
+                    }
+                    // A DYNAMIC returnVariable (e.g. "#arguments.rv#") -> assign by
+                    // name at runtime. (setVariable resolves variables/request/
+                    // session/application prefixes; other scopes go to variables.)
+                    let set_call = Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "setVariable".to_string(),
+                            location: stmt_loc.clone(),
+                        })),
+                        arguments: vec![rv, call],
+                        location: stmt_loc.clone(),
+                    }));
+                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                        expr: set_call,
+                        location: stmt_loc,
+                    })));
+                }
+            }
         }
 
         // Handle CFScript tag-as-statement syntax: keyword attr=value attr=value;
@@ -823,6 +994,27 @@ impl Parser {
             Token::SlashEqual => Some(AssignOp::SlashEqual),
             Token::AmpEqual => Some(AssignOp::ConcatEqual),
             Token::PercentEqual => Some(AssignOp::PercentEqual),
+            _ => None,
+        }
+    }
+
+    /// Turn a STATIC cfinvoke `returnVariable` name ("msg", "local.rv",
+    /// "variables.x") into an assignable lvalue expression by sub-parsing it, so
+    /// the normal assignment path handles scope prefixes and dotted paths. Returns
+    /// None if the name doesn't parse to a simple lvalue (Identifier / member /
+    /// index access), in which case the caller falls back to setVariable.
+    fn returnvar_lvalue(&self, name: &str) -> Option<Expression> {
+        let mut sub = Parser::new(format!("{};", name));
+        let program = sub.parse().ok()?;
+        let expr = program.statements.into_iter().find_map(|node| match node {
+            CfmlNode::Statement(Statement::Expression(es)) => Some(es.expr),
+            CfmlNode::Expression(e) => Some(e),
+            _ => None,
+        })?;
+        match expr {
+            Expression::Identifier(_)
+            | Expression::MemberAccess(_)
+            | Expression::ArrayAccess(_) => Some(expr),
             _ => None,
         }
     }
@@ -2464,6 +2656,25 @@ impl Parser {
         self.is_identifier_like_at(0)
     }
 
+    /// Decide whether a `component` token at the current position begins a CFC
+    /// declaration (vs. being used as an ordinary identifier). A declaration is
+    /// `component`, optionally followed by a name and/or metadata attributes,
+    /// then a `{` body. The token immediately after `component` is decisive:
+    ///   - `{`                       -> anonymous component body
+    ///   - `extends` / `implements`  -> inheritance clause
+    ///   - an identifier-like token  -> the CFC name, or a metadata key such as
+    ///                                  `output=` / `displayname=` / `hint=`
+    ///                                  (note `output` and friends lex as keyword
+    ///                                  tokens, hence is_identifier_like_at, not a
+    ///                                  bare Identifier check).
+    /// Anything else (`=`, `.`, `[`, `(`, `;`, an operator, EOF) means `component`
+    /// is an identifier — e.g. `component = "x"` or a cfinvoke `component="..."`
+    /// attribute — so it is NOT a declaration and falls through to expressions.
+    fn is_component_declaration(&self) -> bool {
+        self.is_identifier_like_at(1)
+            || matches!(self.peek(1), Token::LBrace | Token::Extends | Token::Implements)
+    }
+
     /// Check if the token at offset can be used as an identifier.
     fn is_identifier_like_at(&self, offset: usize) -> bool {
         matches!(self.peek(offset),
@@ -3266,6 +3477,10 @@ impl Parser {
                 location: self.current_location(),
             })),
             // CFML soft keywords used as variables in expressions
+            Token::Component => Ok(Expression::Identifier(Identifier {
+                name: "component".to_string(),
+                location: self.current_location(),
+            })),
             Token::Local => Ok(Expression::Identifier(Identifier {
                 name: "local".to_string(),
                 location: self.current_location(),
@@ -3567,7 +3782,10 @@ impl Parser {
                     // NOT an assignment operator. We must parse the key without
                     // consuming `=` as assignment.
                     // Check for simple `identifier =` pattern first (most common case).
-                    let is_key_eq = matches!(self.peek(0), Token::Identifier(_))
+                    // is_identifier_like_at covers soft-keyword keys too (component,
+                    // output, ...) so `{ component = x }` treats `component` as the
+                    // KEY rather than parsing `component = x` as an assignment expr.
+                    let is_key_eq = self.is_identifier_like_at(0)
                         && matches!(self.peek(1), Token::Equal);
                     let key = if is_key_eq {
                         // Parse just the identifier, don't let parse_expression consume `=`

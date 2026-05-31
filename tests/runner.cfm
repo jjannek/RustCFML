@@ -221,6 +221,18 @@ try { include "core/test_undefined_var_autovivify.cfm"; } catch (any e) { writeO
 //     throws at instantiation -> non-object -> empty dispatch.
 try { include "core/test_multiword_operators.cfm"; } catch (any e) { writeOutput("ERROR | core/test_multiword_operators.cfm | " & e.message & chr(10)); }
 try { include "tags/test_mapping_include.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_mapping_include.cfm | " & e.message & chr(10)); }
+//   - component_soft_keyword: `component` is a SOFT keyword on Lucee/ACF/BoxLang
+//     (a CFC introducer only when it begins a declaration; otherwise an ordinary
+//     identifier). RustCFML used to treat it as a HARD reserved keyword, so a
+//     bare `component = x` (and the `component` attribute of cfinvoke) failed to
+//     PARSE. Now soft; genuine declarations still parse.
+try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOutput("ERROR | core/test_component_soft_keyword.cfm | " & e.message & chr(10)); }
+//   - cfinvoke_statement: `invoke` as a CFScript statement (attributes + optional
+//     invokeargument block) is now compiled to __cfinvoke(...). RustCFML previously
+//     only supported the <cfinvoke> tag and the invoke(...) call forms. (RustCFML
+//     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
+//     rejects it, so the cross-engine test uses the cf-less `invoke`.)
+try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
