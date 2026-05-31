@@ -1839,10 +1839,18 @@ fn parse_cfloop_tag(
         let from = strip_hashes(from);
         let to = strip_hashes(to);
         let step = strip_hashes(&step);
+        // Decide loop direction at runtime from the sign of the (possibly
+        // dynamic) step, matching Lucee. Hoist step into a temp so it is
+        // evaluated once rather than per-iteration.
+        let step_var = format!("__cfloop_step_{}", consumed);
         (
             format!(
-                "for (var {} = {}; {} <= {}; {} = {} + {}) {{\n",
-                index, from, index, to, index, index, step
+                "var {sv} = {step};\nfor (var {i} = {from}; ({sv} < 0 ? {i} >= {to} : {i} <= {to}); {i} = {i} + {sv}) {{\n",
+                sv = step_var,
+                step = step,
+                i = index,
+                from = from,
+                to = to
             ),
             consumed,
         )
