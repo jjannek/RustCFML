@@ -1,7 +1,7 @@
 //! CFML Virtual Machine - Bytecode execution engine
 
 use cfml_codegen::{BytecodeFunction, BytecodeOp, BytecodeProgram, CmpOp};
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlStruct, CfmlValue};
 use cfml_common::vfs::{RealFs, Vfs};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use indexmap::IndexMap;
@@ -4201,7 +4201,8 @@ impl CfmlVirtualMachine {
 
             if matches!(name_lower.as_str(), "cfdirectory" | "__cfdirectory") {
                 if let Some(CfmlValue::Struct(opts)) = args.first() {
-                    let action = Self::struct_get_ci(opts, "action")
+                    let action = opts
+                        .get_ci("action")
                         .map(|v| v.as_string().to_lowercase())
                         .unwrap_or_else(|| "list".to_string());
                     if action == "list" {
@@ -11090,14 +11091,17 @@ impl CfmlVirtualMachine {
         }
     }
 
-    fn cfdirectory_list_from_opts(&self, opts: &IndexMap<String, CfmlValue>) -> CfmlResult {
-        let dir = Self::struct_get_ci(opts, "directory")
+    fn cfdirectory_list_from_opts(&self, opts: &CfmlStruct) -> CfmlResult {
+        let dir = opts
+            .get_ci("directory")
             .map(|v| v.as_string())
             .unwrap_or_default();
-        let filter = Self::struct_get_ci(opts, "filter")
+        let filter = opts
+            .get_ci("filter")
             .map(|v| v.as_string())
             .unwrap_or_else(|| "*".to_string());
-        let recurse = Self::struct_get_ci(opts, "recurse")
+        let recurse = opts
+            .get_ci("recurse")
             .map(|v| v.is_true())
             .unwrap_or(false);
         match self.resolve_directory_path_with_mappings(&dir) {
@@ -11107,15 +11111,6 @@ impl CfmlVirtualMachine {
                 dir
             ))),
         }
-    }
-
-    fn struct_get_ci<'a>(
-        s: &'a IndexMap<String, CfmlValue>,
-        key: &str,
-    ) -> Option<&'a CfmlValue> {
-        s.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v)
     }
 
     fn sandbox_cfdirectory_list(&self, path: &str, recurse: bool, filter: &str) -> CfmlResult {

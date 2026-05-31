@@ -1,12 +1,11 @@
 <cfscript>
 suiteBegin("cfdirectory mapping paths");
-
-directory action="list"
+</cfscript>
+<cfdirectory action="list"
     directory="/oop/native_cfcs"
     name="mappedCfcFiles"
-    filter="*.cfc";
-
+    filter="*.cfc">
+<cfscript>
 assert("mapped directory resolves via Application.cfc mapping", mappedCfcFiles.recordCount, 3);
-
 suiteEnd();
 </cfscript>
