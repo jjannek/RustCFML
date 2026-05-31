@@ -29,6 +29,21 @@ function greet(name, greeting="Hello") {
 assert("default arg used", greet("World"), "Hello World");
 assert("default arg overridden", greet("World", "Hi"), "Hi World");
 
+// --- Optional argument omission ---
+function checkOffset(offset) {
+    if (structKeyExists(arguments, "offset")) {
+        return "present:" & arguments.offset;
+    }
+    return "missing";
+}
+assert("omitted optional argument absent from arguments", checkOffset(), "missing");
+assert("provided optional argument present in arguments", checkOffset(5), "present:5");
+
+function pageArgs(table_name, offset, limit=250) {
+    return (structKeyExists(arguments, "offset") ? "offset" : "no-offset") & ":" & arguments.limit;
+}
+assert("named later argument does not materialize omitted optional argument", pageArgs(table_name="moo_role", limit=20), "no-offset:20");
+
 // --- Closures ---
 multiply = function(a, b) {
     return a * b;
