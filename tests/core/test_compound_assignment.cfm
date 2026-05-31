@@ -60,6 +60,17 @@ fc = 10;
 fc -= five();
 assert("-= function() order", fc, 5);
 
+profileInitials = "";
+part = "Mat";
+profileInitials &= uCase(left(part, 1));
+assert("&= function() concat", profileInitials, "M");
+
+item = { count = 2, label = "A" };
+item.count += val("3");
+item.label &= uCase(left("bee", 1));
+assert("struct += function() RHS", item.count, 5);
+assert("struct &= function() RHS", item.label, "AB");
+
 // --- nested array index RHS ---
 matrix = [[1, 2], [3, 4]];
 n = 0;
