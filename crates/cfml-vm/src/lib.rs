@@ -3213,7 +3213,18 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::CallMethod(method_name, arg_count, write_back) => {
+                BytecodeOp::CallMethod(method_name, arg_count, write_back)
+                | BytecodeOp::CallMethodNamed(method_name, _, arg_count, write_back) => {
+                    // For the named variant, recover the call-site argument names
+                    // from the instruction (ip was already advanced past it). The
+                    // `|`-pattern can't bind the names field directly because the
+                    // two variants differ in shape, so read them back here. This
+                    // mirrors how CallNamed recovers arg sources via ip - 1.
+                    let method_arg_names: Option<&[String]> =
+                        match &func.instructions[ip - 1] {
+                            BytecodeOp::CallMethodNamed(_, names, _, _) => Some(names.as_slice()),
+                            _ => None,
+                        };
                     let mut extra_args: Vec<CfmlValue> =
                         (0..*arg_count).filter_map(|_| stack.pop()).collect();
                     extra_args.reverse();
@@ -3256,7 +3267,12 @@ impl CfmlVirtualMachine {
                                         } else {
                                             None
                                         };
-                                    let args: Vec<CfmlValue> = extra_args.drain(..).collect();
+                                    let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
+                                    let args = Self::reorder_named_args_for_function(
+                                        &prop,
+                                        method_arg_names,
+                                        raw_args,
+                                    );
                                     let mut method_locals = IndexMap::new();
                                     // Merge captured scope first (closure vars from defining scope)
                                     if let Some(ref shared_env) = f.captured_scope {
@@ -3306,13 +3322,24 @@ impl CfmlVirtualMachine {
                                         &object,
                                         &method_name,
                                         &mut extra_args,
+                                        method_arg_names,
                                     )
                                 }
                             } else {
-                                self.call_member_function(&object, &method_name, &mut extra_args)
+                                self.call_member_function(
+                                    &object,
+                                    &method_name,
+                                    &mut extra_args,
+                                    method_arg_names,
+                                )
                             }
                         } else {
-                            self.call_member_function(&object, &method_name, &mut extra_args)
+                            self.call_member_function(
+                                &object,
+                                &method_name,
+                                &mut extra_args,
+                                method_arg_names,
+                            )
                         };
                     self.try_stack = saved_try_stack_method;
                     let result = match method_result {
@@ -8115,11 +8142,78 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Rebind call-site method arguments to a function's parameters by name.
+    ///
+    /// `arg_names` carries one entry per positional value in `arg_values`: an
+    /// empty string means the argument was passed positionally, a non-empty
+    /// string is its call-site name. An `argumentCollection` entry whose value
+    /// is a struct is expanded into named arguments. The result is the values
+    /// ordered to match `func.params`, with any unmatched named arguments
+    /// appended (so the callee's `arguments` scope still receives them).
+    ///
+    /// When `arg_names` is `None` (a plain CallMethod) or the receiver is not a
+    /// function, the values are returned untouched. Mirrors the inline logic in
+    /// the `CallNamed` handler for free-function calls.
+    fn reorder_named_args_for_function(
+        func_ref: &CfmlValue,
+        arg_names: Option<&[String]>,
+        arg_values: Vec<CfmlValue>,
+    ) -> Vec<CfmlValue> {
+        let Some(arg_names) = arg_names else {
+            return arg_values;
+        };
+        let CfmlValue::Function(func) = func_ref else {
+            return arg_values;
+        };
+
+        // Expand argumentCollection structs into individual named arguments.
+        let mut expanded_names = Vec::with_capacity(arg_names.len());
+        let mut expanded_values = Vec::with_capacity(arg_names.len());
+        for (i, name) in arg_names.iter().enumerate() {
+            let value = arg_values.get(i).cloned().unwrap_or(CfmlValue::Null);
+            if name.eq_ignore_ascii_case("argumentcollection") {
+                if let CfmlValue::Struct(s) = &value {
+                    for (k, v) in s.iter() {
+                        expanded_names.push(k.clone());
+                        expanded_values.push(v.clone());
+                    }
+                    continue;
+                }
+            }
+            expanded_names.push(name.clone());
+            expanded_values.push(value);
+        }
+
+        let mut positional = vec![CfmlValue::Null; func.params.len().max(expanded_names.len())];
+        for (i, name) in expanded_names.iter().enumerate() {
+            let value = expanded_values.get(i).cloned().unwrap_or(CfmlValue::Null);
+            if name.is_empty() {
+                if i < positional.len() {
+                    positional[i] = value;
+                }
+                continue;
+            }
+            match func
+                .params
+                .iter()
+                .position(|param| param.name.eq_ignore_ascii_case(name))
+            {
+                Some(param_index) if param_index < positional.len() => {
+                    positional[param_index] = value;
+                }
+                Some(_) => {}
+                None => positional.push(value),
+            }
+        }
+        positional
+    }
+
     fn call_member_function(
         &mut self,
         object: &CfmlValue,
         method: &str,
         extra_args: &mut Vec<CfmlValue>,
+        arg_names: Option<&[String]>,
     ) -> CfmlResult {
         let method_lower = method.to_lowercase();
 
@@ -8865,7 +8959,8 @@ impl CfmlVirtualMachine {
         };
         if let CfmlValue::Function(ref _fdata) = &prop {
             let func_ref = prop.clone();
-            let args: Vec<CfmlValue> = extra_args.drain(..).collect();
+            let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
+            let args = Self::reorder_named_args_for_function(&prop, arg_names, raw_args);
             // Bind 'this' / __variables ONLY when the receiver is an actual CFC.
             // For plain struct-stored closures (e.g. `enc = { string: fn }`), the
             // closure should keep whatever `this` it captured at definition (or
@@ -12564,7 +12659,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::TryStart(_) | BytecodeOp::TryEnd => (0, 0),
         BytecodeOp::Throw | BytecodeOp::Rethrow => (0, 1),
         // Method call: pops obj + args, pushes 1
-        BytecodeOp::CallMethod(_, n, _) => (1, n + 1),
+        BytecodeOp::CallMethod(_, n, _) | BytecodeOp::CallMethodNamed(_, _, n, _) => (1, n + 1),
         BytecodeOp::CallRustSuperCtor(n) => (1, *n),
         // Include
         BytecodeOp::Include(_) => (0, 0),

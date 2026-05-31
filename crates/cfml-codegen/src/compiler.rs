@@ -239,6 +239,12 @@ pub enum BytecodeOp {
     //   - Some(vec!["local", "_taffy", "factory"]) for local._taffy.factory.method()
     //   - None — no write-back needed
     CallMethod(String, usize, Option<Vec<String>>),
+    // Method call with named arguments: like CallMethod but carries the
+    // call-site argument names (empty string for positional args), so the VM
+    // can rebind them to the resolved method's parameters by name. Mirrors
+    // CallNamed for free-function calls. The names are boxed so this variant
+    // does not grow BytecodeOp past its size ceiling (it is the rare path).
+    CallMethodNamed(String, Box<Vec<String>>, usize, Option<Vec<String>>),
 
     // For-in support
     GetKeys,  // Pop value: if struct, push array of keys; if array, leave as-is
@@ -2562,6 +2568,28 @@ impl CfmlCompiler {
                 // this.items.append(x) → write_back = Some(("this", Some("items")))
                 // dog.method(x)        → write_back = Some(("dog", None))
                 let write_back = Self::method_call_write_back(&call.object);
+                let has_named = call
+                    .arguments
+                    .iter()
+                    .any(|arg| matches!(arg, Expression::NamedArgument(_)));
+
+                // Compile each argument value onto the stack, collecting the
+                // call-site names (empty string for positional args). Mirrors
+                // the named-arg handling for free-function calls (CallNamed).
+                let compile_args =
+                    |compiler: &mut Self, instructions: &mut Vec<BytecodeOp>| -> Vec<String> {
+                        let mut names = Vec::with_capacity(call.arguments.len());
+                        for arg in &call.arguments {
+                            if let Expression::NamedArgument(named) = arg {
+                                names.push(named.name.clone());
+                                compiler.compile_expression(&named.value, instructions);
+                            } else {
+                                names.push(String::new());
+                                compiler.compile_expression(arg, instructions);
+                            }
+                        }
+                        names
+                    };
 
                 // For null-safe method calls, use TryLoadLocal for simple identifiers
                 if call.null_safe {
@@ -2579,24 +2607,38 @@ impl CfmlCompiler {
                     let jump_end = instructions.len();
                     instructions.push(BytecodeOp::Jump(0));
                     instructions[jump_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
-                    for arg in &call.arguments {
-                        self.compile_expression(arg, instructions);
+                    let names = compile_args(self, instructions);
+                    if has_named {
+                        instructions.push(BytecodeOp::CallMethodNamed(
+                            call.method.clone(),
+                            Box::new(names),
+                            call.arguments.len(),
+                            write_back.clone(),
+                        ));
+                    } else {
+                        instructions.push(BytecodeOp::CallMethod(
+                            call.method.clone(),
+                            call.arguments.len(),
+                            write_back.clone(),
+                        ));
                     }
-                    instructions.push(BytecodeOp::CallMethod(
-                        call.method.clone(),
-                        call.arguments.len(),
-                        write_back.clone(),
-                    ));
                     instructions[jump_end] = BytecodeOp::Jump(instructions.len());
                 } else {
-                    for arg in &call.arguments {
-                        self.compile_expression(arg, instructions);
+                    let names = compile_args(self, instructions);
+                    if has_named {
+                        instructions.push(BytecodeOp::CallMethodNamed(
+                            call.method.clone(),
+                            Box::new(names),
+                            call.arguments.len(),
+                            write_back,
+                        ));
+                    } else {
+                        instructions.push(BytecodeOp::CallMethod(
+                            call.method.clone(),
+                            call.arguments.len(),
+                            write_back,
+                        ));
                     }
-                    instructions.push(BytecodeOp::CallMethod(
-                        call.method.clone(),
-                        call.arguments.len(),
-                        write_back,
-                    ));
                 }
             }
             Expression::Array(arr) => {
