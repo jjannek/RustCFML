@@ -50,5 +50,14 @@ math = buildMathService();
 assert("service add", math.add(3, 4), 7);
 assert("service multiply", math.multiply(3, 4), 12);
 
+// Named arguments through a function reference should bind by parameter name,
+// not by the order supplied at the call site.
+function read(table_name, id) {
+    return arguments.table_name & ":" & arguments.id;
+}
+db = {};
+db.read = read;
+assert("function ref named args reorder by parameter", db.read(id="p1", table_name="moo_profile"), "moo_profile:p1");
+
 suiteEnd();
 </cfscript>
