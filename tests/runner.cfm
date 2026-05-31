@@ -115,6 +115,7 @@ try { include "oop/test_external_prop.cfm"; } catch (any e) { writeOutput("ERROR
 try { include "oop/test_repeated_instantiation.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_repeated_instantiation.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_mapping_paths.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_mapping_paths.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_method_named_args.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_method_named_args.cfm | " & e.message & chr(10)); }
+try { include "oop/test_component_method_precedence.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_method_precedence.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }

@@ -8612,6 +8612,16 @@ impl CfmlVirtualMachine {
                 _ => None,
             },
             CfmlValue::Struct(s) => match method_lower.as_str() {
+                // Struct member-function helpers must NEVER fire on a component.
+                // A CFC is represented internally as a struct, but it is not a
+                // struct to user code: a method named like a struct helper
+                // (delete/count/find/insert/each/...) must resolve to the
+                // component's own method, an inherited method, or onMissingMethod
+                // — never to structDelete/structCount/etc. Returning None here
+                // skips builtin mapping so dispatch falls through to the user
+                // method / onMissingMethod path below. (This matches Lucee, where
+                // struct member functions are not available on components.)
+                _ if s.contains_key("__variables") || s.contains_key("__name") => None,
                 "count" | "len" | "size" => Some("structCount"),
                 "keyexists" => Some("structKeyExists"),
                 "keylist" => Some("structKeyList"),
