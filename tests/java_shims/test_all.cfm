@@ -159,6 +159,18 @@ assertTrue( "Pattern matcher find", matcher.find() );
 assert( "Pattern matcher group", matcher.group( 1 ), "4e4727bd-f93d-40e6-9409-bed317fe76df" );
 assert( "Pattern matcher groupCount", matcher.groupCount(), 1 );
 
+// find() must advance like Java's Matcher: a while(find()) loop walks every
+// non-overlapping match in order, then terminates once they are exhausted.
+multiMatcher = createObject( "java", "java.util.regex.Pattern" )
+    .compile( javaCast( "string", "([0-9]+)" ) )
+    .matcher( javaCast( "string", "a1b22c333" ) );
+foundNumbers = [];
+while ( multiMatcher.find() ) {
+    arrayAppend( foundNumbers, multiMatcher.group( 1 ) );
+}
+assert( "Pattern find loop walks all matches", arrayToList( foundNumbers ), "1,22,333" );
+assertFalse( "Pattern find returns false once exhausted", multiMatcher.find() );
+
 writeOutput( "\n=== All Java shim tests passed! ===\n" );
 
 suiteEnd( "Java Shims" );

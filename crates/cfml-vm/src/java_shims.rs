@@ -1026,11 +1026,11 @@ fn rand_u128() -> u128 {
 ///
 /// Flow: `createObject("java","java.util.regex.Pattern")` → `init`; then
 /// `.compile(regex)` → a compiled Pattern shim; `.matcher(input)` → a Matcher
-/// shim. The match is computed eagerly at `matcher()` time and the capture
-/// groups are stored, so `find()` reports whether a match exists and
-/// `group(n)`/`groupCount()` read the stored results. NOTE: `find()` does not
-/// advance through multiple matches (single-match semantics), which covers the
-/// dominant route-matching use case.
+/// shim. `find()`/`matches()`/`lookingAt()` advance the matcher's cursor and
+/// stash the capture groups; they are handled inline in the VM (see
+/// `java_matcher_step`) because they mutate matcher state that must be written
+/// back to the variable. `group(n)`/`groupCount()` read that stashed state and
+/// stay here (pure reads).
 pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     use regex::Regex;
 
@@ -1075,24 +1075,14 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             Ok(CfmlValue::strukt(shim))
         }
         "pattern" | "tostring" => Ok(CfmlValue::String(object_regex())),
-        // Pattern.matcher(input) — eagerly evaluate and stash capture groups.
+        // Pattern.matcher(input) — create a Matcher positioned before the first
+        // match. find()/matches()/lookingAt() (handled inline in the VM so they
+        // can write the advanced state back) populate the capture groups.
         "matcher" => {
             let regex_str = object_regex();
             let input = args.first().map(|a| a.as_string()).unwrap_or_default();
             let re = compile(&regex_str)?;
             let group_count = re.captures_len() as i64 - 1;
-            let mut groups: Vec<CfmlValue> = Vec::new();
-            let mut matched = false;
-            if let Some(caps) = re.captures(&input) {
-                matched = true;
-                for i in 0..re.captures_len() {
-                    groups.push(
-                        caps.get(i)
-                            .map(|m| CfmlValue::String(m.as_str().to_string()))
-                            .unwrap_or(CfmlValue::Null),
-                    );
-                }
-            }
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
@@ -1102,16 +1092,10 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             shim.insert("__regex".to_string(), CfmlValue::String(regex_str));
             shim.insert("__input".to_string(), CfmlValue::String(input));
             shim.insert("__groupcount".to_string(), CfmlValue::Int(group_count));
-            shim.insert("__matched".to_string(), CfmlValue::Bool(matched));
-            shim.insert("__groups".to_string(), CfmlValue::array(groups));
+            shim.insert("__matched".to_string(), CfmlValue::Bool(false));
+            shim.insert("__findindex".to_string(), CfmlValue::Int(0));
+            shim.insert("__groups".to_string(), CfmlValue::array(Vec::new()));
             Ok(CfmlValue::strukt(shim))
-        }
-        // Matcher.find() / matches() — report whether the stashed match exists.
-        "find" | "matches" | "lookingat" => {
-            if let CfmlValue::Struct(s) = object {
-                return Ok(s.get("__matched").unwrap_or(CfmlValue::Bool(false)));
-            }
-            Ok(CfmlValue::Bool(false))
         }
         // Matcher.group([n]) — group 0 is the whole match.
         "group" => {
@@ -1134,4 +1118,70 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
         }
         _ => Ok(CfmlValue::Null),
     }
+}
+
+/// Which matcher operation `java_matcher_step` performs.
+pub enum MatchMode {
+    /// `find()` — next non-overlapping match from the cursor; advances it.
+    Find,
+    /// `matches()` — the whole input must match; does not move the cursor.
+    Matches,
+    /// `lookingAt()` — match anchored at the start; does not move the cursor.
+    LookingAt,
+}
+
+/// Advance a `java.util.regex.Matcher` shim one step. Returns
+/// `(matched, updated_matcher)`: the updated struct carries the refreshed
+/// `__groups`/`__matched` (and, for `Find`, the incremented `__findindex`) and
+/// must be written back to the matcher variable so a subsequent `group(n)`
+/// sees this step's captures. `find()` walks non-overlapping matches
+/// left-to-right exactly like Java's `Matcher.find()`, so `while (m.find())`
+/// terminates.
+pub fn java_matcher_step(
+    s: &cfml_common::dynamic::CfmlStruct,
+    mode: MatchMode,
+) -> Result<(bool, CfmlValue), CfmlError> {
+    use regex::Regex;
+    let regex_str = s.get("__regex").map(|v| v.as_string()).unwrap_or_default();
+    let input = s.get("__input").map(|v| v.as_string()).unwrap_or_default();
+    let re = Regex::new(&regex_str).map_err(|e| {
+        CfmlError::runtime(format!(
+            "java.util.regex.Matcher: invalid pattern [{}]: {}",
+            regex_str, e
+        ))
+    })?;
+
+    let find_index = s
+        .get("__findindex")
+        .and_then(|v| v.as_string().trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let caps = match mode {
+        MatchMode::Find => re.captures_iter(&input).nth(find_index),
+        MatchMode::Matches => re
+            .captures(&input)
+            .filter(|c| c.get(0).map(|m| m.start() == 0 && m.end() == input.len()).unwrap_or(false)),
+        MatchMode::LookingAt => re
+            .captures(&input)
+            .filter(|c| c.get(0).map(|m| m.start() == 0).unwrap_or(false)),
+    };
+
+    let mut ns = s.snapshot();
+    let matched = caps.is_some();
+    let groups: Vec<CfmlValue> = match &caps {
+        Some(caps) => (0..re.captures_len())
+            .map(|i| {
+                caps.get(i)
+                    .map(|m| CfmlValue::String(m.as_str().to_string()))
+                    .unwrap_or(CfmlValue::Null)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    ns.insert("__matched".to_string(), CfmlValue::Bool(matched));
+    ns.insert("__groups".to_string(), CfmlValue::array(groups));
+    if matches!(mode, MatchMode::Find) && matched {
+        ns.insert("__findindex".to_string(), CfmlValue::Int((find_index + 1) as i64));
+    }
+    Ok((matched, CfmlValue::strukt(ns)))
 }

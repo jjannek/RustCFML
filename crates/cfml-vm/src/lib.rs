@@ -8342,6 +8342,24 @@ impl CfmlVirtualMachine {
                     return Ok(old);
                 }
 
+                // Special: Matcher.find()/matches()/lookingAt() advance the
+                // matcher cursor and refresh its capture groups; the updated
+                // matcher must be written back so a following group(n) reads
+                // this step's match — same pattern as Queue.poll / Map.remove.
+                if java_class == "java.util.regex.matcher"
+                    && matches!(method_lower.as_str(), "find" | "matches" | "lookingat")
+                {
+                    let mode = match method_lower.as_str() {
+                        "matches" => java_shims::MatchMode::Matches,
+                        "lookingat" => java_shims::MatchMode::LookingAt,
+                        _ => java_shims::MatchMode::Find,
+                    };
+                    let (matched, new_matcher) =
+                        java_shims::java_matcher_step(s, mode).map_err(|e| self.wrap_error(e))?;
+                    self.method_this_writeback = Some(new_matcher);
+                    return Ok(CfmlValue::Bool(matched));
+                }
+
                 let all_args: Vec<CfmlValue> = std::mem::take(extra_args);
                 let m = method_lower.clone();
                 let result = match java_class.as_str() {
