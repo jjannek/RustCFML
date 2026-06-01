@@ -1093,6 +1093,41 @@ async fn handle_request(
         resolve_file(&state.doc_root, &path, state.vfs.as_ref(), welcome_files, cfml_exts)
     };
 
+    // Front-controller fallback: an unresolved URL is routed to a configured
+    // template (instead of 404), with the original path exposed in the URL
+    // scope and the original query string preserved.
+    let fallback = &state.cfconfig.server.fallback;
+    let resolved = if resolved.is_none() && !fallback.template.is_empty() {
+        match resolve_file(
+            &state.doc_root,
+            &fallback.template,
+            state.vfs.as_ref(),
+            welcome_files,
+            cfml_exts,
+        ) {
+            Some(rf) => {
+                // Inject the original path as url.<routeParam>, ahead of the
+                // original params (the template reads it via the URL scope).
+                let route_param = if fallback.route_param.is_empty() {
+                    "route"
+                } else {
+                    fallback.route_param.as_str()
+                };
+                let route_pair = format!("{}={}", route_param, query_encode(&path));
+                query_string = if query_string.is_empty() {
+                    route_pair
+                } else {
+                    format!("{}&{}", route_pair, query_string)
+                };
+                log::debug!("  -> front-controller fallback to {}", fallback.template);
+                Some(rf)
+            }
+            None => None,
+        }
+    } else {
+        resolved
+    };
+
     // CFML extensions to dispatch through the interpreter. `.cfc` files are
     // never served as static even if absent from cfml_extensions — that would
     // expose source. Likewise `.cfm` stays in the default list.
@@ -1295,6 +1330,26 @@ fn content_type_for(path: &Path) -> &'static str {
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
+}
+
+/// Percent-encode a value for safe placement in a query-string pair. Encodes
+/// the characters that would otherwise be reinterpreted by the query parser
+/// (`&`, `=`, `+`, `%`, space) while leaving path-friendly chars like `/` and
+/// `.` intact, so it round-trips through `parse_query_string`'s `url_decode`.
+fn query_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'&' | b'=' | b'+' | b'%' | b' ' | b'#' | b'?' => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+            // Non-ASCII and control bytes: percent-encode each byte so the
+            // value survives the decoder and stays valid UTF-8.
+            _ if b < 0x20 || b >= 0x7F => out.push_str(&format!("%{:02X}", b)),
+            _ => out.push(b as char),
+        }
+    }
+    out
 }
 
 fn html_escape(s: &str) -> String {

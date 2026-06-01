@@ -66,6 +66,9 @@ pub struct ServerCfg {
     #[serde(rename = "requestTimeout")]
     pub request_timeout: u32,
     pub http2: bool,
+    /// Front-controller fallback: run a configured template for URLs that
+    /// resolve to no file, instead of returning 404.
+    pub fallback: FallbackCfg,
 }
 
 impl Default for ServerCfg {
@@ -80,6 +83,30 @@ impl Default for ServerCfg {
             max_request_body_size: 10 * 1024 * 1024,
             request_timeout: 0,
             http2: false,
+            fallback: FallbackCfg::default(),
+        }
+    }
+}
+
+/// Front-controller fallback routing. When `template` is non-empty, any URL
+/// that resolves to no file (would otherwise 404) is dispatched to that
+/// web-root-relative CFML template, with the original path exposed in the URL
+/// scope under `route_param` and the original query string preserved.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct FallbackCfg {
+    /// Web-root-relative CFML template to run for unresolved URLs. Empty = off.
+    pub template: String,
+    /// URL var name that receives the original (unresolved) path.
+    #[serde(rename = "routeParam")]
+    pub route_param: String,
+}
+
+impl Default for FallbackCfg {
+    fn default() -> Self {
+        Self {
+            template: String::new(),
+            route_param: "route".into(),
         }
     }
 }
