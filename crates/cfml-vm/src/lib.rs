@@ -2555,6 +2555,22 @@ impl CfmlVirtualMachine {
                     }
                     // Pass-by-reference writeback: collect final values of complex-type params
                     self.collect_arg_ref_writeback(func, &locals);
+                    // Capture locals on early return too (mirrors the normal-exit
+                    // epilogue below). Without this, an explicit <cfreturn> in a
+                    // __main__/__cfc_body__ template skips the capture, so a custom
+                    // tag's start phase that mutates `attributes` then returns early
+                    // loses those mutations for the end phase. See epilogue ~L4136.
+                    if func.name == "__main__" || func.name == "__cfc_body__" {
+                        for (_, v) in locals.iter_mut() {
+                            if let CfmlValue::Function(ref mut f) = v {
+                                f.captured_scope = None;
+                            }
+                        }
+                        if let Some(ref env) = closure_env {
+                            env.write().unwrap().clear();
+                        }
+                        self.captured_locals = Some(std::mem::take(&mut locals));
+                    }
                     // Pop call frame before early return (matches push at function entry)
                     self.call_stack.pop();
                     debug_assert_eq!(

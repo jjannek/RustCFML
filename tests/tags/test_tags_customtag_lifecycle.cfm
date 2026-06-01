@@ -32,4 +32,11 @@
     assert("body tag start cfreturn preserves start attributes", trim(ltReturnOut), '<main class="px-5 py-5">body</main>');
 </cfscript>
 
+<!--- The same early-<cfreturn> must also preserve a variables-scope value the
+      start phase set, not just mutated attributes. --->
+<cfsavecontent variable="ltReturnVarOut"><cf_ltreturnvar seed="42">x</cf_ltreturnvar></cfsavecontent>
+<cfscript>
+    assert("body tag start cfreturn preserves variables locals", trim(ltReturnVarOut), "[tok-42]");
+</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
