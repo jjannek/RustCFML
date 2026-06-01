@@ -427,6 +427,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getComponentMetadata".into(), fn_get_component_metadata);
     f.insert("createUUID".into(), fn_create_uuid);
     f.insert("createUniqueID".into(), fn_create_unique_id);
+    f.insert("preserveSingleQuotes".into(), fn_preserve_single_quotes);
     f.insert("createGUID".into(), fn_create_guid);
     f.insert("hash".into(), fn_hash);
     f.insert("lsParseNumber".into(), fn_ls_parse_number);
@@ -4641,6 +4642,13 @@ fn fn_create_uuid(_args: Vec<CfmlValue>) -> CfmlResult {
         (mixed as u16),
         (nanos.wrapping_mul(6364136223846793005).wrapping_add(random_bits)),
     )))
+}
+
+fn fn_preserve_single_quotes(args: Vec<CfmlValue>) -> CfmlResult {
+    // Tells cfquery not to escape single quotes inside the value. Outside a
+    // query the string is returned verbatim (the "preservation" is a no-op
+    // marker), which matches Lucee's behaviour when used as a plain function.
+    Ok(CfmlValue::String(get_str(&args, 0)))
 }
 
 fn fn_create_unique_id(args: Vec<CfmlValue>) -> CfmlResult {
