@@ -214,6 +214,7 @@ try { include "oop/test_metadata_name_value.cfm"; } catch (any e) { writeOutput(
 try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_script_syntax_body.cfm | " & e.message & chr(10)); }
 try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
 try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_member_loop_var.cfm | " & e.message & chr(10)); }
+try { include "core/test_forin_keyword_member_access.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_keyword_member_access.cfm | " & e.message & chr(10)); }
 
 // --- v0.34.3 round: Wheels now parses, constructs, and boots its full app
 //     lifecycle + DI on RustCFML. This is the remaining language gap found
