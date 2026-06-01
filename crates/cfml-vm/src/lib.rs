@@ -524,6 +524,12 @@ pub struct CfmlVirtualMachine {
     pub request_scope: IndexMap<String, CfmlValue>,
     /// Application scope — shared across requests (Arc<Mutex> for thread safety)
     pub application_scope: Option<Arc<Mutex<IndexMap<String, CfmlValue>>>>,
+    /// Name of the application currently attached to `application_scope`.
+    /// Needed so `applicationStop()` knows which shared entry to reset.
+    current_application_name: Option<String>,
+    /// Set when `applicationStop()` has torn down the attached application during
+    /// this request, so the end-of-request writeback does not resurrect it.
+    application_stopped: bool,
     /// Server-level state — persists across requests in --serve mode
     pub server_state: Option<ServerState>,
     /// HTTP response headers set by cfheader
@@ -725,6 +731,8 @@ impl CfmlVirtualMachine {
             closure_parent_writeback: None,
             request_scope: IndexMap::new(),
             application_scope: None,
+            current_application_name: None,
+            application_stopped: false,
             server_state: None,
             response_headers: Vec::new(),
             response_status: None,
@@ -4410,6 +4418,7 @@ impl CfmlVirtualMachine {
                 | "sessioninvalidate"
                 | "sessionrotate"
                 | "sessiongetmetadata"
+                | "applicationstop"
                 | "getauthuser"
                 | "isuserinrole"
                 | "isuserloggedin"
@@ -7126,6 +7135,10 @@ impl CfmlVirtualMachine {
                         }
                     }
                     return Ok(CfmlValue::strukt(meta));
+                }
+                "applicationstop" => {
+                    self.stop_current_application();
+                    return Ok(CfmlValue::Null);
                 }
                 "getauthuser" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
@@ -12007,8 +12020,57 @@ impl CfmlVirtualMachine {
         source
     }
 
+    /// Tear down the application attached to this request, as `applicationStop()`
+    /// requires: fire `onApplicationEnd`, clear the shared application scope, mark
+    /// the app unstarted so the next request re-fires `onApplicationStart`, and
+    /// drop every cached lifecycle function so the restarted app rebuilds them.
+    fn stop_current_application(&mut self) {
+        // Lucee fires onApplicationEnd(applicationScope) synchronously when
+        // applicationStop() runs, BEFORE the scope is destroyed, so the handler
+        // still sees the live application data. Snapshot the scope and invoke it
+        // exactly like the onSessionEnd path does.
+        let app_scope_snapshot = self
+            .application_scope
+            .as_ref()
+            .and_then(|a| a.lock().ok().map(|s| CfmlValue::strukt(s.clone())))
+            .unwrap_or_else(|| CfmlValue::strukt(IndexMap::new()));
+        if let Some(mut template) = self.app_cfc_template.take() {
+            let _ = self.call_lifecycle_method(
+                &mut template,
+                "onApplicationEnd",
+                vec![app_scope_snapshot],
+            );
+            self.app_cfc_template = Some(template);
+        }
+
+        if let Some(app_name) = self.current_application_name.clone() {
+            if let Some(ref server_state) = self.server_state {
+                server_state.applications.modify(&app_name, &mut |app| {
+                    app.variables.clear();
+                    app.started = false;
+                    app.cached_functions.clear();
+                    app.cached_function_indices.clear();
+                    app.cached_functions_original_offset = 0;
+                });
+            }
+        }
+
+        // Clear the live scope so any further `application.*` access in this
+        // request sees an empty scope, matching the destroyed shared state.
+        if let Some(ref app_scope) = self.application_scope {
+            if let Ok(mut scope) = app_scope.lock() {
+                scope.clear();
+            }
+        }
+
+        self.application_stopped = true;
+    }
+
     /// Execute with Application.cfc lifecycle
     pub fn execute_with_lifecycle(&mut self) -> CfmlResult {
+        self.application_stopped = false;
+        self.current_application_name = None;
+
         // 1. Find Application.cfc
         let app_cfc_path = self.find_application_cfc();
 
@@ -12164,6 +12226,7 @@ impl CfmlVirtualMachine {
             }
             let app_snapshot = server_state.applications.get(&app_name).unwrap();
             let scope = Arc::new(Mutex::new(app_snapshot.variables.clone()));
+            self.current_application_name = Some(app_name.clone());
             self.application_scope = Some(scope.clone());
 
             // 5. onApplicationStart (if not yet started)
@@ -12427,9 +12490,14 @@ impl CfmlVirtualMachine {
         // and any function values that the application scope captured during the
         // request (e.g. `application._taffy.factory.getBean`) end up with body
         // indices beyond the restored program length.
-        if let Some(ref server_state) = self.server_state.clone() {
-            if let Some(ref app_scope) = self.application_scope {
-                if let Ok(scope) = app_scope.lock() {
+        //
+        // Skip entirely when `applicationStop()` ran this request: it already
+        // reset the shared entry, and re-persisting here would re-anchor the
+        // function cache from the just-cleared scope.
+        if !self.application_stopped {
+            if let Some(ref server_state) = self.server_state.clone() {
+                if let Some(ref app_scope) = self.application_scope {
+                    if let Ok(scope) = app_scope.lock() {
                     let scope_snapshot = scope.clone();
                     let program_functions = self.program.functions.clone();
                     server_state.applications.modify(&app_name, &mut |app| {
@@ -12465,6 +12533,7 @@ impl CfmlVirtualMachine {
                             app.cached_functions.clear();
                         }
                     });
+                    }
                 }
             }
         }
