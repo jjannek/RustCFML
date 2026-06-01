@@ -276,6 +276,12 @@ try { include "core/test_for_increment_compound.cfm"; } catch (any e) { writeOut
 //     (function f() output=true { ... }). RustCFML used to misparse the body as
 //     a struct literal for the unquoted form. Used in the wheelstest BaseSpec.
 try { include "core/test_script_fn_post_paren_attr.cfm"; } catch (any e) { writeOutput("ERROR | core/test_script_fn_post_paren_attr.cfm | " & e.message & chr(10)); }
+//   - invoke_canonical_forms: pins the two cross-engine invoke() forms — the
+//     positional BIF invoke(objOrName, method, args) and the statement form
+//     invoke component=.. method=.. {invokeargument ..}. The named-arg
+//     function-call form invoke(component=..)/cfinvoke(..) is intentionally NOT
+//     tested: Lucee rejects it at compile time, so it is not a portable contract.
+try { include "core/test_invoke_canonical_forms.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_canonical_forms.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
