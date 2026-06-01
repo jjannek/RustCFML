@@ -1074,11 +1074,14 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let uses_template = template.is_some();
 
             let path_expr = if let Some(t) = template {
-                let t = strip_hashes(&t);
-                format!("\"{}\"", t.replace('"', "\\\""))
+                // template may contain #hash# interpolation, e.g.
+                // <cfmodule template="#modulePath#">. Evaluate it like any
+                // other attribute rather than treating it as a literal string.
+                format_attr_value(&t, quoted.contains("template"))
             } else if let Some(n) = name_attr {
-                let n = strip_hashes(&n);
-                format!("\"__name:{}\"", n.replace('"', "\\\""))
+                // name= form is dispatched via a "__name:" sentinel prefix, so
+                // concatenate the (possibly interpolated) name onto it.
+                format!("\"__name:\" & ({})", format_attr_value(&n, quoted.contains("name")))
             } else {
                 return ("".to_string(), tag_end - start); // missing required attr
             };

@@ -106,4 +106,19 @@
 </cftry>
 <cfscript>assertTrue("cfmodule unresolvable leading-slash throws", len(missingSlashError) GT 0);</cfscript>
 
+<!--- Test 19: cfmodule template supports hash interpolation (credit: Blute, PR #42) --->
+<cfset echoed = "">
+<cfset modulePath = "customtags/echo_attr.cfm">
+<cfset dynamicModuleError = "">
+<cftry>
+    <cfmodule template="#modulePath#" value="dynamic-module">
+    <cfcatch type="any">
+        <cfset dynamicModuleError = cfcatch.message>
+    </cfcatch>
+</cftry>
+<cfscript>
+    assert("cfmodule dynamic template error", dynamicModuleError, "");
+    assert("cfmodule dynamic template", echoed, "dynamic-module");
+</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
