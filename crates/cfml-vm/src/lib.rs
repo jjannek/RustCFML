@@ -9636,6 +9636,19 @@ impl CfmlVirtualMachine {
                 "Custom tag with name '{}' not found",
                 dot_path
             )))
+        } else if path_spec.starts_with('/') {
+            // Leading-slash template: webroot-relative in CFML — resolve
+            // through this.mappings (Application.cfc), then webroot, then the
+            // entry template dir. Must NOT be treated as OS-absolute or as a
+            // source-relative path.
+            if let Some(resolved) = self.resolve_leading_slash_include(path_spec) {
+                Ok(resolved)
+            } else {
+                Err(CfmlError::runtime(format!(
+                    "Custom tag template '{}' not found",
+                    path_spec
+                )))
+            }
         } else {
             // Plain path: resolve relative to source_file
             let resolved = if let Some(ref source) = self.source_file {

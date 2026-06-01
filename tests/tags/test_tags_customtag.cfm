@@ -86,4 +86,24 @@
     assert("cfmodule leading-slash mapped template", echoed, "leading-slash-module");
 </cfscript>
 
+<!--- Test 16: leading-slash module resolved via an alternate mapping name --->
+<cfset echoed = "">
+<cfmodule template="/wheelsmapprobe/customtags/echo_attr.cfm" value="alt-mapping-module">
+<cfscript>assert("cfmodule leading-slash alternate mapping", echoed, "alt-mapping-module");</cfscript>
+
+<!--- Test 17: caller write-back through a leading-slash module --->
+<cfset result = "">
+<cfmodule template="/tags/customtags/setter.cfm" value="leading-slash-writeback">
+<cfscript>assert("cfmodule leading-slash caller writeback", result, "leading-slash-writeback");</cfscript>
+
+<!--- Test 18: unresolvable leading-slash module still throws --->
+<cfset missingSlashError = "">
+<cftry>
+    <cfmodule template="/tags/customtags/does_not_exist_xyz.cfm" value="nope">
+    <cfcatch type="any">
+        <cfset missingSlashError = cfcatch.message>
+    </cfcatch>
+</cftry>
+<cfscript>assertTrue("cfmodule unresolvable leading-slash throws", len(missingSlashError) GT 0);</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
