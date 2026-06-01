@@ -2169,8 +2169,13 @@ impl Parser {
             // Patterns we recognise as a key:
             //   <ident>            =
             //   <ident> : <ident>  =       (namespaced, e.g. taffy:uri)
-            let head_is_keyish = matches!(self.peek(0), Token::Identifier(_))
-                || self.token_as_string(&self.peek(0).clone()).is_some();
+            // `extends`/`implements` are accepted here too: component header
+            // attributes are order-independent on Lucee/ACF/BoxLang, so they may
+            // appear AFTER another attribute (e.g. `component output="false"
+            // extends="Foo" {`) and still populate the dedicated fields.
+            let head_is_keyish =
+                matches!(self.peek(0), Token::Identifier(_) | Token::Extends | Token::Implements)
+                    || self.token_as_string(&self.peek(0).clone()).is_some();
             if !head_is_keyish {
                 break;
             }
@@ -2182,15 +2187,27 @@ impl Parser {
             if !is_simple && !is_namespaced {
                 break;
             }
-            let mut key = if let Token::Identifier(ref s) = self.peek(0) {
-                let s = s.clone();
-                self.advance();
-                s
-            } else if let Some(s) = self.token_as_string(&self.peek(0).clone()) {
-                self.advance();
-                s
-            } else {
-                break;
+            let mut key = match self.peek(0).clone() {
+                Token::Identifier(s) => {
+                    self.advance();
+                    s
+                }
+                Token::Extends => {
+                    self.advance();
+                    "extends".to_string()
+                }
+                Token::Implements => {
+                    self.advance();
+                    "implements".to_string()
+                }
+                ref t => {
+                    if let Some(s) = self.token_as_string(t) {
+                        self.advance();
+                        s
+                    } else {
+                        break;
+                    }
+                }
             };
             if is_namespaced {
                 self.advance(); // consume ':'
@@ -2208,15 +2225,30 @@ impl Parser {
                 key.push_str(&suffix);
             }
             self.consume(&Token::Equal)?;
-            if let Token::String(val) = self.peek(0).clone() {
-                self.advance();
+            // The value may be quoted OR unquoted (e.g. `output=false`).
+            let val = match self.parse_decl_attr_value() {
+                Some(v) => v,
+                None => break,
+            };
+            if key.eq_ignore_ascii_case("extends") {
+                // Only fill from the attribute form if a leading `extends` (handled
+                // above) didn't already set it.
+                if extends.is_none() {
+                    extends = Some(val);
+                }
+            } else if key.eq_ignore_ascii_case("implements") {
+                for iface in val.split(',') {
+                    let trimmed = iface.trim().to_string();
+                    if !trimmed.is_empty() {
+                        implements.push(trimmed);
+                    }
+                }
+            } else {
                 // If this is the name attribute and we have an Anonymous component, use it as the name
-                if key.to_lowercase() == "name" && name == "Anonymous" {
+                if key.eq_ignore_ascii_case("name") && name == "Anonymous" {
                     name = val.clone();
                 }
                 metadata.push((key, val));
-            } else {
-                break;
             }
         }
 
@@ -2752,6 +2784,38 @@ impl Parser {
         };
         self.advance();
         Ok(name.to_string())
+    }
+
+    /// Extract a component/interface declaration attribute VALUE. CFML accepts
+    /// the value quoted OR unquoted: a string literal, a boolean/number keyword,
+    /// or a bare (optionally dotted) identifier are all legal value positions on
+    /// Lucee/Adobe CF/BoxLang. Returns the value rendered as a string, or None if
+    /// the next token cannot begin a value.
+    fn parse_decl_attr_value(&mut self) -> Option<String> {
+        match self.peek(0).clone() {
+            Token::String(s) => {
+                self.advance();
+                Some(s)
+            }
+            Token::True => {
+                self.advance();
+                Some("true".to_string())
+            }
+            Token::False => {
+                self.advance();
+                Some("false".to_string())
+            }
+            Token::Integer(n) => {
+                self.advance();
+                Some(n.to_string())
+            }
+            Token::Double(d) => {
+                self.advance();
+                Some(d.to_string())
+            }
+            Token::Identifier(_) => self.extract_dotted_identifier().ok(),
+            _ => None,
+        }
     }
 
     /// Convert a keyword token to its string representation for use as metadata keys.
