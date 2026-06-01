@@ -426,6 +426,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getDirectoryFromPath".into(), fn_get_directory_from_path);
     f.insert("getComponentMetadata".into(), fn_get_component_metadata);
     f.insert("createUUID".into(), fn_create_uuid);
+    f.insert("createUniqueID".into(), fn_create_unique_id);
     f.insert("createGUID".into(), fn_create_guid);
     f.insert("hash".into(), fn_hash);
     f.insert("lsParseNumber".into(), fn_ls_parse_number);
@@ -4640,6 +4641,45 @@ fn fn_create_uuid(_args: Vec<CfmlValue>) -> CfmlResult {
         (mixed as u16),
         (nanos.wrapping_mul(6364136223846793005).wrapping_add(random_bits)),
     )))
+}
+
+fn fn_create_unique_id(args: Vec<CfmlValue>) -> CfmlResult {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // createUniqueID("counter") returns a per-instance lifecycle counter (1, 2, ...).
+    if !args.is_empty() && get_str(&args, 0).eq_ignore_ascii_case("counter") {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        return Ok(CfmlValue::String(n.to_string()));
+    }
+
+    // Default: a 16-byte UUID encoded as URL-safe Base64 without padding (22 chars).
+    let nanos = cfml_common::clock::now_unix_nanos() as u64;
+    let random_bits = ((cfml_random() * u32::MAX as f64) as u64) << 32
+                    | (cfml_random() * u32::MAX as f64) as u64;
+    let hi = nanos ^ random_bits;
+    let lo = nanos.wrapping_mul(6364136223846793005).wrapping_add(random_bits);
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&lo.to_be_bytes());
+
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut result = String::with_capacity(22);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        result.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((n >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            result.push(ALPHABET[(n & 63) as usize] as char);
+        }
+    }
+    Ok(CfmlValue::String(result))
 }
 
 fn fn_create_guid(_args: Vec<CfmlValue>) -> CfmlResult {
