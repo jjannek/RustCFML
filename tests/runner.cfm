@@ -257,6 +257,9 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
+//   - script_transaction_attrs: cfscript `transaction action="begin" { ... }`
+//     (the attribute form of the transaction tag, with a body).
+try { include "tags/test_script_transaction_attrs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_script_transaction_attrs.cfm | " & e.message & chr(10)); }
 //   - component_declaration_attributes: follow-on to component_soft_keyword.
 //     Component-header metadata attributes are order-independent and may be
 //     written quoted or unquoted on Lucee/ACF/BoxLang. Two shapes the Wheels
@@ -296,6 +299,17 @@ try { include "core/test_script_fn_post_paren_attr.cfm"; } catch (any e) { write
 //     function-call form invoke(component=..)/cfinvoke(..) is intentionally NOT
 //     tested: Lucee rejects it at compile time, so it is not a portable contract.
 try { include "core/test_invoke_canonical_forms.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_canonical_forms.cfm | " & e.message & chr(10)); }
+//   - reserved_word_identifiers / quoted_catch_type: follow-on to PR #32 — `new`
+//     as a method name, `extends`/`implements` as parameter names, and a quoted
+//     string catch type (`catch ("My.Type" e)`) are all soft constructs on
+//     Lucee/ACF/BoxLang now accepted by RustCFML.
+try { include "core/test_reserved_word_identifiers.cfm"; } catch (any e) { writeOutput("ERROR | core/test_reserved_word_identifiers.cfm | " & e.message & chr(10)); }
+try { include "core/test_quoted_catch_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_quoted_catch_type.cfm | " & e.message & chr(10)); }
+//   - chained_compound_assignment: `a = b &= c` (compound assignment as the RHS
+//     of an assignment); switch_braced_case: a compound-assignment statement
+//     inside a braced `case`/`default` body. Both surfaced while booting Wheels.
+try { include "core/test_chained_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_chained_compound_assignment.cfm | " & e.message & chr(10)); }
+try { include "core/test_switch_braced_case.cfm"; } catch (any e) { writeOutput("ERROR | core/test_switch_braced_case.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

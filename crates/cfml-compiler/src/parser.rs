@@ -913,10 +913,32 @@ impl Parser {
                     }
                 }
             }
-            if nlow == "transaction" && matches!(self.peek(1), Token::LBrace) {
+            // `transaction { body }` (bare) or `transaction action="begin" { body }`
+            // (with space-separated tag attributes). Lucee/Adobe CF/BoxLang accept
+            // both. The attribute form mirrors the angle-bracket `<cftransaction
+            // action="...">` tag and lowers to the same start/commit/rollback shape.
+            if nlow == "transaction"
+                && (matches!(self.peek(1), Token::LBrace)
+                    || (self.is_identifier_like_at(1) && matches!(self.peek(2), Token::Equal)))
+            {
+                let saved = self.current;
                 self.advance(); // consume 'transaction'
-                let body = self.parse_block()?;
-                return Ok(self.lower_script_body_tag("cftransaction", Vec::new(), body, stmt_loc));
+                let mut attrs: Vec<(String, Expression)> = Vec::new();
+                while self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                    let key = self.extract_identifier()?;
+                    self.advance(); // consume =
+                    match self.parse_expression() {
+                        Ok(v) => attrs.push((key, v)),
+                        Err(_) => break,
+                    }
+                }
+                if self.check(&Token::LBrace) {
+                    let body = self.parse_block()?;
+                    return Ok(self.lower_script_body_tag("cftransaction", attrs, body, stmt_loc));
+                }
+                // No `{` body (e.g. a bare `transaction action="commit";` statement
+                // form we don't special-case) — restore and fall through.
+                self.current = saved;
             }
         }
 
@@ -1429,9 +1451,17 @@ impl Parser {
                     && !self.check(&Token::RBrace)
                     && !self.is_at_end()
                 {
-                    let node = self.parse_statement()?;
-                    if let CfmlNode::Statement(s) = node {
-                        body.push(s);
+                    // A case body may be wrapped in braces (`case "x": { … }`).
+                    // A bare `{` at statement position would otherwise be misread
+                    // as a struct literal, so treat it as a block and flatten its
+                    // statements (CFML blocks introduce no scope of their own).
+                    if self.check(&Token::LBrace) {
+                        body.extend(self.parse_block()?);
+                    } else {
+                        let node = self.parse_statement()?;
+                        if let CfmlNode::Statement(s) = node {
+                            body.push(s);
+                        }
                     }
                 }
 
@@ -1444,9 +1474,15 @@ impl Parser {
                     && !self.check(&Token::RBrace)
                     && !self.is_at_end()
                 {
-                    let node = self.parse_statement()?;
-                    if let CfmlNode::Statement(s) = node {
-                        body.push(s);
+                    // See the `case` body above: a braced default body would be
+                    // misread as a struct literal, so flatten a leading block.
+                    if self.check(&Token::LBrace) {
+                        body.extend(self.parse_block()?);
+                    } else {
+                        let node = self.parse_statement()?;
+                        if let CfmlNode::Statement(s) = node {
+                            body.push(s);
+                        }
                     }
                 }
 
@@ -1476,13 +1512,22 @@ impl Parser {
             self.consume(&Token::LParen)?;
 
             // catch (type varname) or catch (varname) or catch (any e)
-            // Exception types can be dotted: catch (FW1.AbortControllerException e)
-            let mut first = self.extract_identifier()?;
-            while self.check(&Token::Dot) && self.is_identifier_like_at(1) {
-                self.advance(); // consume dot
-                let part = self.extract_identifier()?;
-                first = format!("{}.{}", first, part);
-            }
+            // The exception type may be a bare (optionally dotted) identifier
+            // (`catch (FW1.AbortControllerException e)`) OR a quoted string literal
+            // (`catch ("My.Custom.Type" e)`) — the idiomatic way to name a dotted,
+            // namespaced custom exception. Lucee/Adobe CF/BoxLang accept both forms.
+            let mut first = if let Token::String(s) = self.peek(0).clone() {
+                self.advance();
+                s
+            } else {
+                let mut id = self.extract_identifier()?;
+                while self.check(&Token::Dot) && self.is_identifier_like_at(1) {
+                    self.advance(); // consume dot
+                    let part = self.extract_identifier()?;
+                    id = format!("{}.{}", id, part);
+                }
+                id
+            };
 
             let (var_type, var_name) = if self.check(&Token::RParen) {
                 (None, first)
@@ -2811,7 +2856,7 @@ impl Parser {
             | Token::Property | Token::Abstract | Token::Final | Token::Static | Token::Lock
             | Token::Function | Token::Var | Token::Throw | Token::Component
             | Token::Interface | Token::Package | Token::Remote
-            | Token::Public | Token::Private
+            | Token::Public | Token::Private | Token::Extends | Token::Implements
         )
     }
 
@@ -2846,6 +2891,13 @@ impl Parser {
             Token::Remote => { self.advance(); Ok("remote".to_string()) }
             Token::Public => { self.advance(); Ok("public".to_string()) }
             Token::Private => { self.advance(); Ok("private".to_string()) }
+            // `extends` / `implements` are declaration keywords but, like the
+            // other soft keywords above, are legal ordinary identifiers (e.g.
+            // function parameter names) on Lucee/Adobe CF/BoxLang. Component and
+            // interface headers match these tokens explicitly before reaching
+            // here, so accepting them as identifiers does not shadow inheritance.
+            Token::Extends => { self.advance(); Ok("extends".to_string()) }
+            Token::Implements => { self.advance(); Ok("implements".to_string()) }
             _ => Err(self.parse_error("Expected identifier")),
         }
     }
@@ -2975,7 +3027,7 @@ impl Parser {
             if let Expression::Identifier(ref ident) = expr {
                 let name = ident.name.clone();
                 self.advance(); // consume =
-                let value = self.parse_expression()?;
+                let value = self.parse_assignment_rhs()?;
                 return Ok(Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(Expression::Identifier(Identifier {
                         name,
@@ -2987,11 +3039,60 @@ impl Parser {
                 })));
             } else if let Expression::MemberAccess(_) | Expression::ArrayAccess(_) = &expr {
                 self.advance(); // consume =
-                let value = self.parse_expression()?;
+                let value = self.parse_assignment_rhs()?;
                 return Ok(Expression::BinaryOp(Box::new(BinaryOp {
                     left: Box::new(expr),
                     operator: BinaryOpType::Assign,
                     right: Box::new(value),
+                    location: self.current_location(),
+                })));
+            }
+        }
+
+        Ok(expr)
+    }
+
+    /// Parse the right-hand side of an assignment. Unlike `parse_assignment_expr`,
+    /// this also accepts a *compound* assignment operator (`&=`, `+=`, …) so a
+    /// chained assignment like `local.sql = local.sql &= ";"` parses as
+    /// `local.sql = (local.sql = local.sql & ";")`. Top-level statement
+    /// compound-assignment is intentionally NOT routed here: the statement parser
+    /// handles `lhs OP= rhs` directly (check_assignment_op) to keep the
+    /// single-evaluation semantics of struct/array targets in codegen
+    /// (Statement::Assignment / emit_load_current_target).
+    fn parse_assignment_rhs(&mut self) -> Result<Expression, ParseError> {
+        let expr = self.parse_ternary()?;
+
+        if self.check(&Token::Equal) {
+            if let Expression::Identifier(_) | Expression::MemberAccess(_) | Expression::ArrayAccess(_) = &expr {
+                self.advance(); // consume =
+                let value = self.parse_assignment_rhs()?;
+                return Ok(Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(expr),
+                    operator: BinaryOpType::Assign,
+                    right: Box::new(value),
+                    location: self.current_location(),
+                })));
+            }
+        } else if let Some(bin_op) = self.compound_assign_binop() {
+            if matches!(
+                expr,
+                Expression::Identifier(_)
+                    | Expression::MemberAccess(_)
+                    | Expression::ArrayAccess(_)
+            ) {
+                self.advance(); // consume the compound operator
+                let value = self.parse_assignment_rhs()?;
+                let combined = Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(expr.clone()),
+                    operator: bin_op,
+                    right: Box::new(value),
+                    location: self.current_location(),
+                }));
+                return Ok(Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(expr),
+                    operator: BinaryOpType::Assign,
+                    right: Box::new(combined),
                     location: self.current_location(),
                 })));
             }
@@ -3706,6 +3807,14 @@ impl Parser {
             })),
             Token::Remote => Ok(Expression::Identifier(Identifier {
                 name: "remote".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Extends => Ok(Expression::Identifier(Identifier {
+                name: "extends".to_string(),
+                location: self.current_location(),
+            })),
+            Token::Implements => Ok(Expression::Identifier(Identifier {
+                name: "implements".to_string(),
                 location: self.current_location(),
             })),
             Token::This => Ok(Expression::This(This {
