@@ -31,6 +31,11 @@ switch (url.test) {
         writeOutput(url.probe ?: "");
         break;
 
+    case "echo":
+        header name="X-Echo-Method" value=cgi.request_method ?: "";
+        writeOutput("echo-ok");
+        break;
+
     default:
         writeOutput("unknown-test");
 }

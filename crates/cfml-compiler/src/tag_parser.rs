@@ -578,19 +578,19 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let proxyserver = attrs.get("proxyserver").cloned();
 
             let mut opts = Vec::new();
-            let url_stripped = strip_hashes(&url);
-            if url != url_stripped {
-                opts.push(format!("url: {}", url_stripped));
-            } else {
-                opts.push(format!("url: \"{}\"", url));
-            }
-            opts.push(format!("method: \"{}\"", method));
+            // String attributes may carry #expr# interpolation inside an
+            // otherwise-literal quoted value (e.g. url="#baseUrl##path#").
+            // format_attr_value emits literal segments quoted and only evaluates
+            // the #...# parts; strip_hashes would collapse the whole value into a
+            // bare (mis-parsed) expression like `baseUrlpath`.
+            opts.push(format!("url: {}", format_attr_value(&url, quoted.contains("url"))));
+            opts.push(format!("method: {}", format_attr_value(&method, quoted.contains("method"))));
             if let Some(t) = timeout { opts.push(format!("timeout: {}", t)); }
-            if let Some(c) = charset { opts.push(format!("charset: \"{}\"", c)); }
-            if let Some(u) = username { opts.push(format!("username: \"{}\"", u)); }
-            if let Some(p) = password { opts.push(format!("password: \"{}\"", p)); }
-            if let Some(u) = useragent { opts.push(format!("useragent: \"{}\"", u)); }
-            if let Some(p) = proxyserver { opts.push(format!("proxyserver: \"{}\"", p)); }
+            if let Some(c) = charset { opts.push(format!("charset: {}", format_attr_value(&c, quoted.contains("charset")))); }
+            if let Some(u) = username { opts.push(format!("username: {}", format_attr_value(&u, quoted.contains("username")))); }
+            if let Some(p) = password { opts.push(format!("password: {}", format_attr_value(&p, quoted.contains("password")))); }
+            if let Some(u) = useragent { opts.push(format!("useragent: {}", format_attr_value(&u, quoted.contains("useragent")))); }
+            if let Some(p) = proxyserver { opts.push(format!("proxyserver: {}", format_attr_value(&p, quoted.contains("proxyserver")))); }
 
             // Check for body with <cfhttpparam> child tags
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp") {
