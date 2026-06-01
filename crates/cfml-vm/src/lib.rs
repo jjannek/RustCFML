@@ -1192,14 +1192,40 @@ impl CfmlVirtualMachine {
             }
         }
 
-        // Build CFML arguments scope
+        // Build CFML arguments scope.
+        //
+        // A declared param that the caller omits is only materialized when it
+        // has a default value: the default-value preamble (emitted by codegen)
+        // seeds the local + the `arguments` key at runtime. An omitted param
+        // with no default must stay ABSENT from both `locals` and `arguments`,
+        // so `structKeyExists(arguments, "p")` is false — matching Lucee/ACF.
         let mut arguments_map: IndexMap<String, CfmlValue> = IndexMap::new();
         for (i, param_name) in func.params.iter().enumerate() {
-            let value = args.get(i).cloned().unwrap_or(CfmlValue::Null);
-            locals.insert(param_name.clone(), value.clone());
-            arguments_map.insert(param_name.clone(), value.clone());
-            // Also make args accessible by position (1-based)
-            arguments_map.insert((i + 1).to_string(), value);
+            let has_default = func.has_default.get(i).copied().unwrap_or(false);
+            // A Null arg value counts as "not supplied": CFML has no way to pass
+            // an explicit null, and the named-argument rebinder pads omitted
+            // slots with Null to keep later named args at the right index.
+            let supplied = match args.get(i) {
+                Some(v) if !matches!(v, CfmlValue::Null) => Some(v.clone()),
+                _ => None,
+            };
+            match supplied {
+                Some(value) => {
+                    locals.insert(param_name.clone(), value.clone());
+                    arguments_map.insert(param_name.clone(), value.clone());
+                    // Also make args accessible by position (1-based)
+                    arguments_map.insert((i + 1).to_string(), value);
+                }
+                None => {
+                    // Omitted. Pre-seed Null only so the default preamble's
+                    // LoadLocal/IsNull check works; it then fills the real
+                    // default into both the local and the arguments key. A param
+                    // with no default stays absent from `arguments` entirely.
+                    if has_default {
+                        locals.insert(param_name.clone(), CfmlValue::Null);
+                    }
+                }
+            }
         }
         // Also add any extra positional args beyond declared params
         for i in func.params.len()..args.len() {

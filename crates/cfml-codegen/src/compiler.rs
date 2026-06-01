@@ -82,6 +82,11 @@ pub struct BytecodeFunction {
     pub params: Vec<String>,
     /// Which params are required (parallel to `params`; true = required)
     pub required_params: Vec<bool>,
+    /// Which params declare a default value (parallel to `params`; true = has
+    /// default). An omitted param with no default must stay absent from the
+    /// `arguments` scope; one with a default is materialized by the bytecode
+    /// preamble, so the VM only needs to pre-seed it as Null.
+    pub has_default: Vec<bool>,
     pub instructions: Vec<BytecodeOp>,
     pub source_file: Option<String>,
     /// Lucee `localMode` for this function. `Some(true)` = modern (unscoped
@@ -297,6 +302,7 @@ impl CfmlCompiler {
                     name: "__main__".to_string(),
                     params: Vec::new(),
                     required_params: Vec::new(),
+                    has_default: Vec::new(),
                     instructions: Vec::new(),
                     source_file: None,
                     declared_local_mode: None,
@@ -1908,6 +1914,7 @@ impl CfmlCompiler {
             name: func.name.clone(),
             params: func.params.iter().map(|p| p.name.clone()).collect(),
             required_params: func.params.iter().map(|p| p.required).collect(),
+            has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
             source_file: None,
             declared_local_mode: declared_mode,
@@ -2086,6 +2093,7 @@ impl CfmlCompiler {
                     name: getter_name.clone(),
                     params: Vec::new(),
                     required_params: Vec::new(),
+                    has_default: Vec::new(),
                     instructions: vec![
                         BytecodeOp::LoadLocal("this".to_string()),
                         BytecodeOp::GetProperty(prop.name.clone()),
@@ -2117,6 +2125,7 @@ impl CfmlCompiler {
                     name: setter_name.clone(),
                     params: vec![prop.name.clone()],
                     required_params: vec![true],
+                    has_default: vec![false],
                     instructions: vec![
                         // Set on this: this.name = value; store modified this back
                         BytecodeOp::LoadLocal("this".to_string()),
@@ -2775,6 +2784,7 @@ impl CfmlCompiler {
                     name: func_name.clone(),
                     params: closure.params.iter().map(|p| p.name.clone()).collect(),
                     required_params: closure.params.iter().map(|p| p.required).collect(),
+                    has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
                     source_file: None,
                     declared_local_mode: effective_declared,
@@ -2817,6 +2827,7 @@ impl CfmlCompiler {
                     name: func_name.clone(),
                     params: arrow.params.iter().map(|p| p.name.clone()).collect(),
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
+                    has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
                     source_file: None,
                     declared_local_mode: arrow_effective,
