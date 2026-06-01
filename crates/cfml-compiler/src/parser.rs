@@ -2077,31 +2077,28 @@ impl Parser {
         let mut return_type = None;
         let name;
 
-        let first = self.extract_identifier()?;
-
-        // Absorb a dotted continuation: `a.b.c`. This is either a dotted return
-        // type (`MachII.framework.AppManager getFoo()`) or — in tag-based CFCs —
-        // a dotted function NAME (`<cffunction name="upload.profile_id">`).
+        // Parse a (possibly dotted) run. A function name is always immediately
+        // followed by `(`, so if `(` does not follow the first run, that run was
+        // a return type and the real name is the next run. Names accept soft
+        // keywords and other keyword identifiers (e.g. a method named `new`);
+        // in tag-based CFCs they may also be dotted (`upload.profile_id`).
+        let first = self.extract_function_name()?;
         let mut dotted = first;
         while self.match_token(&Token::Dot) {
-            let part = self.extract_identifier()?;
             dotted.push('.');
-            dotted.push_str(&part);
+            dotted.push_str(&self.extract_function_name()?);
         }
 
-        // If an identifier follows, `dotted` was the return type and the real
-        // name comes next (which may itself be dotted).
-        if let Token::Identifier(_) = self.peek(0) {
+        if self.check(&Token::LParen) {
+            name = dotted;
+        } else {
             return_type = Some(dotted);
-            let mut n = self.extract_identifier()?;
+            let mut n = self.extract_function_name()?;
             while self.match_token(&Token::Dot) {
-                let part = self.extract_identifier()?;
                 n.push('.');
-                n.push_str(&part);
+                n.push_str(&self.extract_function_name()?);
             }
             name = n;
-        } else {
-            name = dotted;
         }
 
         self.consume(&Token::LParen)?;
@@ -2851,6 +2848,13 @@ impl Parser {
             Token::Private => { self.advance(); Ok("private".to_string()) }
             _ => Err(self.parse_error("Expected identifier")),
         }
+    }
+
+    /// Extract a function/method name. Accepts identifiers, soft keywords, and
+    /// other keywords that are legal member names in CFML (e.g. a method named
+    /// `new`), mirroring property-name rules.
+    fn extract_function_name(&mut self) -> Result<String, ParseError> {
+        self.extract_property_name()
     }
 
     /// Extract a property name after a dot — any keyword or identifier is valid in CFML.
