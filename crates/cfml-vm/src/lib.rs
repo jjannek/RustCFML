@@ -12598,39 +12598,45 @@ impl CfmlVirtualMachine {
             if let Some(ref server_state) = self.server_state.clone() {
                 if let Some(ref app_scope) = self.application_scope {
                     if let Ok(scope) = app_scope.lock() {
-                    let scope_snapshot = scope.clone();
-                    let program_functions = self.program.functions.clone();
+                    // Refresh the function cache to the bytecode functions still
+                    // reachable from application scope, so long-lived CFCs,
+                    // factories and closures stay callable on later requests.
+                    // Reachability is recomputed from the current scope every
+                    // request, so functions whose app-scope values were
+                    // overwritten/abandoned during the request drop out — no
+                    // stale retention, no unbounded growth.
+                    //
+                    // This deliberately carries EVERY reachable function, including
+                    // those whose bytecode lives in Application.cfc or the page
+                    // itself (i.e. below the onApplicationStart offset). A closure
+                    // or function reference defined there and stored in application
+                    // scope still holds a volatile per-request `func_idx`; unless it
+                    // is carried and remapped on restore it dangles to whatever
+                    // occupies that slot on the next request once a differently
+                    // sized page shifts the table layout.
+                    let function_indices: Vec<usize> =
+                        Self::application_scope_function_indices(&*scope)
+                            .into_iter()
+                            .filter(|idx| *idx < self.program.functions.len())
+                            .collect();
+                    // Clone only the reachable function Arcs, not the whole table.
+                    let cached_functions: Vec<_> = function_indices
+                        .iter()
+                        .map(|idx| self.program.functions[*idx].clone())
+                        .collect();
+                    // Legacy field — the restore path keys off cached_function_indices;
+                    // keep it as the minimum reachable index for the fallback path.
+                    let original_offset = function_indices.first().copied().unwrap_or(0);
                     server_state.applications.modify(&app_name, &mut |app| {
-                        app.variables = scope_snapshot.clone();
-                        // Refresh the function cache to the bytecode functions
-                        // still reachable from application scope. This keeps
-                        // long-lived CFCs/factories callable across requests
-                        // without retaining stale functions from app-scope
-                        // values that were overwritten during this request.
-                        let offset = app.cached_functions_original_offset;
-                        let function_indices = Self::application_scope_function_indices(
-                            &scope_snapshot,
-                        )
-                        .into_iter()
-                        .filter(|idx| offset == 0 || *idx >= offset)
-                        .collect::<Vec<_>>();
-                        if !function_indices.is_empty() {
-                            if offset == 0 {
-                                app.cached_functions_original_offset = function_indices[0];
-                            }
-                            app.cached_function_indices = function_indices
-                                .into_iter()
-                                .filter(|idx| *idx < program_functions.len())
-                                .collect();
-                            app.cached_functions = app
-                                .cached_function_indices
-                                .iter()
-                                .map(|idx| program_functions[*idx].clone())
-                                .collect();
-                        } else {
+                        app.variables = scope.clone();
+                        if function_indices.is_empty() {
                             app.cached_functions_original_offset = 0;
                             app.cached_function_indices.clear();
                             app.cached_functions.clear();
+                        } else {
+                            app.cached_functions_original_offset = original_offset;
+                            app.cached_function_indices = function_indices.clone();
+                            app.cached_functions = cached_functions.clone();
                         }
                     });
                     }
