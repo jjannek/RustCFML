@@ -12647,6 +12647,8 @@ where
 
 /// CFML equality comparison (case-insensitive for strings, type-coercing for numbers)
 fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
+    // A QueryColumn proxy behaves as its first-row value in scalar comparison.
+    let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
     match (a, b) {
         (CfmlValue::Null, CfmlValue::Null) => true,
         (CfmlValue::Null, _) | (_, CfmlValue::Null) => false,
@@ -12698,6 +12700,8 @@ fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
 
 /// CFML comparison ordering
 fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
+    // A QueryColumn proxy behaves as its first-row value in scalar comparison.
+    let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
     match (a, b) {
         (CfmlValue::Int(x), CfmlValue::Int(y)) => x.cmp(y) as i32,
         (CfmlValue::Double(x), CfmlValue::Double(y)) => x.partial_cmp(y).map_or(0, |o| o as i32),

@@ -746,7 +746,8 @@ fn get_str(args: &[CfmlValue], idx: usize) -> String {
 }
 
 fn get_int(args: &[CfmlValue], idx: usize) -> i64 {
-    match args.get(idx) {
+    // A QueryColumn proxy coerces to its first-row value in scalar contexts.
+    match args.get(idx).map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Int(i)) => *i,
         Some(CfmlValue::Double(d)) => *d as i64,
         Some(CfmlValue::String(s)) => s.parse().unwrap_or(0),
@@ -756,7 +757,8 @@ fn get_int(args: &[CfmlValue], idx: usize) -> i64 {
 }
 
 fn get_float(args: &[CfmlValue], idx: usize) -> f64 {
-    match args.get(idx) {
+    // A QueryColumn proxy coerces to its first-row value in scalar contexts.
+    match args.get(idx).map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Int(i)) => *i as f64,
         Some(CfmlValue::Double(d)) => *d,
         Some(CfmlValue::String(s)) => s.parse().unwrap_or(0.0),

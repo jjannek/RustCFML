@@ -519,6 +519,18 @@ impl CfmlValue {
         }
     }
 
+    /// For a `QueryColumn` proxy, the scalar value it stands in for — its first
+    /// row (Lucee treats `q.col` as a proxy that behaves like the first row in
+    /// scalar contexts: numeric coercion, comparison). For anything else,
+    /// returns `self` unchanged.
+    pub fn query_column_scalar(&self) -> &CfmlValue {
+        static NULL: CfmlValue = CfmlValue::Null;
+        match self {
+            CfmlValue::QueryColumn(a) => a.first().unwrap_or(&NULL),
+            _ => self,
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<CfmlValue> {
         match self {
             CfmlValue::Struct(s) => s.get(key),
