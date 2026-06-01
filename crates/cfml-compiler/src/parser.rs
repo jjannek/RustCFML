@@ -3895,7 +3895,14 @@ impl Parser {
                     let expr = self.parse_expression()?;
                     elements.push(Expression::Spread(Box::new(expr)));
                 } else {
-                    elements.push(self.parse_expression()?);
+                    let expr = self.parse_expression()?;
+                    // `[ key: value, ... ]` is an ordered struct literal (Lucee).
+                    // We only learn this once we hit the first colon, so hand off
+                    // to the bracket-struct parser carrying the key parsed so far.
+                    if elements.is_empty() && self.match_token(&Token::Colon) {
+                        return self.parse_bracket_struct_literal(expr);
+                    }
+                    elements.push(expr);
                 }
                 if !self.match_token(&Token::Comma) {
                     break;
@@ -3907,6 +3914,51 @@ impl Parser {
 
         Ok(Expression::Array(Array {
             elements,
+            location: self.current_location(),
+        }))
+    }
+
+    /// Finish parsing a bracket-delimited ordered struct literal
+    /// (`[ "key": value, ... ]`). `first_key` is the already-parsed key whose
+    /// trailing `:` has just been consumed.
+    fn parse_bracket_struct_literal(
+        &mut self,
+        first_key: Expression,
+    ) -> Result<Expression, ParseError> {
+        let mut pairs = Vec::new();
+        let first_value = self.parse_expression()?;
+        pairs.push((first_key, first_value));
+
+        while self.match_token(&Token::Comma) {
+            if self.check(&Token::RBracket) {
+                break; // trailing comma
+            }
+            if self.match_token(&Token::DotDotDot) {
+                let expr = self.parse_expression()?;
+                pairs.push((Expression::Spread(Box::new(expr.clone())), expr));
+                continue;
+            }
+            let is_key_eq =
+                self.is_identifier_like_at(0) && matches!(self.peek(1), Token::Equal);
+            let key = if is_key_eq {
+                self.parse_ternary()?
+            } else {
+                self.parse_expression()?
+            };
+            if self.match_token(&Token::Colon) || self.match_token(&Token::Equal) {
+                let value = self.parse_expression()?;
+                pairs.push((key, value));
+            } else {
+                // Shorthand [x] means [x: x]
+                pairs.push((key.clone(), key));
+            }
+        }
+
+        self.consume(&Token::RBracket)?;
+
+        Ok(Expression::Struct(Struct {
+            pairs,
+            ordered: true,
             location: self.current_location(),
         }))
     }
