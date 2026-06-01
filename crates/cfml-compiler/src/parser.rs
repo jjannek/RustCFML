@@ -2578,8 +2578,12 @@ impl Parser {
             let required = self.match_token(&Token::Required);
             let mut param_type = None;
 
+            // The leading token(s) are EITHER the parameter name, OR a type
+            // annotation followed by the name. A type may be a dotted FQN
+            // (`wheels.system.TestResult`), so parse it as a dotted identifier;
+            // the name itself is always a single identifier.
             let first = self
-                .extract_identifier()
+                .extract_dotted_identifier()
                 .unwrap_or_else(|_| "arg".to_string());
 
             // If next is also an identifier (or soft keyword usable as identifier),

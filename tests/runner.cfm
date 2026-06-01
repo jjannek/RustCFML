@@ -262,6 +262,11 @@ try { include "core/test_interface_extends_attribute.cfm"; } catch (any e) { wri
 //     inherited via an interface's own `extends` (IDeclDog extends
 //     IDeclCreature), for both `new X()` and createObject("component", ...).
 try { include "core/test_isinstanceof_interface_chain.cfm"; } catch (any e) { writeOutput("ERROR | core/test_isinstanceof_interface_chain.cfm | " & e.message & chr(10)); }
+//   - dotted_param_type: a function/method parameter may carry a dotted FQN
+//     type (function f( wheels.system.TestResult x )). RustCFML used to reject
+//     the first `.` ("Expected RParen, found Dot"). Parse-only (Lucee enforces
+//     the type at call time, so the test never calls with a mismatched value).
+try { include "core/test_dotted_param_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_dotted_param_type.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
