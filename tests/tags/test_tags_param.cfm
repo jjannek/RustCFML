@@ -32,6 +32,20 @@
 <cfparam name="typedDefault" type="string" default="typed">
 <cfscript>assert("cfparam default with type", typedDefault, "typed");</cfscript>
 
+<!--- cfparam quoted defaults with spaces/operators remain literal strings --->
+<cfset quotedDefaultError = "">
+<cftry>
+    <cfparam name="classDefault" default="px-5 py-5">
+    <cfcatch type="any">
+        <cfset quotedDefaultError = cfcatch.message>
+    </cfcatch>
+</cftry>
+<cfscript>
+    classDefaultValue = structKeyExists(variables, "classDefault") ? variables.classDefault : "";
+    assert("cfparam quoted default error", quotedDefaultError, "");
+    assert("cfparam quoted default with spaces and hyphens", classDefaultValue, "px-5 py-5");
+</cfscript>
+
 <!--- cfparam with type="array" default --->
 <cfparam name="arrDefault" type="array" default="#[]#">
 <cfscript>assertTrue("cfparam array default is array", isArray(arrDefault));</cfscript>
