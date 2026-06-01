@@ -507,6 +507,27 @@ impl CfmlCompiler {
         self.compile_expression(base, instructions);
     }
 
+    /// Push the current value of a compound-assignment target onto the stack.
+    /// Used by `+=`, `-=`, `*=`, `/=`, `%=`, `&=` so the existing value can be
+    /// combined with the RHS regardless of whether the target is a plain
+    /// variable, a struct member, or an array element.
+    fn emit_load_current_target(&mut self, target: &AssignTarget, instructions: &mut Vec<BytecodeOp>) {
+        match target {
+            AssignTarget::Variable(name) => {
+                instructions.push(BytecodeOp::LoadLocal(name.clone()));
+            }
+            AssignTarget::StructAccess(obj, member) => {
+                self.compile_expression(obj, instructions);
+                instructions.push(BytecodeOp::GetProperty(member.clone()));
+            }
+            AssignTarget::ArrayAccess(arr, idx) => {
+                self.compile_expression(arr, instructions);
+                self.compile_expression(idx, instructions);
+                instructions.push(BytecodeOp::GetIndex);
+            }
+        }
+    }
+
     /// Get the first argument expression of a function call (for mutating write-back).
     fn mutating_call_first_arg(expr: &Expression) -> Option<&Expression> {
         if let Expression::FunctionCall(call) = expr {
@@ -739,93 +760,43 @@ impl CfmlCompiler {
 
                 self.compile_expression(&assign.value, instructions);
 
+                // Stack on entry to each arithmetic/concat arm: [rhs]. We push the
+                // target's current value, then a RUNTIME Swap to get [current, rhs]
+                // (the correct order for the non-commutative ops), then the op.
+                // A compile-time instruction swap would only be correct when the
+                // RHS is a single push; for multi-op RHS like `x += arr[i]` or
+                // `x -= obj.p` it corrupts the bytecode. The current-value load
+                // must cover all three target kinds, not just plain variables.
                 match &assign.operator {
                     AssignOp::PlusEqual => {
-                        if let AssignTarget::Variable(name) = &assign.target {
-                            instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                        }
-                        // Reorder to [target, rhs] with a RUNTIME swap. A
-                        // compile-time instruction swap would only be correct
-                        // when the RHS is a single push; for multi-op RHS like
-                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        self.emit_load_current_target(&assign.target, instructions);
                         instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Add);
                     }
                     AssignOp::MinusEqual => {
-                        if let AssignTarget::Variable(name) = &assign.target {
-                            instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                        }
-                        // Reorder to [target, rhs] with a RUNTIME swap. A
-                        // compile-time instruction swap would only be correct
-                        // when the RHS is a single push; for multi-op RHS like
-                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        self.emit_load_current_target(&assign.target, instructions);
                         instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Sub);
                     }
                     AssignOp::StarEqual => {
-                        if let AssignTarget::Variable(name) = &assign.target {
-                            instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                        }
-                        // Reorder to [target, rhs] with a RUNTIME swap. A
-                        // compile-time instruction swap would only be correct
-                        // when the RHS is a single push; for multi-op RHS like
-                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        self.emit_load_current_target(&assign.target, instructions);
                         instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Mul);
                     }
                     AssignOp::SlashEqual => {
-                        match &assign.target {
-                            AssignTarget::Variable(name) => {
-                                instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                            }
-                            _ => {}
-                        }
-                        // Reorder to [target, rhs] with a RUNTIME swap. A
-                        // compile-time instruction swap would only be correct
-                        // when the RHS is a single push; for multi-op RHS like
-                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        self.emit_load_current_target(&assign.target, instructions);
                         instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Div);
                     }
                     AssignOp::PercentEqual => {
-                        match &assign.target {
-                            AssignTarget::Variable(name) => {
-                                instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                            }
-                            _ => {}
-                        }
-                        // Reorder to [target, rhs] with a RUNTIME swap. A
-                        // compile-time instruction swap would only be correct
-                        // when the RHS is a single push; for multi-op RHS like
-                        // `x += arr[i]` or `x -= obj.p` it corrupts the bytecode.
+                        self.emit_load_current_target(&assign.target, instructions);
                         instructions.push(BytecodeOp::Swap);
                         instructions.push(BytecodeOp::Mod);
                     }
                     AssignOp::ConcatEqual => {
-                        match &assign.target {
-                            AssignTarget::Variable(name) => {
-                                instructions.push(BytecodeOp::LoadLocal(name.clone()));
-                                // Runtime swap → [target, rhs]; correct even when
-                                // the RHS compiled to multiple instructions.
-                                instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::Concat);
-                            }
-                            AssignTarget::StructAccess(obj, member) => {
-                                // Stack: [rhs]. Load current, then Swap + Concat so
-                                // the final stack order is [current, rhs] → [result].
-                                self.compile_expression(obj, instructions);
-                                instructions.push(BytecodeOp::GetProperty(member.clone()));
-                                instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::Concat);
-                            }
-                            AssignTarget::ArrayAccess(arr, idx) => {
-                                self.compile_expression(arr, instructions);
-                                self.compile_expression(idx, instructions);
-                                instructions.push(BytecodeOp::GetIndex);
-                                instructions.push(BytecodeOp::Swap);
-                                instructions.push(BytecodeOp::Concat);
-                            }
-                        }
+                        self.emit_load_current_target(&assign.target, instructions);
+                        instructions.push(BytecodeOp::Swap);
+                        instructions.push(BytecodeOp::Concat);
                     }
                     AssignOp::Equal => {} // Value already on stack
                 }
