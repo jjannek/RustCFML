@@ -27,6 +27,10 @@ switch (url.test) {
         writeOutput('{"status":"ok"}');
         break;
 
+    case "url-echo":
+        writeOutput(url.probe ?: "");
+        break;
+
     default:
         writeOutput("unknown-test");
 }
