@@ -157,6 +157,7 @@ try { include "includes/test_named_args_includes.cfm"; } catch (any e) { writeOu
 
 // --- Lifecycle / server request fixtures ---
 try { include "lifecycle/test_application_mapping_coverage.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_mapping_coverage.cfm | " & e.message & chr(10)); }
+try { include "lifecycle/test_application_load_errors.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_load_errors.cfm | " & e.message & chr(10)); }
 
 // --- Java Shims ---
 try { include "java_shims/test_all.cfm"; } catch (any e) { writeOutput("ERROR | java_shims/test_all.cfm | " & e.message & chr(10)); }

@@ -11630,9 +11630,17 @@ impl CfmlVirtualMachine {
     }
 
     /// Load and execute Application.cfc, returning the component struct
-    fn load_application_cfc(&mut self, path: &str) -> Option<CfmlValue> {
+    ///
+    /// Returns `Ok(Some(template))` on success, `Ok(None)` when no usable
+    /// component could be located/compiled (caller falls through to the page),
+    /// and `Err(e)` when the Application.cfc pseudo-constructor itself threw —
+    /// a load failure must abort the request, not silently run the page.
+    fn load_application_cfc(&mut self, path: &str) -> Result<Option<CfmlValue>, CfmlError> {
         let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-        let sub_program = compile_file_cached(path, cache, self.vfs.as_ref()).ok()?;
+        let sub_program = match compile_file_cached(path, cache, self.vfs.as_ref()) {
+            Ok(p) => p,
+            Err(e) => return Err(e),
+        };
 
         // Save current program, swap in sub-program
         let old_program = std::mem::replace(&mut self.program, sub_program);
@@ -11649,7 +11657,8 @@ impl CfmlVirtualMachine {
         let mut cfc_body = (*cfc_func).clone();
         cfc_body.name = "__cfc_body__".to_string();
         let empty_locals = IndexMap::new();
-        let _ = self.execute_function_with_args(&cfc_body, Vec::new(), Some(&empty_locals));
+        let exec_result =
+            self.execute_function_with_args(&cfc_body, Vec::new(), Some(&empty_locals));
 
         // Capture component body locals as the variables scope
         let component_variables = self.captured_locals.take().unwrap_or_default();
@@ -11658,6 +11667,13 @@ impl CfmlVirtualMachine {
         let sub_funcs = self.program.functions.clone();
         self.program = old_program;
         self.program_swap_depth -= 1;
+
+        // If the pseudo-constructor threw, surface it now (after restoring the
+        // program) so the request fails rather than falling through to the page.
+        if let Err(e) = exec_result {
+            return Err(e);
+        }
+
         let base_idx = self.program.functions.len();
         for func in sub_funcs {
             if func.name != "__main__" {
@@ -11668,7 +11684,7 @@ impl CfmlVirtualMachine {
         }
 
         // Find the component struct in globals
-        let mut template = self
+        let template = self
             .globals
             .iter()
             .find(|(k, v)| {
@@ -11696,7 +11712,11 @@ impl CfmlVirtualMachine {
                         }
                     })
                     .map(|(_, v)| v.clone())
-            })?;
+            });
+        let mut template = match template {
+            Some(t) => t,
+            None => return Ok(None),
+        };
 
         // Fix up func_idx in the template's function values (sub-program index → merged index)
         if base_idx > 0 {
@@ -11757,7 +11777,7 @@ impl CfmlVirtualMachine {
 
         // Resolve inheritance (e.g. extends="taffy.core.api")
         let resolved = self.resolve_inheritance(template, &IndexMap::new());
-        Some(resolved)
+        Ok(Some(resolved))
     }
 
     /// Extract application config from a component struct.
@@ -12156,10 +12176,13 @@ impl CfmlVirtualMachine {
             None => return self.execute(), // No Application.cfc, just execute directly
         };
 
-        // 2. Load Application.cfc
+        // 2. Load Application.cfc. A pseudo-constructor throw (or compile error)
+        // aborts the request — Lucee does not fall through to the target page
+        // when Application.cfc fails to load.
         let mut template = match self.load_application_cfc(&app_cfc_path) {
-            Some(t) => t,
-            None => return self.execute(), // Failed to load, fall through
+            Ok(Some(t)) => t,
+            Ok(None) => return self.execute(), // No usable component, fall through
+            Err(e) => return Err(e),
         };
 
         // 3. Extract config and mappings
