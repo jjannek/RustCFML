@@ -11282,38 +11282,7 @@ impl CfmlVirtualMachine {
                     .collect(),
             ))
         } else if list_info == "query" {
-            // Return a query object with name, directory, size, type, dateLastModified columns
-            let mut names = Vec::new();
-            let mut dirs = Vec::new();
-            let mut sizes = Vec::new();
-            let mut types = Vec::new();
-            let mut dates = Vec::new();
-            for (name, full_path, is_dir) in &entries {
-                names.push(CfmlValue::String(name.clone()));
-                dirs.push(CfmlValue::String(path.to_string()));
-                sizes.push(CfmlValue::Int(0));
-                types.push(CfmlValue::String(if *is_dir {
-                    "Dir".to_string()
-                } else {
-                    "File".to_string()
-                }));
-                dates.push(CfmlValue::String(String::new()));
-                let _ = full_path; // suppress unused
-            }
-            let mut columns = IndexMap::new();
-            columns.insert("name".to_string(), CfmlValue::array(names));
-            columns.insert("directory".to_string(), CfmlValue::array(dirs));
-            columns.insert("size".to_string(), CfmlValue::array(sizes));
-            columns.insert("type".to_string(), CfmlValue::array(types));
-            columns.insert("datelastmodified".to_string(), CfmlValue::array(dates));
-            let mut q = IndexMap::new();
-            q.insert("__type".to_string(), CfmlValue::String("query".to_string()));
-            q.insert("__columns".to_string(), CfmlValue::strukt(columns));
-            q.insert(
-                "recordcount".to_string(),
-                CfmlValue::Int(entries.len() as i64),
-            );
-            Ok(CfmlValue::strukt(q))
+            Ok(Self::build_directory_query(&entries, path))
         } else {
             // "path" mode: return array of full paths
             Ok(CfmlValue::array(
@@ -11351,42 +11320,58 @@ impl CfmlVirtualMachine {
         let mut entries = Vec::new();
         self.sandbox_collect_entries(path, recurse, &mut entries)?;
         entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
+        Ok(Self::build_directory_query(&entries, path))
+    }
 
-        let mut names = Vec::new();
-        let mut dirs = Vec::new();
-        let mut sizes = Vec::new();
-        let mut types = Vec::new();
-        let mut dates = Vec::new();
-        for (name, full_path, is_dir) in &entries {
-            names.push(CfmlValue::String(name.clone()));
+    /// Build a real `Query` value from collected directory entries
+    /// (`(name, full_path, is_dir)`), matching Lucee's `cfdirectory action="list"`
+    /// column set: `name, size, type, dateLastModified, attributes, mode,
+    /// directory`. Returning an actual `CfmlValue::Query` (rather than a struct
+    /// tagged `__type="query"`) means `isQuery()`, `queryColumnExists()`, and
+    /// row access all behave like the reference engine.
+    fn build_directory_query(entries: &[(String, String, bool)], fallback_dir: &str) -> CfmlValue {
+        let mut query = cfml_common::dynamic::CfmlQuery::new(vec![
+            "name".to_string(),
+            "size".to_string(),
+            "type".to_string(),
+            "dateLastModified".to_string(),
+            "attributes".to_string(),
+            "mode".to_string(),
+            "directory".to_string(),
+        ]);
+        for (name, full_path, is_dir) in entries {
+            let meta = std::fs::metadata(full_path).ok();
+            let size = if *is_dir {
+                0
+            } else {
+                meta.as_ref().map(|m| m.len() as i64).unwrap_or(0)
+            };
+            let date = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                })
+                .unwrap_or_default();
             let directory = std::path::Path::new(full_path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string());
-            dirs.push(CfmlValue::String(directory));
-            sizes.push(CfmlValue::Int(0));
-            types.push(CfmlValue::String(if *is_dir {
-                "Dir".to_string()
-            } else {
-                "File".to_string()
-            }));
-            dates.push(CfmlValue::String(String::new()));
+                .unwrap_or_else(|| fallback_dir.to_string());
+            let mut row = IndexMap::new();
+            row.insert("name".to_string(), CfmlValue::String(name.clone()));
+            row.insert("size".to_string(), CfmlValue::Int(size));
+            row.insert(
+                "type".to_string(),
+                CfmlValue::String(if *is_dir { "Dir" } else { "File" }.to_string()),
+            );
+            row.insert("dateLastModified".to_string(), CfmlValue::String(date));
+            row.insert("attributes".to_string(), CfmlValue::String(String::new()));
+            row.insert("mode".to_string(), CfmlValue::String(String::new()));
+            row.insert("directory".to_string(), CfmlValue::String(directory));
+            query.rows.push(row);
         }
-
-        let mut columns = IndexMap::new();
-        columns.insert("name".to_string(), CfmlValue::array(names));
-        columns.insert("directory".to_string(), CfmlValue::array(dirs));
-        columns.insert("size".to_string(), CfmlValue::array(sizes));
-        columns.insert("type".to_string(), CfmlValue::array(types));
-        columns.insert("datelastmodified".to_string(), CfmlValue::array(dates));
-        let mut q = IndexMap::new();
-        q.insert("__type".to_string(), CfmlValue::String("query".to_string()));
-        q.insert("__columns".to_string(), CfmlValue::strukt(columns));
-        q.insert(
-            "recordcount".to_string(),
-            CfmlValue::Int(entries.len() as i64),
-        );
-        Ok(CfmlValue::strukt(q))
+        CfmlValue::Query(Box::new(query))
     }
 
     fn resolve_directory_path_with_mappings(&self, path: &str) -> Option<String> {

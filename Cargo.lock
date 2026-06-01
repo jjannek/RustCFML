@@ -1361,6 +1361,7 @@ dependencies = [
  "cfml-compiler",
  "cfml-config",
  "cfml-stdlib",
+ "chrono",
  "indexmap",
  "log",
  "parking_lot",
