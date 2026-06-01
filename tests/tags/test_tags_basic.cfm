@@ -85,6 +85,13 @@
 </cfloop>
 <cfscript>assert("cfloop list", listResult, "abc");</cfscript>
 
+<!--- cfloop list with item (Lucee alias for index, no index attr) --->
+<cfset listItemResult = "">
+<cfloop list="name,email,mobile" item="field_name">
+    <cfset listItemResult = listAppend(listItemResult, uCase(field_name))>
+</cfloop>
+<cfscript>assert("cfloop list item", listItemResult, "NAME,EMAIL,MOBILE");</cfscript>
+
 <!--- cfloop struct --->
 <cfset s = {x: 1, y: 2}>
 <cfset structKeyCount = 0>

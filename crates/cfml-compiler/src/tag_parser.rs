@@ -1914,7 +1914,11 @@ fn parse_cfloop_tag(
                 consumed,
             )
         }
-    } else if let (Some(list), Some(index)) = (attrs.get("list"), attrs.get("index")) {
+    } else if let (Some(list), Some(index)) =
+        (attrs.get("list"), attrs.get("index").or_else(|| attrs.get("item")))
+    {
+        // `item` is a Lucee alias for `index` on list loops: either names the
+        // current element binding, so accept whichever is present.
         // If the list contains #expr#, strip hashes to get the expression.
         // Otherwise treat it as a string literal and quote it.
         let list = if list.contains('#') {
