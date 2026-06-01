@@ -20,8 +20,8 @@ pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_collections, handle_java_concurrenthashmap, handle_java_concurrentlinkedqueue,
     handle_java_file, handle_java_inetaddress, handle_java_linkedhashmap,
-    handle_java_messagedigest, handle_java_paths, handle_java_stringbuilder, handle_java_system,
-    handle_java_thread, handle_java_treemap, handle_java_uuid,
+    handle_java_messagedigest, handle_java_paths, handle_java_pattern, handle_java_stringbuilder,
+    handle_java_system, handle_java_thread, handle_java_treemap, handle_java_uuid,
 };
 
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
@@ -6263,6 +6263,9 @@ impl CfmlVirtualMachine {
                                 "java.nio.file.paths" | "java.nio.file.path" => {
                                     handle_java_paths("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.util.regex.pattern" => {
+                                    handle_java_pattern("init", empty_args, &CfmlValue::Null)
+                                }
                                 _ => Ok(CfmlValue::Null),
                             };
                         }
@@ -8371,6 +8374,9 @@ impl CfmlVirtualMachine {
                     }
                     "java.nio.file.paths" | "java.nio.file.path" => {
                         handle_java_paths(&m, all_args, object)
+                    }
+                    "java.util.regex.pattern" | "java.util.regex.matcher" => {
+                        handle_java_pattern(&m, all_args, object)
                     }
                     _ => Ok(CfmlValue::Null),
                 };

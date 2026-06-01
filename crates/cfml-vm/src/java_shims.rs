@@ -1,7 +1,7 @@
 // Java shim handlers - to be inserted into lib.rs
 
 use cfml_common::dynamic::CfmlValue;
-use cfml_common::vm::CfmlResult;
+use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 
 pub fn handle_java_messagedigest(
@@ -1018,4 +1018,120 @@ fn rand_u128() -> u128 {
     cfml_common::clock::now_unix_nanos().hash(&mut h);
     0x12345678u64.hash(&mut h);
     h.finish() as u128
+}
+
+/// Shim for `java.util.regex.Pattern` and the `Matcher` it produces — used by
+/// Lucee apps for dynamic route matching. Backed by Rust's `regex` crate, whose
+/// syntax is a close superset for the patterns these apps use.
+///
+/// Flow: `createObject("java","java.util.regex.Pattern")` → `init`; then
+/// `.compile(regex)` → a compiled Pattern shim; `.matcher(input)` → a Matcher
+/// shim. The match is computed eagerly at `matcher()` time and the capture
+/// groups are stored, so `find()` reports whether a match exists and
+/// `group(n)`/`groupCount()` read the stored results. NOTE: `find()` does not
+/// advance through multiple matches (single-match semantics), which covers the
+/// dominant route-matching use case.
+pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    use regex::Regex;
+
+    let object_regex = || -> String {
+        if let CfmlValue::Struct(s) = object {
+            s.get("__regex").map(|v| v.as_string()).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    let compile = |pattern: &str| -> Result<Regex, CfmlError> {
+        Regex::new(pattern).map_err(|e| {
+            CfmlError::runtime(format!(
+                "java.util.regex.Pattern: invalid pattern [{}]: {}",
+                pattern, e
+            ))
+        })
+    };
+
+    match method {
+        // createObject(...) with no pattern yet — an uncompiled Pattern handle.
+        "init" => {
+            let mut shim = IndexMap::new();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::String("java.util.regex.pattern".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // Pattern.compile(regex[, flags]) — returns a compiled Pattern shim.
+        "compile" => {
+            let regex_str = args.first().map(|a| a.as_string()).unwrap_or_default();
+            compile(&regex_str)?; // validate up front
+            let mut shim = IndexMap::new();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::String("java.util.regex.pattern".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__regex".to_string(), CfmlValue::String(regex_str));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "pattern" | "tostring" => Ok(CfmlValue::String(object_regex())),
+        // Pattern.matcher(input) — eagerly evaluate and stash capture groups.
+        "matcher" => {
+            let regex_str = object_regex();
+            let input = args.first().map(|a| a.as_string()).unwrap_or_default();
+            let re = compile(&regex_str)?;
+            let group_count = re.captures_len() as i64 - 1;
+            let mut groups: Vec<CfmlValue> = Vec::new();
+            let mut matched = false;
+            if let Some(caps) = re.captures(&input) {
+                matched = true;
+                for i in 0..re.captures_len() {
+                    groups.push(
+                        caps.get(i)
+                            .map(|m| CfmlValue::String(m.as_str().to_string()))
+                            .unwrap_or(CfmlValue::Null),
+                    );
+                }
+            }
+            let mut shim = IndexMap::new();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::String("java.util.regex.matcher".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__regex".to_string(), CfmlValue::String(regex_str));
+            shim.insert("__input".to_string(), CfmlValue::String(input));
+            shim.insert("__groupcount".to_string(), CfmlValue::Int(group_count));
+            shim.insert("__matched".to_string(), CfmlValue::Bool(matched));
+            shim.insert("__groups".to_string(), CfmlValue::array(groups));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // Matcher.find() / matches() — report whether the stashed match exists.
+        "find" | "matches" | "lookingat" => {
+            if let CfmlValue::Struct(s) = object {
+                return Ok(s.get("__matched").unwrap_or(CfmlValue::Bool(false)));
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        // Matcher.group([n]) — group 0 is the whole match.
+        "group" => {
+            if let CfmlValue::Struct(s) = object {
+                let idx = args
+                    .first()
+                    .and_then(|a| a.as_string().trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if let Some(CfmlValue::Array(groups)) = s.get("__groups") {
+                    return Ok(groups.snapshot().get(idx).cloned().unwrap_or(CfmlValue::Null));
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "groupcount" => {
+            if let CfmlValue::Struct(s) = object {
+                return Ok(s.get("__groupcount").unwrap_or(CfmlValue::Int(0)));
+            }
+            Ok(CfmlValue::Int(0))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
 }
