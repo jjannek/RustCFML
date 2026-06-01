@@ -13,5 +13,14 @@ assert("helper-named call routes to onMissingMethod (count)", missing.count(), "
 assert("helper-named call routes to onMissingMethod (delete)", missing.delete("x"), "missing:delete");
 assert("helper-named call routes to onMissingMethod (keyExists)", missing.keyExists("y"), "missing:keyExists");
 
+// With no matching method and no onMissingMethod, an undefined call throws
+// (matches Lucee) rather than silently returning null or a struct-helper result.
+assertThrows("undefined component method throws", function() {
+    service.frobnicate();
+});
+assertThrows("undefined helper-named component method throws (not structKeyExists)", function() {
+    service.keyExists("x");
+});
+
 suiteEnd();
 </cfscript>

@@ -9121,6 +9121,28 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // A method call on a component that resolved to nothing — no own/inherited
+        // method, no implicit accessor, no native parent, no onMissingMethod — is
+        // an error in CFML, not a silent Null. Matches Lucee, which throws
+        // "Component [x] has no function with name [y]". (Non-component receivers
+        // keep the lenient Null return; tightening those is a separate concern.)
+        if let CfmlValue::Struct(ref s) = object {
+            if s.contains_key("__variables") || s.contains_key("__name") {
+                let comp_name = s
+                    .get("__name")
+                    .map(|v| v.as_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "component".to_string());
+                return Err(CfmlError::new(
+                    format!(
+                        "Component [{}] has no function with name [{}]",
+                        comp_name, method
+                    ),
+                    CfmlErrorType::Expression,
+                ));
+            }
+        }
+
         Ok(CfmlValue::Null)
     }
 

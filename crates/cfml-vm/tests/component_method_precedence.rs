@@ -19,7 +19,7 @@ fn compile_page(vfs: &Arc<dyn Vfs>, path: &str) -> BytecodeProgram {
     CfmlCompiler::new().compile(ast)
 }
 
-fn run_page(index: &str, cfc_name: &str, cfc_body: &str) -> String {
+fn build(index: &str, cfc_name: &str, cfc_body: &str) -> CfmlVirtualMachine {
     let mut files = HashMap::new();
     files.insert("index.cfm".to_string(), index.as_bytes().to_vec());
     files.insert(
@@ -45,7 +45,11 @@ fn run_page(index: &str, cfc_name: &str, cfc_body: &str) -> String {
     for (name, func) in get_builtin_functions() {
         vm.builtins.insert(name, func);
     }
+    vm
+}
 
+fn run_page(index: &str, cfc_name: &str, cfc_body: &str) -> String {
+    let mut vm = build(index, cfc_name, cfc_body);
     vm.execute().unwrap();
     vm.get_output().split_whitespace().collect::<String>()
 }
@@ -97,4 +101,30 @@ fn struct_helpers_never_shadow_on_missing_method_on_components() {
     );
 
     assert_eq!("missing:count|missing:delete", output);
+}
+
+#[test]
+fn undefined_component_method_throws_instead_of_struct_helper_or_null() {
+    // No matching method, no onMissingMethod: a helper-named call must error
+    // (matching Lucee) rather than fall back to structKeyExists or return null.
+    let mut vm = build(
+        r##"
+<cfset service = CreateObject("component", "/lib/service") />
+<cfoutput>#service.keyExists("x")#</cfoutput>
+"##,
+        "service",
+        r#"
+<cfcomponent>
+    <cffunction name="ping"><cfreturn "pong" /></cffunction>
+</cfcomponent>
+"#,
+    );
+    let err = vm
+        .execute()
+        .expect_err("undefined helper-named component method should error");
+    assert!(
+        err.message.contains("has no function with name"),
+        "unexpected error message: {}",
+        err.message
+    );
 }
