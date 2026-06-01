@@ -72,4 +72,18 @@
 <cfmodule template="customtags/echo_attr.cfm" value="mod-hyphen-ok">
 <cfscript>assert("cfmodule attr with hyphen", echoed, "mod-hyphen-ok");</cfscript>
 
+<!--- Test 15: cfmodule with leading-slash template resolves through mappings --->
+<cfset echoed = "">
+<cfset leadingSlashModuleError = "">
+<cftry>
+    <cfmodule template="/tags/customtags/echo_attr.cfm" value="leading-slash-module">
+    <cfcatch type="any">
+        <cfset leadingSlashModuleError = cfcatch.message>
+    </cfcatch>
+</cftry>
+<cfscript>
+    assert("cfmodule leading-slash mapped template error", leadingSlashModuleError, "");
+    assert("cfmodule leading-slash mapped template", echoed, "leading-slash-module");
+</cfscript>
+
 <cfscript>suiteEnd();</cfscript>
