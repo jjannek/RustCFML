@@ -483,13 +483,21 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cfparam" => {
             let name = attrs.get("name").cloned().unwrap_or_default();
-            let default = attrs.get("default").cloned().unwrap_or("\"\"".to_string());
-            // If default contains #expr#, strip hashes to get the expression.
-            // Otherwise treat it as a string literal and quote it.
-            let default = if default.contains('#') {
-                strip_hashes(&default)
-            } else {
-                quote_if_needed(&default)
+            // A quoted default is ALWAYS a literal string in CFML (Lucee parity):
+            // default="px-5 py-5", default="1+1", default="now()" all stay literal
+            // strings; only #expr# segments interpolate. Unquoted defaults fall back
+            // to the expression-or-literal heuristic. format_attr_value handles both,
+            // using the quote flag the attribute parser already tracked. The one
+            // exception: a value that is EXACTLY a single #expr# (e.g. "#[]#") keeps
+            // the expression's native type (array/struct/number), so emit it bare
+            // rather than as a string concatenation.
+            let default = match attrs.get("default") {
+                Some(raw) if quoted.contains("default") => match single_hash_expr(raw) {
+                    Some(expr) => format!("({})", expr),
+                    None => format_attr_value(raw, true),
+                },
+                Some(raw) => format_attr_value(raw, false),
+                None => "\"\"".to_string(),
             };
             // Clean name - remove scope prefix quotes and strip hash expressions
             let clean_name = strip_hashes(&name.replace('"', "").replace('\'', ""));
@@ -1611,6 +1619,21 @@ fn format_attr_value(raw: &str, was_quoted: bool) -> String {
     } else {
         parts.join(" & ")
     }
+}
+
+/// If `raw` is exactly one `#expr#` spanning the whole value (no surrounding
+/// literal text and no inner `#`), return the inner expression. Such a value
+/// keeps the expression's native type instead of being coerced to a string —
+/// e.g. cfparam default="#[]#" must yield an array, not "".
+fn single_hash_expr(raw: &str) -> Option<&str> {
+    if raw.len() < 2 || !raw.starts_with('#') || !raw.ends_with('#') {
+        return None;
+    }
+    let inner = &raw[1..raw.len() - 1];
+    if inner.is_empty() || inner.contains('#') {
+        return None;
+    }
+    Some(inner)
 }
 
 fn escape_for_string_literal(s: &str) -> String {

@@ -46,6 +46,21 @@
     assert("cfparam quoted default with spaces and hyphens", classDefaultValue, "px-5 py-5");
 </cfscript>
 
+<!--- A quoted default is ALWAYS literal: operator- and function-call-looking
+      strings are NOT evaluated; only #...# segments interpolate (Lucee parity). --->
+<cfparam name="opDefault" default="1+1">
+<cfscript>assert("cfparam quoted operator default is literal", opDefault, "1+1");</cfscript>
+
+<cfparam name="fnDefault" default="now()">
+<cfscript>assert("cfparam quoted function-call default is literal", fnDefault, "now()");</cfscript>
+
+<cfparam name="dotDefault" default="a.b.c">
+<cfscript>assert("cfparam quoted dotted default is literal", dotDefault, "a.b.c");</cfscript>
+
+<cfparam name="interpDefault" default="sum-#1+1#">
+<cfscript>assert("cfparam hash segment in default interpolates", interpDefault, "sum-2");</cfscript>
+
+
 <!--- cfparam with type="array" default --->
 <cfparam name="arrDefault" type="array" default="#[]#">
 <cfscript>assertTrue("cfparam array default is array", isArray(arrDefault));</cfscript>
