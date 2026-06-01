@@ -2964,23 +2964,9 @@ impl CfmlVirtualMachine {
                         // Attach a Rust-class parent if extends="rust:Name"
                         let instance = self.attach_native_parent(instance)?;
 
-                        // Validate interface implementation and collect transitive interfaces
-                        let instance = if let CfmlValue::Struct(ref s) = instance {
-                            let all_ifaces = self.validate_interface_implementation(&s.snapshot(), &locals)?;
-                            if !all_ifaces.is_empty() {
-                                let mut m = s.snapshot();
-                                let chain: Vec<CfmlValue> = all_ifaces
-                                    .into_iter()
-                                    .map(|name| CfmlValue::String(name))
-                                    .collect();
-                                m.insert("__implements_chain".to_string(), CfmlValue::array(chain));
-                                CfmlValue::strukt(m)
-                            } else {
-                                instance
-                            }
-                        } else {
-                            instance
-                        };
+                        // Validate interface implementation and stamp the
+                        // transitive interface set (for isInstanceOf).
+                        let instance = self.attach_implements_chain(instance, &locals)?;
 
                         // Call init() constructor if present
                         let final_instance = if let CfmlValue::Struct(ref s) = instance {
@@ -6180,7 +6166,8 @@ impl CfmlVirtualMachine {
                                 self.resolve_component_template(&comp_name, parent_locals)
                             {
                                 let instance = self.resolve_inheritance(template, parent_locals);
-                                return self.attach_native_parent(instance);
+                                let instance = self.attach_native_parent(instance)?;
+                                return self.attach_implements_chain(instance, parent_locals);
                             }
                         } else if obj_type == "rust" {
                             let class_name = args[1].as_string();
@@ -10808,6 +10795,29 @@ impl CfmlVirtualMachine {
         }
 
         Ok(all_interfaces)
+    }
+
+    /// Validate a freshly-instantiated component against its declared interfaces
+    /// and stamp the transitive interface set onto `__implements_chain`, so that
+    /// `isInstanceOf` recognises inherited interfaces (an interface's `extends`
+    /// ancestors). Shared by `new X()` and `createObject("component", …)` so both
+    /// instantiation forms honour interface inheritance identically.
+    fn attach_implements_chain(
+        &mut self,
+        instance: CfmlValue,
+        locals: &IndexMap<String, CfmlValue>,
+    ) -> Result<CfmlValue, CfmlError> {
+        if let CfmlValue::Struct(ref s) = instance {
+            let all_ifaces = self.validate_interface_implementation(&s.snapshot(), locals)?;
+            if !all_ifaces.is_empty() {
+                let mut m = s.snapshot();
+                let chain: Vec<CfmlValue> =
+                    all_ifaces.into_iter().map(CfmlValue::String).collect();
+                m.insert("__implements_chain".to_string(), CfmlValue::array(chain));
+                return Ok(CfmlValue::strukt(m));
+            }
+        }
+        Ok(instance)
     }
 
     fn resolve_inheritance(

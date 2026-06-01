@@ -258,6 +258,10 @@ try { include "core/test_component_declaration_attributes.cfm"; } catch (any e) 
 //     used to reject the `=` ("Expected LBrace, found Equal"). Used across
 //     vendor/wheels/interfaces/.
 try { include "core/test_interface_extends_attribute.cfm"; } catch (any e) { writeOutput("ERROR | core/test_interface_extends_attribute.cfm | " & e.message & chr(10)); }
+//   - isinstanceof_interface_chain: isInstanceOf must recognise interfaces
+//     inherited via an interface's own `extends` (IDeclDog extends
+//     IDeclCreature), for both `new X()` and createObject("component", ...).
+try { include "core/test_isinstanceof_interface_chain.cfm"; } catch (any e) { writeOutput("ERROR | core/test_isinstanceof_interface_chain.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
