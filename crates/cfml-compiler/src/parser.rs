@@ -2079,12 +2079,29 @@ impl Parser {
 
         let first = self.extract_identifier()?;
 
-        // If the next token is an identifier, then `first` is the return type
+        // Absorb a dotted continuation: `a.b.c`. This is either a dotted return
+        // type (`MachII.framework.AppManager getFoo()`) or — in tag-based CFCs —
+        // a dotted function NAME (`<cffunction name="upload.profile_id">`).
+        let mut dotted = first;
+        while self.match_token(&Token::Dot) {
+            let part = self.extract_identifier()?;
+            dotted.push('.');
+            dotted.push_str(&part);
+        }
+
+        // If an identifier follows, `dotted` was the return type and the real
+        // name comes next (which may itself be dotted).
         if let Token::Identifier(_) = self.peek(0) {
-            return_type = Some(first);
-            name = self.extract_identifier()?;
+            return_type = Some(dotted);
+            let mut n = self.extract_identifier()?;
+            while self.match_token(&Token::Dot) {
+                let part = self.extract_identifier()?;
+                n.push('.');
+                n.push_str(&part);
+            }
+            name = n;
         } else {
-            name = first;
+            name = dotted;
         }
 
         self.consume(&Token::LParen)?;
