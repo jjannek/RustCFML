@@ -148,6 +148,17 @@ assertTrue( "Path isAbsolute", paths.isAbsolute() );
 test27 = paths.toString() == "/home/user/file.txt";
 assertTrue( "Path toString", test27 );
 
+// Test java.util.regex.Pattern — used by Lucee apps for dynamic route matching.
+writeOutput( "\n--- Testing Pattern ---\n" );
+pattern = createObject( "java", "java.util.regex.Pattern" );
+matcher = pattern
+    .compile( javaCast( "string", "^\/sysadmin\/routes\/([0-9A-Za-z\s\-_]+)$" ) )
+    .matcher( javaCast( "string", "/sysadmin/routes/4e4727bd-f93d-40e6-9409-bed317fe76df" ) );
+
+assertTrue( "Pattern matcher find", matcher.find() );
+assert( "Pattern matcher group", matcher.group( 1 ), "4e4727bd-f93d-40e6-9409-bed317fe76df" );
+assert( "Pattern matcher groupCount", matcher.groupCount(), 1 );
+
 writeOutput( "\n=== All Java shim tests passed! ===\n" );
 
 suiteEnd( "Java Shims" );
