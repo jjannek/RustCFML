@@ -252,6 +252,12 @@ try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput(
 //     Failing headers live in fixtures (parse errors escape try/catch); via
 //     createObject they degrade to a non-object, so the assertions show the gap.
 try { include "core/test_component_declaration_attributes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_component_declaration_attributes.cfm | " & e.message & chr(10)); }
+//   - interface_extends_attribute: an interface may declare its parent in the
+//     attribute form (interface extends="Foo") and order-independently with
+//     other header attributes, not just the bareword `extends Foo`. RustCFML
+//     used to reject the `=` ("Expected LBrace, found Equal"). Used across
+//     vendor/wheels/interfaces/.
+try { include "core/test_interface_extends_attribute.cfm"; } catch (any e) { writeOutput("ERROR | core/test_interface_extends_attribute.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

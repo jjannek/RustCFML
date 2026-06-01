@@ -2325,44 +2325,74 @@ impl Parser {
             "Anonymous".to_string()
         };
 
-        // interfaces can extend multiple other interfaces
+        // interfaces can extend multiple other interfaces, in either the
+        // bareword form (`interface extends Base, Other`) or the attribute form
+        // (`interface extends="Base"` / `extends="A,B"`), matching Lucee/ACF.
         let mut extends = Vec::new();
         if self.match_token(&Token::Extends) {
-            loop {
-                if let Ok(parent) = self.extract_dotted_identifier() {
-                    extends.push(parent);
+            if self.match_token(&Token::Equal) {
+                if let Some(val) = self.parse_decl_attr_value() {
+                    for parent in val.split(',') {
+                        let trimmed = parent.trim().to_string();
+                        if !trimmed.is_empty() {
+                            extends.push(trimmed);
+                        }
+                    }
                 }
-                if !self.match_token(&Token::Comma) {
-                    break;
+            } else {
+                loop {
+                    if let Ok(parent) = self.extract_dotted_identifier() {
+                        extends.push(parent);
+                    }
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
                 }
             }
         }
 
-        // Parse metadata attributes (same as component)
+        // Parse metadata attributes (same order-independent rules as component:
+        // values may be quoted or unquoted, and `extends` may appear here too —
+        // e.g. `interface displayname="x" extends="Base" {`).
         let mut metadata = Vec::new();
         loop {
-            let is_attr_key = matches!(self.peek(1), Token::Equal)
-                && (matches!(self.peek(0), Token::Identifier(_))
-                    || self.token_as_string(&self.peek(0).clone()).is_some());
-            if !is_attr_key {
+            let head_is_keyish = matches!(self.peek(0), Token::Identifier(_) | Token::Extends)
+                || self.token_as_string(&self.peek(0).clone()).is_some();
+            if !matches!(self.peek(1), Token::Equal) || !head_is_keyish {
                 break;
             }
-            let key = if let Token::Identifier(ref s) = self.peek(0) {
-                let s = s.clone();
-                self.advance();
-                s
-            } else if let Some(s) = self.token_as_string(&self.peek(0).clone()) {
-                self.advance();
-                s
-            } else {
-                break;
+            let key = match self.peek(0).clone() {
+                Token::Identifier(s) => {
+                    self.advance();
+                    s
+                }
+                Token::Extends => {
+                    self.advance();
+                    "extends".to_string()
+                }
+                ref t => {
+                    if let Some(s) = self.token_as_string(t) {
+                        self.advance();
+                        s
+                    } else {
+                        break;
+                    }
+                }
             };
             self.consume(&Token::Equal)?;
-            if let Token::String(val) = self.peek(0).clone() {
-                self.advance();
-                metadata.push((key, val));
+            let val = match self.parse_decl_attr_value() {
+                Some(v) => v,
+                None => break,
+            };
+            if key.eq_ignore_ascii_case("extends") {
+                for parent in val.split(',') {
+                    let trimmed = parent.trim().to_string();
+                    if !trimmed.is_empty() {
+                        extends.push(trimmed);
+                    }
+                }
             } else {
-                break;
+                metadata.push((key, val));
             }
         }
 
