@@ -998,6 +998,21 @@ impl Parser {
         }
     }
 
+    /// Map a compound-assignment operator token to the binary op it applies, for
+    /// desugaring `lhs OP= rhs` into `lhs = (lhs OP rhs)` (used in the
+    /// for-increment clause, which is parsed as an expression).
+    fn compound_assign_binop(&self) -> Option<BinaryOpType> {
+        match self.peek(0) {
+            Token::PlusEqual => Some(BinaryOpType::Add),
+            Token::MinusEqual => Some(BinaryOpType::Sub),
+            Token::StarEqual => Some(BinaryOpType::Mul),
+            Token::SlashEqual => Some(BinaryOpType::Div),
+            Token::PercentEqual => Some(BinaryOpType::Mod),
+            Token::AmpEqual => Some(BinaryOpType::Concat),
+            _ => None,
+        }
+    }
+
     /// Turn a STATIC cfinvoke `returnVariable` name ("msg", "local.rv",
     /// "variables.x") into an assignable lvalue expression by sub-parsing it, so
     /// the normal assignment path handles scope prefixes and dotted paths. Returns
@@ -1269,7 +1284,40 @@ impl Parser {
         self.consume(&Token::Semicolon)?;
 
         let increment = if !self.check(&Token::RParen) {
-            Some(Box::new(self.parse_expression()?))
+            let expr = self.parse_expression()?;
+            // Support compound assignment in the increment clause (`i += 2`).
+            // Statement-level compound assignment is handled in the statement
+            // parser, but the for-increment is parsed as an expression, so
+            // desugar `lhs OP= rhs` to `lhs = (lhs OP rhs)` here for assignable
+            // targets — reusing the existing Assign binary op.
+            let expr = if let Some(bin_op) = self.compound_assign_binop() {
+                if matches!(
+                    expr,
+                    Expression::Identifier(_)
+                        | Expression::MemberAccess(_)
+                        | Expression::ArrayAccess(_)
+                ) {
+                    self.advance(); // consume the compound operator
+                    let value = self.parse_expression()?;
+                    let combined = Expression::BinaryOp(Box::new(BinaryOp {
+                        left: Box::new(expr.clone()),
+                        operator: bin_op,
+                        right: Box::new(value),
+                        location: self.current_location(),
+                    }));
+                    Expression::BinaryOp(Box::new(BinaryOp {
+                        left: Box::new(expr),
+                        operator: BinaryOpType::Assign,
+                        right: Box::new(combined),
+                        location: self.current_location(),
+                    }))
+                } else {
+                    expr
+                }
+            } else {
+                expr
+            };
+            Some(Box::new(expr))
         } else {
             None
         };

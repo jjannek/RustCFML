@@ -267,6 +267,10 @@ try { include "core/test_isinstanceof_interface_chain.cfm"; } catch (any e) { wr
 //     the first `.` ("Expected RParen, found Dot"). Parse-only (Lucee enforces
 //     the type at call time, so the test never calls with a mismatched value).
 try { include "core/test_dotted_param_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_dotted_param_type.cfm | " & e.message & chr(10)); }
+//   - for_increment_compound: the for-loop increment clause accepts compound
+//     assignment (for (i=1; i<=10; i+=2)). RustCFML used to reject it
+//     ("Expected RParen, found PlusEqual"). Used in vendor/wheels/model/bulk.cfc.
+try { include "core/test_for_increment_compound.cfm"; } catch (any e) { writeOutput("ERROR | core/test_for_increment_compound.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
