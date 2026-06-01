@@ -2343,35 +2343,25 @@ fn parse_cfhttpparam_tags(body: &str) -> Vec<String> {
                 let next_after = chars.get(i + 12);
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     let name_end = i + 12;
-                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, quoted, _) = parse_tag_attributes(&chars, name_end, len);
 
                     let mut parts = Vec::new();
                     if let Some(t) = tag_attrs.get("type") {
                         parts.push(format!("type: \"{}\"", t.to_lowercase()));
                     }
+                    // name/value/file may contain #expr# interpolation inside an
+                    // otherwise-literal quoted string (e.g. value="value-#x#").
+                    // format_attr_value emits literal segments quoted and only
+                    // evaluates the #...# parts, instead of strip_hashes turning the
+                    // whole thing into a bare (mis-parsed) expression.
                     if let Some(n) = tag_attrs.get("name") {
-                        let stripped = strip_hashes(n);
-                        if stripped != *n {
-                            parts.push(format!("name: {}", stripped));
-                        } else {
-                            parts.push(format!("name: \"{}\"", n));
-                        }
+                        parts.push(format!("name: {}", format_attr_value(n, quoted.contains("name"))));
                     }
                     if let Some(v) = tag_attrs.get("value") {
-                        let stripped = strip_hashes(v);
-                        if stripped != *v {
-                            parts.push(format!("value: {}", stripped));
-                        } else {
-                            parts.push(format!("value: \"{}\"", v));
-                        }
+                        parts.push(format!("value: {}", format_attr_value(v, quoted.contains("value"))));
                     }
                     if let Some(f) = tag_attrs.get("file") {
-                        let stripped = strip_hashes(f);
-                        if stripped != *f {
-                            parts.push(format!("file: {}", stripped));
-                        } else {
-                            parts.push(format!("file: \"{}\"", f));
-                        }
+                        parts.push(format!("file: {}", format_attr_value(f, quoted.contains("file"))));
                     }
                     if let Some(e) = tag_attrs.get("encoded") {
                         parts.push(format!("encoded: \"{}\"", e));
