@@ -2402,32 +2402,22 @@ fn parse_cfmailparam_tags(body: &str) -> Vec<String> {
                 let next_after = chars.get(i + 12);
                 if next_after == Some(&' ') || next_after == Some(&'>') || next_after == Some(&'/') || next_after == Some(&'\t') || next_after == Some(&'\n') {
                     let name_end = i + 12;
-                    let (tag_attrs, _, _) = parse_tag_attributes(&chars, name_end, len);
+                    let (tag_attrs, quoted, _) = parse_tag_attributes(&chars, name_end, len);
 
                     let mut parts = Vec::new();
+                    // name/value/file may contain #expr# interpolation inside an
+                    // otherwise-literal quoted string (e.g. value="x-#var#").
+                    // format_attr_value emits literal segments quoted and only
+                    // evaluates the #...# parts, instead of strip_hashes turning the
+                    // whole thing into a bare (mis-parsed) expression.
                     if let Some(n) = tag_attrs.get("name") {
-                        let stripped = strip_hashes(n);
-                        if stripped != *n {
-                            parts.push(format!("name: {}", stripped));
-                        } else {
-                            parts.push(format!("name: \"{}\"", n));
-                        }
+                        parts.push(format!("name: {}", format_attr_value(n, quoted.contains("name"))));
                     }
                     if let Some(v) = tag_attrs.get("value") {
-                        let stripped = strip_hashes(v);
-                        if stripped != *v {
-                            parts.push(format!("value: {}", stripped));
-                        } else {
-                            parts.push(format!("value: \"{}\"", v));
-                        }
+                        parts.push(format!("value: {}", format_attr_value(v, quoted.contains("value"))));
                     }
                     if let Some(f) = tag_attrs.get("file") {
-                        let stripped = strip_hashes(f);
-                        if stripped != *f {
-                            parts.push(format!("file: {}", stripped));
-                        } else {
-                            parts.push(format!("file: \"{}\"", f));
-                        }
+                        parts.push(format!("file: {}", format_attr_value(f, quoted.contains("file"))));
                     }
                     if let Some(t) = tag_attrs.get("type") {
                         parts.push(format!("type: \"{}\"", t.to_lowercase()));
@@ -2639,5 +2629,27 @@ mod tests {
         assert!(result.contains("for (var i = 1; ("));
         assert!(result.contains("i >= 10 : i <= 10"));
         assert!(result.contains("i = i + __cfloop_step_"));
+    }
+
+    #[test]
+    fn test_cfhttpparam_value_interpolation() {
+        // A quoted attr with #expr# must interpolate (literal segment quoted,
+        // expression in parens), NOT be stripped into a bare expression that
+        // parses as `value - paramValue`.
+        let input = r#"<cfhttp url="http://x"><cfhttpparam type="url" name="probe" value="value-#paramValue#"></cfhttp>"#;
+        let result = tags_to_script(input);
+        assert!(result.contains(r#""value-" & (paramValue)"#), "got: {result}");
+        assert!(!result.contains("value: value-paramValue"), "got: {result}");
+        // Plain literal (no hashes) stays a quoted literal string.
+        let input2 = r#"<cfhttp url="http://x"><cfhttpparam type="url" name="probe" value="static-val"></cfhttp>"#;
+        assert!(tags_to_script(input2).contains(r#"value: "static-val""#));
+    }
+
+    #[test]
+    fn test_cfmailparam_value_interpolation() {
+        let input = r#"<cfmail to="a@b.c" from="c@d.e" subject="s"><cfmailparam name="X-Tag" value="tok-#mailVar#"></cfmail>"#;
+        let result = tags_to_script(input);
+        assert!(result.contains(r#""tok-" & (mailVar)"#), "got: {result}");
+        assert!(!result.contains("value: tok-mailVar"), "got: {result}");
     }
 }
