@@ -2113,12 +2113,13 @@ impl Parser {
                 break;
             };
             self.consume(&Token::Equal)?;
-            if let Token::String(val) = self.peek(0).clone() {
-                self.advance();
-                metadata.push((key, val));
-            } else {
-                break;
-            }
+            // Attribute values may be quoted OR unquoted (e.g. `output=true`),
+            // matching component/interface headers.
+            let val = match self.parse_decl_attr_value() {
+                Some(v) => v,
+                None => break,
+            };
+            metadata.push((key, val));
         }
 
         let body = if self.check(&Token::LBrace) {

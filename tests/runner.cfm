@@ -271,6 +271,11 @@ try { include "core/test_dotted_param_type.cfm"; } catch (any e) { writeOutput("
 //     assignment (for (i=1; i<=10; i+=2)). RustCFML used to reject it
 //     ("Expected RParen, found PlusEqual"). Used in vendor/wheels/model/bulk.cfc.
 try { include "core/test_for_increment_compound.cfm"; } catch (any e) { writeOutput("ERROR | core/test_for_increment_compound.cfm | " & e.message & chr(10)); }
+//   - script_fn_post_paren_attr: a script function may carry metadata
+//     attributes after its () with quoted OR unquoted values
+//     (function f() output=true { ... }). RustCFML used to misparse the body as
+//     a struct literal for the unquoted form. Used in the wheelstest BaseSpec.
+try { include "core/test_script_fn_post_paren_attr.cfm"; } catch (any e) { writeOutput("ERROR | core/test_script_fn_post_paren_attr.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
