@@ -21,14 +21,26 @@ assertTrue("log text/type parsed", true);
 log text="Debug message" type="debug" file="testlog";
 assertTrue("log with file parsed", true);
 
+// Hash interpolation inside quoted log attributes. CFML supports the bare
+// `log text=...` statement form and the parenthesized `cflog(...)` call form;
+// both interpolate #expr# in quoted attributes. (The cf-prefixed bare form
+// `cflog text=...` is NOT valid CFScript on Lucee, so it is not tested here.)
 logMessage = "dynamic";
-logError = "";
+logBareError = "";
 try {
-    cflog text="cfml_literal_#logMessage#" type="information";
+    log text="cfml_literal_#logMessage#" type="information";
 } catch (any e) {
-    logError = e.message;
+    logBareError = e.message;
 }
-assert("cflog quoted attribute hash interpolation error", logError, "");
+assert("log statement hash interpolation in quoted attr", logBareError, "");
+
+logCallError = "";
+try {
+    cflog(text="cfml_literal_#logMessage#", type="information");
+} catch (any e) {
+    logCallError = e.message;
+}
+assert("cflog() call hash interpolation in quoted attr", logCallError, "");
 
 // ============================================================
 // thread (cfthread) — run/join/terminate actions
