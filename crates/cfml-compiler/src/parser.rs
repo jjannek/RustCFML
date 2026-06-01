@@ -383,7 +383,11 @@ impl Parser {
                 }
             }
 
-            // Parse httpparam statements if block body present
+            // Parse httpparam statements if block body present.
+            // KNOWN LIMITATION (issue #55): only literal `httpparam` statements are
+            // collected here — control flow in the body (e.g. `for (x in coll) {
+            // cfhttpparam(...); }`) is not supported and needs runtime param
+            // collection, like cfquery got in 28af97d.
             let mut params: Vec<Expression> = Vec::new();
             if self.check(&Token::LBrace) {
                 self.advance(); // consume {

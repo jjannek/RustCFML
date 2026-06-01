@@ -592,7 +592,11 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let Some(u) = useragent { opts.push(format!("useragent: {}", format_attr_value(&u, quoted.contains("useragent")))); }
             if let Some(p) = proxyserver { opts.push(format!("proxyserver: {}", format_attr_value(&p, quoted.contains("proxyserver")))); }
 
-            // Check for body with <cfhttpparam> child tags
+            // Check for body with <cfhttpparam> child tags.
+            // KNOWN LIMITATION (issue #55): params are extracted statically from
+            // the body text, so <cfhttpparam> tags nested inside control flow
+            // (<cfloop>/<cfif>) are not built at runtime. cfquery solved the same
+            // problem in 28af97d (body_has_control_flow); cfhttp still needs it.
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
@@ -2395,6 +2399,9 @@ fn process_sql_hashes(sql: &str) -> String {
 
 /// Parse <cfhttpparam> tags from the body of a <cfhttp> tag.
 /// Returns a vector of struct literal strings like: { type: "header", name: "X-Custom", value: "foo" }
+/// NOTE (issue #55): this is a compile-time scan — it does not execute control
+/// flow, so cfhttpparams inside a <cfloop>/<cfif> are missed. Needs the runtime
+/// param-building treatment cfquery received in 28af97d.
 fn parse_cfhttpparam_tags(body: &str) -> Vec<String> {
     let mut params = Vec::new();
     let chars: Vec<char> = body.chars().collect();
