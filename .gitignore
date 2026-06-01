@@ -40,3 +40,6 @@ whitebackground.png
 # Sibling standalone worker repo — accidentally committed here in the past,
 # now lives at github.com/RustCFML/Rust-CFML-Cloudflare-worker
 /RustCFMLWorker/
+
+# Generated sqlite test datasource artifact (served-mode cfconfig tests)
+testds

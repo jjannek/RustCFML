@@ -209,7 +209,8 @@ fn rows_to_query(
 
     let mut q = IndexMap::new();
     q.insert("recordCount".into(), CfmlValue::Int(record_count as i64));
-    q.insert("columnList".into(), CfmlValue::String(columns.join(",")));
+    // columnList reports column names uppercased, matching Lucee/ACF.
+    q.insert("columnList".into(), CfmlValue::String(columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
     q.insert(
         "columns".into(),
         CfmlValue::array(

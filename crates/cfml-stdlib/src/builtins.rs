@@ -4202,7 +4202,8 @@ fn fn_query_column_count(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_column_list(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        Some(CfmlValue::Query(q)) => Ok(CfmlValue::String(q.columns.join(","))),
+        // columnList reports column names uppercased, matching Lucee/ACF.
+        Some(CfmlValue::Query(q)) => Ok(CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(","))),
         _ => Ok(CfmlValue::String(String::new())),
     }
 }

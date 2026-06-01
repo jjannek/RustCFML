@@ -23,5 +23,8 @@ if (isQuery(mappedCfcFiles)) {
     assertTrue("cfdirectory row exposes mapped directory", findNoCase("/tests/oop/native_cfcs", replace(firstMappedFile.directory, "\", "/", "all")) > 0);
     assert("cfdirectory row type is file", firstMappedFile.type, "file");
 }
+
+loader = createObject("component", "oop.CfdirectoryLoader");
+assert("cfdirectory unscoped name inside component method", loader.loadRoutes(), "3|NAME,SIZE,TYPE,DATELASTMODIFIED,ATTRIBUTES,MODE,DIRECTORY");
 suiteEnd();
 </cfscript>

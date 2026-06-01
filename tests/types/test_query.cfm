@@ -36,6 +36,9 @@ cols = q.columnList;
 assertTrue("columnList contains ID", findNoCase("id", cols) > 0);
 assertTrue("columnList contains NAME", findNoCase("name", cols) > 0);
 assertTrue("columnList contains EMAIL", findNoCase("email", cols) > 0);
+// columnList reports column names uppercased (Lucee/ACF parity)
+assert("columnList is uppercased", q.columnList, "ID,NAME,EMAIL");
+assert("queryColumnList() is uppercased", queryColumnList(q), "ID,NAME,EMAIL");
 
 // --- queryAddRow with data struct ---
 q3 = queryNew("id,name");

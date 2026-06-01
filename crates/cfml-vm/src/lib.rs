@@ -1055,7 +1055,8 @@ impl CfmlVirtualMachine {
                 if name.eq_ignore_ascii_case("recordcount") {
                     CfmlValue::Int(q.rows.len() as i64)
                 } else if name.eq_ignore_ascii_case("columnlist") {
-                    CfmlValue::String(q.columns.join(","))
+                    // columnList reports column names uppercased, matching Lucee/ACF.
+                    CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(","))
                 } else {
                     let is_col = q.columns.iter().any(|c| c.eq_ignore_ascii_case(name));
                     if is_col {
@@ -2876,7 +2877,8 @@ impl CfmlVirtualMachine {
                                         stack.push(CfmlValue::Int(q.rows.len() as i64));
                                     }
                                     "columnlist" => {
-                                        stack.push(CfmlValue::String(q.columns.join(",")));
+                                        // Uppercase column names, matching Lucee/ACF columnList.
+                                        stack.push(CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
                                     }
                                     _ => {
                                         // Column access: q.columnName returns a QueryColumn
@@ -8837,7 +8839,8 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Int(q.rows.len() as i64));
                 }
                 "columnlist" => {
-                    return Ok(CfmlValue::String(q.columns.join(",")));
+                    // Uppercase column names, matching Lucee/ACF columnList.
+                    return Ok(CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
                 }
                 "addrow" => Some("queryAddRow"),
                 "getrow" => Some("queryGetRow"),
