@@ -1344,7 +1344,14 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 }
                 "join" => {
                     let timeout = attrs.get("timeout").cloned().unwrap_or_else(|| "0".to_string());
-                    (format!("__cfthread_join({}, {});\n", thread_name_expr, timeout), tag_end - start)
+                    // No `name` attribute => join ALL outstanding threads. (The
+                    // shared `thread_name` defaults to "thread1", so the join
+                    // arm must consult the raw attribute rather than the default.)
+                    let join_name = match attrs.get("name") {
+                        Some(n) => format!("\"{}\"", n.replace('"', "\\\"")),
+                        None => "\"\"".to_string(),
+                    };
+                    (format!("__cfthread_join({}, {});\n", join_name, timeout), tag_end - start)
                 }
                 "terminate" => {
                     (format!("__cfthread_terminate({});\n", thread_name_expr), tag_end - start)

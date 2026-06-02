@@ -144,6 +144,7 @@ try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { write
 try { include "tags/test_cfdirectory_mapping_path.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_mapping_path.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfimport.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfimport.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfthread.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfthread.cfm | " & e.message & chr(10)); }
+try { include "tags/test_tags_cfthread_concurrency.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfthread_concurrency.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfscript_statements.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfscript_statements.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfhttp_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfhttp_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfhttpparam_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfhttpparam_interpolation.cfm | " & e.message & chr(10)); }
