@@ -54,6 +54,26 @@ The fastest way to start is with a prebuilt binary — no toolchain required.
 
 You can also run a single template (`rustcfml myapp.cfm`), drop into a REPL (`rustcfml -r`), or run inline code (`rustcfml -c '...'`). See **[Getting Started](docs/getting-started.md)** for those and shebang scripts.
 
+## Performance
+
+RustCFML compiles to a native binary with no runtime VM overhead, so it starts instantly and serves requests with a fraction of the memory of JVM-based CFML engines.
+
+Serving a "Hello World" `.cfm` page in `--production` mode against a warmed Lucee 7 — same machine (Apple M-series), same page, Apache Bench, 8s runs. Requests/sec, higher is better:
+
+| Concurrency | RustCFML | Lucee 7.0 | RustCFML (keep-alive) | Lucee (keep-alive) |
+|---|---|---|---|---|
+| `-c 1`   | **1,908** | 1,205 | **3,118**  | 1,625 |
+| `-c 10`  | **5,466** | 2,648 | **21,716** | 8,125 |
+| `-c 50`  | **6,983** | 3,503 | **25,833** | 8,085 |
+| `-c 100` | **7,528** | 3,107 | **25,855** | 7,419 |
+
+| | RustCFML | Lucee 7.0 |
+|---|---|---|
+| **Memory (RSS, under load)** | **~60 MB** | ~560 MB |
+| **Startup** | **instant** | ~15s |
+
+RustCFML serves roughly 2–3.5× the throughput at about a tenth of the memory, with no JVM warmup. Both engines benefit from HTTP keep-alive; RustCFML scales further with it, sustaining ~26,000 req/s. See **[Performance](docs/performance.md)** for full methodology and production-mode caching.
+
 ## Documentation
 
 | Topic | Description |
@@ -89,26 +109,6 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 - **Cloudflare Workers** — run RustCFML at the edge via WebAssembly. See **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**.
 
 **Production mode** (warm caching) and **sandbox / virtual filesystem** (host isolation, embedded files) apply to both web and CLI deployments — they're documented once in **[Deployment](docs/deployment.md)**.
-
-## Performance
-
-RustCFML compiles to a native binary with no runtime VM overhead, so it starts instantly and serves requests with a fraction of the memory of JVM-based CFML engines.
-
-Serving a "Hello World" `.cfm` page in `--production` mode against a warmed Lucee 7 — same machine (Apple M-series), same page, Apache Bench, 8s runs. Requests/sec, higher is better:
-
-| Concurrency | RustCFML | Lucee 7.0 | RustCFML (keep-alive) | Lucee (keep-alive) |
-|---|---|---|---|---|
-| `-c 1`   | **1,908** | 1,205 | **3,118**  | 1,625 |
-| `-c 10`  | **5,466** | 2,648 | **21,716** | 8,125 |
-| `-c 50`  | **6,983** | 3,503 | **25,833** | 8,085 |
-| `-c 100` | **7,528** | 3,107 | **25,855** | 7,419 |
-
-| | RustCFML | Lucee 7.0 |
-|---|---|---|
-| **Memory (RSS, under load)** | **~60 MB** | ~560 MB |
-| **Startup** | **instant** | ~15s |
-
-RustCFML serves roughly 2–3.5× the throughput at about a tenth of the memory, with no JVM warmup. Both engines benefit from HTTP keep-alive; RustCFML scales further with it, sustaining ~26,000 req/s. See **[Performance](docs/performance.md)** for full methodology and production-mode caching.
 
 ## Features
 
