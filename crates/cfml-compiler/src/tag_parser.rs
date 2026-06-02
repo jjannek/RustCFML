@@ -1308,9 +1308,35 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                         let body: String = chars[tag_end..end_tag_pos].iter().collect();
                         let close_end = find_tag_end(chars, end_tag_pos, len);
                         let body_script = tags_to_script_impl(&body, imports);
+                        // Custom attributes (everything but the reserved control
+                        // attributes) become the thread's `attributes` scope,
+                        // bound from the parent context at spawn. Values are
+                        // emitted as double-quoted strings so `#expr#` in an
+                        // attribute interpolates in the parent, as for any tag.
+                        let attr_entries: Vec<String> = attrs
+                            .iter()
+                            .filter(|(k, _)| {
+                                !matches!(
+                                    k.to_lowercase().as_str(),
+                                    "action" | "name" | "priority" | "timeout"
+                                )
+                            })
+                            .map(|(k, v)| {
+                                format!(
+                                    "\"{}\": \"{}\"",
+                                    k.replace('"', "\\\""),
+                                    v.replace('"', "\\\"")
+                                )
+                            })
+                            .collect();
+                        let attrs_arg = if attr_entries.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {{ {} }}", attr_entries.join(", "))
+                        };
                         (format!(
-                            "__cfthread_run({}, function() {{\n{}\n}});\n",
-                            thread_name_expr, body_script
+                            "__cfthread_run({}, function() {{\n{}\n}}{});\n",
+                            thread_name_expr, body_script, attrs_arg
                         ), close_end - start)
                     } else {
                         (String::new(), tag_end - start)
