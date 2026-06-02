@@ -2,292 +2,111 @@
 
 ![RustCFML Mascot](crab.svg)
 
-A CFML (ColdFusion&reg; Markup Language) Interpreter written in Rust.
-
-ColdFusion is a registered trademark of Adobe Inc. This project is not affiliated with or endorsed by Adobe.
+A CFML (ColdFusion&reg; Markup Language) interpreter written in Rust — a single, fast, run-anywhere binary with a tiny memory footprint.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 ![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)
 
-## Usage
+> ColdFusion is a registered trademark of Adobe Inc. RustCFML is not affiliated with or endorsed by Adobe.
 
 **[Try RustCFML in your browser](https://rustcfml.github.io/RustCFML/demo/)** — interactive demo running on WebAssembly.
 
-RustCFML requires Rust stable (>= 1.75.0). Install via [rustup.rs](https://rustup.rs/).
+## Project Aims
 
-### Building from Source
+RustCFML aims to be a **compatible, fast, run-anywhere** CFML engine with a minimal memory footprint and maximum performance. It is deliberately opinionated:
 
-```plaintext
-git clone https://github.com/RustCFML/RustCFML.git
-cd RustCFML
-cargo build --release
-```
+- **A lean, stable core.** We don't add things to the core that are prone to constant churn in the wider ecosystem. Reliability comes first — think of RustCFML as an LTS-style engine. It is already blazingly fast.
+- **Libraries over built-ins.** We won't add core functions that are better served by libraries. Instead, where possible, we make the engine compatible enough to *run* those libraries.
+- **No administrator, ever.** RustCFML does not have — and never will have — a ColdFusion Administrator. Configuration is file-based via [`.cfconfig.json`](docs/configuration.md), with environment-variable substitution for secrets.
+- **Inspired by real apps and modern deployment.** We follow modern deployment practices and won't bake in CI/CD features that belong in your pipeline, not your language runtime.
+- **Honest about Java.** There is no JVM under the hood. We provide limited Java-class shim support (faking common Java classes), but you should expect — and will find — differences.
 
-### Running CFML Files
+## Project Background
 
-```plaintext
-cargo run --release -- myapp.cfm          # Run a .cfm template
-cargo run --release -- -c 'writeOutput("Hello!")' # Inline code
-cargo run --release -- -r                 # Interactive REPL
-```
+RustCFML began as a proof of AI model capabilities by Alex Skinner, CEO of [Pixl8 Group](https://www.pixl8.co.uk/). It has been written almost entirely by AI — predominantly Claude Opus — with research and test synthesis assisted by local models.
 
-### Web Server Mode
+## Getting Started
 
-Serve `.cfm` files over HTTP with full CFML web scopes (CGI, URL, Form, Cookie, Session, Application, Request):
+The fastest way to start is with a prebuilt binary — no toolchain required.
 
-```plaintext
-cargo run --release -- --serve                          # Current dir on port 8500
-cargo run --release -- --serve examples/miniapp --port 3000  # Custom root and port
-```
+1. **Download a binary** for your platform from the **[latest release](https://github.com/RustCFML/RustCFML/releases/latest)** (Linux x86_64/aarch64, macOS aarch64), then put it on your `PATH`:
 
-The server is built on [Axum](https://github.com/tokio-rs/axum) with concurrent request handling. It serves `.cfm` files and static assets from the document root. Directory requests serve `index.cfm` if present. Path info routing is supported (`/index.cfm/users/123` resolves to `index.cfm` with path info `/users/123`). Bytecode caching skips recompilation for unchanged files across requests.
+   ```bash
+   chmod +x rustcfml-macos-aarch64
+   sudo mv rustcfml-macos-aarch64 /usr/local/bin/rustcfml
+   ```
 
-#### Configuration (`.cfconfig.json`)
+2. **Run a web application** — the most common way to get going. Point RustCFML at a directory of `.cfm` files:
 
-Drop a `.cfconfig.json` at the webroot to configure datasources, mappings, mail, security policies, error handling, and more. The format follows the Ortus CFConfig filename convention with a BoxLang-style flat schema, so the same file works across CommandBox/Lucee, BoxLang, and RustCFML — engine-specific keys are silently ignored. See **[CFCONFIG.md](CFCONFIG.md)** for the full reference.
+   ```bash
+   rustcfml --serve ./mywebroot --port 8500
+   ```
 
-#### Distributed sessions
+   It serves `.cfm` pages and static assets, runs the `Application.cfc` lifecycle, and supports sessions, URL rewriting, and file uploads. See **[Web Server](docs/web-server.md)**.
 
-RustCFML supports two pluggable session backends beyond the in-process default, both built into the stock binary and selected via `.cfconfig.json`:
+You can also run a single template (`rustcfml myapp.cfm`), drop into a REPL (`rustcfml -r`), or run inline code (`rustcfml -c '...'`). See **[Getting Started](docs/getting-started.md)** for those and shebang scripts.
 
-- **Memcached** — sessions stored in an external Memcached cluster. Lucee-compatible config shape.
-- **Cluster** — gossip-based peer-to-peer replication across native RustCFML nodes using [memberlist](https://github.com/al8n/memberlist) for membership and [Automerge](https://automerge.org) CRDTs for conflict-free merging. Suitable for LAN or WAN deployments up to a few dozen nodes; no external store required.
+## Building from Source
 
-Both backends share the same `sessionStorage` / `caches` keys in `.cfconfig.json` so the configuration shape carries across Lucee and BoxLang. Switching backends is a config-only change — no rebuild needed. See the **[`caches` and `sessionStorage` section of CFCONFIG.md](CFCONFIG.md#caches-and-sessionstorage)** for the full reference, a three-node walkthrough, and a troubleshooting table.
-
-#### URL Rewriting
-
-Place a `urlrewrite.xml` file in your document root for Tuckey-compatible URL rewriting. This enables clean URLs and REST-style routing:
-
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<urlrewrite>
-    <rule>
-        <from>^/([a-zA-Z][a-zA-Z0-9_/-]*)$</from>
-        <to>/index.cfm/$1</to>
-    </rule>
-    <rule>
-        <from>^/old-page$</from>
-        <to type="permanent-redirect">/new-page</to>
-    </rule>
-</urlrewrite>
-```
-
-Supported features:
-- **Regex and wildcard patterns** with backreference substitution (`$1`, `$2`)
-- **Forward**, **redirect** (302), and **permanent-redirect** (301) actions
-- **Conditions** on HTTP method, port, and headers
-- **Rule chaining** with `last="true"` to stop processing
-
-#### Application.cfc Lifecycle
-
-If an `Application.cfc` file exists in the document root (or any parent directory), it is automatically loaded and its lifecycle methods are called:
-
-- `onApplicationStart()` — runs once when the application is first accessed
-- `onRequestStart(targetPage)` — runs before each request
-- `onRequest(targetPage)` — handles the request (replaces default page execution)
-- `onRequestEnd(targetPage)` — runs after each request
-- `onError(exception, eventName)` — handles uncaught errors
-
-Application state (`application` scope) persists across requests in serve mode. Component mappings defined via `this.mappings` in Application.cfc are supported for virtual path resolution.
-
-### Installing Globally
-
-```plaintext
-cargo install --path crates/cli
-rustcfml myapp.cfm
-```
-
-### Shell Scripts (Shebang Support)
-
-RustCFML scripts can be executed directly as shell scripts using a shebang line. The file extension does not matter.
+If you'd rather build it yourself (or you're contributing), you need Rust stable (>= 1.75.0) — install via [rustup.rs](https://rustup.rs/):
 
 ```bash
-#!/usr/bin/env rustcfml
-writeOutput("Hello from a shell script!" & chr(10));
-var x = 2 + 2;
-writeOutput("2 + 2 = " & x & chr(10));
+git clone https://github.com/RustCFML/RustCFML.git
+cd RustCFML
+cargo build --release        # binary at target/release/rustcfml
+cargo install --path crates/cli   # optional: install on your PATH
 ```
 
-```plaintext
-chmod +x myscript.cfm
-./myscript.cfm
-```
+See **[Getting Started → Building from source](docs/getting-started.md#building-from-source)** for feature flags, the WebAssembly target, and the self-contained-binary build path.
 
-### Self-Contained Binaries
+## Deployment
 
-Package a CFML application into a single executable — no runtime dependencies, no source files to deploy. The binary includes the RustCFML interpreter, web server, and all your application files.
+RustCFML is designed to deploy as a single artifact in several shapes — see **[Deployment](docs/deployment.md)** for full detail:
 
-#### CLI Tools
+- **Web application** — run `--serve` behind your reverse proxy, with `--production` for warm in-memory caching:
 
-Build command-line tools from CFML. Arguments are available via the `cli` scope, which works like CFML's `arguments` scope — named keys for flags, 1-based numeric keys for positional args.
+  ```bash
+  rustcfml --serve ./mywebroot --production
+  ```
 
-```plaintext
-rustcfml --build ./myapp -o greet --mode cli --entry main.cfm
-```
+- **Optimised Docker container** — *coming soon*: a minimal image for containerised deployment.
 
-**myapp/main.cfm:**
-```cfml
-<cfscript>
-name = cli.name ?: "World";
-writeOutput("Hello, #name#!" & chr(10));
+- **CLI tool** — compile a CFML app into a standalone command-line binary. See **[Deployment → CLI tools](docs/deployment.md#cli-tools)**.
 
-// Positional args: cli[1], cli[2], ...
-for (i = 1; i <= structCount(cli); i++) {
-    if (isNumeric(i) && structKeyExists(cli, i))
-        writeOutput("  arg #i#: #cli[i]#" & chr(10));
-}
-</cfscript>
-```
+- **Cloudflare Workers** — run RustCFML at the edge via WebAssembly. See **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**.
 
-```plaintext
-./greet                     # Hello, World!
-./greet --name Alex         # Hello, Alex!
-./greet foo bar             # positional: cli[1]="foo", cli[2]="bar"
-```
-
-#### Web Applications
-
-Package a web application as a single binary with an embedded HTTP server.
-
-```plaintext
-rustcfml --build ./webapp -o myserver --mode serve
-```
-
-Run it:
-```plaintext
-./myserver                          # Foreground on port 8500
-./myserver --port 3000              # Custom port
-./myserver start --port 3000        # Daemonize (background)
-./myserver status                   # Check if running
-./myserver stop                     # Graceful shutdown
-```
-
-#### Sandbox Mode
-
-Self-contained binaries can run in **sandbox mode**, which completely isolates the application from the host filesystem.
-
-```plaintext
-./myserver --sandbox                # No host filesystem access
-./myserver --sandbox --port 3000    # Sandbox + custom port
-```
-
-In sandbox mode:
-
-- **Embedded files are readable** — `fileRead()`, `fileExists()`, `directoryList()`, `expandPath()`, and `include` all work against the embedded virtual filesystem. Your application can read its own bundled config files, templates, and assets normally.
-- **Host filesystem is invisible** — `fileExists("/etc/passwd")` returns `false`. `fileRead()` on any host path returns "file not found". The application cannot discover or read files outside the embedded archive.
-- **All writes are blocked** — `fileWrite()`, `fileAppend()`, `fileDelete()`, `directoryCreate()`, and all other write operations throw an error: *"filesystem writes are disabled in sandbox mode"*.
-
-This means even if application code is compromised (e.g. via a code injection vulnerability), the attacker cannot:
-- Read sensitive files from the host (`/etc/passwd`, environment files, SSH keys)
-- Write persistent backdoors, web shells, or malware to disk
-- Modify or delete files on the host system
-
-The embedded virtual filesystem is **read-only and non-persistent** — there is no writable overlay. Any state the application needs to persist should use external services (databases, APIs).
-
-#### Binary Sizes
-
-| Build | Size |
-|---|---|
-| Release binary (no app) | ~13 MB |
-| + small web app | ~13 MB |
-| + large app (100+ files) | ~13-15 MB |
-
-No JRE, no runtime, no dependencies. Compare: Lucee/BoxLang require a 200+ MB JRE.
-
-#### Native (Rust) Modules
-
-Self-contained binaries can include user-authored Rust code that surfaces as
-first-class CFML built-ins and classes. When `rustcfml --build` finds a
-`native/<crate>/Cargo.toml` inside your app dir, it generates a Cargo
-workspace and compiles your modules into the binary alongside the CFML.
-
-```
-myapp/
-├── main.cfm
-└── native/
-    └── greeter/
-        ├── Cargo.toml
-        └── src/lib.rs   — pub fn register(vm: &mut Vm)
-```
-
-In `src/lib.rs`:
-
-```rust
-use rustcfml_cli::{CfmlNative, CfmlResult, Value, Vm};
-
-pub fn register(vm: &mut Vm) {
-    vm.register_native_fn("rustGreet", |args| {
-        let name = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-        Ok(Value::String(format!("Hello, {}", name)))
-    });
-    vm.register_native_class("Tally", tally_new);
-}
-```
-
-In your CFML:
-
-```cfml
-writeOutput(rustGreet("Alex"));         // Hello, Alex
-counter = createObject("rust", "Tally");
-counter.bump();
-```
-
-Working example: [`examples/native_module_demo/`](examples/native_module_demo/).
-
-**Requirements.** `cargo`/`rustc` on PATH at build time (the standard Rust
-toolchain — install from https://rustup.rs). End users running the
-produced binary need nothing extra. Plain CFML apps with no `native/`
-directory keep the original toolchain-free bundling path.
+**Production mode** (warm caching) and **sandbox / virtual filesystem** (host isolation, embedded files) apply to both web and CLI deployments — they're documented once in **[Deployment](docs/deployment.md)**.
 
 ## Performance
 
-Benchmarked serving a "Hello World" `.cfm` page using Apache Bench (`ab -n 100 -c 1`):
+RustCFML compiles to a native binary with no runtime VM overhead, so it starts instantly and serves requests with a fraction of the memory of JVM-based CFML engines.
 
-| Metric | RustCFML (dev) | RustCFML (`--production`) | Lucee 7.0.1 | BoxLang 1.10 |
+Serving a "Hello World" `.cfm` page in `--production` mode against a warmed Lucee 7 — same machine (Apple M-series), same page, Apache Bench, 8s runs. Requests/sec, higher is better:
+
+| Concurrency | RustCFML | Lucee 7.0 | RustCFML (keep-alive) | Lucee (keep-alive) |
 |---|---|---|---|---|
-| **Memory (RSS)** | **~8 MB** | **~8 MB** | ~350 MB | ~305 MB |
-| **Requests/sec** | 1,949 req/s | **2,558 req/s** | 635 req/s | 293 req/s |
-| **Avg response time** | 0.5 ms | **0.39 ms** | 1.6 ms | 3.4 ms |
-| **Startup** | instant | instant | ~15s | ~15s |
+| `-c 1`   | **1,908** | 1,205 | **3,118**  | 1,625 |
+| `-c 10`  | **5,466** | 2,648 | **21,716** | 8,125 |
+| `-c 50`  | **6,983** | 3,503 | **25,833** | 8,085 |
+| `-c 100` | **7,528** | 3,107 | **25,855** | 7,419 |
 
-RustCFML compiles to a native binary with no runtime VM overhead, resulting in significantly lower memory usage and faster response times compared to JVM-based CFML engines.
+| | RustCFML | Lucee 7.0 |
+|---|---|---|
+| **Memory (RSS, under load)** | **~60 MB** | ~560 MB |
+| **Startup** | **instant** | ~15s |
 
-### Production mode
-
-By default, the server re-validates files on each request: it walks up from the page directory to find `Application.cfc`, stats the resolved file, and stats every cached bytecode entry to detect source changes. This keeps the dev loop hot — edit a file and refresh.
-
-Passing `--production` (or setting `RUSTCFML_PRODUCTION=1`) enables three in-memory caches that persist for the server's lifetime:
-
-- **Application.cfc path resolution** — the first request walks the directory tree; subsequent requests hit a hashmap. Negative results (no `Application.cfc` anywhere in the chain) are cached too.
-- **URL → file resolution** — `is_file` stats from request routing are memoized.
-- **Bytecode cache trust** — the per-hit `mtime` check on every compiled file is skipped.
-
-Net effect: requests pay zero filesystem IO once the cache is warm. The typical speedup on an app with `Application.cfc` + cfincludes is 3–4× requests/sec (measured on `examples/miniapp`: 671 → 2,558 req/s at `-c 1`, 3,440 → 11,812 req/s at `-c 10`). Files added or modified on disk are not picked up until the server is restarted.
-
-Self-contained binaries built with `rustcfml --build` that run in sandbox mode enable production caching automatically, since the embedded VFS is immutable at runtime.
+RustCFML serves roughly 2–3.5× the throughput at about a tenth of the memory, with no JVM warmup. Both engines benefit from HTTP keep-alive; RustCFML scales further with it, sustaining ~26,000 req/s. See **[Performance](docs/performance.md)** for full methodology and production-mode caching.
 
 ## Features
 
-RustCFML covers a substantial portion of the CFML language:
+- **Complete CFML language** — CFScript and tag syntax (a preprocessor converts 50+ tags to CFScript), components with inheritance and interfaces, closures, member functions, and higher-order functions across arrays, structs, queries, and lists.
+- **400+ built-in functions** — strings, arrays, structs, dates, math, lists, queries, JSON, XML, regex, encoding, hashing, and modern password hashing (bcrypt/scrypt/argon2).
+- **Batteries-included web server** — `Application.cfc` lifecycle, sessions (in-process, Memcached, or clustered), cookies, authentication, URL rewriting, and file uploads.
+- **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
+- **Run anywhere** — native binaries, self-contained single-file apps, and a WebAssembly target that runs on Cloudflare Workers.
+- **Extensible** — drop in first-class built-ins and classes written in Rust ([native modules](docs/native-modules.md)).
 
-- **Full CFScript and CFML tag syntax** — tag preprocessor converts 50+ CFML tags to CFScript automatically
-- **Stack-based bytecode VM** with compilation caching in serve mode
-- **400+ built-in functions** — strings, arrays, structs, math, dates, lists, queries, JSON, file I/O, regex, security, caching, hashing, encoding, XML, INI files, locale formatting, password hashing (bcrypt/scrypt/argon2)
-- **Member functions and method chaining** — `"hello".ucase().reverse()`, `[1,2,3].len()`
-- **Higher-order functions** — map, filter, reduce, each, some, every on arrays, structs, lists, queries, strings, and collections
-- **Components** — inheritance, interfaces, implicit accessors, `onMissingMethod`, metadata, `createObject`
-- **Web server** — Application.cfc lifecycle, sessions, cookies, authentication, URL rewriting, file uploads, component mappings
-- **Database** — `queryExecute` with SQLite, MySQL, PostgreSQL, MSSQL; connection pooling, `cfqueryparam`, `cftransaction`
-- **HTTP client** — `cfhttp`/`cfhttpparam` for GET/POST/PUT/DELETE/PATCH
-- **Object storage** — full AWS S3 + S3-compatible (Cloudflare R2, MinIO, DigitalOcean Spaces) support, both via explicit `S3*` functions and transparent `s3://` paths in `fileRead` / `fileWrite` / `directoryList` / etc. Key-prefix scoping and Application.cfc s3 mappings included. See [docs/s3.md](docs/s3.md)
-- **Email** — `cfmail`/`cfmailparam`/`cfmailpart` with SMTP sending
-- **Threading** — `cfthread` tag (sequential execution model)
-- **Closures** — scope capture with parent write-back, arrow functions, spread operator
-- **WASM target** — compile to WebAssembly via `wasm-bindgen`
-- **Self-contained binaries** — package CFML apps as single executables (CLI tools or web servers) with optional sandbox mode for host filesystem isolation
-
-See [Work.md](Work.md) for detailed implementation status.
+See **[Compatibility & Status](docs/status.md)** for implementation status.
 
 ### Not Supported
 
@@ -295,94 +114,48 @@ See [Work.md](Work.md) for detailed implementation status.
 - Image functions, Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
 - `cfschedule`, `cfwddx`, real concurrent `cfthread` execution
 
+## Documentation
+
+| Topic | Description |
+|---|---|
+| **[Getting Started](docs/getting-started.md)** | Prebuilt binaries, running files, REPL, shebang scripts, building from source |
+| **[Web Server](docs/web-server.md)** | Serve mode, Application.cfc lifecycle, URL rewriting, distributed sessions |
+| **[Configuration](docs/configuration.md)** | `.cfconfig.json` — datasources, mappings, mail, security, caches, env vars |
+| **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
+| **[Database](docs/database.md)** | `queryExecute`, datasources, `cfqueryparam`, engine specifics |
+| **[Object Storage](docs/s3.md)** | S3 / R2 / MinIO — `S3*` functions and transparent `s3://` paths |
+| **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
+| **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
+| **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
+| **[Architecture](docs/architecture.md)** | Compilation pipeline and crate layout |
+| **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
+| **[Testing](docs/testing.md)** | Running the test suites and writing tests |
+| **[Status](docs/status.md)** | Implementation status and remaining work |
+
 ## Architecture
 
 ```plaintext
 CFML Source (.cfm / .cfc)
-    → Tag Preprocessor → CFScript
-    → Lexer → Tokens
-    → Parser → AST
-    → Compiler → Bytecode
-    → VM → Output
+    → Tag Preprocessor → CFScript → Lexer → Parser → AST → Compiler → Bytecode → VM → Output
 ```
 
-```plaintext
-crates/
-├── cfml-common/     # Shared types: CfmlValue, CfmlError
-├── cfml-compiler/   # Lexer, Parser, AST, Tag Preprocessor
-├── cfml-codegen/    # Bytecode compiler (AST → BytecodeOp)
-├── cfml-vm/         # Stack-based bytecode VM
-├── cfml-stdlib/     # 400+ built-in functions
-├── cli/             # CLI + Axum web server
-└── wasm/            # WebAssembly target
-```
+RustCFML is a Cargo workspace of focused crates (`cfml-common`, `cfml-compiler`, `cfml-codegen`, `cfml-vm`, `cfml-stdlib`, `cli`, `wasm`). See **[Architecture](docs/architecture.md)** for the full breakdown.
 
-## Embedding in Rust
+## Contributing
 
-```rust
-use cfml_codegen::compiler::CfmlCompiler;
-use cfml_compiler::parser::Parser;
-use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
-use cfml_vm::CfmlVirtualMachine;
+Contributions are welcome.
 
-let source = r#"writeOutput("Hello from Rust!");"#;
-let ast = Parser::new(source.to_string()).parse().unwrap();
-let program = CfmlCompiler::new().compile(ast);
-let mut vm = CfmlVirtualMachine::new(program);
-for (name, value) in get_builtins() { vm.globals.insert(name, value); }
-for (name, func) in get_builtin_functions() { vm.builtins.insert(name, func); }
-vm.execute().unwrap();
-println!("{}", vm.output_buffer);
-```
+- **New here?** If you haven't contributed before, please **[open an Issue](https://github.com/RustCFML/RustCFML/issues)** with detail (a minimal reproducible CFML snippet, expected vs actual behaviour) before opening a PR.
+- **Pull requests are the preferred way to contribute a fix.** A great place to start is a **CFML-based test** that demonstrates the behaviour (see **[Testing](docs/testing.md)**).
+- **Lucee is the reference for compatibility.** Your test **must pass on Lucee** — if it doesn't, we won't accept it. RustCFML targets [cfdocs.org](https://cfdocs.org) with Lucee as the primary implementation target. (By rare exception, where Lucee allows something genuinely unreasonable, we may choose not to match it.)
 
-## Object Storage (S3 / R2 / MinIO)
+See **[Testing](docs/testing.md)** for how to run the suite against both RustCFML and Lucee.
 
-```cfml
-// Explicit S3* functions
-s3Write("my-bucket", "logs/today.txt", "hello");
-s3Read("my-bucket", "logs/today.txt");
+### Contributors
 
-// Transparent s3:// in normal file/directory functions
-fileWrite("s3://my-bucket/logs/today.txt", "hello");
-fileRead("s3://my-bucket/logs/today.txt");
-directoryList("s3://my-bucket/logs/");
+[![Contributors](https://contrib.rocks/image?repo=RustCFML/RustCFML)](https://github.com/RustCFML/RustCFML/graphs/contributors)
 
-// Application.cfc — credentials, key-prefix scoping, and s3:// mappings
-this.s3 = {
-    accessKeyId:  "AKIA…",
-    awsSecretKey: "…",
-    defaultLocation: "us-east-1",      // "auto" for R2
-    host: "",                          // R2/MinIO endpoint, blank for AWS
-    keyPrefix: "myapp/"                // optional scope
-};
-this.mappings["/logs"] = "s3://KEY:SECRET@my-bucket/logs/";
-```
-
-Works with AWS S3, Cloudflare R2, MinIO, DigitalOcean Spaces, Backblaze B2, Wasabi, etc. Full documentation: [docs/s3.md](docs/s3.md).
-
-**Cloudflare Workers note:** S3 is not yet available in the WASM/Worker build — the AWS SDK uses tokio/hyper transport which doesn't compile on `wasm32-unknown-unknown`. For Workers, use the native R2 binding via [RustCFMLWorker](https://github.com/RustCFML/RustCFMLWorker)'s host config. A `fetch()`-backed S3 transport for the WASM target is on the roadmap — see [docs/s3.md](docs/s3.md#wasm--cloudflare-workers).
-
-## Compiling to WebAssembly
-
-```plaintext
-cargo install wasm-pack
-wasm-pack build crates/wasm --target web
-```
-
-```javascript
-import init, { CfmlEngine } from './pkg/rustcfml_wasm.js';
-await init();
-const output = CfmlEngine.new().execute('writeOutput("Hello from WASM!");');
-```
-
-## Testing
-
-```plaintext
-cargo run -- tests/runner.cfm    # 1197 assertions across 90 suites
-cargo test                        # Rust unit tests
-```
-
-See [TESTING.md](TESTING.md) for the full testing guide.
+_Avatars are generated automatically from the [GitHub contributor graph](https://github.com/RustCFML/RustCFML/graphs/contributors) by [contrib.rocks](https://contrib.rocks)._
 
 ## Related Projects
 
@@ -393,3 +166,4 @@ See [TESTING.md](TESTING.md) for the full testing guide.
 ## License
 
 MIT
+

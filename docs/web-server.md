@@ -1,0 +1,66 @@
+# Web Server
+
+[← Back to README](../README.md)
+
+Serve `.cfm` files over HTTP with full CFML web scopes (CGI, URL, Form, Cookie, Session, Application, Request):
+
+```bash
+rustcfml --serve                           # Current dir on port 8500
+rustcfml --serve ./mywebroot --port 3000   # Custom root and port
+```
+
+The server is built on [Axum](https://github.com/tokio-rs/axum) with concurrent request handling. It serves `.cfm` files and static assets from the document root. Directory requests serve `index.cfm` if present. Path-info routing is supported (`/index.cfm/users/123` resolves to `index.cfm` with path info `/users/123`). Bytecode caching skips recompilation for unchanged files across requests.
+
+For deploying the server (production caching, Docker, standalone binaries), see **[Deployment](deployment.md)**.
+
+## Configuration (`.cfconfig.json`)
+
+Drop a `.cfconfig.json` at the webroot to configure datasources, mappings, mail, security policies, error handling, and more. The format follows the Ortus CFConfig filename convention with a BoxLang-style flat schema, so the same file works across CommandBox/Lucee, BoxLang, and RustCFML — engine-specific keys are silently ignored. Secrets can use environment-variable substitution.
+
+See **[Configuration](configuration.md)** for the full reference.
+
+## Application.cfc lifecycle
+
+If an `Application.cfc` file exists in the document root (or any parent directory), it is automatically loaded and its lifecycle methods are called:
+
+- `onApplicationStart()` — runs once when the application is first accessed
+- `onRequestStart(targetPage)` — runs before each request
+- `onRequest(targetPage)` — handles the request (replaces default page execution)
+- `onRequestEnd(targetPage)` — runs after each request
+- `onError(exception, eventName)` — handles uncaught errors
+
+Application state (`application` scope) persists across requests in serve mode. Component mappings defined via `this.mappings` in `Application.cfc` are supported for virtual path resolution.
+
+## Distributed sessions
+
+RustCFML supports two pluggable session backends beyond the in-process default, both built into the stock binary and selected via `.cfconfig.json`:
+
+- **Memcached** — sessions stored in an external Memcached cluster. Lucee-compatible config shape.
+- **Cluster** — gossip-based peer-to-peer replication across native RustCFML nodes using [memberlist](https://github.com/al8n/memberlist) for membership and [Automerge](https://automerge.org) CRDTs for conflict-free merging. Suitable for LAN or WAN deployments up to a few dozen nodes; no external store required.
+
+Both backends share the same `sessionStorage` / `caches` keys in `.cfconfig.json`, so the configuration shape carries across Lucee and BoxLang. Switching backends is a config-only change — no rebuild needed. See the **[`caches` and `sessionStorage` section of Configuration](configuration.md#caches-and-sessionstorage)** for the full reference, a three-node walkthrough, and a troubleshooting table.
+
+## URL rewriting
+
+Place a `urlrewrite.xml` file in your document root for Tuckey-compatible URL rewriting. This enables clean URLs and REST-style routing:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<urlrewrite>
+    <rule>
+        <from>^/([a-zA-Z][a-zA-Z0-9_/-]*)$</from>
+        <to>/index.cfm/$1</to>
+    </rule>
+    <rule>
+        <from>^/old-page$</from>
+        <to type="permanent-redirect">/new-page</to>
+    </rule>
+</urlrewrite>
+```
+
+Supported features:
+
+- **Regex and wildcard patterns** with backreference substitution (`$1`, `$2`)
+- **Forward**, **redirect** (302), and **permanent-redirect** (301) actions
+- **Conditions** on HTTP method, port, and headers
+- **Rule chaining** with `last="true"` to stop processing
