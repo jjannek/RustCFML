@@ -19,7 +19,7 @@ RustCFML aims to be a **compatible, fast, run-anywhere** CFML engine with a mini
 - **Libraries over built-ins.** We won't add core functions that are better served by libraries. Instead, where possible, we make the engine compatible enough to *run* those libraries.
 - **No administrator, ever.** RustCFML does not have — and never will have — a ColdFusion Administrator. Configuration is file-based via [`.cfconfig.json`](docs/configuration.md), with environment-variable substitution for secrets.
 - **Inspired by real apps and modern deployment.** We follow modern deployment practices and won't bake in CI/CD features that belong in your pipeline, not your language runtime.
-- **Honest about Java.** There is no JVM under the hood. We provide limited Java-class shim support (faking common Java classes), but you should expect — and will find — differences.
+- **Honest about Java.** There is no JVM under the hood. We provide limited [Java-class shim support](docs/java-shims.md) (faking common Java classes), but you should expect — and will find — differences.
 
 ## Project Background
 
@@ -85,6 +85,7 @@ RustCFML serves roughly 2–3.5× the throughput at about a tenth of the memory,
 | **[Database](docs/database.md)** | `queryExecute`, datasources, `cfqueryparam`, engine specifics |
 | **[Object Storage](docs/s3.md)** | S3 / R2 / MinIO — `S3*` functions and transparent `s3://` paths |
 | **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
+| **[Java Shims](docs/java-shims.md)** | Emulated Java classes for `createObject("java", …)` — what's supported and known gaps |
 | **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
 | **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
 | **[Architecture](docs/architecture.md)** | Compilation pipeline and crate layout |
