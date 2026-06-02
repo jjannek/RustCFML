@@ -44,20 +44,33 @@ The fastest way to start is with a prebuilt binary — no toolchain required.
 
    It serves `.cfm` pages and static assets, runs the `Application.cfc` lifecycle, and supports sessions, URL rewriting, and file uploads. See **[Web Server](docs/web-server.md)**.
 
+3. **Go to production** — add `--production` to enable warm in-memory caching (skips per-request filesystem checks for a 3–4× throughput gain):
+
+   ```bash
+   rustcfml --serve ./mywebroot --production
+   ```
+
+   See **[Deployment](docs/deployment.md)** for production mode, the sandbox/virtual filesystem, standalone binaries, and Cloudflare Workers.
+
 You can also run a single template (`rustcfml myapp.cfm`), drop into a REPL (`rustcfml -r`), or run inline code (`rustcfml -c '...'`). See **[Getting Started](docs/getting-started.md)** for those and shebang scripts.
 
-## Building from Source
+## Documentation
 
-If you'd rather build it yourself (or you're contributing), you need Rust stable (>= 1.75.0) — install via [rustup.rs](https://rustup.rs/):
-
-```bash
-git clone https://github.com/RustCFML/RustCFML.git
-cd RustCFML
-cargo build --release        # binary at target/release/rustcfml
-cargo install --path crates/cli   # optional: install on your PATH
-```
-
-See **[Getting Started → Building from source](docs/getting-started.md#building-from-source)** for feature flags, the WebAssembly target, and the self-contained-binary build path.
+| Topic | Description |
+|---|---|
+| **[Getting Started](docs/getting-started.md)** | Prebuilt binaries, running files, REPL, shebang scripts, building from source |
+| **[Web Server](docs/web-server.md)** | Serve mode, Application.cfc lifecycle, URL rewriting, distributed sessions |
+| **[Configuration](docs/configuration.md)** | `.cfconfig.json` — datasources, mappings, mail, security, caches, env vars |
+| **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
+| **[Database](docs/database.md)** | `queryExecute`, datasources, `cfqueryparam`, engine specifics |
+| **[Object Storage](docs/s3.md)** | S3 / R2 / MinIO — `S3*` functions and transparent `s3://` paths |
+| **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
+| **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
+| **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
+| **[Architecture](docs/architecture.md)** | Compilation pipeline and crate layout |
+| **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
+| **[Testing](docs/testing.md)** | Running the test suites and writing tests |
+| **[Status](docs/status.md)** | Implementation status and remaining work |
 
 ## Deployment
 
@@ -114,24 +127,6 @@ See **[Compatibility & Status](docs/status.md)** for implementation status.
 - Image functions, Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
 - `cfschedule`, `cfwddx`, real concurrent `cfthread` execution
 
-## Documentation
-
-| Topic | Description |
-|---|---|
-| **[Getting Started](docs/getting-started.md)** | Prebuilt binaries, running files, REPL, shebang scripts, building from source |
-| **[Web Server](docs/web-server.md)** | Serve mode, Application.cfc lifecycle, URL rewriting, distributed sessions |
-| **[Configuration](docs/configuration.md)** | `.cfconfig.json` — datasources, mappings, mail, security, caches, env vars |
-| **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
-| **[Database](docs/database.md)** | `queryExecute`, datasources, `cfqueryparam`, engine specifics |
-| **[Object Storage](docs/s3.md)** | S3 / R2 / MinIO — `S3*` functions and transparent `s3://` paths |
-| **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
-| **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
-| **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
-| **[Architecture](docs/architecture.md)** | Compilation pipeline and crate layout |
-| **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
-| **[Testing](docs/testing.md)** | Running the test suites and writing tests |
-| **[Status](docs/status.md)** | Implementation status and remaining work |
-
 ## Architecture
 
 ```plaintext
@@ -140,6 +135,19 @@ CFML Source (.cfm / .cfc)
 ```
 
 RustCFML is a Cargo workspace of focused crates (`cfml-common`, `cfml-compiler`, `cfml-codegen`, `cfml-vm`, `cfml-stdlib`, `cli`, `wasm`). See **[Architecture](docs/architecture.md)** for the full breakdown.
+
+## Building from Source
+
+If you'd rather build it yourself (or you're contributing), you need Rust stable (>= 1.75.0) — install via [rustup.rs](https://rustup.rs/):
+
+```bash
+git clone https://github.com/RustCFML/RustCFML.git
+cd RustCFML
+cargo build --release        # binary at target/release/rustcfml
+cargo install --path crates/cli   # optional: install on your PATH
+```
+
+See **[Getting Started → Building from source](docs/getting-started.md#building-from-source)** for feature flags, the WebAssembly target, and the self-contained-binary build path.
 
 ## Contributing
 
@@ -157,7 +165,7 @@ See **[Testing](docs/testing.md)** for how to run the suite against both RustCFM
 
 _Avatars are generated automatically from the [GitHub contributor graph](https://github.com/RustCFML/RustCFML/graphs/contributors) by [contrib.rocks](https://contrib.rocks)._
 
-## Related Projects
+## Project Inspiration
 
 - [Lucee](https://github.com/lucee/Lucee) — open-source CFML engine (Java)
 - [BoxLang](https://github.com/ortus-boxlang/BoxLang) — modern CFML+ runtime (Java)
@@ -166,4 +174,3 @@ _Avatars are generated automatically from the [GitHub contributor graph](https:/
 ## License
 
 MIT
-
