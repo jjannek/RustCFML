@@ -521,7 +521,11 @@ pub struct CfmlVirtualMachine {
     /// to the caller's locals. Enables closures to mutate parent scope.
     closure_parent_writeback: Option<IndexMap<String, CfmlValue>>,
     /// Request scope — lives for the duration of one request
-    pub request_scope: IndexMap<String, CfmlValue>,
+    /// Request scope, backed by a shared `CfmlStruct` (`Arc<RwLock<IndexMap>>`)
+    /// so spawned `cfthread` child VMs can share it live with the parent (CFML
+    /// request scope is shared across threads). Reads still return a snapshot;
+    /// writes mutate the shared backing store in place.
+    pub request_scope: CfmlStruct,
     /// Application scope — shared across requests (Arc<Mutex> for thread safety)
     pub application_scope: Option<Arc<Mutex<IndexMap<String, CfmlValue>>>>,
     /// Name of the application currently attached to `application_scope`.
@@ -729,7 +733,7 @@ impl CfmlVirtualMachine {
             method_this_writeback: None,
             method_variables_writeback: None,
             closure_parent_writeback: None,
-            request_scope: IndexMap::new(),
+            request_scope: CfmlStruct::empty(),
             application_scope: None,
             current_application_name: None,
             application_stopped: false,
@@ -1314,7 +1318,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::strukt(locals.clone())
                         }
                     } else if name_lower == "request" {
-                        CfmlValue::strukt(self.request_scope.clone())
+                        CfmlValue::strukt(self.request_scope.snapshot())
                     } else if name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
                             if let Ok(scope) = app_scope.lock() {
@@ -1436,7 +1440,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::strukt(locals.clone())
                         }
                     } else if name_lower == "request" {
-                        CfmlValue::strukt(self.request_scope.clone())
+                        CfmlValue::strukt(self.request_scope.snapshot())
                     } else if name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
                             if let Ok(scope) = app_scope.lock() {
@@ -1490,7 +1494,7 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "request" {
                             if let CfmlValue::Struct(s) = &val {
-                                self.request_scope = s.snapshot();
+                                self.request_scope.with_write(|m| *m = s.snapshot());
                             }
                         } else if name_lower == "application" {
                             if let CfmlValue::Struct(s) = &val {
@@ -7260,12 +7264,7 @@ impl CfmlVirtualMachine {
                         let key = parts.get(1).copied().unwrap_or("");
                         match scope_name {
                             "request" => {
-                                if let Some(val) = self
-                                    .request_scope
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == key)
-                                    .map(|(_, v)| v.clone())
-                                {
+                                if let Some(val) = self.request_scope.get_ci(key) {
                                     return Ok(val);
                                 }
                                 return Ok(CfmlValue::Null);
@@ -7309,12 +7308,7 @@ impl CfmlVirtualMachine {
                         return Ok(val);
                     }
                     // Request scope
-                    if let Some(val) = self
-                        .request_scope
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == var_lower)
-                        .map(|(_, v)| v.clone())
-                    {
+                    if let Some(val) = self.request_scope.get_ci(&var_lower) {
                         return Ok(val);
                     }
                     // Session scope
@@ -8074,7 +8068,7 @@ impl CfmlVirtualMachine {
             }
         }
         if name_lower == "request" {
-            return Some(CfmlValue::strukt(self.request_scope.clone()));
+            return Some(CfmlValue::strukt(self.request_scope.snapshot()));
         }
         if let Some(v) = locals.get(name) {
             return Some(v.clone());
@@ -8188,7 +8182,7 @@ impl CfmlVirtualMachine {
             }
         } else if name_lower == "request" {
             if let CfmlValue::Struct(s) = &val {
-                self.request_scope = s.snapshot();
+                self.request_scope.with_write(|m| *m = s.snapshot());
             }
         } else if locals.contains_key(name) {
             locals.insert(name.to_string(), val);
@@ -9229,7 +9223,7 @@ impl CfmlVirtualMachine {
         let root_val = if root == "local" || root == "variables" {
             Some(CfmlValue::strukt(locals.clone()))
         } else if root == "request" {
-            Some(CfmlValue::strukt(self.request_scope.clone()))
+            Some(CfmlValue::strukt(self.request_scope.snapshot()))
         } else if root == "application" {
             if let Some(ref app_scope) = self.application_scope {
                 if let Ok(scope) = app_scope.lock() {
@@ -9261,12 +9255,7 @@ impl CfmlVirtualMachine {
                         .map(|(_, v)| v.clone())
                 })
                 // Check request scope
-                .or_else(|| {
-                    self.request_scope
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == root)
-                        .map(|(_, v)| v.clone())
-                })
+                .or_else(|| self.request_scope.get_ci(&root))
                 // Check globals
                 .or_else(|| self.globals.get(parts[0]).cloned())
                 .or_else(|| {
