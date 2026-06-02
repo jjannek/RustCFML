@@ -2356,6 +2356,23 @@ impl CfmlVirtualMachine {
 
                 // Control flow
                 BytecodeOp::Jump(target) => {
+                    // Cooperative cancellation checkpoint. A backward jump is a
+                    // loop back-edge — the bounded place a terminated thread
+                    // aborts. `cancel_flag` is `None` on the main VM, so this is
+                    // a single predictable branch only on back-edges; the whole
+                    // check vanishes when the `real-threads` feature is off.
+                    #[cfg(feature = "real-threads")]
+                    {
+                        if *target <= ip {
+                            if let Some(flag) = &self.cancel_flag {
+                                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return Err(CfmlError::runtime(
+                                        "thread terminated".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     ip = *target;
                 }
                 BytecodeOp::JumpIfFalse(target) => {
@@ -7991,7 +8008,18 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cfthread_terminate" => {
-                    // No-op (thread already finished)
+                    // Request cooperative cancellation: flip the thread's cancel
+                    // flag. The body aborts at its next loop back-edge; a later
+                    // join then reports status TERMINATED. Harmless on an
+                    // already-finished thread. (Rust threads can't be force-
+                    // killed mid-instruction — documented Lucee divergence.)
+                    if let Some(name) = args.get(0).map(|v| v.as_string()) {
+                        if let Some(handle) = self.live_threads.get(&name.to_lowercase()) {
+                            handle
+                                .cancel
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     return Ok(CfmlValue::Null);
                 }
 
