@@ -37,6 +37,10 @@ uuid = { version = "1", features = ["v4", "js"] }
 cfml-stdlib = { workspace = true, default-features = false }
 
 [features]
-default = ["std"]
+default = ["std", "real-threads"]
 std = []
+# Real OS-thread cfthread support. On by default for native targets; the wasm
+# targets (cfml-worker, rustcfml-wasm) build with default-features disabled and
+# fall back to the synchronous-inline cfthread path (no std::thread on wasm32).
+real-threads = []
 s3 = ["dep:cfml-stdlib", "cfml-stdlib/s3"]

@@ -402,6 +402,27 @@ fn compile_and_run_with_session(
     compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox)
 }
 
+/// Register the standard runtime fixtures onto a fresh VM: builtins, builtin
+/// functions, any native modules registered via `set_registrar` /
+/// `run_with_registrar`, and the DB transaction/query function pointers.
+///
+/// Shared by per-request execution (`compile_and_run`) and by spawned
+/// `cfthread` child VMs so both get byte-for-byte identical wiring.
+fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
+    for (name, value) in get_builtins() {
+        vm.globals.insert(name, value);
+    }
+    for (name, func) in get_builtin_functions() {
+        vm.builtins.insert(name, func);
+    }
+    apply_native_modules(vm);
+    vm.txn_begin = Some(cfml_stdlib::builtins::txn_begin_boxed);
+    vm.txn_commit = Some(cfml_stdlib::builtins::txn_commit_boxed);
+    vm.txn_rollback = Some(cfml_stdlib::builtins::txn_rollback_boxed);
+    vm.txn_execute = Some(cfml_stdlib::builtins::txn_execute_boxed);
+    vm.query_execute_fn = Some(cfml_stdlib::builtins::fn_query_execute);
+}
+
 fn compile_and_run(
     source: &str,
     debug: bool,
@@ -502,24 +523,10 @@ fn compile_and_run(
     vm.base_template_path = source_file.clone();
     vm.source_file = source_file;
 
-    // Register builtins
-    for (name, value) in get_builtins() {
-        vm.globals.insert(name, value);
-    }
-    for (name, func) in get_builtin_functions() {
-        vm.builtins.insert(name, func);
-    }
-
-    // Inject any native modules registered via `set_registrar` /
-    // `run_with_registrar` (used by `--build`-produced binaries and tests).
-    apply_native_modules(&mut vm);
-
-    // Register database transaction function pointers
-    vm.txn_begin = Some(cfml_stdlib::builtins::txn_begin_boxed);
-    vm.txn_commit = Some(cfml_stdlib::builtins::txn_commit_boxed);
-    vm.txn_rollback = Some(cfml_stdlib::builtins::txn_rollback_boxed);
-    vm.txn_execute = Some(cfml_stdlib::builtins::txn_execute_boxed);
-    vm.query_execute_fn = Some(cfml_stdlib::builtins::fn_query_execute);
+    // Register builtins, builtin functions, native modules, and the DB
+    // transaction/query function pointers. Shared with spawned cfthread child
+    // VMs so both get identical runtime wiring.
+    register_vm_runtime(&mut vm);
 
     // Ensure web scopes always exist (CFML guarantees url/cgi/form are always defined)
     vm.globals.entry("url".to_string()).or_insert_with(|| CfmlValue::strukt(IndexMap::new()));

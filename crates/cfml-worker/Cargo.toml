@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 cfml-common = { path = "../cfml-common" }
 cfml-compiler = { path = "../cfml-compiler" }
 cfml-codegen = { path = "../cfml-codegen" }
-cfml-vm = { path = "../cfml-vm" }
+cfml-vm = { path = "../cfml-vm", default-features = false, features = ["std"] }
 cfml-stdlib = { path = "../cfml-stdlib", default-features = false }
 cfml-config = { path = "../cfml-config" }
 indexmap = { workspace = true }
