@@ -16,7 +16,7 @@ use cfml_compiler::lexer;
 use cfml_compiler::parser::Parser as CfmlParser;
 use cfml_compiler::tag_parser;
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
-use cfml_vm::{CfmlVirtualMachine, ServerState, compile_file_cached};
+use cfml_vm::{CfmlVirtualMachine, ServerState, ThreadHandle, ThreadSeed, compile_file_cached};
 
 // Public re-exports for `--build`-produced native-module crates. A module's
 // `register(vm)` function only needs to depend on `rustcfml-cli` to reach
@@ -421,6 +421,43 @@ fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
     vm.txn_rollback = Some(cfml_stdlib::builtins::txn_rollback_boxed);
     vm.txn_execute = Some(cfml_stdlib::builtins::txn_execute_boxed);
     vm.query_execute_fn = Some(cfml_stdlib::builtins::fn_query_execute);
+    // Real-OS-thread cfthread spawner. The VM only uses this when its
+    // `real-threads` feature is on (default); injecting it unconditionally is
+    // harmless when the feature is off (the VM ignores it and runs inline).
+    vm.thread_spawn_fn = Some(spawn_cfthread);
+}
+
+/// Stack size for spawned `cfthread` OS threads. Matches the main thread's
+/// 64 MB so deeply-recursive CFML in a thread body can't blow the default
+/// ~8 MB stack. This is virtual address space, not committed memory.
+const CFTHREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Spawn a `cfthread` body on a real OS thread. Builds a fresh child VM from
+/// the seed (same runtime wiring as a request VM, via `register_vm_runtime`),
+/// runs the body, and reports the `ThreadResult` back over a channel. The
+/// parent joins on the returned handle. Registered as the VM's
+/// `thread_spawn_fn` (a plain `fn`, so it coerces to the fn-pointer type).
+fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = seed.cancel_flag.clone();
+    let join = std::thread::Builder::new()
+        .stack_size(CFTHREAD_STACK_SIZE)
+        .spawn(move || {
+            let mut vm = CfmlVirtualMachine::new(seed.program.clone());
+            register_vm_runtime(&mut vm);
+            let (closure, attributes) = vm.apply_thread_seed(seed);
+            let result = vm.run_thread_body(&closure, attributes, &IndexMap::new());
+            // Receiver may be gone if the parent never joined; ignore.
+            let _ = tx.send(result);
+        })
+        .expect("cfthread: failed to spawn OS thread");
+    ThreadHandle {
+        name: String::new(),
+        rx,
+        cancel,
+        join: Some(join),
+        result: None,
+    }
 }
 
 fn compile_and_run(

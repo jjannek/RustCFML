@@ -674,12 +674,111 @@ pub struct CfmlVirtualMachine {
     /// of `createObject("component", path)` and class arg of
     /// `createObject("rust", name)`. Match = refusal.
     pub disallowed_imports: Vec<regex::Regex>,
+
+    /// Injected `cfthread` spawn function. `None` ⇒ run thread bodies
+    /// synchronously inline (wasm targets, or the `real-threads` feature off).
+    /// Set by the CLI to a real-OS-thread spawner; mirrors the `txn_*` fn-ptr
+    /// injection pattern.
+    pub thread_spawn_fn: Option<ThreadSpawnFn>,
+    /// Live `cfthread` handles keyed by lowercased thread name, awaiting join.
+    /// Empty and untouched for code that never spawns a thread.
+    pub live_threads: HashMap<String, ThreadHandle>,
+    /// Set on a spawned child VM: when flipped true (by thread terminate), the
+    /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
+    /// non-threaded hot path pays nothing.
+    pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Constructor signature for a Rust-backed class registered via
 /// `register_native_class`. Receives the constructor arguments and must
 /// return a `CfmlValue::NativeObject` wrapping the new instance.
 pub type NativeConstructor = fn(Vec<CfmlValue>) -> CfmlResult;
+
+/// Outcome of running a `cfthread` body (inline or on a real OS thread): the
+/// metadata the parent surfaces via the `cfthread` scope after join.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadResult {
+    /// `COMPLETED` or `TERMINATED`.
+    pub status: String,
+    /// Anything the body wrote to the page output (captured separately).
+    pub output: String,
+    /// Stringified error if the body threw, else empty.
+    pub error: String,
+    /// Wall-clock duration of the body in milliseconds.
+    pub elapsed: i64,
+    /// The body's `thread` scope (thread.x = ...), surfaced as cfthread.NAME.x.
+    pub thread_vars: IndexMap<String, CfmlValue>,
+}
+
+/// Everything a freshly-spawned child VM needs to run one `cfthread` body on a
+/// real OS thread. `Send` by construction (asserted below): it carries only
+/// shareable state — `Arc`-backed program/functions/scopes plus `CfmlValue`
+/// (which is `Send + Sync`). The parent VM itself never crosses the boundary.
+pub struct ThreadSeed {
+    pub program: BytecodeProgram,
+    pub user_functions: HashMap<String, Arc<BytecodeFunction>>,
+    /// Per-thread copy of the parent `variables` scope at spawn (CFML copy
+    /// semantics: top-level reassignments don't leak back; nested objects stay
+    /// by-reference since `CfmlValue` arrays/structs are `Arc`-backed).
+    pub variables_snapshot: IndexMap<String, CfmlValue>,
+    pub vfs: Arc<dyn Vfs>,
+    pub server_state: Option<ServerState>,
+    pub application_scope: Option<Arc<Mutex<IndexMap<String, CfmlValue>>>>,
+    /// Shared live with the parent (CFML request scope is shared across threads).
+    pub request_scope: CfmlStruct,
+    pub session_id: Option<String>,
+    pub current_application_name: Option<String>,
+    pub base_template_path: Option<String>,
+    pub source_file: Option<String>,
+    pub mappings: Vec<CfmlMapping>,
+    pub custom_tag_paths: Vec<String>,
+    pub app_local_mode_modern: bool,
+    pub sandbox: bool,
+    pub null_support: bool,
+    pub dot_notation_upper: bool,
+    pub locale: String,
+    pub timezone: String,
+    pub whitespace_compression: bool,
+    pub session_timeout_secs: u64,
+    pub application_timeout_secs: u64,
+    pub client_timeout_secs: u64,
+    pub disallowed_functions: std::collections::HashSet<String>,
+    pub disallowed_imports: Vec<regex::Regex>,
+    /// The thread body (a `function(){...}` closure) to invoke.
+    pub closure: CfmlValue,
+    /// Passed `cfthread` attributes, exposed as the `attributes` scope.
+    pub attributes: Option<CfmlValue>,
+    /// Cooperative-cancellation flag the child polls (set by thread terminate).
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A spawned `cfthread`'s live handle, held by the parent until join. Lives on
+/// the single-threaded parent VM, so it need not be `Send`.
+pub struct ThreadHandle {
+    /// Original-case thread name (the `cfthread` scope key is lowercased).
+    pub name: String,
+    /// Receives the body's `ThreadResult` exactly once, on completion.
+    pub rx: std::sync::mpsc::Receiver<ThreadResult>,
+    /// Cooperative-cancel flag shared with the running body.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// OS thread join handle (taken on first join).
+    pub join: Option<std::thread::JoinHandle<()>>,
+    /// Cached result once joined, so repeat reads of cfthread.NAME work.
+    pub result: Option<ThreadResult>,
+}
+
+/// Injected `cfthread` spawner: builds a child VM from the seed, runs the body
+/// on a real OS thread, and returns a handle the parent joins on. Defined by
+/// the CLI (needs `std::thread` + the stdlib builtins). `None` ⇒ run the body
+/// synchronously inline (wasm targets, or the `real-threads` feature off).
+pub type ThreadSpawnFn = fn(ThreadSeed) -> ThreadHandle;
+
+// Compile-time proof that a thread body's payload can cross a thread boundary.
+// If a future field breaks this, the build fails here with a clear pointer.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<ThreadSeed>();
+};
 
 #[derive(Debug, Clone)]
 struct CallFrame {
@@ -785,6 +884,9 @@ impl CfmlVirtualMachine {
             client_timeout_secs: 604_800,
             disallowed_functions: std::collections::HashSet::new(),
             disallowed_imports: Vec::new(),
+            thread_spawn_fn: None,
+            live_threads: HashMap::new(),
+            cancel_flag: None,
         }
     }
 
@@ -844,6 +946,204 @@ impl CfmlVirtualMachine {
                 }
             })
             .collect();
+    }
+
+    /// Snapshot everything a child VM needs to run `closure` as a `cfthread`
+    /// body on its own OS thread. Shareable state (program/functions, request/
+    /// application scope, server state, vfs) is `Arc`-cloned; the `variables`
+    /// scope is copied (CFML copy-at-spawn semantics). The closure's captured
+    /// lexical scope is deep-copied into a fresh `Arc` so the child's top-level
+    /// reassignments don't leak back to the parent.
+    pub fn build_thread_seed(
+        &self,
+        closure: CfmlValue,
+        attributes: Option<CfmlValue>,
+    ) -> ThreadSeed {
+        let mut body = closure;
+        if let CfmlValue::Function(f) = &mut body {
+            if let Some(cap) = &f.captured_scope {
+                let snap = cap.read().map(|g| g.clone()).unwrap_or_default();
+                f.captured_scope = Some(Arc::new(std::sync::RwLock::new(snap)));
+            }
+        }
+        ThreadSeed {
+            program: self.program.clone(),
+            user_functions: self.user_functions.clone(),
+            variables_snapshot: self.globals.clone(),
+            vfs: self.vfs.clone(),
+            server_state: self.server_state.clone(),
+            application_scope: self.application_scope.clone(),
+            request_scope: self.request_scope.clone(),
+            session_id: self.session_id.clone(),
+            current_application_name: self.current_application_name.clone(),
+            base_template_path: self.base_template_path.clone(),
+            source_file: self.source_file.clone(),
+            mappings: self.mappings.clone(),
+            custom_tag_paths: self.custom_tag_paths.clone(),
+            app_local_mode_modern: self.app_local_mode_modern,
+            sandbox: self.sandbox,
+            null_support: self.null_support,
+            dot_notation_upper: self.dot_notation_upper,
+            locale: self.locale.clone(),
+            timezone: self.timezone.clone(),
+            whitespace_compression: self.whitespace_compression,
+            session_timeout_secs: self.session_timeout_secs,
+            application_timeout_secs: self.application_timeout_secs,
+            client_timeout_secs: self.client_timeout_secs,
+            disallowed_functions: self.disallowed_functions.clone(),
+            disallowed_imports: self.disallowed_imports.clone(),
+            closure: body,
+            attributes,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Apply a `ThreadSeed` onto a freshly-constructed child VM (call after
+    /// `new()` + the CLI's runtime registration). Wires shared scopes/config
+    /// and overlays the parent's `variables` snapshot over the builtins.
+    /// Returns the body closure + attributes to run. The two parent-only
+    /// !Send fields (`held_locks`, `transaction_conn`) are intentionally left
+    /// at their fresh-VM defaults — a child starts with no locks/transaction.
+    pub fn apply_thread_seed(&mut self, seed: ThreadSeed) -> (CfmlValue, Option<CfmlValue>) {
+        self.vfs = seed.vfs;
+        self.server_state = seed.server_state;
+        self.application_scope = seed.application_scope;
+        self.request_scope = seed.request_scope;
+        self.session_id = seed.session_id;
+        self.current_application_name = seed.current_application_name;
+        self.base_template_path = seed.base_template_path;
+        self.source_file = seed.source_file;
+        self.mappings = seed.mappings;
+        self.custom_tag_paths = seed.custom_tag_paths;
+        self.user_functions = seed.user_functions;
+        self.app_local_mode_modern = seed.app_local_mode_modern;
+        self.sandbox = seed.sandbox;
+        self.null_support = seed.null_support;
+        self.dot_notation_upper = seed.dot_notation_upper;
+        self.locale = seed.locale;
+        self.timezone = seed.timezone;
+        self.whitespace_compression = seed.whitespace_compression;
+        self.session_timeout_secs = seed.session_timeout_secs;
+        self.application_timeout_secs = seed.application_timeout_secs;
+        self.client_timeout_secs = seed.client_timeout_secs;
+        self.disallowed_functions = seed.disallowed_functions;
+        self.disallowed_imports = seed.disallowed_imports;
+        self.cancel_flag = Some(seed.cancel_flag);
+        for (k, v) in seed.variables_snapshot {
+            self.globals.insert(k, v);
+        }
+        (seed.closure, seed.attributes)
+    }
+
+    /// Run a single `cfthread` body closure and collect its outcome. Shared by
+    /// the synchronous-inline path (on the parent VM) and by a spawned child
+    /// VM, so both produce identical metadata. Does NOT store into the
+    /// `cfthread` scope — the caller decides when (immediately, or on join).
+    pub fn run_thread_body(
+        &mut self,
+        closure: &CfmlValue,
+        attributes: Option<CfmlValue>,
+        parent_locals: &IndexMap<String, CfmlValue>,
+    ) -> ThreadResult {
+        // Fresh `thread` scope the body writes into (thread.x = ...).
+        self.globals
+            .insert("thread".to_string(), CfmlValue::strukt(IndexMap::new()));
+        // Expose any passed attributes as the `attributes` scope.
+        if let Some(attrs) = attributes {
+            self.globals.insert("attributes".to_string(), attrs);
+        }
+        // Capture body output separately (same pattern as cfsavecontent).
+        self.saved_output_buffers
+            .push(std::mem::take(&mut self.output_buffer));
+        let start_time = cfml_common::clock::Monotonic::now();
+        let result = self.call_function(closure, vec![], parent_locals);
+        let elapsed = start_time.elapsed().as_millis() as i64;
+        let output = std::mem::take(&mut self.output_buffer);
+        self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
+        let error = match &result {
+            Err(e) => format!("{}", e),
+            Ok(_) => String::new(),
+        };
+        let thread_vars = match self.globals.shift_remove("thread") {
+            Some(CfmlValue::Struct(ts)) => ts.snapshot(),
+            _ => IndexMap::new(),
+        };
+        let status = if error.is_empty() {
+            "COMPLETED"
+        } else {
+            "TERMINATED"
+        };
+        ThreadResult {
+            status: status.to_string(),
+            output,
+            error,
+            elapsed,
+            thread_vars,
+        }
+    }
+
+    /// Block until the named (lowercased) thread completes, or `timeout_ms`
+    /// elapses (0 = wait forever), then publish its result into the `cfthread`
+    /// scope. A timeout leaves the thread RUNNING and returns without error.
+    /// No-op for an unknown or already-joined name.
+    pub fn join_thread(&mut self, name: &str, timeout_ms: i64) {
+        let collected: Option<ThreadResult> = {
+            let handle = match self.live_threads.get_mut(name) {
+                Some(h) => h,
+                None => return,
+            };
+            if handle.result.is_some() {
+                return; // already joined and published
+            }
+            let recv = if timeout_ms > 0 {
+                handle
+                    .rx
+                    .recv_timeout(std::time::Duration::from_millis(timeout_ms as u64))
+                    .ok()
+            } else {
+                handle.rx.recv().ok()
+            };
+            match recv {
+                Some(res) => {
+                    if let Some(j) = handle.join.take() {
+                        let _ = j.join();
+                    }
+                    handle.result = Some(res.clone());
+                    Some(res)
+                }
+                None => None, // timed out — thread keeps running
+            }
+        };
+        if let Some(res) = collected {
+            let orig = self
+                .live_threads
+                .get(name)
+                .map(|h| h.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| name.to_string());
+            self.store_cfthread_result(&orig, res);
+        }
+    }
+
+    /// Store a completed `ThreadResult` into the `cfthread` scope as
+    /// `cfthread.NAME = { status, name, output, error, elapsedtime, ...vars }`.
+    pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
+        let mut meta = IndexMap::new();
+        meta.insert("status".to_string(), CfmlValue::String(r.status));
+        meta.insert(
+            "name".to_string(),
+            CfmlValue::String(thread_name.to_string()),
+        );
+        meta.insert("output".to_string(), CfmlValue::String(r.output));
+        meta.insert("error".to_string(), CfmlValue::String(r.error));
+        meta.insert("elapsedtime".to_string(), CfmlValue::Int(r.elapsed));
+        for (k, v) in r.thread_vars {
+            meta.insert(k, v);
+        }
+        let thread_struct = self.get_or_create_cfthread_scope();
+        if let Some(ts) = thread_struct.as_cfml_struct() {
+            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
+        }
     }
 
     /// Register a Rust-backed class so that CFML code can construct
@@ -7628,73 +7928,66 @@ impl CfmlVirtualMachine {
                         .get(0)
                         .map(|v| v.as_string())
                         .unwrap_or_else(|| "thread1".to_string());
+                    let callback = match args.get(1) {
+                        Some(c) => c.clone(),
+                        None => return Ok(CfmlValue::Null),
+                    };
+                    let attributes = args.get(2).cloned();
 
-                    let mut thread_output = String::new();
-                    let mut thread_error = String::new();
-                    let mut thread_vars: IndexMap<String, CfmlValue> = IndexMap::new();
-                    let mut elapsed: i64 = 0;
+                    // Real OS thread when a spawner is injected AND the feature
+                    // is on; otherwise run synchronously inline (wasm / off).
+                    #[cfg(feature = "real-threads")]
+                    let spawn = self.thread_spawn_fn;
+                    #[cfg(not(feature = "real-threads"))]
+                    let spawn: Option<ThreadSpawnFn> = None;
 
-                    if let Some(callback) = args.get(1) {
-                        let callback = callback.clone();
-
-                        // Set up thread scope in globals (thread.varName = value)
-                        self.globals
-                            .insert("thread".to_string(), CfmlValue::strukt(IndexMap::new()));
-
-                        // Capture output (same pattern as cfsavecontent)
-                        self.saved_output_buffers
-                            .push(std::mem::take(&mut self.output_buffer));
-
-                        // Track elapsed time
-                        let start_time = cfml_common::clock::Monotonic::now();
-
-                        // Execute thread body, catching errors
-                        let result = self.call_function(&callback, vec![], parent_locals);
-
-                        elapsed = start_time.elapsed().as_millis() as i64;
-
-                        // Capture any output written during thread body
-                        thread_output = std::mem::take(&mut self.output_buffer);
-                        self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
-
-                        // Capture error if any
-                        if let Err(ref e) = result {
-                            thread_error = format!("{}", e);
+                    if let Some(spawn_fn) = spawn {
+                        let seed = self.build_thread_seed(callback, attributes);
+                        let mut handle = spawn_fn(seed);
+                        handle.name = thread_name.clone();
+                        self.live_threads.insert(thread_name.to_lowercase(), handle);
+                        // Pre-seed cfthread.NAME as RUNNING so reads before join
+                        // see a live status rather than a missing key.
+                        let mut meta = IndexMap::new();
+                        meta.insert(
+                            "status".to_string(),
+                            CfmlValue::String("RUNNING".to_string()),
+                        );
+                        meta.insert(
+                            "name".to_string(),
+                            CfmlValue::String(thread_name.clone()),
+                        );
+                        let cf = self.get_or_create_cfthread_scope();
+                        if let Some(ts) = cf.as_cfml_struct() {
+                            ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(meta));
                         }
-
-                        // Collect thread scope variables
-                        if let Some(CfmlValue::Struct(ts)) = self.globals.shift_remove("thread") {
-                            thread_vars = ts.snapshot();
-                        }
+                        return Ok(CfmlValue::Null);
                     }
 
-                    // Build thread metadata. Status is TERMINATED if an error
-                    // occurred, COMPLETED otherwise (matches Lucee).
-                    let status = if thread_error.is_empty() { "COMPLETED" } else { "TERMINATED" };
-                    let mut thread_meta = IndexMap::new();
-                    thread_meta.insert(
-                        "status".to_string(),
-                        CfmlValue::String(status.to_string()),
-                    );
-                    thread_meta.insert("name".to_string(), CfmlValue::String(thread_name.clone()));
-                    thread_meta.insert("output".to_string(), CfmlValue::String(thread_output));
-                    thread_meta.insert("error".to_string(), CfmlValue::String(thread_error));
-                    thread_meta.insert("elapsedtime".to_string(), CfmlValue::Int(elapsed));
-
-                    // Merge thread scope variables into metadata
-                    for (k, v) in thread_vars {
-                        thread_meta.insert(k, v);
-                    }
-
-                    // Store in cfthread scope
-                    let thread_struct = self.get_or_create_cfthread_scope();
-                    if let Some(ts) = thread_struct.as_cfml_struct() {
-                        ts.insert(thread_name.to_lowercase(), CfmlValue::strukt(thread_meta));
-                    }
+                    // Inline fallback: run now on this VM and store immediately.
+                    let r = self.run_thread_body(&callback, attributes, parent_locals);
+                    self.store_cfthread_result(&thread_name, r);
                     return Ok(CfmlValue::Null);
                 }
                 "__cfthread_join" => {
-                    // No-op since execution already happened (thread is already complete)
+                    // Join named thread(s), comma-separated; empty/absent name
+                    // joins all currently-live threads.
+                    let names: Vec<String> = match args.get(0).map(|v| v.as_string()) {
+                        Some(n) if !n.trim().is_empty() => n
+                            .split(',')
+                            .map(|s| s.trim().to_lowercase())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                        _ => self.live_threads.keys().cloned().collect(),
+                    };
+                    // Timeout in ms; 0 or absent = wait indefinitely.
+                    let timeout_ms = args
+                        .get(1)
+                        .map(|v| v.as_string().parse::<i64>().unwrap_or(0))
+                        .unwrap_or(0);
+                    for name in names {
+                        self.join_thread(&name, timeout_ms);
+                    }
                     return Ok(CfmlValue::Null);
                 }
                 "__cfthread_terminate" => {
