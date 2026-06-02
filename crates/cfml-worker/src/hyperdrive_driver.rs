@@ -51,7 +51,16 @@ impl HyperdriveDriver {
 #[derive(Serialize)]
 struct WireRequest<'a> {
     datasource: &'a str,
-    sql: &'a str,
+    /// One or more statements to run in order on a single connection. For
+    /// PostgreSQL the SQL has already been rewritten to `$1..$n` placeholders
+    /// and split into single statements (see `cfml_stdlib::pg_sql`); for MySQL
+    /// it's a single statement with native `?` placeholders.
+    statements: Vec<WireStatement>,
+}
+
+#[derive(Serialize)]
+struct WireStatement {
+    sql: String,
     params: Vec<WireParam>,
 }
 
@@ -101,18 +110,41 @@ struct WireMeta {
 
 impl DynamicDbDriver for HyperdriveDriver {
     fn execute(&self, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
-        let params = match params_arg {
+        // The HyperdriveDriver serves both PostgreSQL and MySQL — the scheme is
+        // only known from the binding's connection string. PostgreSQL needs
+        // `?`→`$n` rewriting and multi-statement splitting (postgres.js
+        // `unsafe()` accepts one parameterized command); MySQL keeps native `?`
+        // placeholders untouched. See docs/compatibility-notes/postgres-*.md.
+        let cs = self.binding.connection_string();
+        let is_pg = cs.starts_with("postgres://") || cs.starts_with("postgresql://");
+
+        let statements: Vec<WireStatement> = if is_pg {
+            let split = !cfml_stdlib::pg_sql::is_pg_select(sql);
+            let prepared = cfml_stdlib::pg_sql::prepare_pg_statements(sql, params_arg, split)?;
+            prepared
+                .into_iter()
+                .map(|st| WireStatement {
+                    sql: st.sql,
+                    params: st.params.iter().map(WireParam::from_cfml).collect(),
+                })
+                .collect()
+        } else {
             // CfmlArray::iter() yields owned CfmlValues (reference-typed array
             // snapshot), so borrow each for WireParam::from_cfml(&CfmlValue).
-            CfmlValue::Array(arr) => arr.iter().map(|v| WireParam::from_cfml(&v)).collect(),
-            CfmlValue::Null => Vec::new(),
-            single => vec![WireParam::from_cfml(single)],
+            let params = match params_arg {
+                CfmlValue::Array(arr) => arr.iter().map(|v| WireParam::from_cfml(&v)).collect(),
+                CfmlValue::Null => Vec::new(),
+                single => vec![WireParam::from_cfml(single)],
+            };
+            vec![WireStatement {
+                sql: sql.to_string(),
+                params,
+            }]
         };
 
         let req = WireRequest {
             datasource: &self.name,
-            sql,
-            params,
+            statements,
         };
         let request_json = serde_json::to_string(&req).map_err(|e| {
             CfmlError::runtime(format!(

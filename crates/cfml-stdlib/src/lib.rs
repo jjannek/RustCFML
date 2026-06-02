@@ -2,6 +2,7 @@
 
 pub mod builtins;
 pub mod db_driver;
+pub mod pg_sql;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(feature = "s3")]

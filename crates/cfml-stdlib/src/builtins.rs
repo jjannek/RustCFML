@@ -6737,23 +6737,39 @@ fn execute_postgres(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &
     let pool = get_postgres_pool(url)?;
     let mut client = pool.get()
         .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL connection error: {}", e)))?;
+    run_postgres_statements(&mut client, sql, params_arg, return_type)
+}
 
-    // Rewrite :name params to $1,$2,... for PostgreSQL
-    let (rewritten_sql, ordered_params) = rewrite_params_for_postgres(sql, params_arg)?;
+/// Shared PostgreSQL execution for both the pooled (`execute_postgres`) and
+/// persistent-connection (`execute_postgres_with_conn`) paths.
+///
+/// SELECTs run as a single `query`. Non-SELECT mutations are split into one
+/// parameterized statement each (see `pg_sql::prepare_pg_statements`) and run
+/// in order, summing affected rows — the `postgres` crate's `execute` only
+/// accepts a single command per call, so multi-statement framework mutations
+/// would otherwise fail. See docs/compatibility-notes/postgres-multi-statement-mutations.md.
+#[cfg(feature = "postgres_db")]
+fn run_postgres_statements(
+    client: &mut postgres::Client,
+    sql: &str,
+    params_arg: &CfmlValue,
+    return_type: &str,
+) -> CfmlResult {
+    let select = is_select_query(sql);
+    let statements = crate::pg_sql::prepare_pg_statements(sql, params_arg, !select)?;
 
-    // Build param references for the postgres crate
-    let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = ordered_params.iter()
-        .map(|v| v as &(dyn postgres::types::ToSql + Sync))
-        .collect();
-
-    if is_select_query(sql) {
-        let rows = client.query(&rewritten_sql, &param_refs)
+    if select {
+        // split=false guarantees exactly one statement.
+        let stmt = &statements[0];
+        let pg_params: Vec<PgParam> = stmt.params.iter().map(cfml_to_pg_param).collect();
+        let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = pg_params.iter()
+            .map(|v| v as &(dyn postgres::types::ToSql + Sync))
+            .collect();
+        let rows = client.query(stmt.sql.as_str(), &param_refs)
             .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL query error: {}", e)))?;
 
         let columns: Vec<String> = if let Some(first_row) = rows.first() {
-            first_row.columns().iter()
-                .map(|c| c.name().to_string())
-                .collect()
+            first_row.columns().iter().map(|c| c.name().to_string()).collect()
         } else {
             vec![]
         };
@@ -6762,18 +6778,23 @@ fn execute_postgres(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &
         for row in &rows {
             let mut row_map = IndexMap::new();
             for (i, col) in columns.iter().enumerate() {
-                let val = postgres_row_to_cfml(row, i);
-                row_map.insert(col.clone(), val);
+                row_map.insert(col.clone(), postgres_row_to_cfml(row, i));
             }
             result_rows.push(row_map);
         }
-
         build_query_result(columns, result_rows, sql, return_type)
     } else {
-        let affected = client.execute(&rewritten_sql, &param_refs)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL error: {}", e)))?;
-
-        build_mutation_result(affected as i64, 0) // PG uses RETURNING, not last_insert_id
+        let mut total: i64 = 0;
+        for stmt in &statements {
+            let pg_params: Vec<PgParam> = stmt.params.iter().map(cfml_to_pg_param).collect();
+            let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = pg_params.iter()
+                .map(|v| v as &(dyn postgres::types::ToSql + Sync))
+                .collect();
+            let affected = client.execute(stmt.sql.as_str(), &param_refs)
+                .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL error: {}", e)))?;
+            total += affected as i64;
+        }
+        build_mutation_result(total, 0) // PG uses RETURNING, not last_insert_id
     }
 }
 
@@ -6788,15 +6809,117 @@ enum PgParam {
     Bytes(Vec<u8>),
 }
 
+/// Append `s` to the postgres wire buffer as raw text bytes and report a
+/// present value. Used for `Type::UNKNOWN` targets, where PostgreSQL hasn't
+/// resolved a concrete type yet and accepts the text representation, letting
+/// the server coerce it. See docs/compatibility-notes/postgres-unknown-params.md.
+#[cfg(feature = "postgres_db")]
+fn write_pg_text(
+    s: &str,
+    out: &mut postgres::types::private::BytesMut,
+) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    out.extend_from_slice(s.as_bytes());
+    Ok(postgres::types::IsNull::No)
+}
+
+/// Stringify an f64 the way PostgreSQL text input expects: whole numbers lose
+/// their `.0` (`250.0` -> `250`) so an UNKNOWN/integer target accepts them.
+#[cfg(feature = "postgres_db")]
+fn format_pg_numeric_f64(d: f64) -> String {
+    if d.is_finite() && d.fract() == 0.0 && d.abs() < 9.007_199_254_740_992e15 {
+        format!("{}", d as i64)
+    } else {
+        format!("{}", d)
+    }
+}
+
+#[cfg(feature = "postgres_db")]
+type PgToSqlResult = Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>;
+
+/// Bind a string by parsing it to `target`'s native type. CFML values are very
+/// often strings (form/URL values are untyped), so `"123"` must reach an `int4`
+/// column as 4-byte binary, not raw text — the `postgres` crate sends all
+/// parameters in BINARY format, so the wire bytes must match the column type.
+#[cfg(feature = "postgres_db")]
+fn bind_parse_err(s: &str, ty: &postgres::types::Type, e: impl std::fmt::Display) -> Box<dyn std::error::Error + Sync + Send> {
+    format!("queryExecute: cannot bind \"{}\" as PostgreSQL {}: {}", s, ty.name(), e).into()
+}
+
 #[cfg(feature = "postgres_db")]
 impl postgres::types::ToSql for PgParam {
-    fn to_sql(&self, ty: &postgres::types::Type, out: &mut postgres::types::private::BytesMut) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    fn to_sql(&self, ty: &postgres::types::Type, out: &mut postgres::types::private::BytesMut) -> PgToSqlResult {
+        use postgres::types::Type;
+        use std::str::FromStr;
         match self {
             PgParam::Null => Ok(postgres::types::IsNull::Yes),
-            PgParam::Bool(b) => b.to_sql(ty, out),
-            PgParam::Int(i) => i.to_sql(ty, out),
-            PgParam::Double(d) => d.to_sql(ty, out),
-            PgParam::Text(s) => s.to_sql(ty, out),
+
+            // Integers: encode at the column's exact width. `i64::to_sql` always
+            // writes 8 bytes, which a 2/4-byte column rejects ("incorrect binary
+            // data format"), so downcast per target type. TEXT-family and
+            // UNKNOWN targets take the text form (their binary repr is utf-8;
+            // UNKNOWN is parsed as cstring server-side).
+            PgParam::Int(i) => match *ty {
+                Type::INT2 => (*i as i16).to_sql(ty, out),
+                Type::INT4 => (*i as i32).to_sql(ty, out),
+                Type::INT8 => i.to_sql(ty, out),
+                Type::OID => (*i as u32).to_sql(ty, out),
+                Type::FLOAT4 => (*i as f32).to_sql(ty, out),
+                Type::FLOAT8 => (*i as f64).to_sql(ty, out),
+                Type::NUMERIC => rust_decimal::Decimal::from(*i).to_sql(ty, out),
+                Type::BOOL => (*i != 0).to_sql(ty, out),
+                _ => write_pg_text(&i.to_string(), out),
+            },
+
+            // Doubles: likewise width-correct; whole numbers drop their `.0` in
+            // the text fallback so integer/unknown targets accept them.
+            PgParam::Double(d) => match *ty {
+                Type::FLOAT8 => d.to_sql(ty, out),
+                Type::FLOAT4 => (*d as f32).to_sql(ty, out),
+                Type::INT2 => (*d as i16).to_sql(ty, out),
+                Type::INT4 => (*d as i32).to_sql(ty, out),
+                Type::INT8 => (*d as i64).to_sql(ty, out),
+                Type::NUMERIC => match rust_decimal::Decimal::try_from(*d) {
+                    Ok(dec) => dec.to_sql(ty, out),
+                    Err(_) => write_pg_text(&format_pg_numeric_f64(*d), out),
+                },
+                _ => write_pg_text(&format_pg_numeric_f64(*d), out),
+            },
+
+            PgParam::Bool(b) => match *ty {
+                Type::BOOL => b.to_sql(ty, out),
+                Type::INT2 => (*b as i16).to_sql(ty, out),
+                Type::INT4 => (*b as i32).to_sql(ty, out),
+                Type::INT8 => (*b as i64).to_sql(ty, out),
+                _ => write_pg_text(if *b { "true" } else { "false" }, out),
+            },
+
+            // Strings: parse to the column's native type so untyped CFML strings
+            // bind correctly. UUID parsing fixes the documented #52 case; the
+            // numeric arms fix the common "string id -> int column" pattern.
+            // TEXT-family / UNKNOWN / other fall through to raw utf-8 bytes
+            // (`String::to_sql` writes the bytes regardless of `ty`).
+            PgParam::Text(s) => match *ty {
+                Type::UUID => uuid::Uuid::parse_str(s.trim())
+                    .map_err(|e| bind_parse_err(s, ty, e))?
+                    .to_sql(ty, out),
+                Type::INT2 => s.trim().parse::<i16>().map_err(|e| bind_parse_err(s, ty, e))?.to_sql(ty, out),
+                Type::INT4 => s.trim().parse::<i32>().map_err(|e| bind_parse_err(s, ty, e))?.to_sql(ty, out),
+                Type::INT8 => s.trim().parse::<i64>().map_err(|e| bind_parse_err(s, ty, e))?.to_sql(ty, out),
+                Type::OID => s.trim().parse::<u32>().map_err(|e| bind_parse_err(s, ty, e))?.to_sql(ty, out),
+                Type::FLOAT4 => s.trim().parse::<f32>().map_err(|e| bind_parse_err(s, ty, e))?.to_sql(ty, out),
+                Type::FLOAT8 => s.trim().parse::<f64>().map_err(|e| bind_parse_err(s, ty, e))?.to_sql(ty, out),
+                Type::NUMERIC => rust_decimal::Decimal::from_str(s.trim())
+                    .map_err(|e| bind_parse_err(s, ty, e))?
+                    .to_sql(ty, out),
+                Type::BOOL => {
+                    let t = s.trim();
+                    let b = t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("t")
+                        || t.eq_ignore_ascii_case("yes") || t == "1";
+                    b.to_sql(ty, out)
+                }
+                _ => s.to_sql(ty, out),
+            },
+
             PgParam::Bytes(b) => b.to_sql(ty, out),
         }
     }
@@ -6817,97 +6940,13 @@ fn cfml_to_pg_param(val: &CfmlValue) -> PgParam {
         CfmlValue::Double(d) => PgParam::Double(*d),
         CfmlValue::String(s) => PgParam::Text(s.clone()),
         CfmlValue::Binary(b) => PgParam::Bytes(b.clone()),
+        // A query-column proxy stands in for its first-row scalar (defensive:
+        // prepare_pg_statements already flattens these).
+        CfmlValue::QueryColumn(_) => cfml_to_pg_param(val.query_column_scalar()),
         _ => PgParam::Text(val.as_string()),
     }
 }
 
-#[cfg(feature = "postgres_db")]
-fn rewrite_params_for_postgres(sql: &str, params_arg: &CfmlValue) -> Result<(String, Vec<PgParam>), CfmlError> {
-    match params_arg {
-        CfmlValue::Null => Ok((sql.to_string(), vec![])),
-        CfmlValue::Array(arr) => {
-            // Positional: replace ? with $1, $2, ...
-            let mut result = String::with_capacity(sql.len());
-            let mut idx = 1;
-            let bytes = sql.as_bytes();
-            let len = bytes.len();
-            let mut i = 0;
-            while i < len {
-                if bytes[i] == b'?' {
-                    result.push('$');
-                    result.push_str(&idx.to_string());
-                    idx += 1;
-                } else if bytes[i] == b'\'' {
-                    result.push('\'');
-                    i += 1;
-                    while i < len && bytes[i] != b'\'' {
-                        result.push(bytes[i] as char);
-                        i += 1;
-                    }
-                    if i < len { result.push('\''); }
-                } else {
-                    result.push(bytes[i] as char);
-                }
-                i += 1;
-            }
-            let params: Vec<PgParam> = arr.iter().map(|v| cfml_to_pg_param(&v)).collect();
-            Ok((result, params))
-        }
-        CfmlValue::Struct(map) => {
-            // Named: replace :name with $1, $2, ... tracking seen names
-            let mut result = String::with_capacity(sql.len());
-            let mut param_order: Vec<String> = Vec::new();
-            let bytes = sql.as_bytes();
-            let len = bytes.len();
-            let mut i = 0;
-            while i < len {
-                if bytes[i] == b':' && (i == 0 || !bytes[i-1].is_ascii_alphanumeric()) {
-                    let start = i + 1;
-                    let mut end = start;
-                    while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-                        end += 1;
-                    }
-                    if end > start {
-                        let param_name = String::from_utf8_lossy(&bytes[start..end]).to_string();
-                        // Check if we've seen this param before
-                        let idx = if let Some(pos) = param_order.iter().position(|n| n.eq_ignore_ascii_case(&param_name)) {
-                            pos + 1
-                        } else {
-                            param_order.push(param_name.clone());
-                            param_order.len()
-                        };
-                        result.push('$');
-                        result.push_str(&idx.to_string());
-                        i = end;
-                        continue;
-                    }
-                }
-                if bytes[i] == b'\'' {
-                    result.push('\'');
-                    i += 1;
-                    while i < len && bytes[i] != b'\'' {
-                        result.push(bytes[i] as char);
-                        i += 1;
-                    }
-                    if i < len { result.push('\''); }
-                } else {
-                    result.push(bytes[i] as char);
-                }
-                i += 1;
-            }
-            // Build ordered params vec
-            let params: Vec<PgParam> = param_order.iter().map(|name| {
-                let val = map.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                    .map(|(_, v)| v)
-                    .unwrap_or(CfmlValue::Null);
-                cfml_to_pg_param(&val)
-            }).collect();
-            Ok((result, params))
-        }
-        _ => Ok((sql.to_string(), vec![])),
-    }
-}
 
 // Custom FromSql wrappers for PG types that postgres-types does not provide
 // a built-in impl for: TIMETZ (12B: int64 time + int32 zone) and INTERVAL
@@ -7625,36 +7664,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
 
 #[cfg(feature = "postgres_db")]
 fn execute_postgres_with_conn(client: &mut postgres::Client, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
-    let (rewritten_sql, ordered_params) = rewrite_params_for_postgres(sql, params_arg)?;
-    let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = ordered_params.iter()
-        .map(|v| v as &(dyn postgres::types::ToSql + Sync))
-        .collect();
-
-    if is_select_query(sql) {
-        let rows = client.query(&rewritten_sql, &param_refs)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL query error: {}", e)))?;
-        let columns: Vec<String> = if let Some(first_row) = rows.first() {
-            first_row.columns().iter()
-                .map(|c| c.name().to_string())
-                .collect()
-        } else {
-            vec![]
-        };
-        let mut result_rows: Vec<IndexMap<String, CfmlValue>> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut row_map = IndexMap::new();
-            for (i, col) in columns.iter().enumerate() {
-                let val = postgres_row_to_cfml(row, i);
-                row_map.insert(col.clone(), val);
-            }
-            result_rows.push(row_map);
-        }
-        build_query_result(columns, result_rows, sql, return_type)
-    } else {
-        let affected = client.execute(&rewritten_sql, &param_refs)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL error: {}", e)))?;
-        build_mutation_result(affected as i64, 0)
-    }
+    run_postgres_statements(client, sql, params_arg, return_type)
 }
 
 // -----------------------------------------------

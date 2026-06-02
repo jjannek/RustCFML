@@ -69,7 +69,7 @@ function writeResponse(responseObj, respPtr, respCap) {
  * pooler is the actual pool. We disable prepare to avoid extra round-trips
  * and turn off fetch_types because Workers can't introspect pg_type lazily.
  */
-async function runPostgresQuery(connectionString, sql, params) {
+async function runPostgresQuery(connectionString, statements) {
   const sql_client = postgres(connectionString, {
     max: 1,
     fetch_types: false,
@@ -77,17 +77,23 @@ async function runPostgresQuery(connectionString, sql, params) {
   });
   try {
     const started = Date.now();
-    const rows = await sql_client.unsafe(sql, params);
+    // Statements are pre-split and rewritten to `$n` placeholders on the Rust
+    // side. postgres.js `unsafe()` runs one parameterized command per call, so
+    // we run each in order on this single connection and sum affected rows. The
+    // last statement's rows are returned as the result set (for SELECTs that is
+    // the only statement; for multi-statement mutations they're empty).
+    let results = [];
+    let rows_affected = 0;
+    for (const stmt of statements) {
+      const rows = await sql_client.unsafe(stmt.sql, stmt.params || []);
+      results = rows.map((r) => ({ ...r }));
+      rows_affected += typeof rows.count === "number" ? rows.count : results.length;
+    }
     const duration = Date.now() - started;
-    const results = rows.map((r) => ({ ...r }));
     return {
       success: true,
       results,
-      meta: {
-        duration,
-        rows_affected: typeof rows.count === "number" ? rows.count : results.length,
-        last_insert_id: 0,
-      },
+      meta: { duration, rows_affected, last_insert_id: 0 },
     };
   } finally {
     try {
@@ -102,7 +108,7 @@ async function runPostgresQuery(connectionString, sql, params) {
  * MySQL path — mysql2/promise. `disableEval: true` is required in Workers
  * because mysql2 otherwise uses `new Function(...)` for row parsing.
  */
-async function runMysqlQuery(binding, sql, params) {
+async function runMysqlQuery(binding, statements) {
   const connection = await mysql.createConnection({
     host: binding.host,
     user: binding.user,
@@ -113,30 +119,29 @@ async function runMysqlQuery(binding, sql, params) {
   });
   try {
     const started = Date.now();
-    const [rows, fields] = await connection.query(sql, params || []);
-    const duration = Date.now() - started;
-    if (Array.isArray(rows)) {
-      // SELECT: rows is RowDataPacket[]; serialize to plain objects.
-      const results = rows.map((r) => ({ ...r }));
-      return {
-        success: true,
-        results,
-        meta: {
-          duration,
-          rows_affected: results.length,
-          last_insert_id: 0,
-        },
-      };
+    // MySQL keeps native `?` placeholders and is not split on the Rust side, so
+    // `statements` is normally a single entry; loop defensively and keep the
+    // last result set / summed affected rows either way.
+    let results = [];
+    let rows_affected = 0;
+    let last_insert_id = 0;
+    for (const stmt of statements) {
+      const [rows] = await connection.query(stmt.sql, stmt.params || []);
+      if (Array.isArray(rows)) {
+        // SELECT: rows is RowDataPacket[]; serialize to plain objects.
+        results = rows.map((r) => ({ ...r }));
+        rows_affected += results.length;
+      } else {
+        // INSERT/UPDATE/DELETE: rows is ResultSetHeader.
+        rows_affected += rows.affectedRows || 0;
+        last_insert_id = rows.insertId || last_insert_id;
+      }
     }
-    // INSERT/UPDATE/DELETE: rows is ResultSetHeader.
+    const duration = Date.now() - started;
     return {
       success: true,
-      results: [],
-      meta: {
-        duration,
-        rows_affected: rows.affectedRows || 0,
-        last_insert_id: rows.insertId || 0,
-      },
+      results,
+      meta: { duration, rows_affected, last_insert_id },
     };
   } finally {
     try {
@@ -163,12 +168,13 @@ async function runHyperdriveQuery(req) {
     };
   }
   const cs = binding.connectionString;
+  const statements = req.statements || [];
   try {
     if (cs.startsWith("postgres://") || cs.startsWith("postgresql://")) {
-      return await runPostgresQuery(cs, req.sql, req.params || []);
+      return await runPostgresQuery(cs, statements);
     }
     if (cs.startsWith("mysql://") || cs.startsWith("mysql2://")) {
-      return await runMysqlQuery(binding, req.sql, req.params || []);
+      return await runMysqlQuery(binding, statements);
     }
     return {
       success: false,
