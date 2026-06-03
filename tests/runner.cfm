@@ -316,6 +316,10 @@ try { include "core/test_switch_braced_case.cfm"; } catch (any e) { writeOutput(
 //     identifier. Surfaced while booting WireBox (Injector.cfc uses
 //     `param arguments.target.$wbDelegateMap = {}`).
 try { include "core/test_param_dotted_lhs.cfm"; } catch (any e) { writeOutput("ERROR | core/test_param_dotted_lhs.cfm | " & e.message & chr(10)); }
+//   - as_string_cycle_safety: stringifying a self-referential struct (now
+//     possible since structs are reference types) must terminate rather than
+//     overflow the native stack.
+try { include "core/test_as_string_cycle_safety.cfm"; } catch (any e) { writeOutput("ERROR | core/test_as_string_cycle_safety.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

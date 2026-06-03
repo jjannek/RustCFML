@@ -486,6 +486,16 @@ impl CfmlValue {
     }
 
     pub fn as_string(&self) -> String {
+        let mut visited: Vec<usize> = Vec::new();
+        self.as_string_guarded(&mut visited)
+    }
+
+    /// Cycle-guarded stringification. Structs are reference types, so an object
+    /// graph can contain cycles (e.g. WireBox's injector ↔ binder ↔ builder).
+    /// Stringifying one would otherwise recurse until the native stack overflows
+    /// (no catchable error — a hard process abort). The `visited` set of backing
+    /// Arc pointers terminates revisited containers, mirroring `deep_copy_guarded`.
+    fn as_string_guarded(&self, visited: &mut Vec<usize>) -> String {
         match self {
             CfmlValue::Null => String::new(),
             CfmlValue::Bool(b) => b.to_string(),
@@ -493,18 +503,30 @@ impl CfmlValue {
             CfmlValue::Double(d) => d.to_string(),
             CfmlValue::String(s) => s.clone(),
             CfmlValue::Array(a) => {
+                let ptr = a.backing_ptr();
+                if visited.contains(&ptr) {
+                    return "[...]".to_string();
+                }
+                visited.push(ptr);
                 let items: Vec<String> =
-                    a.snapshot().iter().map(|v| v.as_string()).collect();
+                    a.snapshot().iter().map(|v| v.as_string_guarded(visited)).collect();
+                visited.pop();
                 format!("[{}]", items.join(", "))
             }
             // QueryColumn stringifies to the first row's value, matching Lucee's
             // proxy behavior so `q.col & "x"` concatenates the first row.
             CfmlValue::QueryColumn(a) => a.first().map(|v| v.as_string()).unwrap_or_default(),
             CfmlValue::Struct(s) => {
+                let ptr = s.backing_ptr();
+                if visited.contains(&ptr) {
+                    return "{...}".to_string();
+                }
+                visited.push(ptr);
                 let items: Vec<String> = s
                     .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v.as_string()))
+                    .map(|(k, v)| format!("{}: {}", k, v.as_string_guarded(visited)))
                     .collect();
+                visited.pop();
                 format!("{{{}}}", items.join(", "))
             }
             CfmlValue::Closure(_) => "<Closure>".to_string(),
