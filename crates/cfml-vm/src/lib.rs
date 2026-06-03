@@ -3557,7 +3557,17 @@ impl CfmlVirtualMachine {
                         stack.push(error_val);
                         ip = handler.catch_ip;
                     } else {
-                        return Err(CfmlError::runtime(error_val.as_string()));
+                        // Propagate the original message (not the serialized
+                        // struct) so resolve_catch_error_val matches last_exception
+                        // and reuses the full cfcatch struct — preserving the
+                        // error's `type`/`detail` across the frame boundary.
+                        return Err(CfmlError::runtime(match &error_val {
+                            CfmlValue::Struct(s) => s
+                                .get("message")
+                                .map(|m| m.as_string())
+                                .unwrap_or_else(|| error_val.as_string()),
+                            _ => error_val.as_string(),
+                        }));
                     }
                 }
                 BytecodeOp::Rethrow => {
@@ -3573,7 +3583,17 @@ impl CfmlVirtualMachine {
                         stack.push(error_val);
                         ip = handler.catch_ip;
                     } else {
-                        return Err(CfmlError::runtime(error_val.as_string()));
+                        // Propagate the original message (not the serialized
+                        // struct) so resolve_catch_error_val matches last_exception
+                        // and reuses the full cfcatch struct — preserving the
+                        // error's `type`/`detail` across the frame boundary.
+                        return Err(CfmlError::runtime(match &error_val {
+                            CfmlValue::Struct(s) => s
+                                .get("message")
+                                .map(|m| m.as_string())
+                                .unwrap_or_else(|| error_val.as_string()),
+                            _ => error_val.as_string(),
+                        }));
                     }
                 }
 
@@ -3594,6 +3614,24 @@ impl CfmlVirtualMachine {
                     extra_args.reverse();
                     // Pop the object (receiver)
                     let object = stack.pop().unwrap_or(CfmlValue::Null);
+
+                    // Does this receiver have `this`/variables write-back semantics?
+                    // Only CFCs (carry __variables/__name) and Java shims (e.g.
+                    // Queue.poll / Map.remove mutate-in-place) do. A plain struct or
+                    // array does NOT — so any method_this_writeback / variables
+                    // writeback that surfaces after the call on such a receiver is
+                    // stale: it leaked from a closure that captured `this` and ran
+                    // inside a higher-order member method (e.g. `mappings.some( (k,m)
+                    // => m.isAspect() )`). Applying it would overwrite the receiver
+                    // variable with the closure's captured `this`. Gate on this flag
+                    // so the leaked writeback is discarded for plain receivers.
+                    let receiver_writeback_ok = matches!(
+                        &object,
+                        CfmlValue::Struct(ref s)
+                            if s.contains_key("__variables")
+                                || s.contains_key("__name")
+                                || s.contains_key("__java_shim")
+                    );
 
                     // Clear method-writeback state before the call. Both fields must
                     // be cleared — leaving `method_variables_writeback` set from an
@@ -3767,6 +3805,7 @@ impl CfmlVirtualMachine {
                     // and PRESERVE the existing `__variables` so the variables-writeback
                     // pass below can continue building on what previous chain steps wrote.
                     if let Some(modified_this) = self.method_this_writeback.take() {
+                        if receiver_writeback_ok {
                         if let Some(ref path) = write_back {
                             let var_name = &path[0];
                             if path.len() == 1 {
@@ -3812,11 +3851,13 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         }
+                        }
                     }
 
                     // Propagate component method `variables` scope mutations back.
                     // When a method writes `variables.x = y`, persist it in __variables.
                     if let Some(vars_wb) = self.method_variables_writeback.take() {
+                        if receiver_writeback_ok {
                         if let Some(ref path) = write_back {
                             let var_name = &path[0];
                             // Load the component object, update __variables, store it back
@@ -3852,6 +3893,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
+                        }
                         }
                     }
 

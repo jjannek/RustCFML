@@ -320,6 +320,13 @@ try { include "core/test_param_dotted_lhs.cfm"; } catch (any e) { writeOutput("E
 //     possible since structs are reference types) must terminate rather than
 //     overflow the native stack.
 try { include "core/test_as_string_cycle_safety.cfm"; } catch (any e) { writeOutput("ERROR | core/test_as_string_cycle_safety.cfm | " & e.message & chr(10)); }
+//   - lock_finally_semantics: try/finally + lock { } must run the finally on a
+//     `return` (release the lock) and re-propagate exceptions thrown inside.
+try { include "core/test_lock_finally_semantics.cfm"; } catch (any e) { writeOutput("ERROR | core/test_lock_finally_semantics.cfm | " & e.message & chr(10)); }
+//   - hof_member_writeback: a higher-order struct member fn (some/every/...)
+//     run inside a CFC method must not leak the closure's captured `this` onto
+//     the receiver variable (the WireBox `binder.hasAspects()` bug).
+try { include "core/test_hof_member_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_hof_member_writeback.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

@@ -54,8 +54,12 @@ pub struct CfmlCompiler {
     pub program: BytecodeProgram,
     /// Stack of (break_placeholder_indices, continue_placeholder_indices) for loops
     loop_stack: Vec<(Vec<usize>, Vec<usize>)>,
-    /// Finally body to emit before rethrow (set when inside try-catch-finally)
-    current_finally: Option<Vec<Statement>>,
+    /// Stack of enclosing `finally` bodies (one entry per enclosing
+    /// try-with-finally / `lock {}`, innermost last). A `return` must run ALL of
+    /// them (innermost first) before the Return op exits the function, since the
+    /// runtime Return op does not run finallys; a `rethrow` in a catch runs the
+    /// innermost (its own try's) finally before propagating.
+    finally_stack: Vec<Vec<Statement>>,
     /// Nesting depth of function-body compilation. 0 means page-scope; inside any
     /// UDF or CFC method this is > 0. Used to gate the `variables.x` peephole:
     /// at page scope `variables.x` is a read of globals (LoadGlobal semantics),
@@ -309,7 +313,7 @@ impl CfmlCompiler {
                 })],
             },
             loop_stack: Vec::new(),
-            current_finally: None,
+            finally_stack: Vec::new(),
             function_depth: 0,
             current_fn_local_mode: None,
         }
@@ -846,6 +850,25 @@ impl CfmlCompiler {
                 } else {
                     instructions.push(BytecodeOp::Null);
                 }
+                // Run every enclosing finally (innermost first) before exiting:
+                // the runtime Return op does not run finallys, so a `return`
+                // inside a `lock {}` / `try {} finally {}` would otherwise skip
+                // the unlock/cleanup (e.g. leak the lock → next acquire deadlocks).
+                // Stash the return value in a temp local first so the finally
+                // bodies run on a clean operand stack (they are not guaranteed
+                // net-zero relative to an extra value sitting beneath them); the
+                // `__`-prefix keeps the temp out of the variables-scope writeback.
+                if !self.finally_stack.is_empty() {
+                    instructions.push(BytecodeOp::StoreLocal("__cf_finally_retval".to_string()));
+                    let finallys: Vec<Vec<Statement>> =
+                        self.finally_stack.iter().rev().cloned().collect();
+                    for fb in &finallys {
+                        for s in fb {
+                            self.compile_statement(s, instructions);
+                        }
+                    }
+                    instructions.push(BytecodeOp::LoadLocal("__cf_finally_retval".to_string()));
+                }
                 instructions.push(BytecodeOp::Return);
             }
             Statement::If(if_stmt) => {
@@ -893,9 +916,12 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::Throw);
             }
             Statement::Rethrow(_loc) => {
-                // Emit finally body before rethrow if we're inside a try-catch-finally
-                if let Some(ref finally_body) = self.current_finally.clone() {
-                    for s in finally_body {
+                // Emit the innermost enclosing finally before rethrow (a catch's
+                // rethrow must run its own try's finally before the exception
+                // propagates; outer finallys run when the exception reaches their
+                // runtime handlers).
+                if let Some(finally_body) = self.finally_stack.last().cloned() {
+                    for s in &finally_body {
                         self.compile_statement(s, instructions);
                     }
                 }
@@ -1818,9 +1844,61 @@ impl CfmlCompiler {
     }
 
     fn compile_try(&mut self, try_stmt: &Try, instructions: &mut Vec<BytecodeOp>) {
+        // Special case: `try { body } finally { ... }` with NO catch clauses.
+        // CFML (and the `lock {}` desugaring — `try { body } finally { unlock }`)
+        // require the finally to run AND the exception to re-propagate. The
+        // generic catch-handler shape below routes every exception to
+        // catch_start, runs the finally, and then continues — which *swallows*
+        // the exception (and leaves the thrown error on the operand stack).
+        // Emit the finally on both the normal and exception paths, and re-raise
+        // on the exception path.
+        if try_stmt.catches.is_empty() {
+            if let Some(ref finally_body) = try_stmt.finally_body {
+                let try_start_idx = instructions.len();
+                instructions.push(BytecodeOp::TryStart(0)); // placeholder -> exception handler
+
+                // While compiling the body, a `return` must run this finally
+                // inline before exiting (the runtime Return op won't).
+                self.finally_stack.push(finally_body.clone());
+                for s in &try_stmt.body {
+                    self.compile_statement(s, instructions);
+                }
+                self.finally_stack.pop();
+                instructions.push(BytecodeOp::TryEnd);
+
+                // Normal-path finally, then jump over the exception handler.
+                for s in finally_body {
+                    self.compile_statement(s, instructions);
+                }
+                let jump_over_handler = instructions.len();
+                instructions.push(BytecodeOp::Jump(0)); // -> end
+
+                // Exception handler: the in-flight error is on the operand stack
+                // (pushed by Throw/Rethrow). Run the finally, then re-raise.
+                let handler_start = instructions.len();
+                instructions[try_start_idx] = BytecodeOp::TryStart(handler_start);
+                for s in finally_body {
+                    self.compile_statement(s, instructions);
+                }
+                instructions.push(BytecodeOp::Rethrow);
+
+                let end_pos = instructions.len();
+                instructions[jump_over_handler] = BytecodeOp::Jump(end_pos);
+                return;
+            }
+        }
+
         // TryStart points to catch handler
         let try_start_idx = instructions.len();
         instructions.push(BytecodeOp::TryStart(0)); // placeholder
+
+        // Push the finally (if any) for the duration of the body AND catches, so
+        // a `return` in either runs it inline (Return op won't) and a `rethrow`
+        // in a catch runs it before propagating.
+        let has_finally = try_stmt.finally_body.is_some();
+        if let Some(ref finally_body) = try_stmt.finally_body {
+            self.finally_stack.push(finally_body.clone());
+        }
 
         // Try body
         for s in &try_stmt.body {
@@ -1836,12 +1914,6 @@ impl CfmlCompiler {
         let catch_start = instructions.len();
         instructions[try_start_idx] = BytecodeOp::TryStart(catch_start);
 
-        // Set current_finally so that rethrow can emit finally body first
-        let prev_finally = self.current_finally.take();
-        if let Some(ref finally_body) = try_stmt.finally_body {
-            self.current_finally = Some(finally_body.clone());
-        }
-
         for catch in &try_stmt.catches {
             // The error value will be on the stack
             instructions.push(BytecodeOp::StoreLocal(catch.var_name.clone()));
@@ -1851,13 +1923,14 @@ impl CfmlCompiler {
             }
         }
 
-        // Restore previous finally context
-        self.current_finally = prev_finally;
+        if has_finally {
+            self.finally_stack.pop();
+        }
 
         let end_pos = instructions.len();
         instructions[jump_over_catch] = BytecodeOp::Jump(end_pos);
 
-        // Finally
+        // Finally (normal completion + caught path)
         if let Some(finally_body) = &try_stmt.finally_body {
             for s in finally_body {
                 self.compile_statement(s, instructions);
