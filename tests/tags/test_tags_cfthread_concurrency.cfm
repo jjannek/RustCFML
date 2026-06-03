@@ -65,6 +65,25 @@ assert("thread error status is TERMINATED", cfthread.boom.status, "TERMINATED");
 assert("parent survives a thread error", 1 + 1, 2);
 </cfscript>
 
+<!--- threadJoin() script BIF: joins by name and surfaces the thread scope --->
+<cfthread name="bif1"><cfset thread.v = 7></cfthread>
+<cfscript>
+threadJoin("bif1", 5000);
+assert("threadJoin() BIF surfaces thread scope", cfthread.bif1.v, 7);
+assert("threadJoin() BIF status", cfthread.bif1.status, "COMPLETED");
+</cfscript>
+
+<!--- threadTerminate() script BIF is callable and harmless on a finished thread.
+      (Terminating a CPU-bound loop is timing-dependent and not deterministic
+      across engines, so it isn't asserted here; cooperative cancellation of a
+      running loop is covered by a local smoke test.) --->
+<cfthread name="bif2"><cfset thread.done = true></cfthread>
+<cfscript>
+threadJoin("bif2", 5000);
+threadTerminate("bif2");
+assert("threadTerminate() BIF callable, completed thread unchanged", cfthread.bif2.status, "COMPLETED");
+</cfscript>
+
 <!--- join with no name joins all outstanding threads --->
 <cfthread name="ja1"><cfset request.cft_ja1 = "a"></cfthread>
 <cfthread name="ja2"><cfset request.cft_ja2 = "b"></cfthread>

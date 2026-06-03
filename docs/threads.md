@@ -24,6 +24,10 @@ on separate cores, not sequentially inline. This is on by default on native buil
 | `join` | Blocks until the named thread(s) finish. `timeout` is in ms; `0` or omitted waits forever. **Omit `name` to join *all* outstanding threads.** A timeout leaves the thread `RUNNING` and continues without error. |
 | `terminate` | Requests cooperative cancellation of the named thread (see caveats). |
 
+The script BIFs **`threadJoin([name][, timeout])`** and **`threadTerminate(name)`**
+are equivalent to the `join` / `terminate` actions (e.g. `threadJoin("t", 5000)`,
+or `threadJoin()` to join all).
+
 After a thread completes and is joined, its metadata is available at `cfthread.NAME`:
 `status` (`COMPLETED` / `TERMINATED` / `RUNNING`), `name`, `output`, `error`,
 `elapsedtime` (ms), plus every key the body wrote to its `thread` scope.

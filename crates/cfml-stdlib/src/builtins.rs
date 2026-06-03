@@ -555,6 +555,9 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cfthread_run".into(), fn_cfthread_stub);
     f.insert("__cfthread_join".into(), fn_cfthread_stub);
     f.insert("__cfthread_terminate".into(), fn_cfthread_stub);
+    // Script BIFs threadJoin()/threadTerminate() route to the same handlers.
+    f.insert("threadjoin".into(), fn_cfthread_stub);
+    f.insert("threadterminate".into(), fn_cfthread_stub);
 
     // ---- Cache functions (VM-intercepted) ----
     f.insert("cachePut".into(), fn_cache_stub);

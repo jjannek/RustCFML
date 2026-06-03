@@ -4794,6 +4794,8 @@ impl CfmlVirtualMachine {
                 | "__cfthread_run"
                 | "__cfthread_join"
                 | "__cfthread_terminate"
+                | "threadjoin"
+                | "threadterminate"
                 | "callstackget"
                 | "callstackdump"
                 | "precisionevaluate" => {
@@ -7986,7 +7988,9 @@ impl CfmlVirtualMachine {
                     self.store_cfthread_result(&thread_name, r);
                     return Ok(CfmlValue::Null);
                 }
-                "__cfthread_join" => {
+                // Also reached by the threadJoin() script BIF (same arg shape:
+                // optional name, optional timeout-ms).
+                "__cfthread_join" | "threadjoin" => {
                     // Join named thread(s), comma-separated; empty/absent name
                     // joins all currently-live threads.
                     let names: Vec<String> = match args.get(0).map(|v| v.as_string()) {
@@ -8007,7 +8011,8 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::Null);
                 }
-                "__cfthread_terminate" => {
+                // Also reached by the threadTerminate() script BIF.
+                "__cfthread_terminate" | "threadterminate" => {
                     // Request cooperative cancellation: flip the thread's cancel
                     // flag. The body aborts at its next loop back-edge; a later
                     // join then reports status TERMINATED. Harmless on an
