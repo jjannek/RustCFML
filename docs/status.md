@@ -57,8 +57,8 @@ extends (dot-path), super.method(), isInstanceOf, getMetadata, createObject, int
 ### Database
 queryExecute with SQLite, MySQL, PostgreSQL, MSSQL. Connection pooling, cfqueryparam, cftransaction, structured query params.
 
-### Threading (Sequential — No Real Concurrency)
-cfthread tag with action=run/join/terminate. **Thread bodies execute inline sequentially** — no threads are spawned. This means cfthread code works functionally but does not run in parallel; sleep/long operations block the parent. cfthread scope with thread metadata (status, output, error, elapsedtime). Output capture, error capture, and thread scope (thread.varName) all work correctly within this sequential model.
+### Threading (Real OS Threads)
+cfthread tag with action=run/join/terminate. **Thread bodies run on real OS threads** (concurrently, on separate cores); join blocks with an optional timeout, and no name joins all outstanding threads. `application`/`server`/`session`/`request` scopes are shared live across threads (guard concurrent writes with cflock); `variables` is copied at spawn; `attributes` are bound from the parent at spawn; the per-thread `thread` scope plus status/output/error/elapsedtime surface as `cfthread.NAME`. Errors set status TERMINATED without aborting the parent. Default-on behind the `real-threads` Cargo feature; wasm targets (no `std::thread`) and feature-off builds fall back to the synchronous-inline path. **Two deliberate Lucee divergences:** `terminate` is cooperative (the body aborts at loop back-edges, not mid-instruction — Rust can't safely force-kill a thread), and a `cftransaction` can't span the parent↔child boundary (the DB connection is thread-bound). See [Threading](threads.md).
 
 ### Infrastructure
 CLI (file exec, `-c` inline, `-d` debug, `-r` REPL, `--serve`), WASM target, error handling with line/column info.
@@ -73,7 +73,7 @@ CLI (file exec, `-c` inline, `-d` debug, `-r` REPL, `--serve`), WASM target, err
 ### Explicitly Unsupported
 - **Query-of-Queries (QoQ)**: SQL SELECT on in-memory query objects is not supported
 - Image functions (80+), Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway, JWT
-- cfschedule, cfwddx, real concurrent cfthread execution
+- cfschedule, cfwddx
 
 ### Taffy Framework
 Believed feature-complete. cgi.remote_addr, cgi.server_name (from Host header), and all request headers (cgi.http_*) available for rate limiting and CORS.

@@ -86,6 +86,7 @@ RustCFML serves roughly 2–3.5× the throughput at about a tenth of the memory,
 | **[Object Storage](docs/s3.md)** | S3 / R2 / MinIO — `S3*` functions and transparent `s3://` paths |
 | **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
 | **[Java Shims](docs/java-shims.md)** | Emulated Java classes for `createObject("java", …)` — what's supported and known gaps |
+| **[Threading](docs/threads.md)** | `cfthread` on real OS threads — shared vs copied scopes, join/terminate, caveats |
 | **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
 | **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
 | **[Architecture](docs/architecture.md)** | Compilation pipeline and crate layout |
@@ -117,6 +118,7 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 - **400+ built-in functions** — strings, arrays, structs, dates, math, lists, queries, JSON, XML, regex, encoding, hashing, and modern password hashing (bcrypt/scrypt/argon2).
 - **Batteries-included web server** — `Application.cfc` lifecycle, sessions (in-process, Memcached, or clustered), cookies, authentication, URL rewriting, and file uploads.
 - **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
+- **Real concurrency** — `cfthread` runs bodies on real OS threads with shared `application`/`request`/`session` scopes and `cflock`. See **[Threading](docs/threads.md)**.
 - **Run anywhere** — native binaries, self-contained single-file apps, and a WebAssembly target that runs on Cloudflare Workers.
 - **Extensible** — drop in first-class built-ins and classes written in Rust ([native modules](docs/native-modules.md)).
 
@@ -126,7 +128,18 @@ See **[Compatibility & Status](docs/status.md)** for implementation status.
 
 - **Query-of-Queries (QoQ)** — SQL SELECT on in-memory query objects
 - Image functions, Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
-- `cfschedule`, `cfwddx`, real concurrent `cfthread` execution
+- `cfschedule`, `cfwddx`
+
+## Threading
+
+`<cfthread>` bodies run on **real OS threads** — concurrently, on separate cores — not sequentially inline. `action="join"` blocks until a thread (or, with no `name`, all threads) completes; results land in `cfthread.NAME` (`status`, `output`, `error`, `elapsedtime`, plus the body's `thread` scope). `application`, `server`, `session`, and `request` scopes are **shared live** across threads (guard concurrent writes with `cflock`); `variables` is **copied at spawn**, and data is passed in via the thread's `attributes`. An error in a thread sets its status to `TERMINATED` without aborting the parent.
+
+Two deliberate differences from Lucee, both arising from doing threading safely in Rust:
+
+- **`terminate` is cooperative, not forceful.** Rust can't safely kill a running thread mid-instruction (it could leave locks held or memory half-written — the reason Java deprecated `Thread.stop()`). Instead, `terminate` sets a flag the body checks at loop back-edges and then aborts. A thread spinning in a loop stops promptly; one parked in a single long call (`sleep`, a slow query) won't notice until it returns to a loop. It's a difference in responsiveness, not correctness.
+- **A `cftransaction` can't span the parent↔child boundary.** Its live DB connection can't be used from another thread, so a spawned thread starts with no transaction — its queries aren't part of one the parent has open, and a parent rollback won't undo them. Keep transactional work within a single thread.
+
+Full detail, scope tables, and examples: **[Threading](docs/threads.md)**.
 
 ## Architecture
 
