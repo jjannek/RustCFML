@@ -1564,9 +1564,92 @@ impl Parser {
 
     /// Parse cfscript lock block: lock name="x" type="exclusive" timeout="5" { body }
     /// Desugars to: __cflock_start({name:"x", type:"exclusive", timeout:5}); try { body } finally { __cflock_end("x"); }
+    /// Lower a `param` with a (possibly dotted) variable name + default value into
+    ///   if ( !isDefined("var.name") ) { var.name = default; }
+    /// Dotted names build a MemberAccess chain with a final StructAccess target so
+    /// the mutation flows through the normal struct-assignment codegen (which
+    /// propagates Arc mutations back to the caller's locals, exactly like
+    /// `arguments.obj.foo = bar`). Shared by both the `name="..."` attribute form
+    /// and the `param a.b.c = default` shorthand.
+    fn lower_param_default(
+        &self,
+        var_name: &str,
+        default_val: Expression,
+        loc: SourceLocation,
+    ) -> CfmlNode {
+        let condition = Expression::FunctionCall(Box::new(FunctionCall {
+            name: Box::new(Expression::Identifier(Identifier {
+                name: "isDefined".to_string(),
+                location: loc,
+            })),
+            arguments: vec![Expression::Literal(Literal {
+                value: LiteralValue::String(var_name.to_string()),
+                location: loc,
+            })],
+            location: loc,
+        }));
+
+        let assign_stmt = if let Some(dot_pos) = var_name.find('.') {
+            let root = var_name[..dot_pos].to_string();
+            let rest = &var_name[dot_pos + 1..];
+            let parts: Vec<&str> = rest.split('.').collect();
+            let mut expr = Expression::Identifier(Identifier {
+                name: root.clone(),
+                location: loc,
+            });
+            for (i, part) in parts.iter().enumerate() {
+                if i < parts.len() - 1 {
+                    expr = Expression::MemberAccess(Box::new(MemberAccess {
+                        object: Box::new(expr),
+                        member: part.to_string(),
+                        null_safe: false,
+                        location: loc,
+                    }));
+                }
+            }
+            let last_part = parts.last().unwrap().to_string();
+            Statement::Assignment(Assignment {
+                target: if parts.len() == 1 {
+                    AssignTarget::StructAccess(
+                        Box::new(Expression::Identifier(Identifier {
+                            name: root,
+                            location: loc,
+                        })),
+                        last_part,
+                    )
+                } else {
+                    AssignTarget::StructAccess(Box::new(expr), last_part)
+                },
+                value: default_val,
+                operator: AssignOp::Equal,
+                location: loc,
+            })
+        } else {
+            Statement::Assignment(Assignment {
+                target: AssignTarget::Variable(var_name.to_string()),
+                value: default_val,
+                operator: AssignOp::Equal,
+                location: loc,
+            })
+        };
+
+        CfmlNode::Statement(Statement::If(If {
+            condition: Expression::UnaryOp(Box::new(UnaryOp {
+                operator: UnaryOpType::Not,
+                operand: Box::new(condition),
+                location: loc,
+            })),
+            then_branch: vec![assign_stmt],
+            else_if: vec![],
+            else_branch: None,
+            location: loc,
+        }))
+    }
+
     /// Parse cfscript `param` statement:
     ///   param name="varName" default="value" type="string";
     ///   param varName = defaultValue;
+    ///   param a.b.c = defaultValue;   (dotted lvalue shorthand)
     /// Converts to: if (!isDefined("varName")) varName = defaultValue;
     fn parse_param_statement(&mut self, loc: SourceLocation) -> Result<CfmlNode, ParseError> {
         // Check if it's the named-attribute form: param name="..." default="..."
@@ -1603,70 +1686,7 @@ impl Parser {
                             value: LiteralValue::String(String::new()),
                             location: loc,
                         }));
-                        let condition = Expression::FunctionCall(Box::new(FunctionCall {
-                            name: Box::new(Expression::Identifier(Identifier {
-                                name: "isDefined".to_string(),
-                                location: loc,
-                            })),
-                            arguments: vec![Expression::Literal(Literal {
-                                value: LiteralValue::String(var_name.clone()),
-                                location: loc,
-                            })],
-                            location: loc,
-                        }));
-
-                        let assign_stmt = if let Some(dot_pos) = var_name.find('.') {
-                            let root = var_name[..dot_pos].to_string();
-                            let rest = &var_name[dot_pos + 1..];
-                            let parts: Vec<&str> = rest.split('.').collect();
-                            let mut expr = Expression::Identifier(Identifier {
-                                name: root.clone(),
-                                location: loc,
-                            });
-                            for (i, part) in parts.iter().enumerate() {
-                                if i < parts.len() - 1 {
-                                    expr = Expression::MemberAccess(Box::new(MemberAccess {
-                                        object: Box::new(expr),
-                                        member: part.to_string(),
-                                        null_safe: false,
-                                        location: loc,
-                                    }));
-                                }
-                            }
-                            let last_part = parts.last().unwrap().to_string();
-                            Statement::Assignment(Assignment {
-                                target: if parts.len() == 1 {
-                                    AssignTarget::StructAccess(Box::new(Expression::Identifier(Identifier {
-                                        name: root,
-                                        location: loc,
-                                    })), last_part)
-                                } else {
-                                    AssignTarget::StructAccess(Box::new(expr), last_part)
-                                },
-                                value: default_val,
-                                operator: AssignOp::Equal,
-                                location: loc,
-                            })
-                        } else {
-                            Statement::Assignment(Assignment {
-                                target: AssignTarget::Variable(var_name.clone()),
-                                value: default_val,
-                                operator: AssignOp::Equal,
-                                location: loc,
-                            })
-                        };
-
-                        return Ok(CfmlNode::Statement(Statement::If(If {
-                            condition: Expression::UnaryOp(Box::new(UnaryOp {
-                                operator: UnaryOpType::Not,
-                                operand: Box::new(condition),
-                                location: loc,
-                            })),
-                            then_branch: vec![assign_stmt],
-                            else_if: vec![],
-                            else_branch: None,
-                            location: loc,
-                        })));
+                        return Ok(self.lower_param_default(var_name, default_val, loc));
                     }
                 }
             }
@@ -1707,13 +1727,27 @@ impl Parser {
         }
 
         // Shorthand form: param varName = defaultValue;
-        // or: param type varName = defaultValue;
-        let _type = if self.is_identifier_like() && !matches!(self.peek(1), Token::Equal | Token::Semicolon) {
-            Some(self.extract_identifier()?)
-        } else {
-            None
-        };
-        let var_name = self.extract_identifier()?;
+        //   or typed:      param type varName = defaultValue;
+        //   or dotted:     param arguments.obj.key = defaultValue;
+        //
+        // A leading type is present only when TWO identifier-like tokens appear
+        // back to back (`param numeric x`). For a dotted lvalue (`param a.b`)
+        // peek(1) is a Dot, so the first token is the variable, not a type —
+        // this is why the old `peek(1) != Equal|Semicolon` heuristic wrongly
+        // consumed `arguments` as a type and then choked on the `.`.
+        if self.is_identifier_like_at(0) && self.is_identifier_like_at(1) {
+            let _type = self.extract_identifier()?; // discard the declared type
+        }
+
+        // Parse the (possibly dotted) lvalue path into a string, e.g.
+        // "arguments.target.$wbDelegateMap". Segments after a dot use
+        // extract_property_name so keywords / $-prefixed names are accepted.
+        let mut var_name = self.extract_identifier()?;
+        while self.match_token(&Token::Dot) {
+            var_name.push('.');
+            var_name.push_str(&self.extract_property_name()?);
+        }
+
         let default_value = if self.match_token(&Token::Equal) {
             self.parse_expression()?
         } else {
@@ -1724,34 +1758,7 @@ impl Parser {
         };
         self.match_token(&Token::Semicolon);
 
-        let condition = Expression::FunctionCall(Box::new(FunctionCall {
-            name: Box::new(Expression::Identifier(Identifier {
-                name: "isDefined".to_string(),
-                location: loc,
-            })),
-            arguments: vec![Expression::Literal(Literal {
-                value: LiteralValue::String(var_name.clone()),
-                location: loc,
-            })],
-            location: loc,
-        }));
-
-        Ok(CfmlNode::Statement(Statement::If(If {
-            condition: Expression::UnaryOp(Box::new(UnaryOp {
-                operator: UnaryOpType::Not,
-                operand: Box::new(condition),
-                location: loc,
-            })),
-            then_branch: vec![Statement::Assignment(Assignment {
-                target: AssignTarget::Variable(var_name),
-                value: default_value,
-                operator: AssignOp::Equal,
-                location: loc,
-            })],
-            else_if: vec![],
-            else_branch: None,
-            location: loc,
-        })))
+        Ok(self.lower_param_default(&var_name, default_value, loc))
     }
 
     /// Parse a comma-separated `key = expr` list inside the parens of a

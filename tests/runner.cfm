@@ -311,6 +311,11 @@ try { include "core/test_quoted_catch_type.cfm"; } catch (any e) { writeOutput("
 //     inside a braced `case`/`default` body. Both surfaced while booting Wheels.
 try { include "core/test_chained_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_chained_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_switch_braced_case.cfm"; } catch (any e) { writeOutput("ERROR | core/test_switch_braced_case.cfm | " & e.message & chr(10)); }
+//   - param_dotted_lhs: the cfscript `param` shorthand must accept a dotted /
+//     scoped lvalue (`param arguments.obj.key = default`), not just a bare
+//     identifier. Surfaced while booting WireBox (Injector.cfc uses
+//     `param arguments.target.$wbDelegateMap = {}`).
+try { include "core/test_param_dotted_lhs.cfm"; } catch (any e) { writeOutput("ERROR | core/test_param_dotted_lhs.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>
