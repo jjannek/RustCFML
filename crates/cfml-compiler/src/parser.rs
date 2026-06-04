@@ -1520,7 +1520,7 @@ impl Parser {
             // (`catch (FW1.AbortControllerException e)`) OR a quoted string literal
             // (`catch ("My.Custom.Type" e)`) — the idiomatic way to name a dotted,
             // namespaced custom exception. Lucee/Adobe CF/BoxLang accept both forms.
-            let mut first = if let Token::String(s) = self.peek(0).clone() {
+            let first = if let Token::String(s) = self.peek(0).clone() {
                 self.advance();
                 s
             } else {

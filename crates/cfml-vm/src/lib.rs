@@ -2710,6 +2710,61 @@ impl CfmlVirtualMachine {
                                 .push(named_values.get(i).cloned().unwrap_or(CfmlValue::Null));
                         }
 
+                        // Tag-call builtins (e.g. `cfdirectory(action=..., name=...)`)
+                        // take a single struct-of-options at the bytecode level —
+                        // bundle the named args into one struct here. `name`/
+                        // `variable` becomes a side-effect write-back of the
+                        // return value into the caller's scope (matches the
+                        // tag form).
+                        let tag_builtin_name = match &func_ref {
+                            CfmlValue::Function(f)
+                                if Self::is_tag_call_builtin(&f.name) => Some(f.name.to_lowercase()),
+                            _ => None,
+                        };
+                        if let Some(_) = tag_builtin_name {
+                            let mut opts: IndexMap<String, CfmlValue> = IndexMap::new();
+                            let mut writeback_var: Option<String> = None;
+                            let writeback_attr = Self::tag_call_writeback_attr();
+                            for (i, name) in expanded_names.iter().enumerate() {
+                                let value = if i < expanded_values.len() {
+                                    std::mem::replace(&mut expanded_values[i], CfmlValue::Null)
+                                } else {
+                                    CfmlValue::Null
+                                };
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                if writeback_attr.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+                                    writeback_var = Some(value.as_string());
+                                }
+                                opts.insert(name.clone(), value);
+                            }
+                            self.closure_parent_writeback = None;
+                            self.arg_ref_writeback = None;
+                            let saved_try_stack = if self.try_stack.is_empty() {
+                                None
+                            } else {
+                                Some(std::mem::take(&mut self.try_stack))
+                            };
+                            let call_result = self.call_function(
+                                &func_ref,
+                                vec![CfmlValue::strukt(opts)],
+                                &locals,
+                            );
+                            if let Some(saved) = saved_try_stack {
+                                self.try_stack = saved;
+                            }
+                            match call_result {
+                                Ok(result) => {
+                                    if let Some(var) = writeback_var {
+                                        locals.insert(var, result.clone());
+                                    }
+                                    stack.push(result);
+                                }
+                                Err(e) => return Err(self.wrap_error(e)),
+                            }
+                            continue;
+                        }
                         // Reorder named args to match function param positions.
                         // Track overflow (named args with no matching param) so the
                         // callee's `arguments` scope keeps their names.
@@ -8714,18 +8769,25 @@ impl CfmlVirtualMachine {
     /// When `arg_names` is `None` (a plain CallMethod) or the receiver is not a
     /// function, the values are returned untouched. Mirrors the inline logic in
     /// the `CallNamed` handler for free-function calls.
-    fn reorder_named_args_for_function(
-        func_ref: &CfmlValue,
-        arg_names: Option<&[String]>,
-        arg_values: Vec<CfmlValue>,
-    ) -> Vec<CfmlValue> {
-        let (positional, _extras) =
-            Self::reorder_named_args_with_extras(func_ref, arg_names, arg_values);
-        positional
+    /// Builtins whose script-form invocation takes a single struct of attrs
+    /// (matching the corresponding cf<tag>): `cfdirectory(action="list", ...)`
+    /// is shorthand for the tag and is bundled into one struct argument.
+    fn is_tag_call_builtin(name: &str) -> bool {
+        matches!(
+            name.to_lowercase().as_str(),
+            "cfdirectory" | "__cfdirectory"
+        )
     }
 
-    /// Same as `reorder_named_args_for_function` but also returns the named
-    /// args that overflow past the declared params. The VM stashes these in
+    /// Attribute names whose value (a string) is the caller-scope variable
+    /// the tag-call writes its return value back to (e.g. `name="dirQ"` on
+    /// `cfdirectory(...)` populates `dirQ` with the listing query).
+    fn tag_call_writeback_attr() -> &'static [&'static str] {
+        &["name", "variable"]
+    }
+
+    /// Reorder named args to declared-param positions and surface the named
+    /// args that overflow past those params. The VM stashes the extras in
     /// `pending_extra_named_args` so the callee's `arguments` scope keeps
     /// their original names — matching Lucee/ACF/BoxLang.
     fn reorder_named_args_with_extras(

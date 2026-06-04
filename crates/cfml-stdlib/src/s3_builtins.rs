@@ -152,7 +152,7 @@ pub fn fn_s3_download(args: Vec<CfmlValue>) -> CfmlResult {
 /// S3ListBuckets([accessKeyId, secretKey, host])
 pub fn fn_s3_list_buckets(args: Vec<CfmlValue>) -> CfmlResult {
     let (k, s, h) = cred_args(&args, 0);
-    let (client, cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
+    let (client, _cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
     let buckets = s3_list_buckets(&client)?;
     Ok(buckets_to_array(buckets))
 }
@@ -190,7 +190,7 @@ pub fn fn_s3_create_bucket(args: Vec<CfmlValue>) -> CfmlResult {
     let acl = arg_opt_string(&args, 1);
     let location = arg_opt_string(&args, 2).unwrap_or_else(|| "us-east-1".to_string());
     let (k, s, h) = cred_args(&args, 3);
-    let (client, cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
+    let (client, _cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
     s3_create_bucket(&client, &bucket, &location, acl.as_deref())?;
     Ok(CfmlValue::Null)
 }
@@ -220,7 +220,7 @@ pub fn fn_s3_delete(args: Vec<CfmlValue>) -> CfmlResult {
 pub fn fn_s3_clear_bucket(args: Vec<CfmlValue>) -> CfmlResult {
     let bucket = arg_string(&args, 0)?;
     let (k, s, h) = cred_args(&args, 1);
-    let (client, cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
+    let (client, _cfg) = client_for_args(k.as_deref(), s.as_deref(), h.as_deref())?;
     s3_clear_bucket(&client, &bucket)?;
     Ok(CfmlValue::Null)
 }
