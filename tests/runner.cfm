@@ -122,6 +122,7 @@ try { include "oop/test_component_mapping_paths.cfm"; } catch (any e) { writeOut
 try { include "oop/test_component_method_named_args.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_method_named_args.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_method_precedence.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_method_precedence.cfm | " & e.message & chr(10)); }
 try { include "oop/test_method_ref_binding.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_method_ref_binding.cfm | " & e.message & chr(10)); }
+try { include "oop/test_returned_service_chain.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_returned_service_chain.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }

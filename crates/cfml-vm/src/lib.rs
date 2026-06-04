@@ -3885,8 +3885,53 @@ impl CfmlVirtualMachine {
                                 };
                                 self.scope_aware_store(var_name, merged, &mut locals);
                             } else {
-                                // Deep write-back for component this
-                                if let Some(mut root_obj) = self.scope_aware_load(var_name, &locals)
+                                // Chained-CFC identity guard: for
+                                // `a.foo().bar()` with `foo` returning a
+                                // *different* CFC (e.g.
+                                // `injector.getBinder().getCustomDSL()`),
+                                // codegen propagates write_back=path to BOTH
+                                // calls. Outer `bar`'s `this` is then a
+                                // foreign CFC, and a naive deep_set would
+                                // clobber `a.b.c…` with that foreign CFC.
+                                // Detect by walking the path and comparing
+                                // Arc identity. Only fires when both sides
+                                // are CFC structs (cheap to gate on
+                                // __variables presence in modified_this).
+                                let modified_is_cfc = matches!(
+                                    &modified_this,
+                                    CfmlValue::Struct(s) if s.contains_key("__variables")
+                                );
+                                let mut skip_for_identity = false;
+                                if modified_is_cfc {
+                                    if let Some(mut node) =
+                                        self.scope_aware_load(var_name, &locals)
+                                    {
+                                        let mut reached = true;
+                                        for part in &path[1..] {
+                                            match node.get(part) {
+                                                Some(v) => node = v,
+                                                None => { reached = false; break; }
+                                            }
+                                        }
+                                        if reached {
+                                            if let (
+                                                CfmlValue::Struct(cur),
+                                                CfmlValue::Struct(snap),
+                                            ) = (&node, &modified_this)
+                                            {
+                                                if !cur.ptr_eq(snap)
+                                                    && cur.contains_key("__variables")
+                                                {
+                                                    skip_for_identity = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if skip_for_identity {
+                                    self.method_variables_writeback = None;
+                                } else if let Some(mut root_obj) =
+                                    self.scope_aware_load(var_name, &locals)
                                 {
                                     let props = &path[1..];
                                     Self::deep_set(&mut root_obj, props, modified_this);
