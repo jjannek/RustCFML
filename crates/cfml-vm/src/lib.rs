@@ -1648,7 +1648,50 @@ impl CfmlVirtualMachine {
                     } else if let Some(val) =
                         self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
                     {
-                        val
+                        // Bug #9: a CFC method retrieved by bare name in value
+                        // position (e.g. `.each( processPropertyMetadata )`) is
+                        // stored in `__variables` with `captured_scope = None`
+                        // (stripped at CFC-body frame exit for cycle safety).
+                        // When the function is later invoked via a higher-order
+                        // BIF (.each/.map/.filter), the receiver passes an
+                        // empty parent_locals — so the callee's `this` and
+                        // `variables` resolutions both fail.
+                        //
+                        // Bind here at the load site: if we're inside a CFC
+                        // method context (frame carries `this` or `__variables`)
+                        // and the loaded value is an unbound CfmlFunction,
+                        // clone it and stash the relevant scopes into a fresh
+                        // captured_scope. `call_function` already merges this
+                        // captured_scope with parent_locals (lib.rs:4578) — so
+                        // a `.each(...)` call site that previously dropped
+                        // `this` will now see it via the function's binding.
+                        if let CfmlValue::Function(ref f) = val {
+                            if f.captured_scope.is_none()
+                                && (locals.contains_key("this")
+                                    || locals.contains_key("__variables"))
+                            {
+                                let mut bound: IndexMap<String, CfmlValue> =
+                                    IndexMap::new();
+                                for key in [
+                                    "this",
+                                    "__variables",
+                                    "variables",
+                                    "super",
+                                ] {
+                                    if let Some(v) = locals.get(key) {
+                                        bound.insert(key.to_string(), v.clone());
+                                    }
+                                }
+                                let mut bound_fn = (**f).clone();
+                                bound_fn.captured_scope =
+                                    Some(Arc::new(std::sync::RwLock::new(bound)));
+                                CfmlValue::Function(Box::new(bound_fn))
+                            } else {
+                                val
+                            }
+                        } else {
+                            val
+                        }
                     } else if let Some(bc_func) = self
                         .user_functions
                         .get(name.as_str())
