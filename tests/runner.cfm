@@ -327,6 +327,10 @@ try { include "core/test_lock_finally_semantics.cfm"; } catch (any e) { writeOut
 //     run inside a CFC method must not leak the closure's captured `this` onto
 //     the receiver variable (the WireBox `binder.hasAspects()` bug).
 try { include "core/test_hof_member_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_hof_member_writeback.cfm | " & e.message & chr(10)); }
+//   - logical_short_circuit: AND/OR (and &&/||) must skip RHS evaluation
+//     once the left determines the result — matches Lucee/ACF. Surfaced as
+//     `Variable 'defaultValue' is undefined` while booting WireBox.
+try { include "core/test_logical_short_circuit.cfm"; } catch (any e) { writeOutput("ERROR | core/test_logical_short_circuit.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

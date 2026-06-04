@@ -2376,6 +2376,64 @@ impl CfmlCompiler {
                     return;
                 }
 
+                // Logical AND/OR short-circuit: emit jump sequence so the
+                // right-hand side is only evaluated when it can change the
+                // result. Matches Lucee/ACF semantics; any side-effect or
+                // throwing call on the RHS must NOT fire when the LHS already
+                // decides the result (e.g. `false AND throws()`).
+                if matches!(binop.operator, BinaryOpType::And | BinaryOpType::Or) {
+                    let jump_on_short_circuit = matches!(binop.operator, BinaryOpType::Or);
+                    self.compile_expression(&binop.left, instructions);
+                    let short_jump_idx = instructions.len();
+                    instructions.push(if jump_on_short_circuit {
+                        BytecodeOp::JumpIfTrue(0)
+                    } else {
+                        BytecodeOp::JumpIfFalse(0)
+                    });
+                    self.compile_expression(&binop.right, instructions);
+                    let second_jump_idx = instructions.len();
+                    instructions.push(if jump_on_short_circuit {
+                        BytecodeOp::JumpIfTrue(0)
+                    } else {
+                        BytecodeOp::JumpIfFalse(0)
+                    });
+                    // Fall-through path: neither short-circuited — result is
+                    // !jump_on_short_circuit for AND (true), and FALSE for OR
+                    // (we got here because both were not-true).
+                    if jump_on_short_circuit {
+                        instructions.push(BytecodeOp::False);
+                    } else {
+                        instructions.push(BytecodeOp::True);
+                    }
+                    let done_jump_idx = instructions.len();
+                    instructions.push(BytecodeOp::Jump(0));
+                    // Short-circuit landing pad.
+                    let short_target = instructions.len();
+                    if jump_on_short_circuit {
+                        instructions.push(BytecodeOp::True);
+                    } else {
+                        instructions.push(BytecodeOp::False);
+                    }
+                    let end_target = instructions.len();
+                    // Patch the three forward jumps.
+                    match &mut instructions[short_jump_idx] {
+                        BytecodeOp::JumpIfTrue(off) | BytecodeOp::JumpIfFalse(off) => {
+                            *off = short_target;
+                        }
+                        _ => unreachable!(),
+                    }
+                    match &mut instructions[second_jump_idx] {
+                        BytecodeOp::JumpIfTrue(off) | BytecodeOp::JumpIfFalse(off) => {
+                            *off = short_target;
+                        }
+                        _ => unreachable!(),
+                    }
+                    if let BytecodeOp::Jump(off) = &mut instructions[done_jump_idx] {
+                        *off = end_target;
+                    }
+                    return;
+                }
+
                 self.compile_expression(&binop.left, instructions);
                 self.compile_expression(&binop.right, instructions);
 
@@ -2394,8 +2452,7 @@ impl CfmlCompiler {
                     BinaryOpType::LessEqual => BytecodeOp::Lte,
                     BinaryOpType::Greater => BytecodeOp::Gt,
                     BinaryOpType::GreaterEqual => BytecodeOp::Gte,
-                    BinaryOpType::And => BytecodeOp::And,
-                    BinaryOpType::Or => BytecodeOp::Or,
+                    BinaryOpType::And | BinaryOpType::Or => unreachable!(), // handled above
                     BinaryOpType::Xor => BytecodeOp::Xor,
                     BinaryOpType::Contains => BytecodeOp::Contains,
                     BinaryOpType::DoesNotContain => BytecodeOp::DoesNotContain,
