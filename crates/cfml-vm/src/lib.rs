@@ -8775,7 +8775,11 @@ impl CfmlVirtualMachine {
     fn is_tag_call_builtin(name: &str) -> bool {
         matches!(
             name.to_lowercase().as_str(),
-            "cfdirectory" | "__cfdirectory"
+            "cfdirectory"
+                | "__cfdirectory"
+                | "cfhttp"
+                | "cfmail"
+                | "__cfmail"
         )
     }
 

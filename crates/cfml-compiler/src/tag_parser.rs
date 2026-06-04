@@ -592,14 +592,21 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let Some(u) = useragent { opts.push(format!("useragent: {}", format_attr_value(&u, quoted.contains("useragent")))); }
             if let Some(p) = proxyserver { opts.push(format!("proxyserver: {}", format_attr_value(&p, quoted.contains("proxyserver")))); }
 
-            // Check for body with <cfhttpparam> child tags.
-            // KNOWN LIMITATION (issue #55): params are extracted statically from
-            // the body text, so <cfhttpparam> tags nested inside control flow
-            // (<cfloop>/<cfif>) are not built at runtime. cfquery solved the same
-            // problem in 28af97d (body_has_control_flow); cfhttp still needs it.
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
+                // Runtime body assembly when the body contains control-flow
+                // tags (issue #55): <cfhttpparam> inside <cfif>/<cfloop> must
+                // be evaluated at runtime, not collected by a static body scan.
+                if body_has_control_flow_except(&body, &["cfhttpparam"]) {
+                    let body_script = tags_to_script_impl(&body, imports);
+                    opts.push("params: __cfhttp_params".to_string());
+                    let code = format!(
+                        "__cfhttp_params = [];\n{}{} = cfhttp({{ {} }});\n",
+                        body_script, result_var, opts.join(", ")
+                    );
+                    return (code, close_end - start);
+                }
                 let params = parse_cfhttpparam_tags(&body);
                 if !params.is_empty() {
                     opts.push(format!("params: [{}]", params.join(", ")));
@@ -608,6 +615,14 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             } else {
                 (format!("{} = cfhttp({{ {} }});\n", result_var, opts.join(", ")), tag_end - start)
             }
+        }
+        "cfhttpparam" => {
+            // Reached only when a cfhttp body is built at runtime (it contains
+            // control-flow tags). Append the param struct to the runtime list;
+            // outside a runtime cfhttp body __cfhttp_params is undefined — which
+            // is correct since cfhttpparam is invalid there anyway.
+            let lit = cfhttpparam_attrs_to_literal(&attrs, &quoted);
+            (format!("arrayAppend(__cfhttp_params, {});\n", lit), tag_end - start)
         }
         "cfqueryparam" => {
             // Reached only when a cfquery body is built at runtime (it contains
@@ -1211,6 +1226,22 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
 
+                // Runtime body assembly when the body contains control-flow
+                // tags (issue #55): <cfmailparam>/<cfmailpart> inside <cfif>/
+                // <cfloop> must be evaluated at runtime; the body text is
+                // captured via savecontent.
+                if body_has_control_flow_except(&body, &["cfmailparam", "cfmailpart"]) {
+                    let body_script = tags_to_script_inner(&body, imports, true);
+                    opts.push("params: __cfmail_params".to_string());
+                    opts.push("parts: __cfmail_parts".to_string());
+                    opts.push("body: __cfmail_body".to_string());
+                    let code = format!(
+                        "__cfmail_params = [];\n__cfmail_parts = [];\n__cfsavecontent_start();\n{}__cfmail_body = __cfsavecontent_end();\n__cfmail({{ {} }});\n",
+                        body_script, opts.join(", ")
+                    );
+                    return (code, close_end - start);
+                }
+
                 // Parse cfmailparam child tags
                 let params = parse_cfmailparam_tags(&body);
                 if !params.is_empty() {
@@ -1235,9 +1266,35 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 (format!("__cfmail({{ {} }});\n", opts.join(", ")), tag_end - start)
             }
         }
-        "cfmailparam" | "cfmailpart" => {
-            // These are handled as child tags of cfmail; skip if encountered standalone
-            (String::new(), tag_end - start)
+        "cfmailparam" => {
+            // Reached only when a cfmail body is built at runtime (it contains
+            // control-flow tags). Append the param struct to the runtime list;
+            // outside a runtime cfmail body __cfmail_params is undefined — which
+            // is correct since cfmailparam is invalid there anyway.
+            let lit = cfmailparam_attrs_to_literal(&attrs, &quoted);
+            (format!("arrayAppend(__cfmail_params, {});\n", lit), tag_end - start)
+        }
+        "cfmailpart" => {
+            // Runtime cfmail body. Capture the part's own body via a nested
+            // savecontent and append the parts list.
+            let attrs_lit = cfmailpart_attrs_only_literal(&attrs);
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmailpart") {
+                let body_chars = &chars[tag_end..end_tag_pos];
+                let body_source: String = body_chars.iter().collect();
+                let body_script = tags_to_script_inner(&body_source, imports, true);
+                let close_end = find_tag_end(chars, end_tag_pos, len);
+                let code = format!(
+                    "__cfsavecontent_start();\n{}arrayAppend(__cfmail_parts, structAppend({}, {{ body: __cfsavecontent_end() }}));\n",
+                    body_script, attrs_lit
+                );
+                (code, close_end - start)
+            } else {
+                // Self-closing cfmailpart (no body)
+                (
+                    format!("arrayAppend(__cfmail_parts, {});\n", attrs_lit),
+                    tag_end - start,
+                )
+            }
         }
         "cfstoredproc" => {
             let procedure = attrs.get("procedure").cloned().unwrap_or_default();
@@ -1247,8 +1304,38 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
 
-                let proc_params = parse_cfprocparam_tags(&body);
+                // Statically pluck the result variable name (cfprocresult is
+                // declarative and rarely conditional; this lets the runtime
+                // path still assign to the right caller variable).
                 let proc_results = parse_cfprocresult_tags(&body);
+                let result_var = proc_results.first()
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| "cfresult".to_string());
+
+                let mut query_opts = Vec::new();
+                if let Some(ds) = &datasource {
+                    query_opts.push(format!("datasource: \"{}\"", ds));
+                }
+                let opts_str = if query_opts.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {{ {} }}", query_opts.join(", "))
+                };
+
+                // Runtime body assembly when the body wraps cfprocparams in
+                // control flow (issue #55).
+                if body_has_control_flow_except(&body, &["cfprocparam", "cfprocresult"]) {
+                    let body_script = tags_to_script_impl(&body, imports);
+                    // Placeholders are constructed from the runtime list length
+                    // — repeatString is a builtin in stdlib.
+                    let code = format!(
+                        "__cfproc_params = [];\n{}__cfproc_placeholders = arrayLen(__cfproc_params) == 0 ? \"\" : reReplace(repeatString(\"?,\", arrayLen(__cfproc_params)), \",$\", \"\", \"one\");\n{} = queryExecute(\"CALL {}(\" & __cfproc_placeholders & \")\", __cfproc_params{});\n",
+                        body_script, result_var, procedure, opts_str
+                    );
+                    return (code, close_end - start);
+                }
+
+                let proc_params = parse_cfprocparam_tags(&body);
 
                 // Build param placeholders
                 let placeholders: Vec<&str> = proc_params.iter().map(|_| "?").collect();
@@ -1271,21 +1358,6 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     format!("{{ {} }}", parts.join(", "))
                 }).collect();
 
-                let mut query_opts = Vec::new();
-                if let Some(ds) = &datasource {
-                    query_opts.push(format!("datasource: \"{}\"", ds));
-                }
-
-                let result_var = proc_results.first()
-                    .map(|(name, _)| name.clone())
-                    .unwrap_or_else(|| "cfresult".to_string());
-
-                let opts_str = if query_opts.is_empty() {
-                    String::new()
-                } else {
-                    format!(", {{ {} }}", query_opts.join(", "))
-                };
-
                 (format!("{} = queryExecute(\"{}\", [{}]{});\n",
                     result_var, sql, params_arr.join(", "), opts_str), close_end - start)
             } else {
@@ -1293,8 +1365,16 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 (format!("queryExecute(\"CALL {}()\");\n", procedure), tag_end - start)
             }
         }
-        "cfprocparam" | "cfprocresult" => {
-            // These are handled as child tags of cfstoredproc; skip if encountered standalone
+        "cfprocparam" => {
+            // Runtime cfstoredproc body. Append the param struct to the runtime list.
+            let lit = cfprocparam_attrs_to_literal(&attrs, &quoted);
+            (format!("arrayAppend(__cfproc_params, {});\n", lit), tag_end - start)
+        }
+        "cfprocresult" => {
+            // Inert in the runtime path — the result variable name is decided
+            // statically at the cfstoredproc dispatcher (see body-scan in the
+            // "cfstoredproc" arm). Emit nothing so a cfprocresult inside a
+            // cfif/cfloop doesn't break compilation.
             (String::new(), tag_end - start)
         }
         "cfthread" => {
@@ -2383,15 +2463,108 @@ fn cfqueryparam_to_literal(p: &CfQueryParam) -> String {
 /// plain SQL text and `<cfqueryparam>`)? If so the SQL and bound-param set can
 /// vary at runtime and must be built by executing the body.
 fn body_has_control_flow(body: &str) -> bool {
+    body_has_control_flow_except(body, &["cfqueryparam"])
+}
+
+/// Emit a `{ type:..., name:..., value:..., file:..., encoded:..., mimeType:... }`
+/// struct literal from parsed `<cfhttpparam>` attributes.
+fn cfhttpparam_attrs_to_literal(
+    tag_attrs: &std::collections::HashMap<String, String>,
+    quoted: &std::collections::HashSet<String>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(t) = tag_attrs.get("type") {
+        parts.push(format!("type: \"{}\"", t.to_lowercase()));
+    }
+    if let Some(n) = tag_attrs.get("name") {
+        parts.push(format!("name: {}", format_attr_value(n, quoted.contains("name"))));
+    }
+    if let Some(v) = tag_attrs.get("value") {
+        parts.push(format!("value: {}", format_attr_value(v, quoted.contains("value"))));
+    }
+    if let Some(f) = tag_attrs.get("file") {
+        parts.push(format!("file: {}", format_attr_value(f, quoted.contains("file"))));
+    }
+    if let Some(e) = tag_attrs.get("encoded") {
+        parts.push(format!("encoded: \"{}\"", e));
+    }
+    if let Some(m) = tag_attrs.get("mimetype") {
+        parts.push(format!("mimeType: \"{}\"", m));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
+/// Emit a `{ name:..., value:..., file:..., type:..., disposition:... }` struct
+/// literal from parsed `<cfmailparam>` attributes.
+fn cfmailparam_attrs_to_literal(
+    tag_attrs: &std::collections::HashMap<String, String>,
+    quoted: &std::collections::HashSet<String>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(n) = tag_attrs.get("name") {
+        parts.push(format!("name: {}", format_attr_value(n, quoted.contains("name"))));
+    }
+    if let Some(v) = tag_attrs.get("value") {
+        parts.push(format!("value: {}", format_attr_value(v, quoted.contains("value"))));
+    }
+    if let Some(f) = tag_attrs.get("file") {
+        parts.push(format!("file: {}", format_attr_value(f, quoted.contains("file"))));
+    }
+    if let Some(t) = tag_attrs.get("type") {
+        parts.push(format!("type: \"{}\"", t.to_lowercase()));
+    }
+    if let Some(d) = tag_attrs.get("disposition") {
+        parts.push(format!("disposition: \"{}\"", d));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
+/// Emit a `<cfmailpart>` attrs-only literal (everything except body, which is
+/// captured separately via savecontent in the runtime path).
+fn cfmailpart_attrs_only_literal(
+    tag_attrs: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(t) = tag_attrs.get("type") {
+        parts.push(format!("type: \"{}\"", t.to_lowercase()));
+    }
+    if let Some(c) = tag_attrs.get("charset") {
+        parts.push(format!("charset: \"{}\"", c));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
+/// Emit a `{ value:..., cfsqltype:... }` struct literal from parsed
+/// `<cfprocparam>` attributes.
+fn cfprocparam_attrs_to_literal(
+    tag_attrs: &std::collections::HashMap<String, String>,
+    quoted: &std::collections::HashSet<String>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(v) = tag_attrs.get("value") {
+        parts.push(format!("value: {}", format_attr_value(v, quoted.contains("value"))));
+    }
+    if let Some(t) = tag_attrs.get("cfsqltype") {
+        parts.push(format!("cfsqltype: \"{}\"", t));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
+/// Same as `body_has_control_flow` but treats the named cf-tags as inert
+/// (i.e. they don't count as control flow). Used by the container-tag
+/// runtime-vs-static decision: `cfhttp`/`cfmail`/`cfstoredproc` bodies
+/// holding only their own child tags can stay on the cheap static-scan
+/// path, while bodies wrapping those children in `<cfif>`/`<cfloop>`
+/// must switch to runtime assembly.
+fn body_has_control_flow_except(body: &str, allowed: &[&str]) -> bool {
     let lower = body.to_lowercase();
     let mut search = lower.as_str();
     while let Some(pos) = search.find("<cf") {
         let rest = &search[pos + 1..]; // after '<'
-        // A cf tag name runs until a non-identifier char.
         let name: String = rest.chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
-        if name != "cfqueryparam" {
+        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
             return true;
         }
         search = &search[pos + 3..];
