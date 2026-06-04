@@ -10839,6 +10839,8 @@ impl CfmlVirtualMachine {
             };
             self.program = old_program;
             self.program_swap_depth -= 1;
+            let first_merge = sub_funcs.is_some();
+            let sub_func_count = sub_funcs.as_ref().map(|s| s.len()).unwrap_or(0);
             let base_idx = if let Some(sub_funcs) = sub_funcs {
                 let base = self.program.functions.len();
                 for func in sub_funcs {
@@ -10857,6 +10859,37 @@ impl CfmlVirtualMachine {
             } else {
                 cached_base.unwrap()
             };
+            // Remap DefineFunction bytecode ops inside the freshly-merged CFC
+            // methods — they still reference the CFC's own sub-program indices.
+            // Without this, a closure defined inside a CFC method (e.g.
+            // `binder.hasAspects()` doing `mappings.some( (k,m) => m.isAspect() )`)
+            // resolves to a DIFFERENT CFC's function once base_idx > 0 — a
+            // closure-identity collision that mis-fires the callback. Mirrors the
+            // cfinclude merge path; `Arc::make_mut` clones-on-write so the cached
+            // bytecode template is not corrupted. Only needed on first merge.
+            if first_merge && base_idx > 0 && sub_func_count > 1 {
+                let offset = base_idx - 1; // -1 because __main__ (index 0) was skipped
+                let end = self.program.functions.len();
+                for fi in base_idx..end {
+                    let func = Arc::make_mut(&mut self.program.functions[fi]);
+                    for op in func.instructions.iter_mut() {
+                        if let BytecodeOp::DefineFunction(ref mut idx) = op {
+                            if *idx > 0 && *idx < sub_func_count {
+                                *idx += offset;
+                            }
+                        }
+                    }
+                }
+                // Point user_functions at the fixed Arcs (they shared the
+                // sub-program's pre-fixup Arcs).
+                for fi in base_idx..end {
+                    let name = self.program.functions[fi].name.clone();
+                    if self.user_functions.contains_key(&name) {
+                        self.user_functions
+                            .insert(name, Arc::clone(&self.program.functions[fi]));
+                    }
+                }
+            }
             // Fix up func_idx in the component struct stored in globals
             // Sub-program functions were at indices [0..N), now at [base_idx..base_idx+N)
             let short_name = class_name.split('.').last().unwrap_or(class_name);
