@@ -631,6 +631,12 @@ pub struct CfmlVirtualMachine {
     /// After a function call, holds modified complex-type argument values for
     /// pass-by-reference writeback. Maps param name → final value.
     arg_ref_writeback: Option<Vec<(String, CfmlValue)>>,
+    /// Named arguments supplied at a callsite that do not match any declared
+    /// param on the callee. Each entry is `(positional_index, name)`. Drained
+    /// by the next `execute_function_with_args` so the callee's `arguments`
+    /// scope keeps the original names (matches Lucee/ACF/BoxLang: extras
+    /// stay reachable as `arguments.<name>`).
+    pending_extra_named_args: Option<Vec<(usize, String)>>,
     /// Registry of Rust-backed classes, keyed by lowercased class name.
     /// Populated via `register_native_class`. The function is invoked when
     /// CFML calls `createObject("rust", "Name", ...)` / `new rust:Name(...)`
@@ -870,6 +876,7 @@ impl CfmlVirtualMachine {
             enable_cfoutput_only: 0,
             sandbox: false,
             arg_ref_writeback: None,
+            pending_extra_named_args: None,
             native_classes: HashMap::new(),
             // Compiled-in runtime defaults. `apply_cfconfig` overlays the
             // user's `.cfconfig.json` values when a VM is constructed via
@@ -1532,9 +1539,20 @@ impl CfmlVirtualMachine {
                 }
             }
         }
-        // Also add any extra positional args beyond declared params
+        // Extras: named args from the callsite that didn't match a declared
+        // param. Take the pending list (set by the named-args reorder) so a
+        // recursive call doesn't see stale state.
+        let extras = self.pending_extra_named_args.take().unwrap_or_default();
+        // Add any args beyond declared params: by name when the callsite was
+        // named, falling back to position (1-based) for purely positional
+        // overflow. Both keys are inserted for named extras so the value is
+        // reachable as `arguments.<name>` AND `arguments[N]`.
         for i in func.params.len()..args.len() {
-            arguments_map.insert((i + 1).to_string(), args[i].clone());
+            let value = args[i].clone();
+            if let Some((_, name)) = extras.iter().find(|(idx, _)| *idx == i) {
+                arguments_map.insert(name.clone(), value.clone());
+            }
+            arguments_map.insert((i + 1).to_string(), value);
         }
         // Check required parameters
         for (i, param_name) in func.params.iter().enumerate() {
@@ -2692,7 +2710,10 @@ impl CfmlVirtualMachine {
                                 .push(named_values.get(i).cloned().unwrap_or(CfmlValue::Null));
                         }
 
-                        // Reorder named args to match function param positions
+                        // Reorder named args to match function param positions.
+                        // Track overflow (named args with no matching param) so the
+                        // callee's `arguments` scope keeps their names.
+                        let mut extras: Vec<(usize, String)> = Vec::new();
                         let args = if let CfmlValue::Function(ref f) = func_ref {
                             let mut positional =
                                 vec![CfmlValue::Null; f.params.len().max(expanded_names.len())];
@@ -2715,13 +2736,19 @@ impl CfmlVirtualMachine {
                                 match target {
                                     Some(pi) if pi < positional.len() => positional[pi] = value,
                                     Some(_) => {}
-                                    None => positional.push(value),
+                                    None => {
+                                        let idx = positional.len();
+                                        positional.push(value);
+                                        extras.push((idx, name.clone()));
+                                    }
                                 }
                             }
                             positional
                         } else {
                             named_values
                         };
+                        self.pending_extra_named_args =
+                            if extras.is_empty() { None } else { Some(extras) };
 
                         self.closure_parent_writeback = None;
                         self.arg_ref_writeback = None;
@@ -3718,11 +3745,13 @@ impl CfmlVirtualMachine {
                                             None
                                         };
                                     let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
-                                    let args = Self::reorder_named_args_for_function(
+                                    let (args, extras) = Self::reorder_named_args_with_extras(
                                         &prop,
                                         method_arg_names,
                                         raw_args,
                                     );
+                                    self.pending_extra_named_args =
+                                        if extras.is_empty() { None } else { Some(extras) };
                                     let mut method_locals = IndexMap::new();
                                     // Merge captured scope first (closure vars from defining scope)
                                     if let Some(ref shared_env) = f.captured_scope {
@@ -8690,11 +8719,25 @@ impl CfmlVirtualMachine {
         arg_names: Option<&[String]>,
         arg_values: Vec<CfmlValue>,
     ) -> Vec<CfmlValue> {
+        let (positional, _extras) =
+            Self::reorder_named_args_with_extras(func_ref, arg_names, arg_values);
+        positional
+    }
+
+    /// Same as `reorder_named_args_for_function` but also returns the named
+    /// args that overflow past the declared params. The VM stashes these in
+    /// `pending_extra_named_args` so the callee's `arguments` scope keeps
+    /// their original names — matching Lucee/ACF/BoxLang.
+    fn reorder_named_args_with_extras(
+        func_ref: &CfmlValue,
+        arg_names: Option<&[String]>,
+        arg_values: Vec<CfmlValue>,
+    ) -> (Vec<CfmlValue>, Vec<(usize, String)>) {
         let Some(arg_names) = arg_names else {
-            return arg_values;
+            return (arg_values, Vec::new());
         };
         let CfmlValue::Function(func) = func_ref else {
-            return arg_values;
+            return (arg_values, Vec::new());
         };
 
         // Expand argumentCollection structs into individual named arguments.
@@ -8716,6 +8759,7 @@ impl CfmlVirtualMachine {
         }
 
         let mut positional = vec![CfmlValue::Null; func.params.len().max(expanded_names.len())];
+        let mut extras: Vec<(usize, String)> = Vec::new();
         for (i, name) in expanded_names.iter().enumerate() {
             let value = expanded_values.get(i).cloned().unwrap_or(CfmlValue::Null);
             if name.is_empty() {
@@ -8733,10 +8777,14 @@ impl CfmlVirtualMachine {
                     positional[param_index] = value;
                 }
                 Some(_) => {}
-                None => positional.push(value),
+                None => {
+                    let idx = positional.len();
+                    positional.push(value);
+                    extras.push((idx, name.clone()));
+                }
             }
         }
-        positional
+        (positional, extras)
     }
 
     fn call_member_function(
@@ -9523,7 +9571,10 @@ impl CfmlVirtualMachine {
         if let CfmlValue::Function(ref _fdata) = &prop {
             let func_ref = prop.clone();
             let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
-            let args = Self::reorder_named_args_for_function(&prop, arg_names, raw_args);
+            let (args, extras) =
+                Self::reorder_named_args_with_extras(&prop, arg_names, raw_args);
+            self.pending_extra_named_args =
+                if extras.is_empty() { None } else { Some(extras) };
             // Bind 'this' / __variables ONLY when the receiver is an actual CFC.
             // For plain struct-stored closures (e.g. `enc = { string: fn }`), the
             // closure should keep whatever `this` it captured at definition (or
