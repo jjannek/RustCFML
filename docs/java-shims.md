@@ -26,7 +26,7 @@ digest = md.digest();         // Binary
 - **Unsupported classes return `null` silently.** `createObject("java", "java.util.HashMap")` does not throw — it returns null, and subsequent method calls fail in confusing ways. Stick to the supported list below.
 - **Unsupported *methods* on a supported class also return `null`** (no error). For example `File.canRead()` is not implemented and yields null.
 - **Regex uses the Rust [`regex`](https://docs.rs/regex) crate**, whose syntax is a close superset of common Java `Pattern` usage but is **not identical** (no backreferences/lookaround). Invalid patterns throw a clear `java.util.regex.Pattern: invalid pattern …` error.
-- **Threads are stubs.** `Thread.sleep()` is a no-op; there is no real concurrency.
+- **The Java `Thread` *shim* is a stub.** `createObject("java", "java.lang.Thread").sleep()` is a no-op and the shim offers no concurrency. This is **separate** from CFML's `<cfthread>`, which *does* run on real OS threads — see **[Threading](threads.md)**. The Java executor/future classes (`java.util.concurrent.Executors`, `CompletableFuture`, `ForkJoinPool`, …) and `java.time.*` are **not shimmed at all**.
 - **No true immutability/thread-safety.** `Collections.unmodifiableList()` / `synchronizedMap()` are identity operations (matching Lucee's practical behaviour), and the concurrent collections are single-threaded emulations.
 - **`System.getProperty("java.version")` returns `"rustcfml"`** — a deliberate tell that there is no JVM.
 
