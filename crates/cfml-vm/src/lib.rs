@@ -8204,10 +8204,11 @@ impl CfmlVirtualMachine {
                 "__cfcustomtag" => {
                     // Self-closing custom tag: __cfcustomtag(path_spec, attrs_struct)
                     let path_spec = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    let attrs_val = args
-                        .get(1)
-                        .cloned()
-                        .unwrap_or(CfmlValue::strukt(IndexMap::new()));
+                    let attrs_val = Self::merge_attribute_collection(
+                        args.get(1)
+                            .cloned()
+                            .unwrap_or(CfmlValue::strukt(IndexMap::new())),
+                    );
                     let run_end_phase = args.get(2).map(|v| v.is_true()).unwrap_or(false);
 
                     let resolved = self.resolve_custom_tag_path(&path_spec)?;
@@ -8303,10 +8304,11 @@ impl CfmlVirtualMachine {
                 "__cfcustomtag_start" => {
                     // Body custom tag start: __cfcustomtag_start(path_spec, attrs_struct)
                     let path_spec = args.get(0).map(|v| v.as_string()).unwrap_or_default();
-                    let attrs_val = args
-                        .get(1)
-                        .cloned()
-                        .unwrap_or(CfmlValue::strukt(IndexMap::new()));
+                    let attrs_val = Self::merge_attribute_collection(
+                        args.get(1)
+                            .cloned()
+                            .unwrap_or(CfmlValue::strukt(IndexMap::new())),
+                    );
 
                     let resolved = self.resolve_custom_tag_path(&path_spec)?;
 
@@ -10024,6 +10026,36 @@ impl CfmlVirtualMachine {
                 .insert("cfthread".to_string(), CfmlValue::strukt(IndexMap::new()));
         }
         self.globals.get_mut("cfthread").unwrap()
+    }
+
+    /// If `attrs` carries an `attributeCollection` key whose value is a struct,
+    /// merge those entries into a new attribute struct with explicit attrs
+    /// winning. The source `attributeCollection` struct is not mutated.
+    /// Returns the input unchanged when there is no collection to expand.
+    fn merge_attribute_collection(attrs: CfmlValue) -> CfmlValue {
+        let s = match &attrs {
+            CfmlValue::Struct(s) => s.clone(),
+            _ => return attrs,
+        };
+        let ac = match s.get_ci("attributeCollection") {
+            Some(CfmlValue::Struct(ac)) => ac,
+            _ => return attrs,
+        };
+        let mut merged: IndexMap<String, CfmlValue> = ac.snapshot();
+        for (k, v) in s.snapshot() {
+            if k.eq_ignore_ascii_case("attributeCollection") {
+                continue;
+            }
+            if let Some(existing_key) = merged
+                .keys()
+                .find(|ek| ek.eq_ignore_ascii_case(&k))
+                .cloned()
+            {
+                merged.shift_remove(&existing_key);
+            }
+            merged.insert(k, v);
+        }
+        CfmlValue::strukt(merged)
     }
 
     /// Resolve a custom tag path specification to an actual filesystem path.

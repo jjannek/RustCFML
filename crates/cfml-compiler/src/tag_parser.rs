@@ -1596,6 +1596,13 @@ fn format_attr_value(raw: &str, was_quoted: bool) -> String {
     if !was_quoted {
         return quote_if_needed(&strip_hashes(raw));
     }
+    // Pure `#expr#` (whole value is one expression) — preserve native type
+    // rather than coercing through string concat. Custom-tag attrs in
+    // particular need this so attributeCollection="#someStruct#" arrives as
+    // a struct, not its stringified form.
+    if let Some(inner) = single_hash_expr(raw) {
+        return inner.to_string();
+    }
     // Quoted attribute. Split into literal segments and `#...#` expressions.
     let chars: Vec<char> = raw.chars().collect();
     let len = chars.len();
@@ -1754,7 +1761,9 @@ fn strip_hashes(s: &str) -> String {
         return s[1..s.len() - 1].to_string();
     }
     // Handle embedded #expr# within larger expressions
-    // Replace #expr# with just expr (strip the hash delimiters)
+    // Replace #expr# with just expr (strip the hash delimiters), but preserve
+    // hashes that sit inside string literals (CFML uses `#expr#` for string
+    // interpolation and the script lexer will handle it later).
     if !s.contains('#') {
         return s.to_string();
     }
@@ -1762,23 +1771,69 @@ fn strip_hashes(s: &str) -> String {
     let len = chars.len();
     let mut result = String::new();
     let mut i = 0;
+    let mut string_quote: Option<char> = None;
     while i < len {
-        if chars[i] == '#' {
-            // Look for closing #
-            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '#') {
-                let end = i + 1 + end;
-                // Extract expression between hashes
-                let expr: String = chars[i + 1..end].iter().collect();
-                result.push_str(&expr);
-                i = end + 1;
-            } else {
-                result.push(chars[i]);
-                i += 1;
+        let c = chars[i];
+        if let Some(q) = string_quote {
+            // Inside a string literal — preserve everything, watch for the
+            // closing quote (with `""`/`''` doubling treated as an escape).
+            result.push(c);
+            if c == q {
+                if i + 1 < len && chars[i + 1] == q {
+                    result.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                string_quote = None;
             }
-        } else {
-            result.push(chars[i]);
             i += 1;
+            continue;
         }
+        if c == '"' || c == '\'' {
+            string_quote = Some(c);
+            result.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            // Look for closing # at the same nesting level (skip string contents).
+            let mut j = i + 1;
+            let mut inner_quote: Option<char> = None;
+            while j < len {
+                let cj = chars[j];
+                if let Some(q) = inner_quote {
+                    if cj == q {
+                        if j + 1 < len && chars[j + 1] == q {
+                            j += 2;
+                            continue;
+                        }
+                        inner_quote = None;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if cj == '"' || cj == '\'' {
+                    inner_quote = Some(cj);
+                    j += 1;
+                    continue;
+                }
+                if cj == '#' {
+                    break;
+                }
+                j += 1;
+            }
+            if j < len && chars[j] == '#' {
+                let expr: String = chars[i + 1..j].iter().collect();
+                result.push_str(&expr);
+                i = j + 1;
+                continue;
+            }
+            result.push(c);
+            i += 1;
+            continue;
+        }
+        result.push(c);
+        i += 1;
     }
     result
 }
@@ -2236,15 +2291,24 @@ fn parse_cfqueryparam_attrs(tag_attrs: &std::collections::HashMap<String, String
     // Convert value to script expression
     let value_expr = if null {
         "\"\"".to_string()
+    } else if value_raw.is_empty() {
+        "\"\"".to_string()
+    } else if !value_raw.contains('#') {
+        // Pure literal string
+        format!("\"{}\"", value_raw.replace('"', "\\\""))
     } else {
-        let stripped = strip_hashes(&value_raw);
-        if stripped != value_raw {
-            // Had hashes — it's a variable reference
-            stripped
-        } else if value_raw.is_empty() {
-            "\"\"".to_string()
+        let trimmed = value_raw.trim();
+        let is_pure_expr = trimmed.starts_with('#')
+            && trimmed.ends_with('#')
+            && trimmed.len() > 2
+            && trimmed[1..trimmed.len() - 1].find('#').is_none();
+        if is_pure_expr {
+            // Single bare expression — emit unquoted
+            trimmed[1..trimmed.len() - 1].to_string()
         } else {
-            // Literal string value
+            // Mixed literal text + #expr# interpolation — emit as a quoted
+            // CFML string with hashes intact; the lexer handles `#expr#`
+            // interpolation inside double-quoted strings.
             format!("\"{}\"", value_raw.replace('"', "\\\""))
         }
     };
