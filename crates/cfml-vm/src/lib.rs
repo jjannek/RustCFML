@@ -1915,6 +1915,20 @@ impl CfmlVirtualMachine {
                             // pass-by-reference writeback mechanism.
                             if let CfmlValue::Struct(ref args) = val {
                                 for (k, v) in args.iter() {
+                                    // Never sync internal markers (__variables, __name,
+                                    // this, super) from the arguments scope back into the
+                                    // frame's locals: they are not real parameters, and a
+                                    // stray __variables (e.g. one injected onto the
+                                    // arguments scope by a deep variables-writeback such as
+                                    // `arguments.cfc.getName()`) would otherwise clobber the
+                                    // frame's real component scope, nulling out
+                                    // `variables.*`. See tests/oop/test_mixin_writeback.cfm.
+                                    if k.starts_with("__")
+                                        || k.eq_ignore_ascii_case("this")
+                                        || k.eq_ignore_ascii_case("super")
+                                    {
+                                        continue;
+                                    }
                                     if matches!(
                                         v,
                                         CfmlValue::Struct(_)
@@ -4085,9 +4099,18 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 if let Some(s) = comp_obj.as_cfml_struct() {
-                                    let vs = s.get_or_insert_struct("__variables");
-                                    for (k, v) in vars_wb {
-                                        vs.insert(k, v);
+                                    // Only write a method's `variables` mutations back into
+                                    // an actual CFC instance (carries `__name`). A deep
+                                    // write_back path like `arguments.cfc.getName()` resolves
+                                    // comp_obj to the `arguments` SCOPE, which is not a
+                                    // component — injecting a synthetic `__variables` there
+                                    // pollutes the scope and (via the arguments param-sync)
+                                    // clobbers the caller frame's real component scope.
+                                    if s.contains_key("__name") {
+                                        let vs = s.get_or_insert_struct("__variables");
+                                        for (k, v) in vars_wb {
+                                            vs.insert(k, v);
+                                        }
                                     }
                                 }
                                 // Store back
