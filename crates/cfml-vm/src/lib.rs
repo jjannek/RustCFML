@@ -446,6 +446,15 @@ pub struct ServerState {
     /// Cache of Application.cfc path resolution keyed by the page's parent
     /// directory. Only populated when `production_mode` is true.
     pub app_cfc_path_cache: Arc<parking_lot::RwLock<HashMap<std::path::PathBuf, Option<String>>>>,
+    /// Cache of per-application `.cfconfig.json` files (the overlaid result of
+    /// baseline + the file beside an Application.cfc), keyed by the candidate
+    /// file path. `Some(None)` = checked, no file there. Only populated when
+    /// `production_mode` is true — the file read + JSON parse + overlay is a
+    /// pure function of a static file, so it is held in memory rather than
+    /// repeated every request. (Derived `this.*` values are NOT cached — those
+    /// come from re-executing Application.cfc, which must run every request.)
+    pub app_cfconfig_cache:
+        Arc<parking_lot::RwLock<HashMap<std::path::PathBuf, Option<Arc<cfml_config::RustCfmlConfig>>>>>,
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
@@ -472,6 +481,7 @@ impl ServerState {
             webroot: None,
             production_mode,
             app_cfc_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            app_cfconfig_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
         }
     }
@@ -12311,50 +12321,99 @@ impl CfmlVirtualMachine {
             None => return,
         };
         let candidate = format!("{}/{}", dir.trim_end_matches('/'), cfml_config::resolve::FILENAME);
-        if !self.vfs.is_file(&candidate) {
-            return;
+        let candidate_key = std::path::PathBuf::from(&candidate);
+
+        // The overlaid config is a pure function of a static file + the (constant)
+        // server baseline, so in production hold it in memory keyed by path —
+        // file read + JSON parse + overlay run once, not per request.
+        let production = self
+            .server_state
+            .as_ref()
+            .map(|ss| ss.production_mode)
+            .unwrap_or(false);
+        if production {
+            // Resolve the lookup to an owned value so no cache read-guard / self
+            // borrow is held across the mutable apply below.
+            let hit = self.server_state.as_ref().and_then(|ss| {
+                ss.app_cfconfig_cache.read().get(&candidate_key).cloned()
+            });
+            if let Some(cached) = hit {
+                if let Some(merged) = cached {
+                    self.apply_app_cfconfig(merged);
+                }
+                return;
+            }
         }
-        let bytes = match self.vfs.read(&candidate) {
+
+        // Cache miss (or non-production): compute the overlaid config.
+        let merged: Option<Arc<cfml_config::RustCfmlConfig>> = self
+            .compute_app_cfconfig(&candidate);
+
+        if production {
+            if let Some(ref ss) = self.server_state {
+                ss.app_cfconfig_cache
+                    .write()
+                    .insert(candidate_key, merged.clone());
+            }
+        }
+        if let Some(merged) = merged {
+            self.apply_app_cfconfig(merged);
+        }
+    }
+
+    /// Read + parse + overlay a per-app `.cfconfig.json` (no caching, no apply).
+    /// Returns the overlaid config, or `None` when the file is absent/invalid.
+    fn compute_app_cfconfig(&self, candidate: &str) -> Option<Arc<cfml_config::RustCfmlConfig>> {
+        if !self.vfs.is_file(candidate) {
+            return None;
+        }
+        let bytes = match self.vfs.read(candidate) {
             Ok(b) => b,
             Err(e) => {
                 log::warn!("failed to read app cfconfig {}: {}", candidate, e);
-                return;
+                return None;
             }
         };
         let app_json: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("invalid app cfconfig {}: {}", candidate, e);
-                return;
+                return None;
             }
         };
-        // Overlay onto the server baseline (or defaults if no server state).
         let baseline = self
             .server_state
             .as_ref()
             .map(|ss| ss.cfconfig.clone())
             .unwrap_or_else(|| Arc::new(cfml_config::RustCfmlConfig::default()));
         match baseline.overlay_app_json(app_json) {
-            Ok(merged) => {
-                self.apply_cfconfig(&merged);
-                // Seed per-request datasources from the overlaid cfconfig so
-                // `cfquery datasource="x"` resolves the app's view, not just the
-                // process-global baseline. `this.datasources` (read later from
-                // Application.cfc) overrides these.
-                for (name, ds) in merged.datasources.iter() {
-                    if let Some(url) = ds.connection_url() {
-                        self.app_datasources.insert(name.to_lowercase(), url.clone());
-                        if ds.default {
-                            self.app_default_datasource = Some(url);
-                        }
-                    }
-                }
-                self.app_cfconfig = Some(Arc::new(merged));
-            }
+            Ok(merged) => Some(Arc::new(merged)),
             Err(e) => {
                 log::warn!("failed to overlay app cfconfig {}: {}", candidate, e);
+                None
             }
         }
+    }
+
+    /// Apply an already-computed per-app cfconfig to this request: overlay the
+    /// per-VM runtime knobs, seed per-app datasources, and stash it as the source
+    /// for the CFML-visible `server.cfconfig`. Runs every request (cheap); the
+    /// expensive file parse is what `compute_app_cfconfig` does once.
+    fn apply_app_cfconfig(&mut self, merged: Arc<cfml_config::RustCfmlConfig>) {
+        self.apply_cfconfig(&merged);
+        // Seed per-request datasources from the overlaid cfconfig so
+        // `cfquery datasource="x"` resolves the app's view, not just the
+        // process-global baseline. `this.datasources` (read later from
+        // Application.cfc) overrides these.
+        for (name, ds) in merged.datasources.iter() {
+            if let Some(url) = ds.connection_url() {
+                self.app_datasources.insert(name.to_lowercase(), url.clone());
+                if ds.default {
+                    self.app_default_datasource = Some(url);
+                }
+            }
+        }
+        self.app_cfconfig = Some(merged);
     }
 
     /// Convert a single `this.datasources` entry to a connection URL. Accepts a
