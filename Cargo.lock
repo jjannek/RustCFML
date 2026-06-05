@@ -1262,7 +1262,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cfml-codegen"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-common"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "indexmap",
  "js-sys",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-compiler"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "cfml-common",
  "log",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-config"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "indexmap",
  "log",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-stdlib"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "aes",
  "argon2",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-vm"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "anyhow",
  "cfml-codegen",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-worker"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "cfml-codegen",
  "cfml-common",
@@ -4815,7 +4815,7 @@ dependencies = [
 
 [[package]]
 name = "rustcfml-cli"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "anyhow",
  "automerge",
