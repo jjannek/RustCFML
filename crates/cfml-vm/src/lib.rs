@@ -13753,7 +13753,10 @@ impl CfmlVirtualMachine {
         if !self.application_stopped {
             if let Some(ref server_state) = self.server_state.clone() {
                 if let Some(ref app_scope) = self.application_scope {
-                    app_scope.with_read(|scope| {
+                    // Snapshot first so we never hold the application-scope lock
+                    // across the applications-store write below — keeps the two
+                    // locks strictly un-nested (no ordering hazard).
+                    let scope = app_scope.snapshot();
                     // Refresh the function cache to the bytecode functions still
                     // reachable from application scope, so long-lived CFCs,
                     // factories and closures stay callable on later requests.
@@ -13771,7 +13774,7 @@ impl CfmlVirtualMachine {
                     // occupies that slot on the next request once a differently
                     // sized page shifts the table layout.
                     let function_indices: Vec<usize> =
-                        Self::application_scope_function_indices(scope)
+                        Self::application_scope_function_indices(&scope)
                             .into_iter()
                             .filter(|idx| *idx < self.program.functions.len())
                             .collect();
@@ -13794,7 +13797,6 @@ impl CfmlVirtualMachine {
                             app.cached_function_indices = function_indices.clone();
                             app.cached_functions = cached_functions.clone();
                         }
-                    });
                     });
                 }
             }
