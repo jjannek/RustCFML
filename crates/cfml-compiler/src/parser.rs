@@ -2302,8 +2302,38 @@ impl Parser {
                 && (matches!(self.peek(2), Token::Identifier(_))
                     || self.token_as_string(&self.peek(2).clone()).is_some())
                 && matches!(self.peek(3), Token::Equal);
-            if !is_simple && !is_namespaced {
+            // Bare boolean attribute: `singleton`, `serializable`, … — an
+            // attribute with no `="value"`, equivalent to `name="true"`.
+            // Recognised when the next token ends the header (`{`) or begins
+            // another attribute key. Matches Lucee/ACF/BoxLang. Without this,
+            // `component accessors="true" singleton {` left `singleton` before
+            // the `{`, failing the body parse → silent null component.
+            let is_bare_bool = !is_simple
+                && !is_namespaced
+                && matches!(
+                    self.peek(1),
+                    Token::LBrace | Token::Identifier(_) | Token::Extends | Token::Implements
+                );
+            if !is_simple && !is_namespaced && !is_bare_bool {
                 break;
+            }
+            if is_bare_bool {
+                let key = match self.peek(0).clone() {
+                    Token::Identifier(s) => {
+                        self.advance();
+                        s
+                    }
+                    ref t => {
+                        if let Some(s) = self.token_as_string(t) {
+                            self.advance();
+                            s
+                        } else {
+                            break;
+                        }
+                    }
+                };
+                metadata.push((key, "true".to_string()));
+                continue;
             }
             let mut key = match self.peek(0).clone() {
                 Token::Identifier(s) => {

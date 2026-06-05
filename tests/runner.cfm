@@ -128,6 +128,8 @@ try { include "oop/test_returned_service_chain.cfm"; } catch (any e) { writeOutp
 try { include "oop/test_mixin_writeback.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_mixin_writeback.cfm | " & e.message & chr(10)); }
 try { include "oop/test_dynamic_lhs_assign.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_dynamic_lhs_assign.cfm | " & e.message & chr(10)); }
 try { include "oop/test_getmetadata_properties.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_getmetadata_properties.cfm | " & e.message & chr(10)); }
+try { include "oop/test_component_bool_attr.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_bool_attr.cfm | " & e.message & chr(10)); }
+try { include "oop/test_chained_writeback_clobber.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_chained_writeback_clobber.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }

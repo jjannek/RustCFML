@@ -3992,7 +3992,22 @@ impl CfmlVirtualMachine {
                             // Direct variable write-back: var.method(args)
                             let var_name = &path[0];
                             if Self::is_mutating_method(&method_name) {
-                                self.scope_aware_store(var_name, result.clone(), &mut locals);
+                                // Chained-CFC identity guard: for `a.getDep().mutate()`
+                                // the result is a foreign CFC (codegen propagates
+                                // write_back=["a"] to the outer call). Writing it back
+                                // would clobber `a`'s identity. Skip when `a` and the
+                                // result are distinct CFC instances; allow same-instance,
+                                // non-CFC results (arrays/Java shims), or non-CFC `a`.
+                                let clobbers_foreign_cfc = matches!(
+                                    (self.scope_aware_load(var_name, &locals), &result),
+                                    (Some(CfmlValue::Struct(ref cur)), CfmlValue::Struct(ref res))
+                                        if cur.contains_key("__variables")
+                                            && res.contains_key("__variables")
+                                            && !cur.ptr_eq(res)
+                                );
+                                if !clobbers_foreign_cfc {
+                                    self.scope_aware_store(var_name, result.clone(), &mut locals);
+                                }
                             }
                         } else if path.len() >= 2 && Self::is_mutating_method(&method_name) {
                             // Deep property write-back: var.prop1.prop2...propN.method(args)
@@ -4033,6 +4048,25 @@ impl CfmlVirtualMachine {
                                     &modified_this,
                                     CfmlValue::Struct(s) if s.contains_key("__variables")
                                 );
+                                // Chained-CFC identity guard (single-segment path):
+                                // `a.getDep().mutate()` where getDep() returns a
+                                // *different* CFC. Codegen propagates write_back=["a"]
+                                // to the outer call too, so its `this` is a foreign
+                                // CFC; merging it into `a` would clobber `a`'s identity
+                                // (__name/methods). Skip when `a` and modified_this are
+                                // distinct CFC instances. Mirrors the deep-path guard
+                                // below. Java shims lack __variables → not gated, so
+                                // chained shim mutation (sb.append().append()) still
+                                // propagates.
+                                let skip_for_identity = is_cfc
+                                    && matches!(
+                                        (&existing, &modified_this),
+                                        (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap))
+                                            if cur.contains_key("__variables") && !cur.ptr_eq(snap)
+                                    );
+                                if skip_for_identity {
+                                    self.method_variables_writeback = None;
+                                } else {
                                 let merged = if is_cfc {
                                     match (existing, modified_this) {
                                         (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap)) => {
@@ -4055,6 +4089,7 @@ impl CfmlVirtualMachine {
                                     modified_this
                                 };
                                 self.scope_aware_store(var_name, merged, &mut locals);
+                                }
                             } else {
                                 // Chained-CFC identity guard: for
                                 // `a.foo().bar()` with `foo` returning a
