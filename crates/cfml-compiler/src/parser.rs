@@ -2653,52 +2653,54 @@ impl Parser {
         let mut attributes = Vec::new();
 
         loop {
-            // Check for key="value" or key=value pattern — key can be an identifier or a keyword token
-            // For name and type, we require string values; for default, we accept any expression
-            let key_str = if let Token::Identifier(ref s) = self.peek(0) {
-                if matches!(self.peek(1), Token::Equal) {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            } else if let Some(s) = self.token_as_string(&self.peek(0).clone()) {
-                if matches!(self.peek(1), Token::Equal) {
-                    Some(s)
-                } else {
-                    None
+            let next_is_eq = matches!(self.peek(1), Token::Equal);
+
+            // The attribute key: an identifier in any position; a keyword-as-string
+            // only in the key=value form (e.g. `type="x"`). A token that is not a
+            // valid attribute name (`;`, `}`, EOF, …) ends the attribute list.
+            let key = if let Token::Identifier(ref s) = self.peek(0) {
+                s.clone()
+            } else if next_is_eq {
+                match self.token_as_string(&self.peek(0).clone()) {
+                    Some(s) => s,
+                    None => break,
                 }
             } else {
-                None
+                break;
             };
 
-            let key = match key_str {
-                Some(k) => k,
-                None => break,
-            };
+            if next_is_eq {
+                self.advance(); // consume key
+                self.advance(); // consume =
 
-            self.advance(); // consume key
-            self.advance(); // consume =
-
-            // For "default", parse as an expression (can be number, string, boolean, etc.)
-            // For other keys, expect a string value
-            if key.to_lowercase() == "default" {
-                // Parse the default value as an expression
-                let expr = self.parse_expression()?;
-                default = Some(expr);
-            } else {
-                // For name, type, required, etc., expect a string
-                let val = if let Token::String(v) = self.peek(0).clone() {
-                    self.advance();
-                    v
+                // For "default", parse as an expression (number, string, boolean, …).
+                if key.eq_ignore_ascii_case("default") {
+                    let expr = self.parse_expression()?;
+                    default = Some(expr);
                 } else {
-                    break;
-                };
+                    // name, type, inject="X", delegateSuffix="disk", … — string value
+                    let val = if let Token::String(v) = self.peek(0).clone() {
+                        self.advance();
+                        v
+                    } else {
+                        break;
+                    };
 
+                    match key.to_lowercase().as_str() {
+                        "name" => name = val,
+                        "type" => prop_type = Some(val),
+                        "required" => required = val.eq_ignore_ascii_case("true"),
+                        _ => attributes.push((key.to_lowercase(), val)),
+                    }
+                }
+            } else {
+                // Bare annotation with no value (e.g. `inject delegate delegatePrefix`).
+                // Lucee records these with an empty-string value; parsing MUST continue
+                // past them so following annotations aren't dropped.
+                self.advance(); // consume key
                 match key.to_lowercase().as_str() {
-                    "name" => name = val,
-                    "type" => prop_type = Some(val),
-                    "required" => required = val.eq_ignore_ascii_case("true"),
-                    _ => attributes.push((key.to_lowercase(), val)),
+                    "required" => required = true,
+                    _ => attributes.push((key.to_lowercase(), String::new())),
                 }
             }
         }

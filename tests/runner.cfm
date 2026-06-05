@@ -355,6 +355,13 @@ try { include "core/test_hof_member_writeback.cfm"; } catch (any e) { writeOutpu
 //     once the left determines the result — matches Lucee/ACF. Surfaced as
 //     `Variable 'defaultValue' is undefined` while booting WireBox.
 try { include "core/test_logical_short_circuit.cfm"; } catch (any e) { writeOutput("ERROR | core/test_logical_short_circuit.cfm | " & e.message & chr(10)); }
+//   - getFunctionCalledName: a UDF injected under multiple aliases reports the
+//     alias it was called by — the primitive WireBox delegation dispatches on.
+try { include "core/test_get_function_called_name.cfm"; } catch (any e) { writeOutput("ERROR | core/test_get_function_called_name.cfm | " & e.message & chr(10)); }
+//   - delegate annotation metadata: bare + arbitrary-named property annotations
+//     are captured, and component-level annotations surface top-level in
+//     getComponentMetadata (Lucee parity) — the surface WireBox delegation reads.
+try { include "oop/test_delegate_annotation_metadata.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_delegate_annotation_metadata.cfm | " & e.message & chr(10)); }
 
 printSummary();
 </cfscript>

@@ -315,6 +315,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("nowServer".into(), fn_now_server);
     f.insert("getTickCount".into(), fn_get_tick_count);
     f.insert("getFunctionList".into(), fn_get_function_list);
+    f.insert("getFunctionCalledName".into(), fn_get_function_called_name);
     f.insert("getContextRoot".into(), fn_get_context_root);
     f.insert("GetContextRoot".into(), fn_get_context_root);
     f.insert("getPageContext".into(), fn_get_page_context);
@@ -3647,6 +3648,13 @@ fn fn_get_tick_count(args: Vec<CfmlValue>) -> CfmlResult {
         _ => cfml_common::clock::now_unix_millis() as i64,
     };
     Ok(CfmlValue::Int(val))
+}
+
+fn fn_get_function_called_name(_args: Vec<CfmlValue>) -> CfmlResult {
+    // VM-intercepted — this stub only runs if the VM intercept misses (e.g.
+    // called at the top level with no active call frame), where the called
+    // name is undefined.
+    Ok(CfmlValue::String(String::new()))
 }
 
 fn fn_get_function_list(_args: Vec<CfmlValue>) -> CfmlResult {

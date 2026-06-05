@@ -374,7 +374,8 @@ pub fn compile_file_cached(
     let needs_tag_parse =
         cfml_compiler::tag_parser::has_cfml_tags(&source_code) || is_template_ext;
     let source_code = if needs_tag_parse {
-        let converted = cfml_compiler::tag_parser::tags_to_script(&source_code);
+        let converted = cfml_compiler::tag_parser::tags_to_script_checked(&source_code)
+            .map_err(|msg| CfmlError::runtime(format!("{} in '{}'", msg, path)))?;
         if std::env::var("RUSTCFML_DUMP_TAGS").is_ok() {
             eprintln!(
                 "=== TAG CONVERTED: {} ===\n{}\n=== END ===",
@@ -675,6 +676,13 @@ pub struct CfmlVirtualMachine {
     /// scope keeps the original names (matches Lucee/ACF/BoxLang: extras
     /// stay reachable as `arguments.<name>`).
     pending_extra_named_args: Option<Vec<(usize, String)>>,
+    /// The name a member method was invoked under at its call site. Set by
+    /// `call_member_function` just before dispatching, and drained by the next
+    /// `execute_function_with_args` into the new frame's `called_name`. Lets
+    /// `getFunctionCalledName()` report the alias a UDF was called by — the
+    /// primitive WireBox delegation relies on (one `getByDelegate` UDF injected
+    /// under many method names, dispatched by the called name).
+    pending_called_name: Option<String>,
     /// Registry of Rust-backed classes, keyed by lowercased class name.
     /// Populated via `register_native_class`. The function is invoked when
     /// CFML calls `createObject("rust", "Name", ...)` / `new rust:Name(...)`
@@ -830,6 +838,12 @@ const _: fn() = || {
 #[derive(Debug, Clone)]
 struct CallFrame {
     function_name: String,
+    /// The name this function was actually invoked under at the call site —
+    /// for member calls this is the method name used (which can differ from
+    /// `function_name` when one UDF is injected under several aliases, as
+    /// WireBox does for delegated methods). Exposed by `getFunctionCalledName()`.
+    /// Defaults to `function_name` for plain named calls.
+    called_name: String,
     template: String,
     /// Current line within this function (updated by LineInfo)
     line: usize,
@@ -922,6 +936,7 @@ impl CfmlVirtualMachine {
             sandbox: false,
             arg_ref_writeback: None,
             pending_extra_named_args: None,
+            pending_called_name: None,
             native_classes: HashMap::new(),
             // Compiled-in runtime defaults. `apply_cfconfig` overlays the
             // user's `.cfconfig.json` values when a VM is constructed via
@@ -1612,10 +1627,19 @@ impl CfmlVirtualMachine {
         }
         locals.insert("arguments".to_string(), CfmlValue::strukt(arguments_map));
 
+        // The name this call was dispatched under (a member-call alias, if any).
+        // Always drained so it can't leak into a later call; falls back to the
+        // function's declared name for plain named calls.
+        let called_name = self
+            .pending_called_name
+            .take()
+            .unwrap_or_else(|| func.name.clone());
+
         // Push call frame for stack trace tracking (skip __main__ — it's the root)
         if func.name != "__main__" {
             self.call_stack.push(CallFrame {
                 function_name: func.name.clone(),
+                called_name,
                 template: func
                     .source_file
                     .clone()
@@ -5146,6 +5170,7 @@ impl CfmlVirtualMachine {
                 | "__cfsavecontent_end"
                 | "invoke"
                 | "getbasetemplatepath"
+                | "getfunctioncalledname"
                 | "gettimezone"
                 | "expandpath"
                 | "isdefined"
@@ -6897,8 +6922,19 @@ impl CfmlVirtualMachine {
                             }
                         }
                         meta.insert("functions".to_string(), CfmlValue::array(functions));
-                        if let Some(md) = s.get("__metadata") {
-                            meta.insert("metadata".to_string(), md.clone());
+                        if let Some(CfmlValue::Struct(md)) = s.get("__metadata") {
+                            // Custom component attributes appear as top-level keys in
+                            // CFML metadata (Lucee/ACF parity) — e.g. `component
+                            // delegates="..."` => md.delegates. WireBox's
+                            // getAnnotationValue reads them at the top level. Mirrors
+                            // getMetadata(). The guard keeps the reserved keys
+                            // (name/extends/functions/properties) authoritative.
+                            for (mk, mv) in md.iter() {
+                                if !meta.contains_key(&mk) {
+                                    meta.insert(mk, mv);
+                                }
+                            }
+                            meta.insert("metadata".to_string(), CfmlValue::Struct(md.clone()));
                         }
                         if let Some(props) = s.get("__properties") {
                             meta.insert("properties".to_string(), props.clone());
@@ -8448,6 +8484,18 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
 
+                "getfunctioncalledname" => {
+                    // The name the currently-executing UDF was invoked under.
+                    // The top frame is this builtin's caller (getFunctionCalledName
+                    // is a builtin and pushes no frame of its own).
+                    let name = self
+                        .call_stack
+                        .last()
+                        .map(|f| f.called_name.clone())
+                        .unwrap_or_default();
+                    return Ok(CfmlValue::String(name));
+                }
+
                 "callstackget" => {
                     let frames = self.build_stack_trace();
                     let offset = args
@@ -9258,6 +9306,7 @@ impl CfmlVirtualMachine {
                 "listlast" => Some("listLast"),
                 "listrest" => Some("listRest"),
                 "listgetat" => Some("listGetAt"),
+                "gettoken" => Some("getToken"),
                 "listfind" => Some("listFind"),
                 "listcontains" => Some("listContains"),
                 "listappend" => Some("listAppend"),
@@ -9873,6 +9922,10 @@ impl CfmlVirtualMachine {
             // captured scope can't leak to the caller's CallMethod handler.
             let saved_this_wb = self.method_this_writeback.take();
             let saved_vars_wb = self.method_variables_writeback.take();
+            // Record the name this method was invoked under so the callee's
+            // getFunctionCalledName() reports the alias (WireBox delegation
+            // injects one UDF under many method names and dispatches by it).
+            self.pending_called_name = Some(method.to_string());
             let result = self.call_function(&func_ref, args, &method_locals)?;
             if let Some(ref wb) = self.closure_parent_writeback {
                 Self::write_back_to_captured_scope(&func_ref, wb);

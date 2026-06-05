@@ -504,7 +504,8 @@ fn compile_and_run(
 
         // Pre-process: convert CFML tags to script if needed
         let source = if tag_parser::has_cfml_tags(source) {
-            let converted = tag_parser::tags_to_script(source);
+            let converted = tag_parser::tags_to_script_checked(source)
+                .map_err(|msg| CfmlRunError { output: String::new(), message: msg })?;
             if debug {
                 println!("=== TAG CONVERSION ===");
                 println!("{}", converted);

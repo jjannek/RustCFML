@@ -47,5 +47,13 @@ assert("string.ucFirst()", "hello world".ucFirst(), "Hello world");
 // --- compare ---
 assert("string.compare() equal", "Hello".compare("Hello"), 0);
 
+// --- getToken (member form; string-first signature, no arg swap) ---
+// Regression: the member form returned empty while the standalone getToken()
+// worked. WireBox's delegate shorthand parser uses `item.getToken(1, "=")`.
+assert("string.getToken(index) default whitespace delim", "a b c".getToken(2), "b");
+assert("string.getToken(index, delim) first", "Worker=vacation".getToken(1, "="), "Worker");
+assert("string.getToken(index, delim) second", "Worker=vacation".getToken(2, "="), "vacation");
+assert("string.getToken keeps left when no delim present", "ram2>memory".getToken(1, "="), "ram2>memory");
+
 suiteEnd();
 </cfscript>

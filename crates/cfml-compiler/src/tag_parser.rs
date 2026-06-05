@@ -95,10 +95,47 @@ pub fn has_cfml_tags(source: &str) -> bool {
     lower.contains("<cf") || lower.contains("</cf") || source.contains("<!---")
 }
 
-/// Convert CFML tag-based source code to equivalent CFScript
+thread_local! {
+    /// Structural error recorded during the most recent preprocess pass — e.g.
+    /// an unclosed `<cfscript>` (no `</cfscript>` before EOF). Lucee/ACF reject
+    /// these at compile time; we record the first one here so the strict entry
+    /// point ([`tags_to_script_checked`]) can surface it as a compile error
+    /// instead of silently echoing the unterminated body as literal output.
+    static PREPROCESS_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the first structural preprocess error of the current pass.
+fn record_preprocess_error(msg: impl Into<String>) {
+    PREPROCESS_ERROR.with(|e| {
+        let mut slot = e.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(msg.into());
+        }
+    });
+}
+
+/// Convert CFML tag-based source code to equivalent CFScript.
+///
+/// Tolerant: structural errors (e.g. an unclosed `<cfscript>`) degrade rather
+/// than fail. Prefer [`tags_to_script_checked`] on compile paths so those
+/// errors surface the way Lucee/ACF report them.
 pub fn tags_to_script(source: &str) -> String {
     let mut imports = std::collections::HashMap::<String, String>::new();
+    PREPROCESS_ERROR.with(|e| *e.borrow_mut() = None);
     tags_to_script_impl(source, &mut imports)
+}
+
+/// Strict variant of [`tags_to_script`]: returns `Err(message)` when the source
+/// has a structural tag error (an unterminated body tag such as a `<cfscript>`
+/// with no `</cfscript>`). Compile paths should use this so a missing close tag
+/// is a clear compile error rather than the body being emitted as literal text.
+pub fn tags_to_script_checked(source: &str) -> Result<String, String> {
+    let out = tags_to_script(source);
+    match PREPROCESS_ERROR.with(|e| e.borrow_mut().take()) {
+        Some(msg) => Err(msg),
+        None => Ok(out),
+    }
 }
 
 /// Internal implementation that threads cfimport prefix→taglib mappings through.
@@ -408,6 +445,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 (script, close_end - start)
             } else {
+                // No </cfscript> before EOF. Lucee/ACF reject this at compile time;
+                // record it so the strict entry point surfaces a compile error
+                // rather than silently emitting the unterminated body as text.
+                record_preprocess_error("Unclosed <cfscript> tag: missing </cfscript>");
                 (String::new(), tag_end - start)
             }
         }
@@ -2993,5 +3034,26 @@ mod tests {
         let result = tags_to_script(input);
         assert!(result.contains(r#""tok-" & (mailVar)"#), "got: {result}");
         assert!(!result.contains("value: tok-mailVar"), "got: {result}");
+    }
+
+    #[test]
+    fn test_unclosed_cfscript_is_a_compile_error() {
+        // A <cfscript> with no </cfscript> before EOF is rejected by Lucee/ACF
+        // at compile time. The strict entry point must surface that rather than
+        // silently emitting the unterminated body as literal output.
+        let input = "<cfscript>\nwriteOutput(\"hi\");\nx = 1 + 1;\n";
+        let err = tags_to_script_checked(input)
+            .expect_err("unclosed <cfscript> must be a compile error");
+        assert!(err.contains("Unclosed <cfscript>"), "got: {err}");
+        // The tolerant entry point still degrades (drops the open tag, body
+        // passes through) — callers that want strictness use the checked form.
+        let _ = tags_to_script(input);
+    }
+
+    #[test]
+    fn test_closed_cfscript_is_ok() {
+        let input = "<cfscript>\nx = 1 + 1;\n</cfscript>";
+        let out = tags_to_script_checked(input).expect("closed <cfscript> is valid");
+        assert!(out.contains("x = 1 + 1"), "got: {out}");
     }
 }
