@@ -546,6 +546,13 @@ pub struct CfmlVirtualMachine {
     /// Name of the application currently attached to `application_scope`.
     /// Needed so `applicationStop()` knows which shared entry to reset.
     current_application_name: Option<String>,
+    /// Live session scope for the current request, backed by a shared
+    /// `CfmlStruct`. Like `application_scope`, reading `session` returns a live
+    /// handle clone (not a snapshot) so the scope-pointer pattern writes through
+    /// (WireBox session-scoped caching). Loaded from the session store when the
+    /// session is established and synced back at request end. `None` until a
+    /// session exists this request.
+    session_scope: Option<CfmlStruct>,
     /// Set when `applicationStop()` has torn down the attached application during
     /// this request, so the end-of-request writeback does not resurrect it.
     application_stopped: bool,
@@ -764,6 +771,8 @@ pub struct ThreadSeed {
     pub application_scope: Option<CfmlStruct>,
     /// Shared live with the parent (CFML request scope is shared across threads).
     pub request_scope: CfmlStruct,
+    /// Shared live with the parent (handle clone) — see VM `session_scope`.
+    pub session_scope: Option<CfmlStruct>,
     pub session_id: Option<String>,
     pub current_application_name: Option<String>,
     pub base_template_path: Option<String>,
@@ -872,6 +881,7 @@ impl CfmlVirtualMachine {
             closure_parent_writeback: None,
             request_scope: CfmlStruct::empty(),
             application_scope: None,
+            session_scope: None,
             current_application_name: None,
             application_stopped: false,
             server_state: None,
@@ -1016,6 +1026,7 @@ impl CfmlVirtualMachine {
             server_state: self.server_state.clone(),
             application_scope: self.application_scope.clone(),
             request_scope: self.request_scope.clone(),
+            session_scope: self.session_scope.clone(),
             session_id: self.session_id.clone(),
             current_application_name: self.current_application_name.clone(),
             base_template_path: self.base_template_path.clone(),
@@ -1051,6 +1062,7 @@ impl CfmlVirtualMachine {
         self.server_state = seed.server_state;
         self.application_scope = seed.application_scope;
         self.request_scope = seed.request_scope;
+        self.session_scope = seed.session_scope;
         self.session_id = seed.session_id;
         self.current_application_name = seed.current_application_name;
         self.base_template_path = seed.base_template_path;
@@ -5123,6 +5135,7 @@ impl CfmlVirtualMachine {
                 | "createobject"
                 | "getcurrenttemplatepath"
                 | "getcomponentmetadata"
+                | "getapplicationmetadata"
                 | "__cfheader"
                 | "__cfcontent"
                 | "__cflocation"
@@ -6803,6 +6816,29 @@ impl CfmlVirtualMachine {
                     // Fallback: return UTC
                     return Ok(CfmlValue::String("UTC".to_string()));
                 }
+                "getapplicationmetadata" => {
+                    // Build application metadata from the loaded Application.cfc
+                    // `this` scope (name, sessionManagement, sessionTimeout,
+                    // mappings, datasources, and any custom this.* settings),
+                    // matching Lucee/ACF. Falls back to {name:""} when no
+                    // Application.cfc is active. WireBox's ScopeStorage reads
+                    // `getApplicationMetadata().sessionManagement` here.
+                    let mut meta = IndexMap::new();
+                    if let Some(CfmlValue::Struct(s)) = &self.app_cfc_template {
+                        for (k, v) in s.snapshot() {
+                            // Settings only — skip lifecycle methods + internals.
+                            if k.starts_with("__") || matches!(v, CfmlValue::Function(_)) {
+                                continue;
+                            }
+                            meta.insert(k, v);
+                        }
+                    }
+                    if !meta.keys().any(|k| k.eq_ignore_ascii_case("name")) {
+                        let nm = self.current_application_name.clone().unwrap_or_default();
+                        meta.insert("name".to_string(), CfmlValue::String(nm));
+                    }
+                    return Ok(CfmlValue::strukt(meta));
+                }
                 "getcomponentmetadata" => {
                     // Helper: extract metadata from a component struct
                     fn extract_component_meta(
@@ -7852,10 +7888,15 @@ impl CfmlVirtualMachine {
                     {
                         state.sessions.remove(sid);
                     }
+                    // Drop the live scope so subsequent reads see an empty session.
+                    self.session_scope = None;
                     return Ok(CfmlValue::Null);
                 }
                 "sessionrotate" => {
-                    // Generate a new session ID and migrate data
+                    // Flush any pending live-scope writes to the old record first
+                    // so rotate migrates the current data, then migrate + re-attach
+                    // the live scope from the new id.
+                    self.sync_session_scope_to_store();
                     if let (Some(ref state), Some(ref old_sid)) =
                         (&self.server_state, &self.session_id)
                     {
@@ -7863,6 +7904,8 @@ impl CfmlVirtualMachine {
                         state.sessions.rotate(old_sid, &new_sid);
                         self.session_id = Some(new_sid);
                     }
+                    self.session_scope = None;
+                    self.attach_session_scope();
                     return Ok(CfmlValue::Null);
                 }
                 "sessiongetmetadata" => {
@@ -10947,8 +10990,57 @@ impl CfmlVirtualMachine {
         true
     }
 
-    /// Get the session scope for the current request
+    /// Load the live session scope from the session store into `session_scope`
+    /// (once per request). After this, reads return the live handle and writes
+    /// mutate it in place; the result is synced back to the store at request end
+    /// via `sync_session_scope_to_store`.
+    fn attach_session_scope(&mut self) {
+        if self.session_scope.is_some() {
+            return;
+        }
+        if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
+            let vars = state
+                .sessions
+                .get(sid)
+                .map(|s| s.variables)
+                .unwrap_or_default();
+            self.session_scope = Some(CfmlStruct::new(vars));
+        }
+    }
+
+    /// Persist the live session scope back to the session store. Called at the
+    /// end of the request (after user code) so scope-pointer writes that bypass
+    /// `set_session_*` (e.g. `var p = session; p[k]=v`) are committed.
+    fn sync_session_scope_to_store(&mut self) {
+        let snap = match &self.session_scope {
+            Some(ss) => ss.snapshot(),
+            None => return,
+        };
+        if let (Some(state), Some(sid)) = (self.server_state.clone(), self.session_id.clone()) {
+            let now = now_epoch_secs();
+            // Create the record if missing so a write after sessionInvalidate
+            // re-creates the session (matching the pre-cache set_session_* path).
+            let mut session = state.sessions.get(&sid).unwrap_or_else(|| SessionData {
+                variables: IndexMap::new(),
+                created_secs: now,
+                last_accessed_secs: now,
+                auth_user: None,
+                auth_roles: Vec::new(),
+                timeout_secs: self.session_timeout_secs,
+            });
+            session.variables = snap;
+            session.last_accessed_secs = now;
+            state.sessions.set(&sid, session);
+        }
+    }
+
+    /// Get the session scope for the current request — a LIVE handle clone when
+    /// the session scope is attached (so `var p = session; p.x = 1` writes
+    /// through), falling back to a store snapshot otherwise.
     fn get_session_scope(&self) -> CfmlValue {
+        if let Some(ref ss) = self.session_scope {
+            return CfmlValue::Struct(ss.clone());
+        }
         if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
             if let Some(session) = state.sessions.get(sid) {
                 return CfmlValue::strukt(session.variables.clone());
@@ -10957,7 +11049,7 @@ impl CfmlVirtualMachine {
         CfmlValue::strukt(IndexMap::new())
     }
 
-    /// Set the session scope for the current request
+    /// Set the session scope for the current request (mutates the live scope).
     fn set_session_scope(&mut self, vars: IndexMap<String, CfmlValue>) {
         // If lazy-init fires here, `onSessionStart` ran AFTER the user
         // code loaded the (then-empty) session scope. Their `vars`
@@ -10966,45 +11058,27 @@ impl CfmlVirtualMachine {
         // and the user's writes overlay on top. Outside the lazy-init
         // case we fall through to the historical full-replace.
         let merge_with_existing = self.lazy_init_session_if_pending();
-        if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
-            let now = now_epoch_secs();
-            let mut session = state.sessions.get(sid).unwrap_or_else(|| SessionData {
-                variables: IndexMap::new(),
-                created_secs: now,
-                last_accessed_secs: now,
-                auth_user: None,
-                auth_roles: Vec::new(),
-                timeout_secs: 1800,
-            });
+        self.attach_session_scope();
+        if let Some(ref ss) = self.session_scope {
             if merge_with_existing {
-                for (k, v) in vars {
-                    session.variables.insert(k, v);
-                }
+                ss.with_write(|m| {
+                    for (k, v) in vars {
+                        m.insert(k, v);
+                    }
+                });
             } else {
-                session.variables = vars;
+                ss.with_write(|m| *m = vars);
             }
-            session.last_accessed_secs = now;
-            state.sessions.set(sid, session);
         }
     }
 
-    /// Update a single key in the session scope
+    /// Update a single key in the session scope (mutates the live scope).
     #[allow(dead_code)]
     fn set_session_variable(&mut self, key: &str, value: CfmlValue) {
         self.lazy_init_session_if_pending();
-        if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
-            let now = now_epoch_secs();
-            let mut session = state.sessions.get(sid).unwrap_or_else(|| SessionData {
-                variables: IndexMap::new(),
-                created_secs: now,
-                last_accessed_secs: now,
-                auth_user: None,
-                auth_roles: Vec::new(),
-                timeout_secs: 1800,
-            });
-            session.variables.insert(key.to_string(), value);
-            session.last_accessed_secs = now;
-            state.sessions.set(sid, session);
+        self.attach_session_scope();
+        if let Some(ref ss) = self.session_scope {
+            ss.insert(key.to_string(), value);
         }
     }
 
@@ -13553,6 +13627,13 @@ impl CfmlVirtualMachine {
                     let _ = self.call_lifecycle_method(&mut template, "onSessionStart", vec![]);
                 }
             }
+            // Attach the live session scope so `session` reads return a live
+            // handle (scope-pointer pattern). Skip when lazy creation is pending:
+            // there is no session record yet, so the scope attaches on the first
+            // write via set_session_*.
+            if !self.session_lazy_pending {
+                self.attach_session_scope();
+            }
         }
 
         // 6. onRequestStart
@@ -13605,6 +13686,13 @@ impl CfmlVirtualMachine {
             "onRequestEnd",
             vec![CfmlValue::String(target_page)],
         );
+
+        // 8a. Persist the live session scope back to the store. Session
+        // reads/writes during the request mutate a cached live CfmlStruct (so
+        // the scope-pointer pattern works); commit it now before expiry runs.
+        if session_management {
+            self.sync_session_scope_to_store();
+        }
 
         // 8b. Session expiry — scan and expire timed-out sessions
         if session_management {

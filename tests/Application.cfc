@@ -2,6 +2,11 @@ component {
 
     this.name = "RustCFMLTests";
 
+    // Session management on so session-scope tests can run (see
+    // tests/core/test_session_scope_persist.cfm). Harmless for other tests.
+    this.sessionManagement = true;
+    this.sessionTimeout = createTimeSpan( 0, 0, 30, 0 );
+
     // Map "oop" to the tests/oop/ directory so createObject("component", "oop.Greeter") resolves
     this.mappings["/oop"] = getDirectoryFromPath(getCurrentTemplatePath()) & "oop/";
 
