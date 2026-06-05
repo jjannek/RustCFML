@@ -83,4 +83,49 @@ impl RustCfmlConfig {
         cfg.expand_env();
         Ok(cfg)
     }
+
+    /// Overlay an application-level config (raw JSON, as found in a
+    /// `.cfconfig.json` beside an `Application.cfc`) on top of this server
+    /// baseline, returning the merged result. Only keys actually present in
+    /// `app_json` override the baseline; absent keys inherit. Object sections
+    /// (`datasources`, `mappings`, `caches`) merge key-by-key so the app adds to
+    /// or overrides individual baseline entries; scalars and arrays replace.
+    ///
+    /// The app's `server` section is **ignored**: server-level config (port,
+    /// body size, welcome files) is owned by the baseline, never per-application.
+    ///
+    /// Takes a pre-parsed `serde_json::Value` rather than a path so the caller
+    /// can source the bytes through its VFS (real FS or a bundled archive).
+    pub fn overlay_app_json(
+        &self,
+        mut app_json: serde_json::Value,
+    ) -> Result<Self, ConfigError> {
+        if let Some(obj) = app_json.as_object_mut() {
+            obj.remove("server");
+        }
+        let mut base_json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        deep_merge(&mut base_json, &app_json);
+        let mut cfg: Self =
+            serde_json::from_value(base_json).map_err(|source| ConfigError::Parse {
+                path: "<app-overlay>".to_string(),
+                source,
+            })?;
+        cfg.expand_env();
+        Ok(cfg)
+    }
+}
+
+/// Recursively merge `overlay` into `base`. Object values merge key-by-key;
+/// any non-object value (scalar or array) in `overlay` replaces `base`.
+fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(overlay_map)) => {
+            for (k, v) in overlay_map {
+                deep_merge(base_map.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (base_slot, overlay_val) => {
+            *base_slot = overlay_val.clone();
+        }
+    }
 }

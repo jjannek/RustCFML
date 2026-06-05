@@ -115,6 +115,13 @@ struct Args {
     #[arg(long, default_value = "8500")]
     port: u16,
 
+    /// Explicit path to the server-baseline `.cfconfig.json`. When set, it is
+    /// loaded instead of searching webroot/cwd/exe-dir. Also honored via the
+    /// `CFCONFIG` env var (Lucee/CommandBox parity). Per-application
+    /// `.cfconfig.json` files beside an `Application.cfc` overlay this baseline.
+    #[arg(long, value_name = "PATH")]
+    cfconfig: Option<String>,
+
     /// Use single-threaded async runtime (lower memory, lower concurrency)
     #[arg(long)]
     single_threaded: bool,
@@ -215,19 +222,37 @@ fn real_main() {
         let production = args.production
             || std::env::var("RUSTCFML_PRODUCTION").as_deref() == Ok("1");
 
-        // Load .cfconfig.json: webroot → cwd → exe dir.
-        let mut search_paths: Vec<PathBuf> = vec![doc_root.clone()];
-        if let Ok(cwd) = std::env::current_dir() {
-            search_paths.push(cwd);
-        }
-        if let Some(dir) = resolve::exe_dir() {
-            search_paths.push(dir);
-        }
-        let mut cfconfig = match RustCfmlConfig::load(&search_paths) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Error loading .cfconfig.json: {}", e);
-                exit(1);
+        // Server-baseline .cfconfig.json. An explicit `--cfconfig <path>` (or the
+        // `CFCONFIG` env var) wins; otherwise search webroot → cwd → exe dir.
+        // Per-application `.cfconfig.json` files (beside an Application.cfc) are
+        // discovered per-request and overlaid on top of this baseline.
+        let explicit_cfconfig = args
+            .cfconfig
+            .clone()
+            .or_else(|| std::env::var("CFCONFIG").ok().filter(|s| !s.is_empty()));
+        let cfconfig = match explicit_cfconfig {
+            Some(path) => match RustCfmlConfig::from_file(std::path::Path::new(&path)) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error loading --cfconfig {}: {}", path, e);
+                    exit(1);
+                }
+            },
+            None => {
+                let mut search_paths: Vec<PathBuf> = vec![doc_root.clone()];
+                if let Ok(cwd) = std::env::current_dir() {
+                    search_paths.push(cwd);
+                }
+                if let Some(dir) = resolve::exe_dir() {
+                    search_paths.push(dir);
+                }
+                match RustCfmlConfig::load(&search_paths) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error loading .cfconfig.json: {}", e);
+                        exit(1);
+                    }
+                }
             }
         };
 
@@ -265,16 +290,10 @@ fn real_main() {
             }
         }
 
-        // CLI flags win over config. Args::port has a clap default of 8500, so
-        // we can't easily tell "user passed 8500" from "user passed nothing".
-        // Convention: any non-default --port overrides; otherwise config wins.
-        let port = if args.port != 8500 {
-            args.port
-        } else if cfconfig.server.port != 0 {
-            cfconfig.server.port
-        } else {
-            args.port
-        };
+        // The listening port is a server/environment concern, never a cfconfig
+        // setting (cfconfig is application-level). It comes solely from `--port`
+        // (clap default 8500).
+        let port = args.port;
         // server.webroot from config only applies when --serve had no path.
         if doc_root == PathBuf::from(".") && !cfconfig.server.webroot.is_empty() {
             doc_root = PathBuf::from(&cfconfig.server.webroot);
@@ -283,8 +302,6 @@ fn real_main() {
                 exit(1);
             }
         }
-        // Record resolved values so request handlers see the merged view.
-        cfconfig.server.port = port;
 
         run_server(
             &doc_root,

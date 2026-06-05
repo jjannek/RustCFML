@@ -595,6 +595,12 @@ pub struct CfmlVirtualMachine {
     /// `lazy_init_session_if_pending` can fire `onSessionStart` from
     /// inside a bytecode-op handler without re-loading the .cfc.
     pub app_cfc_template: Option<CfmlValue>,
+    /// Per-request application-level cfconfig: a `.cfconfig.json` discovered
+    /// beside this request's `Application.cfc`, overlaid on the server baseline
+    /// (`server_state.cfconfig`). When present it is the source for the
+    /// CFML-visible `server.cfconfig` struct. Server-level keys (port, etc.) are
+    /// never overlaid. Cleared at request end. `None` ⇒ use the server baseline.
+    pub app_cfconfig: Option<Arc<cfml_config::RustCfmlConfig>>,
     /// Stack of held cflock guards (name, guard)
     held_locks: Vec<(String, HeldLock)>,
     /// Custom tag paths from this.customTagPaths in Application.cfc
@@ -865,6 +871,7 @@ impl CfmlVirtualMachine {
             session_record_created: false,
             session_lazy_initializing: false,
             app_cfc_template: None,
+            app_cfconfig: None,
             query_execute_fn: None,
             held_locks: Vec::new(),
             custom_tag_paths: Vec::new(),
@@ -1656,7 +1663,15 @@ impl CfmlVirtualMachine {
                             .unwrap_or(CfmlValue::strukt(IndexMap::new()))
                     } else if name_lower == "server" {
                         let mut scope = build_server_scope();
-                        if let Some(ref ss) = self.server_state {
+                        // Prefer the per-request application-level cfconfig overlay
+                        // (a `.cfconfig.json` beside the Application.cfc) over the
+                        // server baseline when present.
+                        if let Some(ref app_cfg) = self.app_cfconfig {
+                            scope.insert(
+                                "cfconfig".to_string(),
+                                cfconfig_to_cfml(app_cfg),
+                            );
+                        } else if let Some(ref ss) = self.server_state {
                             scope.insert(
                                 "cfconfig".to_string(),
                                 cfconfig_to_cfml(&ss.cfconfig),
@@ -12256,6 +12271,52 @@ impl CfmlVirtualMachine {
         found
     }
 
+    /// Discover and apply an application-level `.cfconfig.json` sitting beside
+    /// the given `Application.cfc`. Overlays it on the server baseline
+    /// (`server_state.cfconfig`), stashes the result in `self.app_cfconfig`, and
+    /// applies the per-VM runtime knobs via `apply_cfconfig`. The server section
+    /// of the app file is ignored (port etc. are server-level). No-op when there
+    /// is no server baseline (CLI single-shot) or no file is found.
+    fn discover_app_cfconfig(&mut self, app_cfc_path: &str) {
+        let dir = match std::path::Path::new(app_cfc_path).parent() {
+            Some(d) => d.to_string_lossy().to_string(),
+            None => return,
+        };
+        let candidate = format!("{}/{}", dir.trim_end_matches('/'), cfml_config::resolve::FILENAME);
+        if !self.vfs.is_file(&candidate) {
+            return;
+        }
+        let bytes = match self.vfs.read(&candidate) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("failed to read app cfconfig {}: {}", candidate, e);
+                return;
+            }
+        };
+        let app_json: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("invalid app cfconfig {}: {}", candidate, e);
+                return;
+            }
+        };
+        // Overlay onto the server baseline (or defaults if no server state).
+        let baseline = self
+            .server_state
+            .as_ref()
+            .map(|ss| ss.cfconfig.clone())
+            .unwrap_or_else(|| Arc::new(cfml_config::RustCfmlConfig::default()));
+        match baseline.overlay_app_json(app_json) {
+            Ok(merged) => {
+                self.apply_cfconfig(&merged);
+                self.app_cfconfig = Some(Arc::new(merged));
+            }
+            Err(e) => {
+                log::warn!("failed to overlay app cfconfig {}: {}", candidate, e);
+            }
+        }
+    }
+
     /// Load and execute Application.cfc, returning the component struct
     ///
     /// Returns `Ok(Some(template))` on success, `Ok(None)` when no usable
@@ -12803,6 +12864,11 @@ impl CfmlVirtualMachine {
             None => return self.execute(), // No Application.cfc, just execute directly
         };
 
+        // 1b. Application-level cfconfig: a `.cfconfig.json` beside this
+        // Application.cfc overlays the server baseline for this request. Applied
+        // before Application.cfc `this.*` settings so those still win on conflict.
+        self.discover_app_cfconfig(&app_cfc_path);
+
         // 2. Load Application.cfc. A pseudo-constructor throw (or compile error)
         // aborts the request — Lucee does not fall through to the target page
         // when Application.cfc fails to load.
@@ -13291,6 +13357,7 @@ impl CfmlVirtualMachine {
         // 10. Clear request scope + stashed Application.cfc template.
         self.request_scope.clear();
         self.app_cfc_template = None;
+        self.app_cfconfig = None;
         self.session_lazy_pending = false;
 
         result

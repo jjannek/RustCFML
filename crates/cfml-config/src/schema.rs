@@ -51,7 +51,10 @@ pub struct RustCfmlConfig {
 #[serde(default)]
 pub struct ServerCfg {
     pub host: String,
-    pub port: u16,
+    // NOTE: the listening port is intentionally NOT a cfconfig setting. The port
+    // is a server/environment concern, set via `--port` (or its default). cfconfig
+    // is application-level config; a per-app `.cfconfig.json` must never be able to
+    // change the port. A stray `"port"` key in a config file is silently ignored.
     pub webroot: String,
     #[serde(rename = "welcomeFiles")]
     pub welcome_files: Vec<String>,
@@ -75,7 +78,6 @@ impl Default for ServerCfg {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".into(),
-            port: 8500,
             webroot: String::new(),
             welcome_files: vec!["index.cfm".into(), "index.htm".into(), "index.html".into()],
             cfml_extensions: vec!["cfm".into(), "cfc".into()],
@@ -597,7 +599,6 @@ mod tests {
     fn empty_object_uses_defaults() {
         let cfg: RustCfmlConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.server.host, "127.0.0.1");
-        assert_eq!(cfg.server.port, 8500);
         assert_eq!(cfg.runtime.session_timeout, "0,0,30,0");
         assert!(cfg.security.csrf_enabled);
         assert!(cfg.url_rewriting.enabled);
@@ -606,13 +607,14 @@ mod tests {
     #[test]
     fn unknown_keys_are_ignored() {
         let json = r#"{
-            "server": {"port": 9000, "luceeOnlyKey": 42},
+            "server": {"host": "0.0.0.0", "port": 9000, "luceeOnlyKey": 42},
             "extensions": [{"id": "lucee-thing"}],
             "adminPassword": "secret"
         }"#;
         let cfg: RustCfmlConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.server.port, 9000);
-        assert_eq!(cfg.server.host, "127.0.0.1"); // default preserved
+        // `port` is intentionally not a schema field — it is silently ignored,
+        // like any other unknown key.
+        assert_eq!(cfg.server.host, "0.0.0.0"); // known key still parses
     }
 
     #[test]

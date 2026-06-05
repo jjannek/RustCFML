@@ -11,10 +11,23 @@ if (!hasCfconfig) {
 cfg = server.cfconfig;
 assert("cfconfig is a struct", isStruct(cfg), true);
 
-// Values from tests/.cfconfig.json
-assert("server.port from fixture", cfg.server.port, 9999);
-assert("server.welcomeFiles[2]", cfg.server.welcomeFiles[2], "default.cfm");
-assert("server.maxRequestBodySize", cfg.server.maxRequestBodySize, 5242880);
+// The whole `server.*` section (port, welcomeFiles, maxRequestBodySize, ...) is
+// SERVER-level config, not application-level. It is owned by the server baseline
+// (`--cfconfig` / discovery) and is intentionally NOT overlaid from a per-app
+// `.cfconfig.json`. The listening port is never a cfconfig setting at all —
+// pages read `cgi.server_port`.
+//
+// Under the CLI runner this fixture (tests/.cfconfig.json) IS the baseline, so
+// the server.* values are in effect and asserted. Over HTTP the same file is
+// discovered as a per-application overlay (it sits beside tests/Application.cfc),
+// whose server section is deliberately ignored — so skip the server.* asserts.
+runningOverHttp = structKeyExists(cgi, "server_port") && val(cgi.server_port) GT 0;
+if (!runningOverHttp) {
+    assert("server.welcomeFiles[2]", cfg.server.welcomeFiles[2], "default.cfm");
+    assert("server.maxRequestBodySize", cfg.server.maxRequestBodySize, 5242880);
+}
+
+// Application-level values from tests/.cfconfig.json — overlaid per request.
 assert("runtime.locale", cfg.runtime.locale, "en-GB");
 assert("runtime.timezone", cfg.runtime.timezone, "Europe/London");
 assert("runtime.sessionTimeout", cfg.runtime.sessionTimeout, "0,0,15,0");

@@ -1,6 +1,5 @@
 {
   "server": {
-    "port": 9999,
     "welcomeFiles": ["index.cfm", "default.cfm"],
     "maxRequestBodySize": 5242880,
     "fallback": {

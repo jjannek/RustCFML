@@ -8,9 +8,29 @@ any keys it doesn't recognise.
 
 All fields are optional. When the file is missing, compiled-in defaults apply.
 
-## File resolution
+## Two tiers: server baseline + per-application overlay
 
-First match wins.
+cfconfig is **application-level**. There are two tiers:
+
+1. **Server baseline** — one config loaded at process startup. Set it explicitly
+   with `--cfconfig <path>` (or the `CFCONFIG` environment variable), otherwise
+   it is discovered (see the table below). It supplies defaults for every
+   application and owns the `server.*` section (host, welcome files, body size).
+2. **Per-application overlay** — a `.cfconfig.json` sitting **beside an
+   `Application.cfc`** is auto-discovered per request and overlaid on top of the
+   baseline for that request. Only the keys present in the app file override the
+   baseline; everything else is inherited. Because one server can host many
+   applications (each is the nearest `Application.cfc` walking up from the
+   requested page), each application can carry its own config.
+
+   The app overlay's **`server.*` section is ignored** — server settings (and the
+   listening **port** in particular) are a server/environment concern, never an
+   application-level setting. An app file cannot change the port; pages read the
+   live port from `cgi.server_port`.
+
+### Baseline file resolution
+
+When `--cfconfig` / `CFCONFIG` is not set, the baseline is found by first match:
 
 | Mode | Search order |
 |---|---|
@@ -18,9 +38,10 @@ First match wins.
 | CLI (`rustcfml file.cfm`) | entry file's directory → cwd → binary directory |
 | `--build` self-contained binary | external file next to the binary → copy embedded into the VFS at build time → defaults |
 
-CLI flags (`--port`, `--serve <path>`, `--sandbox`) always win over the file.
-The config is read once at process startup; restart the server to pick up
-changes.
+CLI flags (`--port`, `--serve <path>`, `--sandbox`, `--cfconfig`) always win over
+file contents. The baseline is read once at process startup; restart the server
+to pick up baseline changes. Per-application overlays are re-read per request
+(subject to the production-mode resolution cache).
 
 ## Environment variable substitution
 
@@ -47,8 +68,7 @@ A realistic production file:
 ```json
 {
   "server": {
-    "host": "0.0.0.0",
-    "port": 8080
+    "host": "0.0.0.0"
   },
   "runtime": {
     "locale": "en-GB",
@@ -92,10 +112,13 @@ A realistic production file:
 
 ### `server`
 
+Server-level only — taken from the **baseline**, never from a per-application
+overlay. There is intentionally **no `port` key**: the listening port is set with
+`--port` (default `8500`); pages read the live port from `cgi.server_port`.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `host` | string | `127.0.0.1` | Bind address. `0.0.0.0` = all interfaces |
-| `port` | int | `8500` | Overridden by `--port` |
 | `webroot` | string | `""` | Document root. Overridden by `--serve <path>` |
 | `welcomeFiles` | string[] | `["index.cfm", "index.htm", "index.html"]` | Tried in order for directory requests |
 | `cfmlExtensions` | string[] | `["cfm", "cfc"]` | Extensions dispatched through the interpreter |

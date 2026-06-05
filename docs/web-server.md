@@ -17,6 +17,8 @@ For deploying the server (production caching, Docker, standalone binaries), see 
 
 Drop a `.cfconfig.json` at the webroot to configure datasources, mappings, mail, security policies, error handling, and more. The format follows the Ortus CFConfig filename convention with a BoxLang-style flat schema, so the same file works across CommandBox/Lucee, BoxLang, and RustCFML — engine-specific keys are silently ignored. Secrets can use environment-variable substitution.
 
+cfconfig is **application-level**: the webroot file is the server *baseline* (or set one explicitly with `--cfconfig <path>` / the `CFCONFIG` env var), and any `.cfconfig.json` sitting beside an `Application.cfc` is overlaid on top of it per request — so each application under the server can tune its own runtime, datasources, and security. The listening **port is not a cfconfig setting** — it is set with `--port` (pages read `cgi.server_port`).
+
 See **[Configuration](configuration.md)** for the full reference.
 
 ## Application.cfc lifecycle
