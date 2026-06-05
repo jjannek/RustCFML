@@ -232,6 +232,9 @@ pub enum BytecodeOp {
 
     // Object
     NewObject(usize),  // arg_count for constructor
+    // arg_count for constructor + call-site argument names (empty string = positional).
+    // Used when `new X(...)` supplies named arguments so init() binds by name, not position.
+    NewObjectNamed(Vec<String>, usize),
 
     // Function definition
     DefineFunction(usize), // Index into program.functions
@@ -2175,13 +2178,23 @@ impl CfmlCompiler {
             for prop in &component.properties {
                 // Generate getter: getPropertyName()
                 let getter_name = format!("get{}", capitalize_first(&prop.name));
+                // Read the property backing field from the VARIABLES scope, not
+                // `this`. The property value lives in __variables (defaults +
+                // setter writes + `variables.prop = ...` assignments all land
+                // there). Reading `this.prop` works only by GetProperty's
+                // fallback-to-__variables, which BREAKS when a same-named public
+                // method occupies the top-level `this.prop` key (e.g. a CFC with
+                // both `property name="foo"` and a method `foo()`): the function
+                // shadows the property and getFoo() reads back the method instead
+                // of the value. Lucee/ACF getters read the variables backing, so
+                // this both fixes the collision and matches the reference engines.
                 let getter_func = BytecodeFunction {
                     name: getter_name.clone(),
                     params: Vec::new(),
                     required_params: Vec::new(),
                     has_default: Vec::new(),
                     instructions: vec![
-                        BytecodeOp::LoadLocal("this".to_string()),
+                        BytecodeOp::LoadLocal("variables".to_string()),
                         BytecodeOp::GetProperty(prop.name.clone()),
                         BytecodeOp::Return,
                     ],
@@ -2330,6 +2343,34 @@ impl CfmlCompiler {
             instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
             instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
             instructions.push(BytecodeOp::StoreGlobal(component.name.clone()));
+        }
+    }
+
+    /// Compile constructor arguments for a `new X(...)` expression (the class
+    /// name has already been pushed). Emits `NewObjectNamed` when any argument
+    /// is named so init() binds by name; otherwise the positional `NewObject`.
+    fn compile_new_args(&mut self, args: &[Expression], instructions: &mut Vec<BytecodeOp>) {
+        let has_named = args
+            .iter()
+            .any(|a| matches!(a, Expression::NamedArgument(_)));
+        if has_named {
+            let mut names = Vec::with_capacity(args.len());
+            for arg in args {
+                if let Expression::NamedArgument(named) = arg {
+                    names.push(named.name.clone());
+                    self.compile_expression(&named.value, instructions);
+                } else {
+                    // Positional arg mixed with named — empty name (mirrors CallNamed).
+                    names.push(String::new());
+                    self.compile_expression(arg, instructions);
+                }
+            }
+            instructions.push(BytecodeOp::NewObjectNamed(names, args.len()));
+        } else {
+            for arg in args {
+                self.compile_expression(arg, instructions);
+            }
+            instructions.push(BytecodeOp::NewObject(args.len()));
         }
     }
 
@@ -2869,18 +2910,12 @@ impl CfmlCompiler {
                         } else {
                             self.compile_expression(&call.name, instructions);
                         }
-                        for arg in &call.arguments {
-                            self.compile_expression(arg, instructions);
-                        }
-                        instructions.push(BytecodeOp::NewObject(call.arguments.len()));
+                        self.compile_new_args(&call.arguments, instructions);
                     }
                     Expression::Identifier(ident) => {
                         // Push class name as string - VM will look up in locals, globals, or .cfc files
                         instructions.push(BytecodeOp::String(ident.name.clone()));
-                        for arg in &new_expr.arguments {
-                            self.compile_expression(arg, instructions);
-                        }
-                        instructions.push(BytecodeOp::NewObject(new_expr.arguments.len()));
+                        self.compile_new_args(&new_expr.arguments, instructions);
                     }
                     Expression::MemberAccess(_) => {
                         // Handle bare dotted path: new a.b.c without parens
@@ -2889,17 +2924,11 @@ impl CfmlCompiler {
                         } else {
                             self.compile_expression(&new_expr.class, instructions);
                         }
-                        for arg in &new_expr.arguments {
-                            self.compile_expression(arg, instructions);
-                        }
-                        instructions.push(BytecodeOp::NewObject(new_expr.arguments.len()));
+                        self.compile_new_args(&new_expr.arguments, instructions);
                     }
                     _ => {
                         self.compile_expression(&new_expr.class, instructions);
-                        for arg in &new_expr.arguments {
-                            self.compile_expression(arg, instructions);
-                        }
-                        instructions.push(BytecodeOp::NewObject(new_expr.arguments.len()));
+                        self.compile_new_args(&new_expr.arguments, instructions);
                     }
                 }
             }

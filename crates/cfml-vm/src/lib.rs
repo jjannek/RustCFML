@@ -3551,7 +3551,16 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::NewObject(arg_count) => {
+                BytecodeOp::NewObject(arg_count)
+                | BytecodeOp::NewObjectNamed(_, arg_count) => {
+                    // When `new X(...)` supplied named arguments, recover the
+                    // call-site names so init() binds by name (not position).
+                    // Cloned eagerly to an owned value to avoid borrowing `op`
+                    // across the &mut self init call below.
+                    let ctor_arg_names: Option<Vec<String>> = match op {
+                        BytecodeOp::NewObjectNamed(names, _) => Some(names.clone()),
+                        _ => None,
+                    };
                     // Pop constructor arguments first
                     let ctor_args: Vec<CfmlValue> = (0..*arg_count)
                         .filter_map(|_| stack.pop())
@@ -3604,9 +3613,25 @@ impl CfmlVirtualMachine {
                                                 .insert("__variables".to_string(), vars.clone());
                                         }
                                     }
+                                    // Reorder named constructor args to match
+                                    // init()'s declared params (extras spill into
+                                    // the arguments scope, mirroring CallMethodNamed).
+                                    let init_args = if ctor_arg_names.is_some() {
+                                        let (reordered, extras) =
+                                            Self::reorder_named_args_with_extras(
+                                                init_func,
+                                                ctor_arg_names.as_deref(),
+                                                ctor_args,
+                                            );
+                                        self.pending_extra_named_args =
+                                            if extras.is_empty() { None } else { Some(extras) };
+                                        reordered
+                                    } else {
+                                        ctor_args
+                                    };
                                     self.closure_parent_writeback = None;
                                     if let Ok(result) =
-                                        self.call_function(init_func, ctor_args, &init_locals)
+                                        self.call_function(init_func, init_args, &init_locals)
                                     {
                                         self.closure_parent_writeback = None;
                                         // Apply variables scope writeback from init() to the component
@@ -11574,11 +11599,26 @@ impl CfmlVirtualMachine {
                 // Add all component methods (public + private) to variables scope
                 // These override component_variables entries for public methods.
                 // Strip captured_scope — CFC methods use __variables, not closures.
+                //
+                // EXCEPTION: if the pseudo-constructor explicitly reassigned a
+                // method's name to a non-function value (e.g. a CFC with both a
+                // `property name="foo"` accessor and a same-named method `foo()`,
+                // where the body did `variables.foo = {...}`), that write must win.
+                // Lucee/ACF hoist methods into the variables scope FIRST, then run
+                // the pseudo-constructor, so a `variables.foo = value` assignment
+                // shadows the same-named method. Without this guard the method
+                // clobbers the assigned value and `getFoo()` reads back empty.
                 for (k, v) in s.iter() {
                     if k.starts_with("__") {
                         continue;
                     }
                     if let CfmlValue::Function(ref f) = v {
+                        let shadowed_by_ctor = component_variables.iter().any(|(ck, cv)| {
+                            ck.eq_ignore_ascii_case(&k) && !matches!(cv, CfmlValue::Function(_))
+                        });
+                        if shadowed_by_ctor {
+                            continue;
+                        }
                         let mut clean = f.clone();
                         clean.captured_scope = None;
                         vars_scope.insert(k.clone(), CfmlValue::Function(clean));
@@ -14107,7 +14147,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::GetKeys => (1, 1),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object
-        BytecodeOp::NewObject(n) => (1, n + 1), // class + args → instance
+        BytecodeOp::NewObject(n) | BytecodeOp::NewObjectNamed(_, n) => (1, n + 1), // class + args → instance
         // Function definition: push 1
         BytecodeOp::DefineFunction(_) => (1, 0),
         // Postfix: push 1 (new value)
