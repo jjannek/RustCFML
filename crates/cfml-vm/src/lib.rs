@@ -12443,15 +12443,33 @@ impl CfmlVirtualMachine {
     /// Walk up the directory tree from source_file to find Application.cfc.
     /// In production mode, the resolved path (or absence) is memoized by
     /// start directory on `ServerState.app_cfc_path_cache`.
+    /// Directory to begin the Application.cfc walk-up from, given the entry
+    /// `source` path and the process `cwd`. A bare filename ("run_tests.cfm")
+    /// has an EMPTY parent (not None) — using it directly made the walk start
+    /// from "" and immediately fail, so a sibling Application.cfc was never
+    /// found. Treat empty/None parents as the current directory. Pure (no I/O)
+    /// so it can be unit-tested.
+    fn app_cfc_start_dir(source: Option<&str>, cwd: &std::path::Path) -> std::path::PathBuf {
+        match source {
+            Some(src) => match std::path::Path::new(src).parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => cwd.to_path_buf(),
+            },
+            None => cwd.to_path_buf(),
+        }
+    }
+
     fn find_application_cfc(&self) -> Option<String> {
-        let start_dir = if let Some(ref source) = self.source_file {
-            std::path::Path::new(source)
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-        } else {
-            std::env::current_dir().unwrap_or_default()
-        };
+        let cwd = std::env::current_dir().unwrap_or_default();
+        // Prefer the resolved `base_template_path` (absolute under the VFS root in
+        // serve/embedded mode) over the raw `source_file` (which may be a bare,
+        // VFS-relative filename) so the walk-up starts from a directory the VFS
+        // can actually read.
+        let discovery_path = self
+            .base_template_path
+            .as_deref()
+            .or(self.source_file.as_deref());
+        let start_dir = Self::app_cfc_start_dir(discovery_path, &cwd);
 
         // Production-mode cache hit
         if let Some(ref ss) = self.server_state {
@@ -14317,5 +14335,38 @@ mod named_lock_tests {
         // Re-locking an existing name must not trigger an eviction sweep.
         evict_idle_named_locks(&mut locks, "idle_5", 1024);
         assert_eq!(locks.len(), 1024);
+    }
+}
+
+#[cfg(test)]
+mod app_cfc_discovery_tests {
+    use super::CfmlVirtualMachine;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn start_dir_handles_bare_filename_relative_and_absolute() {
+        let cwd = Path::new("/work");
+        // Bare filename (no directory component): the empty parent must resolve
+        // to the current directory so the walk-up can find a sibling
+        // Application.cfc. This was the bug — it used to start from "".
+        assert_eq!(
+            CfmlVirtualMachine::app_cfc_start_dir(Some("run_tests.cfm"), cwd),
+            PathBuf::from("/work")
+        );
+        // Relative path with a directory component: use that directory.
+        assert_eq!(
+            CfmlVirtualMachine::app_cfc_start_dir(Some("tests/runner.cfm"), cwd),
+            PathBuf::from("tests")
+        );
+        // Absolute path: use its parent directory unchanged.
+        assert_eq!(
+            CfmlVirtualMachine::app_cfc_start_dir(Some("/abs/dir/app.cfm"), cwd),
+            PathBuf::from("/abs/dir")
+        );
+        // No source file: current directory.
+        assert_eq!(
+            CfmlVirtualMachine::app_cfc_start_dir(None, cwd),
+            PathBuf::from("/work")
+        );
     }
 }
