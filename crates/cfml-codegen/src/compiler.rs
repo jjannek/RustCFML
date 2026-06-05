@@ -1785,17 +1785,21 @@ impl CfmlCompiler {
 
         self.loop_stack.push((Vec::new(), Vec::new())); // break support
 
-        let mut end_jumps = Vec::new();
-        let mut next_case_jump: Option<usize> = None;
+        // CFML/Lucee `switch` is C-style: matching a case transfers control to
+        // its body, and execution then FALLS THROUGH into subsequent case bodies
+        // until an explicit `break`. This is why stacked empty labels
+        // (`case "model": case "id": { … }`) share the following body, and why a
+        // non-empty case without a `break` continues into the next case.
+        //
+        // To model that we split the switch into two sections: a dispatch table
+        // that compares the switch value against each case and jumps to the
+        // matching body, followed by the case bodies emitted sequentially so
+        // they fall through naturally.
 
+        // --- Dispatch section ---
+        let mut dispatch_jumps: Vec<usize> = Vec::with_capacity(switch_stmt.cases.len());
         for case in &switch_stmt.cases {
-            // Patch previous case's fall-through check
-            if let Some(prev_jump) = next_case_jump {
-                instructions[prev_jump] = BytecodeOp::JumpIfFalse(instructions.len());
-            }
-
-            // Compare switch value to case value(s)
-            // For multiple values, OR them together
+            // Compare switch value to case value(s); OR multiple values together.
             for (i, val) in case.values.iter().enumerate() {
                 instructions.push(BytecodeOp::LoadLocal(switch_var.clone()));
                 self.compile_expression(val, instructions);
@@ -1806,25 +1810,30 @@ impl CfmlCompiler {
                 }
             }
 
-            next_case_jump = Some(instructions.len());
-            instructions.push(BytecodeOp::JumpIfFalse(0));
+            // On match, jump to this case's body (patched below).
+            dispatch_jumps.push(instructions.len());
+            instructions.push(BytecodeOp::JumpIfTrue(0));
+        }
 
+        // No case matched -> jump to the default body (or end if none). Patched
+        // once the default position is known.
+        let no_match_jump = instructions.len();
+        instructions.push(BytecodeOp::Jump(0));
+
+        // --- Case bodies (sequential, fall-through) ---
+        for (ci, case) in switch_stmt.cases.iter().enumerate() {
+            let body_start = instructions.len();
+            instructions[dispatch_jumps[ci]] = BytecodeOp::JumpIfTrue(body_start);
             for s in &case.body {
                 self.compile_statement(s, instructions);
             }
-
-            // Jump to end after case body (unless there's a break which does this too)
-            let je_idx = instructions.len();
-            instructions.push(BytecodeOp::Jump(0));
-            end_jumps.push(je_idx);
+            // No implicit jump-to-end: fall through into the next case body.
         }
 
-        // Patch last case jump
-        if let Some(prev_jump) = next_case_jump {
-            instructions[prev_jump] = BytecodeOp::JumpIfFalse(instructions.len());
-        }
-
-        // Default case
+        // Default body is emitted last; the textually-last case falls through
+        // into it when it lacks a `break`, matching Lucee.
+        let default_start = instructions.len();
+        instructions[no_match_jump] = BytecodeOp::Jump(default_start);
         if let Some(default) = &switch_stmt.default_case {
             for s in default {
                 self.compile_statement(s, instructions);
@@ -1832,9 +1841,6 @@ impl CfmlCompiler {
         }
 
         let end_pos = instructions.len();
-        for idx in end_jumps {
-            instructions[idx] = BytecodeOp::Jump(end_pos);
-        }
 
         // Patch break statements
         let (break_indices, _) = self.loop_stack.pop().unwrap();
