@@ -23,5 +23,15 @@ sb = createObject( "java", "java.lang.StringBuilder" ).init( "" );
 sb.append( "a" ).append( "b" ).append( "c" );
 assert("java shim chained mutation still works", sb.toString(), "abc");
 
+// Deep-path (2-segment base) variant: `variables.inner.getStore().put(k,v)` —
+// `put` is a mutating method returning a foreign CFC, and the deep
+// result-writeback would clobber variables.inner. This is the exact shape that
+// broke WireBox app/CF scopes (injector.getScopeStorage().put(...) overwrote
+// variables.injector with the ScopeStorage).
+dh = new DeepHolder();
+dh.setInner( new DeepInner() );
+dh.getInner().setStore( new DeepStore() );
+assert("deep chained mutating call does not clobber the 2-segment base", dh.probe(), "Inner");
+
 suiteEnd();
 </cfscript>

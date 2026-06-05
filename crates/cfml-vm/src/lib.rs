@@ -4014,8 +4014,44 @@ impl CfmlVirtualMachine {
                             let var_name = &path[0];
                             if let Some(mut root_obj) = self.scope_aware_load(var_name, &locals) {
                                 let props = &path[1..];
-                                Self::deep_set(&mut root_obj, props, result.clone());
-                                self.scope_aware_store(var_name, root_obj, &mut locals);
+                                // Chained-CFC identity guard (deep path): for
+                                // `a.b.getDep().mutate()` the mutating call runs on a
+                                // foreign CFC and returns it; codegen propagates
+                                // write_back=["a","b"], so deep_set would overwrite a.b
+                                // with that foreign CFC (e.g.
+                                // `injector.getScopeStorage().put(...)` clobbering
+                                // `variables.injector` with the ScopeStorage put()
+                                // returns). Skip when the current leaf and the result
+                                // are distinct CFC instances. Non-CFC results
+                                // (arrays/Java shims, e.g. `a.b.append(x)`) are ungated.
+                                let result_is_cfc = matches!(
+                                    &result,
+                                    CfmlValue::Struct(s) if s.contains_key("__variables")
+                                );
+                                let mut skip_for_identity = false;
+                                if result_is_cfc {
+                                    let mut node = root_obj.clone();
+                                    let mut reached = true;
+                                    for part in props {
+                                        match node.get(part) {
+                                            Some(v) => node = v,
+                                            None => { reached = false; break; }
+                                        }
+                                    }
+                                    if reached {
+                                        if let (CfmlValue::Struct(cur), CfmlValue::Struct(res)) =
+                                            (&node, &result)
+                                        {
+                                            if cur.contains_key("__variables") && !cur.ptr_eq(res) {
+                                                skip_for_identity = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if !skip_for_identity {
+                                    Self::deep_set(&mut root_obj, props, result.clone());
+                                    self.scope_aware_store(var_name, root_obj, &mut locals);
+                                }
                             }
                         }
                     }
@@ -13168,7 +13204,21 @@ impl CfmlVirtualMachine {
 
         let app_cfc_path = match app_cfc_path {
             Some(path) => path,
-            None => return self.execute(), // No Application.cfc, just execute directly
+            None => {
+                // No Application.cfc: there is no named application, but a single
+                // run is still one execution context — give it a process/request
+                // -lifetime application scope (when none is already attached) so
+                // `application.*` writes persist within the run instead of being
+                // silently dropped. Matches the expectation that an app-scoped
+                // component (e.g. a WireBox app-scoped singleton) caches within a
+                // run. Serve requests WITH an Application.cfc set their shared
+                // scope above and never reach here.
+                if self.application_scope.is_none() {
+                    self.application_scope =
+                        Some(Arc::new(Mutex::new(IndexMap::new())));
+                }
+                return self.execute(); // No Application.cfc, just execute directly
+            }
         };
 
         // 1b. Application-level cfconfig: a `.cfconfig.json` beside this
