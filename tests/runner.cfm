@@ -9,6 +9,7 @@ include "harness.cfm";
 try { include "config/test_cfconfig_loading.cfm"; } catch (any e) { writeOutput("ERROR | config/test_cfconfig_loading.cfm | " & e.message & chr(10)); }
 try { include "config/test_cfconfig_datasource.cfm"; } catch (any e) { writeOutput("ERROR | config/test_cfconfig_datasource.cfm | " & e.message & chr(10)); }
 try { include "config/test_cfconfig_security.cfm"; } catch (any e) { writeOutput("ERROR | config/test_cfconfig_security.cfm | " & e.message & chr(10)); }
+try { include "config/test_app_datasources.cfm"; } catch (any e) { writeOutput("ERROR | config/test_app_datasources.cfm | " & e.message & chr(10)); }
 
 // --- Core Language ---
 try { include "core/test_variables.cfm"; } catch (any e) { writeOutput("ERROR | core/test_variables.cfm | " & e.message & chr(10)); }

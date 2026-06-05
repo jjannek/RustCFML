@@ -601,6 +601,16 @@ pub struct CfmlVirtualMachine {
     /// CFML-visible `server.cfconfig` struct. Server-level keys (port, etc.) are
     /// never overlaid. Cleared at request end. `None` ⇒ use the server baseline.
     pub app_cfconfig: Option<Arc<cfml_config::RustCfmlConfig>>,
+    /// Per-request application-level datasources: lowercased name → resolved
+    /// connection URL. Seeded from `this.datasources` in Application.cfc (highest
+    /// precedence) and the per-request cfconfig (`app_cfconfig`, else baseline).
+    /// `cfquery`/`queryExecute` consult this BEFORE the process-global registry,
+    /// so each application's datasources are isolated (Lucee/BoxLang parity).
+    /// Empty ⇒ fall back to the global registry / bare-string parsing.
+    app_datasources: IndexMap<String, String>,
+    /// Per-request default datasource URL (from `this.datasource` singular, or a
+    /// cfconfig `default: true` datasource). Used when a query omits a datasource.
+    app_default_datasource: Option<String>,
     /// Stack of held cflock guards (name, guard)
     held_locks: Vec<(String, HeldLock)>,
     /// Custom tag paths from this.customTagPaths in Application.cfc
@@ -872,6 +882,8 @@ impl CfmlVirtualMachine {
             session_lazy_initializing: false,
             app_cfc_template: None,
             app_cfconfig: None,
+            app_datasources: IndexMap::new(),
+            app_default_datasource: None,
             query_execute_fn: None,
             held_locks: Vec::new(),
             custom_tag_paths: Vec::new(),
@@ -7188,6 +7200,10 @@ impl CfmlVirtualMachine {
                     }
                 }
                 "queryexecute" => {
+                    // Resolve a per-application datasource (this.datasources /
+                    // per-app cfconfig) to its connection URL before any path
+                    // below sees the args. No-op when this request has none.
+                    let args = self.rewrite_query_datasource(args);
                     // VM intercept for queryExecute — routes through transaction conn if active
                     if self.transaction_conn.is_some() {
                         if let Some(txn_execute) = self.txn_execute {
@@ -7241,6 +7257,11 @@ impl CfmlVirtualMachine {
                                 .filter(|s| !s.is_empty() && s != "begin")
                         })
                         .unwrap_or_else(|| self.get_default_datasource(parent_locals));
+                    // Resolve a per-application datasource name to its URL so
+                    // transactions honour this.datasources too (same as queries).
+                    let datasource = self
+                        .resolve_app_datasource(&datasource)
+                        .unwrap_or(datasource);
                     if datasource.is_empty() {
                         // Lucee/ACF defer transaction-connection setup until a query
                         // actually runs — `transaction { ... }` around non-query code
@@ -10708,6 +10729,13 @@ impl CfmlVirtualMachine {
 
     /// Get default datasource from application scope or request scope
     fn get_default_datasource(&self, parent_locals: &IndexMap<String, CfmlValue>) -> String {
+        // Per-application default datasource (this.datasource / cfconfig default)
+        // takes precedence — already resolved to a URL.
+        if let Some(ref url) = self.app_default_datasource {
+            if !url.is_empty() {
+                return url.clone();
+            }
+        }
         // Check application scope for datasource config
         if let Some(ref app_scope) = self.application_scope {
             if let Ok(scope) = app_scope.lock() {
@@ -12309,12 +12337,138 @@ impl CfmlVirtualMachine {
         match baseline.overlay_app_json(app_json) {
             Ok(merged) => {
                 self.apply_cfconfig(&merged);
+                // Seed per-request datasources from the overlaid cfconfig so
+                // `cfquery datasource="x"` resolves the app's view, not just the
+                // process-global baseline. `this.datasources` (read later from
+                // Application.cfc) overrides these.
+                for (name, ds) in merged.datasources.iter() {
+                    if let Some(url) = ds.connection_url() {
+                        self.app_datasources.insert(name.to_lowercase(), url.clone());
+                        if ds.default {
+                            self.app_default_datasource = Some(url);
+                        }
+                    }
+                }
                 self.app_cfconfig = Some(Arc::new(merged));
             }
             Err(e) => {
                 log::warn!("failed to overlay app cfconfig {}: {}", candidate, e);
             }
         }
+    }
+
+    /// Convert a single `this.datasources` entry to a connection URL. Accepts a
+    /// bare connection-string (used verbatim) or a struct
+    /// (`{driver, host, port, database, username, password, connectionString}`)
+    /// — the struct form is synthesised through the same `DatasourceCfg` URL
+    /// builder the cfconfig datasources use, so both config paths agree.
+    fn datasource_value_to_url(val: &CfmlValue) -> Option<String> {
+        match val {
+            CfmlValue::String(s) if !s.is_empty() => Some(s.clone()),
+            CfmlValue::Struct(s) => {
+                let get = |key: &str| -> String {
+                    s.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                        .map(|(_, v)| v.as_string())
+                        .unwrap_or_default()
+                };
+                let mut ds = cfml_config::DatasourceCfg::default();
+                ds.driver = get("driver");
+                ds.host = get("host");
+                ds.port = get("port");
+                ds.database = get("database");
+                ds.username = get("username");
+                ds.password = get("password");
+                ds.connection_string = {
+                    let cs = get("connectionString");
+                    if cs.is_empty() { get("connectionstring") } else { cs }
+                };
+                ds.connection_url()
+            }
+            _ => None,
+        }
+    }
+
+    /// Read `this.datasources` (named) and `this.datasource` (default) from the
+    /// loaded Application.cfc component and seed `app_datasources` /
+    /// `app_default_datasource`. These take precedence over cfconfig datasources.
+    /// This is what makes per-application datasources work (Lucee/BoxLang parity)
+    /// — previously RustCFML ignored `this.datasources` entirely.
+    fn seed_app_datasources_from_template(&mut self, template: &CfmlValue) {
+        let CfmlValue::Struct(s) = template else { return };
+        if let Some(CfmlValue::Struct(map)) = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("datasources"))
+            .map(|(_, v)| v)
+        {
+            for (name, def) in map.iter() {
+                if let Some(url) = Self::datasource_value_to_url(&def) {
+                    self.app_datasources.insert(name.to_lowercase(), url);
+                }
+            }
+        }
+        // `this.datasource` (singular) names the application's default datasource.
+        if let Some(name) = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
+            .map(|(_, v)| v.as_string())
+            .filter(|n| !n.is_empty())
+        {
+            // Resolve the named default through the per-app map; if it isn't a
+            // known per-app name, store it as-is for the global registry to map.
+            let url = self
+                .app_datasources
+                .get(&name.to_lowercase())
+                .cloned()
+                .unwrap_or(name);
+            self.app_default_datasource = Some(url);
+        }
+    }
+
+    /// Resolve a datasource name to a per-application connection URL, if this
+    /// request defined one (via `this.datasources` or a per-app cfconfig). Used
+    /// by the query/transaction paths before consulting the global registry.
+    fn resolve_app_datasource(&self, name: &str) -> Option<String> {
+        self.app_datasources.get(&name.to_lowercase()).cloned()
+    }
+
+    /// Rewrite a `queryExecute(sql, params, options)` arg list so a per-app
+    /// datasource name resolves to its connection URL before the (global)
+    /// builtin sees it. The builtin treats an unrecognised name as a literal
+    /// connection string, so substituting the URL routes the query to the
+    /// application's datasource. Only fires when this request has per-app
+    /// datasources; otherwise the args pass through untouched and the global
+    /// registry / dynamic-driver path resolves the name as before.
+    ///
+    /// Builds a fresh options struct rather than mutating in place, so the
+    /// caller's CFML struct keeps its original `datasource` name.
+    fn rewrite_query_datasource(&self, mut args: Vec<CfmlValue>) -> Vec<CfmlValue> {
+        if self.app_datasources.is_empty() && self.app_default_datasource.is_none() {
+            return args;
+        }
+        let Some(CfmlValue::Struct(opts)) = args.get(2) else {
+            return args;
+        };
+        let mut map = opts.snapshot();
+        let current = map
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
+            .map(|(_, v)| v.as_string());
+        let new_url = match current {
+            Some(ref name) => self.resolve_app_datasource(name),
+            None => self.app_default_datasource.clone(),
+        };
+        let Some(url) = new_url else {
+            return args;
+        };
+        let key = map
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case("datasource"))
+            .cloned()
+            .unwrap_or_else(|| "datasource".to_string());
+        map.insert(key, CfmlValue::String(url));
+        args[2] = CfmlValue::strukt(map);
+        args
     }
 
     /// Load and execute Application.cfc, returning the component struct
@@ -12878,6 +13032,10 @@ impl CfmlVirtualMachine {
             Err(e) => return Err(e),
         };
 
+        // 2b. Seed per-application datasources from `this.datasources` /
+        // `this.datasource`. Overrides any cfconfig datasources for this request.
+        self.seed_app_datasources_from_template(&template);
+
         // 3. Extract config and mappings
         let (
             app_name,
@@ -13358,6 +13516,8 @@ impl CfmlVirtualMachine {
         self.request_scope.clear();
         self.app_cfc_template = None;
         self.app_cfconfig = None;
+        self.app_datasources.clear();
+        self.app_default_datasource = None;
         self.session_lazy_pending = false;
 
         result
