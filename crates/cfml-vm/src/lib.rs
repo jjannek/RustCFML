@@ -13014,6 +13014,23 @@ impl CfmlVirtualMachine {
                 let original_offset = app_snapshot.cached_functions_original_offset;
                 if !cached.is_empty() {
                     let new_offset = self.program.functions.len();
+                    // Register restored application-scope functions by name so
+                    // they stay callable when the active program is swapped out
+                    // (e.g. inside a cfmodule / custom-tag body, whose tiny
+                    // sub-program lacks these functions). The func_idx fast path
+                    // resolves them for a regular page call, but a swapped program
+                    // makes that index point elsewhere; dispatch then falls back to
+                    // the user_functions by-name lookup. On a COLD request
+                    // createObject (in onApplicationStart) already populates
+                    // user_functions this way — this mirrors that on WARM restore so
+                    // an application-scope CFC's method (application.svc.ping())
+                    // resolves identically from inside a custom tag.
+                    for func in &cached {
+                        if func.name != "__main__" {
+                            self.user_functions
+                                .insert(func.name.clone(), Arc::clone(func));
+                        }
+                    }
                     self.program.functions.extend(cached);
 
                     // If functions ended up at a different offset than originally,
