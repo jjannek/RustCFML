@@ -17,5 +17,14 @@ assertThrows("mixing positional + named UDF args is rejected", function() {
     adder("A", c="C", b="B");
 });
 
+// Undeclared named arguments must populate the arguments scope BY NAME ONLY.
+// A function with no declared parameters, called with named args, should have an
+// arguments scope containing exactly those named keys — no spurious positional
+// (numeric) entries. So StructCount(arguments) == the number of named args passed.
+function argScopeCount() { return StructCount(arguments); }
+assert("undeclared named args yield exactly n keys", argScopeCount(alpha="1", beta="2"), 2);
+function argScopeKeys() { return listSort(structKeyList(arguments), "textnocase"); }
+assert("undeclared named args are keyed by name only", argScopeKeys(alpha="1", beta="2"), "alpha,beta");
+
 suiteEnd();
 </cfscript>
