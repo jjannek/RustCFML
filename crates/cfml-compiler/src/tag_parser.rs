@@ -474,11 +474,19 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cfargument" => {
             let name = attrs.get("name").cloned().unwrap_or_default();
-            let default = attrs.get("default").cloned();
-            if let Some(def) = default {
-                let def = strip_hashes(&def);
-                // Quote the default if it's not already a number, boolean, or quoted
-                let def_val = quote_if_needed(&def);
+            if let Some(raw) = attrs.get("default") {
+                // Mirror cfparam: a quoted default interpolates `#...#` segments
+                // while preserving literal text; a bare `#expr#` keeps its native
+                // type; an unquoted default falls back to the expr-or-literal
+                // heuristic.
+                let def_val = if quoted.contains("default") {
+                    match single_hash_expr(raw) {
+                        Some(expr) => format!("({})", expr),
+                        None => format_attr_value(raw, true),
+                    }
+                } else {
+                    format_attr_value(raw, false)
+                };
                 (
                     format!("if (isNull(arguments.{})) {{ arguments.{} = {}; }}\n", name, name, def_val),
                     tag_end - start,
@@ -497,20 +505,26 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (format!("writeDump({});\n", var), tag_end - start)
         }
         "cfthrow" => {
-            let message = attrs.get("message").cloned().unwrap_or("An error occurred".to_string());
-            let message = strip_hashes(&message);
-            let escaped_msg = message.replace('\\', "\\\\").replace('"', "\\\"");
+            // Route each attribute value through format_attr_value so `#...#`
+            // segments interpolate while literal text before/between/after is
+            // preserved — uniform with cfparam (Lucee parity). A quoted value
+            // that is exactly one `#expr#` keeps the expression's native type.
+            let attr_expr = |key: &str, default_lit: &str| -> String {
+                match attrs.get(key) {
+                    Some(raw) if quoted.contains(key) => match single_hash_expr(raw) {
+                        Some(expr) => format!("({})", expr),
+                        None => format_attr_value(raw, true),
+                    },
+                    Some(raw) => format_attr_value(raw, false),
+                    None => format!("\"{}\"", default_lit),
+                }
+            };
+            let message = attr_expr("message", "An error occurred");
+            let type_ = attr_expr("type", "Application");
+            let detail = attr_expr("detail", "");
+            let errorcode = attr_expr("errorcode", "");
 
-            let type_ = attrs.get("type").cloned().unwrap_or("Application".to_string());
-            let escaped_type = strip_hashes(&type_).replace('\\', "\\\\").replace('"', "\\\"");
-
-            let detail = attrs.get("detail").cloned().unwrap_or_default();
-            let escaped_detail = strip_hashes(&detail).replace('\\', "\\\\").replace('"', "\\\"");
-
-            let errorcode = attrs.get("errorcode").cloned().unwrap_or_default();
-            let escaped_errorcode = strip_hashes(&errorcode).replace('\\', "\\\\").replace('"', "\\\"");
-
-            (format!("throw(\"{}\", \"{}\", \"{}\", \"{}\");\n", escaped_msg, escaped_type, escaped_detail, escaped_errorcode), tag_end - start)
+            (format!("throw({}, {}, {}, {});\n", message, type_, detail, errorcode), tag_end - start)
         }
         "cftry" => {
             ("try {\n".to_string(), tag_end - start)
@@ -1057,7 +1071,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (format!("__cfcookie({{ {} }});\n", parts.join(", ")), tag_end - start)
         }
         "cffile" => {
-            parse_cffile_tag(&attrs, tag_end - start)
+            parse_cffile_tag(&attrs, &quoted, tag_end - start)
         }
         "cflock" => {
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cflock") {
@@ -2247,74 +2261,51 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
 /// Parse <cffile> tag and convert to appropriate function calls
 fn parse_cffile_tag(
     attrs: &std::collections::HashMap<String, String>,
+    quoted: &std::collections::HashSet<String>,
     consumed: usize,
 ) -> (String, usize) {
     let action = attrs.get("action").cloned().unwrap_or("read".to_string()).to_lowercase();
 
+    // Route a path/value attribute through format_attr_value so `#...#`
+    // segments interpolate and literal text is preserved — uniform with
+    // cfparam (Lucee parity). A quoted value that is exactly one `#expr#`
+    // keeps the expression's native type; an unquoted value falls back to the
+    // expr-or-literal heuristic. Replaces the prior `.`/`(` guesswork that
+    // mis-quoted single-variable paths and mis-parsed literal paths.
+    let attr_expr = |key: &str| -> String {
+        match attrs.get(key) {
+            Some(raw) if quoted.contains(key) => match single_hash_expr(raw) {
+                Some(expr) => format!("({})", expr),
+                None => format_attr_value(raw, true),
+            },
+            Some(raw) => format_attr_value(raw, false),
+            None => "\"\"".to_string(),
+        }
+    };
+
     match action.as_str() {
         "read" => {
-            let file = attrs.get("file").cloned().unwrap_or_default();
-            let file = strip_hashes(&file);
             let variable = attrs.get("variable").cloned().unwrap_or("cffile".to_string());
-            let file_expr = if file.contains('.') || file.contains('(') {
-                file
-            } else {
-                format!("\"{}\"", file.replace('"', "\\\""))
-            };
-            (format!("{} = fileRead({});\n", variable, file_expr), consumed)
+            (format!("{} = fileRead({});\n", variable, attr_expr("file")), consumed)
         }
         "readbinary" => {
-            let file = attrs.get("file").cloned().unwrap_or_default();
-            let file = strip_hashes(&file);
             let variable = attrs.get("variable").cloned().unwrap_or("cffile".to_string());
-            let file_expr = if file.contains('.') || file.contains('(') {
-                file
-            } else {
-                format!("\"{}\"", file.replace('"', "\\\""))
-            };
-            (format!("{} = fileReadBinary({});\n", variable, file_expr), consumed)
+            (format!("{} = fileReadBinary({});\n", variable, attr_expr("file")), consumed)
         }
         "write" => {
-            let file = attrs.get("file").cloned().unwrap_or_default();
-            let file = strip_hashes(&file);
-            let output = attrs.get("output").cloned().unwrap_or_default();
-            let output = strip_hashes(&output);
-            let file_expr = if file.contains('.') || file.contains('(') { file } else { format!("\"{}\"", file.replace('"', "\\\"")) };
-            let output_expr = if output.contains('.') || output.contains('(') || output.contains('"') { output } else { format!("\"{}\"", output.replace('"', "\\\"")) };
-            (format!("fileWrite({}, {});\n", file_expr, output_expr), consumed)
+            (format!("fileWrite({}, {});\n", attr_expr("file"), attr_expr("output")), consumed)
         }
         "append" => {
-            let file = attrs.get("file").cloned().unwrap_or_default();
-            let file = strip_hashes(&file);
-            let output = attrs.get("output").cloned().unwrap_or_default();
-            let output = strip_hashes(&output);
-            let file_expr = if file.contains('.') || file.contains('(') { file } else { format!("\"{}\"", file.replace('"', "\\\"")) };
-            let output_expr = if output.contains('.') || output.contains('(') || output.contains('"') { output } else { format!("\"{}\"", output.replace('"', "\\\"")) };
-            (format!("fileAppend({}, {});\n", file_expr, output_expr), consumed)
+            (format!("fileAppend({}, {});\n", attr_expr("file"), attr_expr("output")), consumed)
         }
         "copy" => {
-            let source = attrs.get("source").cloned().unwrap_or_default();
-            let source = strip_hashes(&source);
-            let dest = attrs.get("destination").cloned().unwrap_or_default();
-            let dest = strip_hashes(&dest);
-            let src_expr = if source.contains('.') || source.contains('(') { source } else { format!("\"{}\"", source.replace('"', "\\\"")) };
-            let dst_expr = if dest.contains('.') || dest.contains('(') { dest } else { format!("\"{}\"", dest.replace('"', "\\\"")) };
-            (format!("fileCopy({}, {});\n", src_expr, dst_expr), consumed)
+            (format!("fileCopy({}, {});\n", attr_expr("source"), attr_expr("destination")), consumed)
         }
         "move" | "rename" => {
-            let source = attrs.get("source").cloned().unwrap_or_default();
-            let source = strip_hashes(&source);
-            let dest = attrs.get("destination").cloned().unwrap_or_default();
-            let dest = strip_hashes(&dest);
-            let src_expr = if source.contains('.') || source.contains('(') { source } else { format!("\"{}\"", source.replace('"', "\\\"")) };
-            let dst_expr = if dest.contains('.') || dest.contains('(') { dest } else { format!("\"{}\"", dest.replace('"', "\\\"")) };
-            (format!("fileMove({}, {});\n", src_expr, dst_expr), consumed)
+            (format!("fileMove({}, {});\n", attr_expr("source"), attr_expr("destination")), consumed)
         }
         "delete" => {
-            let file = attrs.get("file").cloned().unwrap_or_default();
-            let file = strip_hashes(&file);
-            let file_expr = if file.contains('.') || file.contains('(') { file } else { format!("\"{}\"", file.replace('"', "\\\"")) };
-            (format!("fileDelete({});\n", file_expr), consumed)
+            (format!("fileDelete({});\n", attr_expr("file")), consumed)
         }
         "upload" | "uploadall" => {
             let func = if action == "uploadall" { "__cffile_upload" } else { "__cffile_upload" };
