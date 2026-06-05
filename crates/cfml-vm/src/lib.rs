@@ -1990,6 +1990,42 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
+                BytecodeOp::SetDynamicVar => {
+                    // Dynamic/quoted-string LHS assignment: the path string was
+                    // resolved at runtime (e.g. "variables.propDep" from
+                    // `"#scope#.#prop#" = v`). Store scope-aware into the current
+                    // frame so `variables.x` lands in a CFC's __variables (not the
+                    // page scope) — matching a normal `variables.x = v` assignment.
+                    let value = stack.pop().unwrap_or(CfmlValue::Null);
+                    let path = stack
+                        .pop()
+                        .map(|v| v.as_string())
+                        .unwrap_or_default();
+                    let parts: Vec<&str> = path.split('.').collect();
+                    if parts.len() >= 2 {
+                        let scope = parts[0];
+                        let root = self
+                            .scope_aware_load(scope, &locals)
+                            .unwrap_or_else(|| CfmlValue::strukt(IndexMap::new()));
+                        if let CfmlValue::Struct(ref s) = root {
+                            // Walk/auto-vivify intermediate structs, set the leaf.
+                            let mut cur = s.clone();
+                            for key in &parts[1..parts.len() - 1] {
+                                cur = cur.get_or_insert_struct(key);
+                            }
+                            cur.insert(parts[parts.len() - 1].to_string(), value.clone());
+                        }
+                        // Write the (possibly copied) scope container back. For
+                        // reference-typed scopes (a CFC's __variables) the leaf is
+                        // already mutated in place; for page scope this commits the
+                        // new key into locals.
+                        self.scope_aware_store(scope, root, &mut locals);
+                    } else {
+                        // Bare name (no scope prefix) — single-variable store.
+                        self.scope_aware_store(&path, value.clone(), &mut locals);
+                    }
+                    stack.push(value);
+                }
                 BytecodeOp::ArrayAppendLocal(name) => {
                     // Fused arrayAppend(<ident>, value). The value is on top of
                     // the stack; the array lives in the named variable. With
@@ -13842,6 +13878,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::LoadLocalProperty(_, _) => (1, 0), // pushes value, reads nothing
         BytecodeOp::StoreLocalProperty(_, _) => (0, 1), // pops 1 (value), pushes 0
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
+        BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value
         BytecodeOp::GetKeys => (1, 1),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object

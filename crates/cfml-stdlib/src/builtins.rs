@@ -4490,17 +4490,26 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                 }
                 meta.insert("functions".to_string(), CfmlValue::array(functions));
 
-                // Enumerate properties (non-function, non-internal keys)
-                let mut properties = Vec::new();
-                for (k, v) in s.iter() {
-                    if k.starts_with("__") { continue; }
-                    if matches!(v, CfmlValue::Function(_)) { continue; }
-                    let mut prop_meta = IndexMap::new();
-                    prop_meta.insert("name".to_string(), CfmlValue::String(k.clone()));
-                    prop_meta.insert("type".to_string(), CfmlValue::String(v.type_name().to_string()));
-                    properties.push(CfmlValue::strukt(prop_meta));
+                // Enumerate properties. Declared properties live in the
+                // __properties array (with full annotations incl. inject/type),
+                // matching getComponentMetadata and Lucee/ACF. This is what
+                // WireBox reads for property/DSL injection. Fall back to
+                // top-level non-function keys only when a component declares no
+                // properties (no __properties key).
+                if let Some(CfmlValue::Array(props)) = s.get("__properties") {
+                    meta.insert("properties".to_string(), CfmlValue::Array(props.clone()));
+                } else {
+                    let mut properties = Vec::new();
+                    for (k, v) in s.iter() {
+                        if k.starts_with("__") { continue; }
+                        if matches!(v, CfmlValue::Function(_)) { continue; }
+                        let mut prop_meta = IndexMap::new();
+                        prop_meta.insert("name".to_string(), CfmlValue::String(k.clone()));
+                        prop_meta.insert("type".to_string(), CfmlValue::String(v.type_name().to_string()));
+                        properties.push(CfmlValue::strukt(prop_meta));
+                    }
+                    meta.insert("properties".to_string(), CfmlValue::array(properties));
                 }
-                meta.insert("properties".to_string(), CfmlValue::array(properties));
             }
             CfmlValue::Function(f) => {
                 meta.insert("name".to_string(), CfmlValue::String(f.name.clone()));

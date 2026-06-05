@@ -222,6 +222,13 @@ pub enum BytecodeOp {
     /// accesses where the receiver is a plain identifier (the common `s.foo = x` pattern).
     StoreLocalProperty(String, String),
     SetProperty(String), // Set object.property = value
+    /// Dynamic/quoted-string LHS assignment: `"#scope#.#prop#" = v` or
+    /// `"variables.x" = v`. Stack: [pathString, value]. The path is resolved at
+    /// runtime and the value stored scope-aware into the current frame (so
+    /// `variables.x` lands in a CFC's __variables, not the page scope). Leaves
+    /// the assigned value on the stack. Lucee/ACF semantics; WireBox's
+    /// MixerUtil.injectPropertyMixin relies on this.
+    SetDynamicVar,
 
     // Object
     NewObject(usize),  // arg_count for constructor
@@ -2341,6 +2348,21 @@ impl CfmlCompiler {
             }
             Expression::BinaryOp(binop) => {
                 if binop.operator == BinaryOpType::Assign {
+                    // Dynamic/quoted-string LHS: `"variables.x" = v` (literal) or
+                    // `"#scope#.#prop#" = v` (interpolated). CFML treats a
+                    // string-valued lvalue as a runtime scope path. Push
+                    // [pathString, value] and resolve the target at runtime.
+                    if matches!(
+                        &*binop.left,
+                        Expression::Literal(Literal { value: LiteralValue::String(_), .. })
+                            | Expression::StringInterpolation(_)
+                    ) {
+                        self.compile_expression(&binop.left, instructions);
+                        self.compile_expression(&binop.right, instructions);
+                        instructions.push(BytecodeOp::SetDynamicVar);
+                        return;
+                    }
+
                     self.compile_expression(&binop.right, instructions);
 
                     match &*binop.left {

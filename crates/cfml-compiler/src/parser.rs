@@ -3057,6 +3057,22 @@ impl Parser {
                     right: Box::new(value),
                     location: self.current_location(),
                 })));
+            } else if matches!(
+                &expr,
+                Expression::Literal(Literal { value: LiteralValue::String(_), .. })
+                    | Expression::StringInterpolation(_)
+            ) {
+                // Dynamic/quoted-string LHS: `"variables.x" = v` or
+                // `"#scope#.#prop#" = v`. CFML (Lucee/ACF) treats a string-valued
+                // lvalue as a runtime scope path. Codegen emits SetDynamicVar.
+                self.advance(); // consume =
+                let value = self.parse_assignment_rhs()?;
+                return Ok(Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(expr),
+                    operator: BinaryOpType::Assign,
+                    right: Box::new(value),
+                    location: self.current_location(),
+                })));
             }
         }
 

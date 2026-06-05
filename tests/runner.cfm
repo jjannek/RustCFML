@@ -126,6 +126,8 @@ try { include "oop/test_component_method_precedence.cfm"; } catch (any e) { writ
 try { include "oop/test_method_ref_binding.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_method_ref_binding.cfm | " & e.message & chr(10)); }
 try { include "oop/test_returned_service_chain.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_returned_service_chain.cfm | " & e.message & chr(10)); }
 try { include "oop/test_mixin_writeback.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_mixin_writeback.cfm | " & e.message & chr(10)); }
+try { include "oop/test_dynamic_lhs_assign.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_dynamic_lhs_assign.cfm | " & e.message & chr(10)); }
+try { include "oop/test_getmetadata_properties.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_getmetadata_properties.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }
