@@ -275,7 +275,19 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
                 i += 1;
             }
             let text: String = chars[start..i].iter().collect();
-            if !text.is_empty() {
+            // Structural gap suppression: whitespace between </cfcatch> (or the
+            // try body) and <cffinally> would otherwise be emitted as
+            // __writeText(...) right at the `} finally {` junction, producing
+            // "} __writeText(...); finally {" which is a parse error. CFML
+            // treats this inter-tag whitespace as structural, not output, so
+            // drop a whitespace-only node when the next tag is <cffinally>.
+            let next_is_cffinally = i + 10 <= len && {
+                let peek: String = chars[i..std::cmp::min(i + 10, len)].iter().collect();
+                peek.to_lowercase().starts_with("<cffinally")
+            };
+            if next_is_cffinally && text.trim().is_empty() {
+                // suppress
+            } else if !text.is_empty() {
                 // Output ALL text including whitespace-only nodes.
                 // Standard CFML outputs everything; whitespace suppression is opt-in
                 // via cfprocessingdirective or cfsetting enableCFOutputOnly.
@@ -2722,8 +2734,11 @@ fn process_sql_hashes(sql: &str) -> String {
     let sql = sql.trim().replace('\n', " ").replace('\r', "");
 
     if !sql.contains('#') {
-        // No hash expressions — simple string literal
-        return format!("\"{}\"", sql.replace('"', "\\\""));
+        // No hash expressions — simple string literal. CFML escapes an embedded
+        // double-quote by DOUBLING it (""), not with a backslash; SQL bodies use
+        // double-quoted identifiers (AS "where"), so a backslash escape would
+        // terminate the string early and fail to parse.
+        return format!("\"{}\"", sql.replace('"', "\"\""));
     }
 
     // Split on hash pairs and build concatenation
@@ -2740,7 +2755,7 @@ fn process_sql_hashes(sql: &str) -> String {
                 let end = i + 1 + end_offset;
                 // Flush current text
                 if !current_text.is_empty() {
-                    parts.push(format!("\"{}\"", current_text.replace('"', "\\\"")));
+                    parts.push(format!("\"{}\"", current_text.replace('"', "\"\"")));
                     current_text = String::new();
                 }
                 // Extract expression
@@ -2756,7 +2771,7 @@ fn process_sql_hashes(sql: &str) -> String {
 
     // Flush remaining text
     if !current_text.is_empty() {
-        parts.push(format!("\"{}\"", current_text.replace('"', "\\\"")));
+        parts.push(format!("\"{}\"", current_text.replace('"', "\"\"")));
     }
 
     if parts.len() == 1 {

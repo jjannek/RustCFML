@@ -137,8 +137,9 @@ impl Parser {
         {
             let access = self.parse_access_modifier();
             // Skip optional return type annotation (e.g. "private array function ..."
-            // or "public MachII.framework.AppManager function ...")
-            if matches!(self.peek(0), Token::Identifier(_)) {
+            // or "public MachII.framework.AppManager function ..." or
+            // "public component function init()")
+            if self.is_return_type_token(0) {
                 // Look ahead past dotted name: Ident.Ident.Ident... then Function
                 let mut lookahead = 1;
                 while matches!(self.peek(lookahead), Token::Dot) && matches!(self.peek(lookahead + 1), Token::Identifier(_)) {
@@ -159,7 +160,7 @@ impl Parser {
             }
             if self.match_token(&Token::Static) {
                 // Skip optional return type after static (including dotted names)
-                if matches!(self.peek(0), Token::Identifier(_)) {
+                if self.is_return_type_token(0) {
                     let mut lookahead = 1;
                     while matches!(self.peek(lookahead), Token::Dot) && matches!(self.peek(lookahead + 1), Token::Identifier(_)) {
                         lookahead += 2;
@@ -2624,8 +2625,9 @@ impl Parser {
 
             let is_static = self.match_token(&Token::Static);
 
-            // Skip optional return type annotation (e.g. "array function ...")
-            if matches!(self.peek(0), Token::Identifier(_)) && matches!(self.peek(1), Token::Function) {
+            // Skip optional return type annotation (e.g. "array function ...",
+            // "component function init()").
+            if self.is_return_type_token(0) && matches!(self.peek(1), Token::Function) {
                 self.advance(); // skip return type
             }
 
@@ -2770,7 +2772,7 @@ impl Parser {
             };
 
             // Skip optional return type annotation
-            if matches!(self.peek(0), Token::Identifier(_)) && matches!(self.peek(1), Token::Function) {
+            if self.is_return_type_token(0) && matches!(self.peek(1), Token::Function) {
                 self.advance();
             }
 
@@ -3022,6 +3024,18 @@ impl Parser {
     /// Check whether an access modifier (public/private/remote/package) at peek(0)
     /// is used as a function declaration prefix vs. a plain identifier.
     /// Returns true if the modifier is followed by: function, static, or a return-type + function.
+    /// A token usable as the (leading) return-type name in a function signature.
+    /// Most type names lex as plain identifiers (`array`, `string`, `query`…),
+    /// but `component` and `interface` are reserved keyword tokens — yet both are
+    /// legal return types (`public component function init()`, as in Wheels'
+    /// Seeder.cfc). Used for return-type lookahead and skipping.
+    fn is_return_type_token(&self, offset: usize) -> bool {
+        matches!(
+            self.peek(offset),
+            Token::Identifier(_) | Token::Component | Token::Interface
+        )
+    }
+
     fn is_access_modifier_for_function(&self) -> bool {
         // peek(0) is the access modifier token itself; check what follows at peek(1)+
         let mut la = 1;
@@ -3033,8 +3047,8 @@ impl Parser {
         if matches!(self.peek(la), Token::Function) {
             return true;
         }
-        // Return-type annotation: Identifier(.Identifier)* followed by "function"
-        if matches!(self.peek(la), Token::Identifier(_)) {
+        // Return-type annotation: type-name(.Identifier)* followed by "function"
+        if self.is_return_type_token(la) {
             la += 1;
             while matches!(self.peek(la), Token::Dot) && matches!(self.peek(la + 1), Token::Identifier(_)) {
                 la += 2;
@@ -3058,8 +3072,8 @@ impl Parser {
         if matches!(self.peek(la), Token::Function | Token::Property) {
             return true;
         }
-        // Return-type annotation: Identifier(.Identifier)* followed by "function"
-        if matches!(self.peek(la), Token::Identifier(_)) {
+        // Return-type annotation: type-name(.Identifier)* followed by "function"
+        if self.is_return_type_token(la) {
             la += 1;
             while matches!(self.peek(la), Token::Dot) && matches!(self.peek(la + 1), Token::Identifier(_)) {
                 la += 2;
