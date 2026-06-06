@@ -719,7 +719,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // bare (mis-parsed) expression like `baseUrlpath`.
             opts.push(format!("url: {}", format_attr_value(&url, quoted.contains("url"))));
             opts.push(format!("method: {}", format_attr_value(&method, quoted.contains("method"))));
-            if let Some(t) = timeout { opts.push(format!("timeout: {}", t)); }
+            if let Some(t) = timeout { opts.push(format!("timeout: {}", format_attr_value(&t, quoted.contains("timeout")))); }
             if let Some(c) = charset { opts.push(format!("charset: {}", format_attr_value(&c, quoted.contains("charset")))); }
             if let Some(u) = username { opts.push(format!("username: {}", format_attr_value(&u, quoted.contains("username")))); }
             if let Some(p) = password { opts.push(format!("password: {}", format_attr_value(&p, quoted.contains("password")))); }
