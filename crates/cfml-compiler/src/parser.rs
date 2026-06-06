@@ -898,7 +898,7 @@ impl Parser {
         if let Token::Identifier(ref nm) = self.peek(0).clone() {
             let nlow = nm.to_lowercase();
             let is_body_tag = matches!(nlow.as_str(),
-                "cfsavecontent" | "cflock" | "cftransaction" | "cfmail" | "cfquery");
+                "cfsavecontent" | "cflock" | "cftransaction" | "cfmail" | "cfquery" | "cfhttp");
             if is_body_tag && matches!(self.peek(1), Token::LParen) {
                 let saved = self.current;
                 self.advance(); // tag name
@@ -942,6 +942,54 @@ impl Parser {
                 }
                 // No `{` body (e.g. a bare `transaction action="commit";` statement
                 // form we don't special-case) — restore and fall through.
+                self.current = saved;
+            }
+            // cfhttpparam(name=…, value=…, type=…) statement → appends to the
+            // runtime params array a surrounding script cfhttp(){ } block set up.
+            // Mirrors the tag preprocessor's <cfhttpparam> → arrayAppend lowering,
+            // so params declared inside control flow (for/if) in a cfhttp body are
+            // collected at runtime (issue #55). Outside a cfhttp block,
+            // __cfhttp_params is undefined — exactly as the tag form behaves.
+            if nlow == "cfhttpparam" && matches!(self.peek(1), Token::LParen) {
+                let saved = self.current;
+                self.advance(); // cfhttpparam
+                self.advance(); // (
+                let attrs = match self.parse_tag_call_attrs() {
+                    Ok(a) => a,
+                    Err(_) => { self.current = saved; Vec::new() }
+                };
+                if self.current != saved && self.check(&Token::RParen) {
+                    self.advance(); // )
+                    self.match_token(&Token::Semicolon); // optional trailing ;
+                    let param_struct = Expression::Struct(Struct {
+                        pairs: attrs.iter().map(|(k, v)| (
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(k.clone()),
+                                location: stmt_loc,
+                            }),
+                            v.clone(),
+                        )).collect(),
+                        ordered: false,
+                        location: stmt_loc,
+                    });
+                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                        expr: Expression::FunctionCall(Box::new(FunctionCall {
+                            name: Box::new(Expression::Identifier(Identifier {
+                                name: "arrayAppend".to_string(),
+                                location: stmt_loc,
+                            })),
+                            arguments: vec![
+                                Expression::Identifier(Identifier {
+                                    name: "__cfhttp_params".to_string(),
+                                    location: stmt_loc,
+                                }),
+                                param_struct,
+                            ],
+                            location: stmt_loc,
+                        })),
+                        location: stmt_loc,
+                    })));
+                }
                 self.current = saved;
             }
         }
@@ -1924,6 +1972,65 @@ impl Parser {
                         Expression::Identifier(Identifier { name: "__cfquery_params".to_string(), location: loc }),
                         opts_struct,
                     ]),
+                    operator: AssignOp::Equal,
+                    location: loc,
+                }));
+                CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
+            }
+            "cfhttp" => {
+                // Script cfhttp(url=…, method=…, result=…) { body } mirrors the
+                // dynamic angle-bracket <cfhttp> path: the body runs after
+                // seeding __cfhttp_params = [], each cfhttpparam(...) appends to
+                // it (incl. inside for/if), then cfhttp({...attrs, params}) runs.
+                // Without this the trailing `{ ... }` was mis-parsed as a struct
+                // literal, dropping params in control flow (issue #55).
+                let result_name = attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("result"))
+                    .and_then(|(_, v)| match v {
+                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
+                        Expression::Identifier(id) => Some(id.name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "cfhttp".to_string());
+                // Options struct: every attribute except `result`, plus the
+                // runtime-collected params array.
+                let mut pairs: Vec<(Expression, Expression)> = attrs.iter()
+                    .filter(|(k, _)| !k.eq_ignore_ascii_case("result"))
+                    .map(|(k, v)| (
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String(k.clone()),
+                            location: loc,
+                        }),
+                        v.clone(),
+                    ))
+                    .collect();
+                pairs.push((
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String("params".to_string()),
+                        location: loc,
+                    }),
+                    Expression::Identifier(Identifier { name: "__cfhttp_params".to_string(), location: loc }),
+                ));
+                let opts_struct = Expression::Struct(Struct { pairs, ordered: false, location: loc });
+                let call = |name: &str, arguments: Vec<Expression>| Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier { name: name.to_string(), location: loc })),
+                    arguments,
+                    location: loc,
+                }));
+                let mut stmts = vec![
+                    // __cfhttp_params = [];
+                    Statement::Assignment(Assignment {
+                        target: AssignTarget::Variable("__cfhttp_params".to_string()),
+                        value: Expression::Array(Array { elements: vec![], location: loc }),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    }),
+                ];
+                stmts.extend(body);
+                // RESULT = cfhttp({ ...attrs, params: __cfhttp_params });
+                stmts.push(Statement::Assignment(Assignment {
+                    target: self.assign_target_from_dotted(&result_name, loc),
+                    value: call("cfhttp", vec![opts_struct]),
                     operator: AssignOp::Equal,
                     location: loc,
                 }));
