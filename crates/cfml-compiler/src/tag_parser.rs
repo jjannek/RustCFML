@@ -1300,15 +1300,18 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             } else {
                 opts.push(format!("name: \"{}\"", name_attr));
             }
+            // arguments/timeout may carry #expr# interpolation inside an
+            // otherwise-literal quoted value; route them through format_attr_value
+            // like cfhttp's attributes. (The old path emitted timeout verbatim —
+            // leaving literal hashes that fail to parse — and escaped embedded
+            // quotes with a backslash, which CFML does not honor; a quote is
+            // escaped by doubling it.)
             if let Some(a) = &arguments {
-                let a_stripped = strip_hashes(a);
-                if *a != a_stripped {
-                    opts.push(format!("arguments: {}", a_stripped));
-                } else {
-                    opts.push(format!("arguments: \"{}\"", a.replace('"', "\\\"")));
-                }
+                opts.push(format!("arguments: {}", format_attr_value(a, quoted.contains("arguments"))));
             }
-            if let Some(t) = &timeout { opts.push(format!("timeout: {}", t)); }
+            if let Some(t) = &timeout {
+                opts.push(format!("timeout: {}", format_attr_value(t, quoted.contains("timeout"))));
+            }
             if variable.is_some() {
                 opts.push("variable: true".to_string());
             }
