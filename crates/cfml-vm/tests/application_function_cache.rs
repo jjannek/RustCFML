@@ -105,6 +105,29 @@ fn overwrite_fixture() -> HashMap<String, Vec<u8>> {
     files
 }
 
+fn closure_fixture() -> HashMap<String, Vec<u8>> {
+    let mut files = HashMap::new();
+    files.insert(
+        "Application.cfc".to_string(),
+        include_str!("../../../tests/lifecycle/application_function_cache/closure/Application.cfc")
+            .as_bytes()
+            .to_vec(),
+    );
+    files.insert(
+        "Service.cfc".to_string(),
+        include_str!("../../../tests/lifecycle/application_function_cache/closure/Service.cfc")
+            .as_bytes()
+            .to_vec(),
+    );
+    files.insert(
+        "index.cfm".to_string(),
+        include_str!("../../../tests/lifecycle/application_function_cache/closure/index.cfm")
+            .as_bytes()
+            .to_vec(),
+    );
+    files
+}
+
 fn sparse_fixture() -> HashMap<String, Vec<u8>> {
     let mut files = HashMap::new();
     files.insert(
@@ -188,4 +211,25 @@ fn persistent_and_overwritten_application_cfc_functions_are_cached_sparsely() {
         app_function_table_size(&server_state),
         "stable table should remain bounded across repeated mixed app-scope CFCs"
     );
+}
+
+/// Regression: a CFC stored in application scope whose method DEFINES a closure
+/// at call time must stay callable on a WARM request. The closure is referenced
+/// only by a `DefineFunction(global_id)` op inside the method's bytecode — never
+/// as a stored value — and its source program isn't reloaded on a warm request,
+/// so unless the carried function table is closed under `DefineFunction` the
+/// warm call hits "DefineFunction global_id N is not registered" (a 500 in serve
+/// mode). The cold request (request 1) instantiates the CFC in onApplicationStart;
+/// every later request is warm and must produce the same output.
+#[test]
+fn warm_request_dispatches_app_scope_method_that_defines_a_closure() {
+    let vfs: Arc<dyn Vfs> = Arc::new(EmbeddedFs::new(closure_fixture(), VROOT.to_string()));
+    let server_state = ServerState::with_production(false);
+
+    // Cold: onApplicationStart stores `application.svc = new Service()`.
+    run_request_with_expected_output(&server_state, vfs.clone(), "ok-3");
+    // Warm: a fresh program/VM; `application.svc.greet()` re-runs the closure's
+    // DefineFunction op, which must resolve against the carried function table.
+    run_request_with_expected_output(&server_state, vfs.clone(), "ok-3");
+    run_request_with_expected_output(&server_state, vfs, "ok-3");
 }

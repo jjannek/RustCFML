@@ -10672,6 +10672,17 @@ impl CfmlVirtualMachine {
     /// is purely a reachability collect: no body rewriting, no per-request remap.
     /// Reachability is recomputed each (dirty) request, so abandoned functions
     /// drop out — bounded growth, no stale retention.
+    ///
+    /// The carried set is closed under `DefineFunction`: a stored function's
+    /// bytecode may define nested closures/UDFs at call time (e.g. a CFC method
+    /// whose body does `var f = function(){...}`). Those nested functions are
+    /// referenced only by a `DefineFunction(global_id)` op, never as a stored
+    /// value, so the value walk alone misses them — and on a later request that
+    /// doesn't reload their source file they would be unregistered (the bug a
+    /// warm `application.svc.method()` call would hit). We therefore also scan
+    /// each carried function's instructions for `DefineFunction` targets and
+    /// carry those transitively. Their Arcs are registered this request (their
+    /// program was loaded when the function was first compiled/instantiated).
     fn rehome_application_functions(&mut self) {
         let Some(app_scope) = self.application_scope.clone() else {
             return;
@@ -10683,6 +10694,20 @@ impl CfmlVirtualMachine {
                 Self::collect_app_fn_ids(value, &mut ids, &mut visited);
             }
         });
+        // Transitive `DefineFunction` closure (see doc comment).
+        let mut worklist: Vec<i64> = ids.iter().copied().collect();
+        while let Some(gid) = worklist.pop() {
+            if let Some(arc) = self.resolve_fn(gid) {
+                for op in &arc.instructions {
+                    if let BytecodeOp::DefineFunction(child) = op {
+                        let child = *child as i64;
+                        if ids.insert(child) {
+                            worklist.push(child);
+                        }
+                    }
+                }
+            }
+        }
         // Carry the Arc for every reachable, currently-registered function.
         let mut table = Vec::with_capacity(ids.len());
         for gid in ids {
