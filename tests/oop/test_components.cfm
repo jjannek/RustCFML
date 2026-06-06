@@ -38,5 +38,14 @@ assertTrue("isStruct on component", isStruct(g));
 assertTrue("greet method exists", structKeyExists(g, "greet"));
 assertTrue("getGreeting method exists", structKeyExists(g, "getGreeting"));
 
+// Single-argument createObject("path") shorthand is equivalent to the
+// two-argument createObject("component", "path") form (Lucee/ACF parity).
+gShort = createObject("oop.Greeter");
+assertTrue("single-arg createObject returns an object", isObject(gShort));
+assertTrue("single-arg createObject instance is struct-like", isStruct(gShort));
+assert("single-arg createObject greet works", gShort.init().greet("World"), "Hello, World!");
+assert("single-arg createObject == two-arg name",
+    getMetadata(gShort).name, getMetadata(g).name);
+
 suiteEnd();
 </cfscript>

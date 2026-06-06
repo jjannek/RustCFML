@@ -6905,12 +6905,13 @@ impl CfmlVirtualMachine {
                         fallback_name: &str,
                     ) -> CfmlValue {
                         let mut meta = IndexMap::new();
-                        meta.insert(
-                            "name".to_string(),
-                            s.get("__name")
-                                .cloned()
-                                .unwrap_or(CfmlValue::String(fallback_name.to_string())),
-                        );
+                        let name_val = s
+                            .get("__name")
+                            .cloned()
+                            .unwrap_or(CfmlValue::String(fallback_name.to_string()));
+                        meta.insert("name".to_string(), name_val.clone());
+                        // fullname mirrors getMetadata(): the dotted component path.
+                        meta.insert("fullname".to_string(), name_val);
                         if let Some(chain) = s.get("__extends_chain") {
                             if let CfmlValue::Array(arr) = chain {
                                 if let Some(first) = arr.first() {
@@ -6996,6 +6997,19 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::strukt(IndexMap::new()));
                 }
                 "createobject" => {
+                    // Single-argument shorthand: createObject("comp.path") is
+                    // equivalent to createObject("component", "comp.path")
+                    // (Lucee/ACF parity). Normalize to the two-arg form so the
+                    // shared resolution below handles it; previously a lone
+                    // argument fell through to the trailing `Null` return.
+                    let args = if args.len() == 1 {
+                        vec![
+                            CfmlValue::String("component".to_string()),
+                            args.into_iter().next().unwrap(),
+                        ]
+                    } else {
+                        args
+                    };
                     if args.len() >= 2 {
                         let obj_type = args[0].as_string().to_lowercase();
                         // security.disallowedImports: block component / rust

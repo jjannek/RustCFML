@@ -69,5 +69,21 @@ assertFalse("inherited metadata.name is not 'Anonymous'",
 assert("inherited metadata.name ends with 'Dog'",
     listLast(dmd.name, "."), "Dog");
 
+// ------------------------------------------------------------
+// fullname — the fully-qualified dotted component path. Lucee and
+// Adobe expose `fullname` alongside `name`; frameworks rely on it
+// (Wheels' Mapper.cfc keys its router mix-ins off getMetaData().fullname).
+// getComponentMetadata() exposes the same key.
+// ------------------------------------------------------------
+assertTrue("metadata has .fullname key", structKeyExists(md, "fullname"));
+assertTrue("metadata.fullname is non-empty", len(toString(md.fullname)) > 0);
+assert("metadata.fullname ends with 'Greeter'",
+    listLast(md.fullname, "."), "Greeter");
+
+cmd = getComponentMetadata(g);
+assertTrue("getComponentMetadata has .fullname key", structKeyExists(cmd, "fullname"));
+assert("getComponentMetadata.fullname ends with 'Greeter'",
+    listLast(cmd.fullname, "."), "Greeter");
+
 suiteEnd();
 </cfscript>

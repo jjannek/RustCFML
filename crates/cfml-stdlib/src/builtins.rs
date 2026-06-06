@@ -4502,6 +4502,10 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                 // Extract __name
                 if let Some(name) = s.get("__name") {
                     meta.insert("name".to_string(), name.clone());
+                    // fullname: the fully-qualified dotted component path. Lucee
+                    // and ACF expose both `name` and `fullname`; frameworks read
+                    // it (e.g. Wheels' Mapper.cfc keys mix-ins off .fullname).
+                    meta.insert("fullname".to_string(), name.clone());
                 }
                 // Type
                 meta.insert("type".to_string(), CfmlValue::String("component".to_string()));
