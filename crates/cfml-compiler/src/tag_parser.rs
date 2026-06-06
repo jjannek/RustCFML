@@ -91,8 +91,75 @@ fn extract_tld_element(block_lower: &str, block_orig: &str, element: &str) -> Op
 
 /// Check if source contains CFML tags or CFML comments
 pub fn has_cfml_tags(source: &str) -> bool {
-    let lower = source.to_lowercase();
-    lower.contains("<cf") || lower.contains("</cf") || source.contains("<!---")
+    // Scan for a real CFML tag — `<cf...>`, `</cf...>`, or a `<!--- --->`
+    // comment — while skipping CFScript comments (`/* */`, `//`) and quoted
+    // strings. A `<cf...>` that appears ONLY inside a script comment or string
+    // (e.g. a doc comment in a script-component body, issue #69) must NOT force
+    // the whole file through the template tag preprocessor, which would mangle
+    // the component into __writeText() echoes. Template extensions (.cfm/.css/
+    // …) are tag-parsed unconditionally by callers regardless of this result,
+    // so skipping script comments/strings here only affects script files (.cfc).
+    let b = source.as_bytes();
+    let n = b.len();
+    // `<cf` / `</cf` at byte i, case-insensitive on the c/f.
+    let is_cf_at = |i: usize| -> bool {
+        if i + 2 >= n || b[i] != b'<' {
+            return false;
+        }
+        let (c1, c2) = if b[i + 1] == b'/' {
+            if i + 3 >= n {
+                return false;
+            }
+            (b[i + 2], b[i + 3])
+        } else {
+            (b[i + 1], b[i + 2])
+        };
+        c1.eq_ignore_ascii_case(&b'c') && c2.eq_ignore_ascii_case(&b'f')
+    };
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        // Block comment /* ... */
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        // Line comment // ... to end of line
+        if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            i += 2;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Quoted string ("" / '' escape by doubling the quote)
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n {
+                if b[i] == c {
+                    if i + 1 < n && b[i + 1] == c {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'<' {
+            if source[i..].starts_with("<!---") || is_cf_at(i) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 thread_local! {

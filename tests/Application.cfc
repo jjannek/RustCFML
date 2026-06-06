@@ -13,6 +13,10 @@ component {
     // Map "tags" for any tag-based test includes
     this.mappings["/tags"] = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/";
 
+    // Map "comments" so createObject("component", "comments.BlockCommentTags")
+    // resolves (issue #69 fixture).
+    this.mappings["/comments"] = getDirectoryFromPath(getCurrentTemplatePath()) & "comments/";
+
     // Distinct mapping name (NOT a real webroot subdirectory) used by
     // tags/test_mapping_include.cfm to isolate this.mappings-based cfinclude
     // resolution: a `/wheelsmapprobe/...` include can ONLY be found via this
