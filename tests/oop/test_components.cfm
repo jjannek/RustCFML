@@ -47,5 +47,17 @@ assert("single-arg createObject greet works", gShort.init().greet("World"), "Hel
 assert("single-arg createObject == two-arg name",
     getMetadata(gShort).name, getMetadata(g).name);
 
+// An unresolvable component path throws (Lucee/ACF) rather than silently
+// returning null/an empty struct — across all instantiation forms.
+assertThrows("single-arg createObject of missing component throws", function() {
+    createObject("oop.NoSuchComponentXyz");
+});
+assertThrows("two-arg createObject of missing component throws", function() {
+    createObject("component", "oop.NoSuchComponentXyz");
+});
+assertThrows("new of missing component throws", function() {
+    new oop.NoSuchComponentXyz();
+});
+
 suiteEnd();
 </cfscript>

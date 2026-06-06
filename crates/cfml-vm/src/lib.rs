@@ -3588,8 +3588,17 @@ impl CfmlVirtualMachine {
                                 CfmlValue::String(s) => s.clone(),
                                 _ => class_ref.as_string(),
                             };
-                            self.resolve_component_template(&class_name, &locals)
-                                .unwrap_or(CfmlValue::strukt(IndexMap::new()))
+                            match self.resolve_component_template(&class_name, &locals) {
+                                Some(t) => t,
+                                // Unresolved component path: throw rather than
+                                // instantiate an empty struct (Lucee/ACF parity).
+                                None => {
+                                    return Err(self.wrap_error(CfmlError::runtime(format!(
+                                        "Could not find the component [{}].",
+                                        class_name
+                                    ))))
+                                }
+                            }
                         };
 
                         // Resolve inheritance chain
@@ -7038,6 +7047,12 @@ impl CfmlVirtualMachine {
                                 let instance = self.attach_native_parent(instance)?;
                                 return self.attach_implements_chain(instance, parent_locals);
                             }
+                            // Unresolved component path: throw rather than return
+                            // null silently (Lucee/ACF both raise here).
+                            return Err(CfmlError::runtime(format!(
+                                "Could not find the component [{}].",
+                                comp_name
+                            )));
                         } else if obj_type == "rust" {
                             let class_name = args[1].as_string();
                             let key = class_name.to_lowercase();
