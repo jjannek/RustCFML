@@ -128,6 +128,23 @@ fn closure_fixture() -> HashMap<String, Vec<u8>> {
     files
 }
 
+fn captured_fixture() -> HashMap<String, Vec<u8>> {
+    let mut files = HashMap::new();
+    files.insert(
+        "Application.cfc".to_string(),
+        include_str!("../../../tests/lifecycle/application_function_cache/captured/Application.cfc")
+            .as_bytes()
+            .to_vec(),
+    );
+    files.insert(
+        "index.cfm".to_string(),
+        include_str!("../../../tests/lifecycle/application_function_cache/captured/index.cfm")
+            .as_bytes()
+            .to_vec(),
+    );
+    files
+}
+
 fn sparse_fixture() -> HashMap<String, Vec<u8>> {
     let mut files = HashMap::new();
     files.insert(
@@ -232,4 +249,22 @@ fn warm_request_dispatches_app_scope_method_that_defines_a_closure() {
     // DefineFunction op, which must resolve against the carried function table.
     run_request_with_expected_output(&server_state, vfs.clone(), "ok-3");
     run_request_with_expected_output(&server_state, vfs, "ok-3");
+}
+
+/// Regression: a closure stored DIRECTLY in application scope that captures a
+/// local from onApplicationStart (`var base = 100; application.adder =
+/// function(n){ return n + base; }`) must keep its captured value on WARM
+/// requests. The carried function Arc preserves the closure's captured_scope and
+/// its body resolves by stable global_id, so `application.adder(5)` returns 105
+/// on every request. (Surfaced by a high-load stress test of a complex
+/// Application.cfc; the prior design lost `base` on warm requests — every
+/// request 500'd with "Variable 'base' is undefined".)
+#[test]
+fn warm_request_preserves_captured_scope_of_app_scope_closure() {
+    let vfs: Arc<dyn Vfs> = Arc::new(EmbeddedFs::new(captured_fixture(), VROOT.to_string()));
+    let server_state = ServerState::with_production(false);
+
+    run_request_with_expected_output(&server_state, vfs.clone(), "105"); // cold
+    run_request_with_expected_output(&server_state, vfs.clone(), "105"); // warm
+    run_request_with_expected_output(&server_state, vfs, "105"); // warm
 }
