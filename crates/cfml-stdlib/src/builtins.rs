@@ -1192,6 +1192,67 @@ fn fn_re_replace_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     re_replace_impl(args, true)
 }
 
+/// Expand a CFML reReplace replacement template against one match.
+///
+/// CFML/Lucee/ACF/BoxLang use Perl-style backslash syntax (NOT the regex crate's
+/// `$1`): `\0`..`\9` substitute captured groups (`\0` = whole match), and the
+/// case modifiers `\u`/`\l` upper/lower the next character while `\U`/`\L` apply
+/// to the rest until `\E`. Any other `\X` emits `X` literally, and a bare `$`
+/// is literal (the regex crate would otherwise treat `$name` as a group ref).
+fn expand_cfml_replacement(template: &str, caps: &regex::Captures) -> String {
+    let chars: Vec<char> = template.chars().collect();
+    let n = chars.len();
+    let mut out = String::new();
+    let mut ranged_upper: Option<bool> = None; // \U / \L .. \E
+    let mut oneshot_upper: Option<bool> = None; // \u / \l (next char only)
+
+    // Append `text`, honoring the active case state. A one-shot \u/\l applies to
+    // the first character only; a ranged \U/\L applies until \E.
+    fn emit(out: &mut String, text: &str, ranged: Option<bool>, oneshot: &mut Option<bool>) {
+        for ch in text.chars() {
+            if let Some(up) = oneshot.take() {
+                if up { out.extend(ch.to_uppercase()); } else { out.extend(ch.to_lowercase()); }
+            } else if let Some(up) = ranged {
+                if up { out.extend(ch.to_uppercase()); } else { out.extend(ch.to_lowercase()); }
+            } else {
+                out.push(ch);
+            }
+        }
+    }
+
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '\\' && i + 1 < n {
+            let next = chars[i + 1];
+            i += 2;
+            let mut buf = [0u8; 4];
+            match next {
+                '0'..='9' => {
+                    let g = next as usize - '0' as usize;
+                    let text = caps.get(g).map(|m| m.as_str()).unwrap_or("");
+                    emit(&mut out, text, ranged_upper, &mut oneshot_upper);
+                }
+                'u' => oneshot_upper = Some(true),
+                'l' => oneshot_upper = Some(false),
+                'U' => ranged_upper = Some(true),
+                'L' => ranged_upper = Some(false),
+                'E' => ranged_upper = None,
+                'n' => emit(&mut out, "\n", ranged_upper, &mut oneshot_upper),
+                't' => emit(&mut out, "\t", ranged_upper, &mut oneshot_upper),
+                'r' => emit(&mut out, "\r", ranged_upper, &mut oneshot_upper),
+                // Unknown escape (incl. "\\"): emit the escaped char literally.
+                other => emit(&mut out, other.encode_utf8(&mut buf), ranged_upper, &mut oneshot_upper),
+            }
+        } else {
+            let mut buf = [0u8; 4];
+            emit(&mut out, c.encode_utf8(&mut buf), ranged_upper, &mut oneshot_upper);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn re_replace_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     if args.len() < 3 {
         return Ok(CfmlValue::String(get_str(&args, 0)));
@@ -1207,10 +1268,18 @@ fn re_replace_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
         Err(_) => return Ok(CfmlValue::String(string)),
     };
 
+    // Use a custom replacer so CFML's `\N` backreferences and `\u`/`\l`/`\U`/`\L`
+    // case modifiers are honored (and `$` stays literal).
     if scope == "all" {
-        Ok(CfmlValue::String(re.replace_all(&string, replacement.as_str()).to_string()))
+        Ok(CfmlValue::String(
+            re.replace_all(&string, |caps: &regex::Captures| expand_cfml_replacement(&replacement, caps))
+                .to_string(),
+        ))
     } else {
-        Ok(CfmlValue::String(re.replace(&string, replacement.as_str()).to_string()))
+        Ok(CfmlValue::String(
+            re.replace(&string, |caps: &regex::Captures| expand_cfml_replacement(&replacement, caps))
+                .to_string(),
+        ))
     }
 }
 
