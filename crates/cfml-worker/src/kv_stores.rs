@@ -218,7 +218,6 @@ impl KvBackedApplicationStore {
                         started: false,
                         config: indexmap::IndexMap::new(),
                         app_function_table: Vec::new(),
-                        app_function_ids: std::collections::HashMap::new(),
                         session_storage: None,
                         app_caches: indexmap::IndexMap::new(),
                     },

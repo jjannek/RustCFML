@@ -1,7 +1,23 @@
 //! CFML Code Generator - AST to bytecode
 
 use cfml_compiler::ast::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+
+/// Process-global monotonic counter assigning every compiled `BytecodeFunction`
+/// a unique, stable `global_id`. The id is stable for the lifetime of a cached
+/// program (the VM's bytecode cache reuses the same `Arc`s), so a stored
+/// function reference resolves through the VM's function registry identically on
+/// every request and under any program swap — identity never depends on a
+/// per-request program-table layout, which is what makes the stale-index bug
+/// class (cross-request dispatch and the issue #70 intra-request swap) impossible
+/// by construction.
+static NEXT_GLOBAL_FN_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate the next process-global function id.
+pub fn next_global_fn_id() -> u32 {
+    NEXT_GLOBAL_FN_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// CFML built-in scope names that resolve through the VM's scope chain
 /// rather than the locals map. `<name>.foo` for any of these should NOT
@@ -97,13 +113,11 @@ pub struct BytecodeFunction {
     pub has_default: Vec<bool>,
     pub instructions: Vec<BytecodeOp>,
     pub source_file: Option<String>,
-    /// Stable per-file ordinal: the function's index within the program it was
-    /// compiled into. Deterministic for a given source (compilation order is
-    /// fixed), so `(source_file, name, ordinal)` is a stable, serialization-safe
-    /// identity for a function — used as the re-homing key for the per-application
-    /// stable function table (see `ApplicationState::app_function_table`). The
-    /// `__main__` entry is ordinal 0.
-    pub ordinal: u32,
+    /// Process-global, stable identity (see [`next_global_fn_id`]). Stored
+    /// function references and `DefineFunction` ops carry this id; the VM
+    /// resolves it through a dense per-request function registry, so dispatch
+    /// never depends on the volatile per-request `program.functions` layout.
+    pub global_id: u32,
     /// Lucee `localMode` for this function. `Some(true)` = modern (unscoped
     /// writes stay in `local`), `Some(false)` = classic (unscoped writes go
     /// to `variables`/`__variables`). `None` = inherit at runtime from the
@@ -248,7 +262,7 @@ pub enum BytecodeOp {
     NewObjectNamed(Vec<String>, usize),
 
     // Function definition
-    DefineFunction(usize), // Index into program.functions
+    DefineFunction(usize), // BytecodeFunction.global_id (resolved via the VM's fn_registry)
 
     // Postfix ops
     Increment(String),  // Increment variable (+1)
@@ -330,7 +344,7 @@ impl CfmlCompiler {
                     has_default: Vec::new(),
                     instructions: Vec::new(),
                     source_file: None,
-                    ordinal: 0,
+                    global_id: next_global_fn_id(),
                     declared_local_mode: None,
                 })],
             },
@@ -2027,15 +2041,16 @@ impl CfmlCompiler {
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
             source_file: self.source_file.clone(),
-            ordinal: self.program.functions.len() as u32,
+            global_id: next_global_fn_id(),
             declared_local_mode: declared_mode,
         };
 
-        let func_idx = self.program.functions.len();
+        let global_id = bc_func.global_id as usize;
         self.program.functions.push(Arc::new(bc_func));
 
-        // Define the function in current scope
-        instructions.push(BytecodeOp::DefineFunction(func_idx));
+        // Define the function in current scope. The op carries the function's
+        // process-stable global_id, resolved by the VM through its registry.
+        instructions.push(BytecodeOp::DefineFunction(global_id));
         instructions.push(BytecodeOp::StoreLocal(func.name.clone()));
     }
 
@@ -2221,12 +2236,12 @@ impl CfmlCompiler {
                         BytecodeOp::Return,
                     ],
                     source_file: self.source_file.clone(),
-                    ordinal: self.program.functions.len() as u32,
+                    global_id: next_global_fn_id(),
                     declared_local_mode: None,
                 };
-                let getter_idx = self.program.functions.len();
                 self.program.functions.push(Arc::new(getter_func));
-                instructions.push(BytecodeOp::DefineFunction(getter_idx));
+                let getter_gid = self.program.functions.last().unwrap().global_id as usize;
+                instructions.push(BytecodeOp::DefineFunction(getter_gid));
                 // Stack: [getter_func]
 
                 // Add getter to component: component[getter_name] = getter_func
@@ -2265,12 +2280,12 @@ impl CfmlCompiler {
                         BytecodeOp::Return,
                     ],
                     source_file: self.source_file.clone(),
-                    ordinal: self.program.functions.len() as u32,
+                    global_id: next_global_fn_id(),
                     declared_local_mode: None,
                 };
-                let setter_idx = self.program.functions.len();
                 self.program.functions.push(Arc::new(setter_func));
-                instructions.push(BytecodeOp::DefineFunction(setter_idx));
+                let setter_gid = self.program.functions.last().unwrap().global_id as usize;
+                instructions.push(BytecodeOp::DefineFunction(setter_gid));
                 // Stack: [setter_func]
 
                 // Add setter to component (same pattern)
@@ -2998,13 +3013,13 @@ impl CfmlCompiler {
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
                     source_file: self.source_file.clone(),
-                    ordinal: self.program.functions.len() as u32,
+                    global_id: next_global_fn_id(),
                     declared_local_mode: effective_declared,
                 };
 
-                let func_idx = self.program.functions.len();
+                let global_id = bc_func.global_id as usize;
                 self.program.functions.push(Arc::new(bc_func));
-                instructions.push(BytecodeOp::DefineFunction(func_idx));
+                instructions.push(BytecodeOp::DefineFunction(global_id));
                 self.current_fn_local_mode = prev_fn_local_mode;
             }
             Expression::ArrowFunction(arrow) => {
@@ -3042,13 +3057,13 @@ impl CfmlCompiler {
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
                     source_file: self.source_file.clone(),
-                    ordinal: self.program.functions.len() as u32,
+                    global_id: next_global_fn_id(),
                     declared_local_mode: arrow_effective,
                 };
 
-                let func_idx = self.program.functions.len();
+                let global_id = bc_func.global_id as usize;
                 self.program.functions.push(Arc::new(bc_func));
-                instructions.push(BytecodeOp::DefineFunction(func_idx));
+                instructions.push(BytecodeOp::DefineFunction(global_id));
                 self.current_fn_local_mode = prev_fn_local_mode;
             }
             Expression::This(_) => {

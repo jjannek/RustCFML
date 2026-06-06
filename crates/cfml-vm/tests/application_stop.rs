@@ -143,11 +143,7 @@ fn application_stop_clears_shared_application_state() {
     );
     assert!(
         stopped_app.app_function_table.is_empty(),
-        "applicationStop() must discard the stable function table"
-    );
-    assert!(
-        stopped_app.app_function_ids.is_empty(),
-        "applicationStop() must discard the function-table id index"
+        "applicationStop() must discard the carried function table"
     );
 
     // The next request must re-fire onApplicationStart, producing a brand-new

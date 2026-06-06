@@ -32,48 +32,17 @@ pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 /// immediately.
 const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
 
-/// Tag base for stored-function bodies that reference the per-application stable
-/// function table (`ApplicationState::app_function_table` /
-/// `CfmlVirtualMachine::app_function_table`) rather than the volatile
-/// per-request `self.program.functions`. A `CfmlClosureBody::Expression(Int(n))`
-/// with `n >= APP_FN_TAG_BASE` means "app-table id `n - APP_FN_TAG_BASE`"; any
-/// smaller `n` is an ordinary program-table index. The base is chosen far above
-/// any plausible program function count so the two ranges never collide, while
-/// staying well inside `i64` so the existing `CfmlValue::Int` encoding is reused
-/// unchanged (no new value variant, no serialization change). Decoding is a
-/// single compare + branch — no hashing on the dispatch hot path.
-const APP_FN_TAG_BASE: i64 = 1 << 48;
-
-/// Encode a stable application-table id into a stored-function body integer.
-#[inline]
-fn encode_app_fn_id(app_id: usize) -> i64 {
-    APP_FN_TAG_BASE + app_id as i64
-}
-
-/// If `body_int` is an app-table-tagged id, return the app id; else `None`
-/// (it is an ordinary program-table index).
-#[inline]
-fn decode_app_fn_id(body_int: i64) -> Option<usize> {
-    if body_int >= APP_FN_TAG_BASE {
-        Some((body_int - APP_FN_TAG_BASE) as usize)
-    } else {
-        None
-    }
-}
-
-/// Serialization-stable identity for a bytecode function: `(source_file, name,
-/// ordinal)`. Deterministic for a given source, so re-homing the same function
-/// twice (this request or a later one) maps to the same `app_id`, and a worker
-/// isolate can rebuild the table from cached bytecode. `source_file` is `None`
-/// only for in-memory/CLI compiles and `__main__`, neither of which is ever
-/// re-homed from application scope.
-fn bytecode_fn_key(f: &BytecodeFunction) -> (String, String, u32) {
-    (
-        f.source_file.clone().unwrap_or_default(),
-        f.name.clone(),
-        f.ordinal,
-    )
-}
+/// A stored `CfmlValue::Function` body is `CfmlClosureBody::Expression(Int(n))`
+/// where `n` is the target function's process-stable `BytecodeFunction.global_id`
+/// (see `cfml_codegen::compiler::next_global_fn_id`). `DefineFunction` ops carry
+/// the same id. The VM resolves it through the dense per-request `fn_registry`
+/// (`CfmlVirtualMachine::resolve_fn`) with an O(1) array index — no hashing, and
+/// independent of the volatile `self.program` layout. This is the single function
+/// identity scheme: there are no program-relative indices in stored bodies or ops
+/// any more, so the stale-index bug class (cross-request dispatch and the issue
+/// #70 intra-request program swap) cannot occur by construction. A non-`Int`
+/// body (e.g. `Null` for native/intercepted functions) simply isn't a UDF
+/// reference and dispatches by name.
 
 /// Persistent application state, keyed by app name.
 #[derive(Clone)]
@@ -82,19 +51,15 @@ pub struct ApplicationState {
     pub variables: IndexMap<String, CfmlValue>,
     pub started: bool,
     pub config: IndexMap<String, CfmlValue>,
-    /// Stable per-application function table (Option A of the stable-function-
-    /// identity redesign). Append-only and monotonic: once a function reachable
-    /// from application scope is re-homed here it keeps its `app_id` (its index
-    /// in this Vec) for the lifetime of the application, surviving page-program
-    /// rebuilds and program swaps. Stored `CfmlValue::Function` bodies that have
-    /// been re-homed encode `APP_FN_TAG_BASE + app_id` instead of a volatile
-    /// per-request program index, so dispatch never needs a per-request remap.
+    /// Functions reachable from application scope, carried across requests so a
+    /// long-lived CFC instance / factory / closure stays resolvable even on a
+    /// request that doesn't reload its source file. At request start these `Arc`s
+    /// are registered into the VM's `fn_registry` by their stable `global_id`,
+    /// which is the single function identity stored bodies carry — so dispatch
+    /// never depends on a per-request program-table layout (no append, no remap).
+    /// Recomputed from reachability each request that defines a function, so it
+    /// stays bounded (abandoned functions drop out).
     pub app_function_table: Vec<std::sync::Arc<cfml_codegen::compiler::BytecodeFunction>>,
-    /// `(source_file, name, ordinal) -> app_id` index over `app_function_table`.
-    /// The key is the serialization-stable identity (Option B's key) so re-homing
-    /// the same function twice is idempotent and a worker isolate can rebuild the
-    /// table deterministically from cached bytecode.
-    pub app_function_ids: HashMap<(String, String, u32), usize>,
     /// Value of `this.sessionStorage` from Application.cfc — name of the cache to use
     /// for session storage. Overrides the server-wide `.cfconfig.json` setting.
     pub session_storage: Option<String>,
@@ -693,45 +658,21 @@ pub struct CfmlVirtualMachine {
     pub app_local_mode_modern: bool,
     /// Stack for nested body-mode custom tags
     custom_tag_stack: Vec<CustomTagState>,
-    /// Dedup cache for the per-request function-table merge performed on CFC
-    /// instantiation and cfinclude. Maps a resolved source-file path to the
-    /// `program.functions` base offset where that file's functions were first
-    /// merged. Subsequent instantiations/includes of the same file reuse the
-    /// offset instead of re-appending the functions, which otherwise grows
-    /// `program.functions` unbounded within a request (see CFC `new`/include
-    /// in a loop).
-    merged_file_offsets: HashMap<String, usize>,
-    /// Number of nested program swaps currently active (CFC load, include,
-    /// custom-tag template, Application.cfc). A merge may only consult/populate
-    /// `merged_file_offsets` when this is 1 — i.e. the program being merged
-    /// into is the request's top-level program. Merges performed deeper in the
-    /// stack (e.g. a parent CFC resolved while loading a child) target a
-    /// temporary sub-program, so their offsets are not stable and must not be
-    /// cached.
-    program_swap_depth: usize,
-    /// Stack of programs swapped OUT by an active swap site (cfinclude, CFC
-    /// load, custom-tag/cfmodule, Application.cfc). Entry 0 is the request's
-    /// top-level (root) program; later entries are nested swaps (LIFO). While a
-    /// sub-program is active in `self.program`, a `user_functions`-registered
-    /// function (e.g. a CFC method) may run whose body carries a
-    /// `DefineFunction(idx)` baked against the program it was MERGED into. A
-    /// merge folds functions into whichever program was active when the owner
-    /// (CFC / included file) loaded — the nearest enclosing swap, NOT
-    /// necessarily the root (e.g. a CFC `new`ed inside an include merges into
-    /// that include's sub-program). That `idx` is out of bounds for the tiny
-    /// swapped-in sub-program, so `resolve_define_function_target` probes this
-    /// stack INNERMOST-first (nearest enclosing down to root) to find the
-    /// program that actually owns the index — root-first would risk matching a
-    /// different function that happens to occupy that slot in an outer program.
-    /// Maintained by `push_program_swap`/`pop_program_swap`.
-    program_swap_stack: Vec<BytecodeProgram>,
-    /// Per-request handle on the application's stable function table
-    /// (`ApplicationState::app_function_table`). Loaded by-reference (Arc clones)
-    /// at request start. A stored `CfmlValue::Function` whose body encodes
-    /// `APP_FN_TAG_BASE + app_id` dispatches through this Vec instead of the
-    /// volatile `self.program.functions`, so its identity is stable across page
-    /// rebuilds and program swaps with no per-request remap.
+    /// Per-request handle on the application's carried function table
+    /// (`ApplicationState::app_function_table`). At request start these Arcs are
+    /// registered into `fn_registry` by global_id so an application-scope
+    /// function whose source file isn't reloaded this request still resolves.
     app_function_table: Vec<Arc<BytecodeFunction>>,
+    /// Dense per-request function registry, indexed by `BytecodeFunction.global_id`.
+    /// Populated as programs become reachable (root program at construction, every
+    /// `push_program_swap`, and the carried `app_function_table` at request start).
+    /// Every stored `CfmlValue::Function` body and every `DefineFunction` op carries
+    /// a `global_id`; dispatch resolves it here with an O(1) index — no hashing, and
+    /// independent of the volatile `self.program` layout, so cross-request dispatch
+    /// and the issue #70 intra-request swap are both correct by construction. Sized
+    /// to the max `global_id` seen, i.e. the app's distinct-function count (cached
+    /// programs reuse ids), not per-request growth.
+    fn_registry: Vec<Option<Arc<BytecodeFunction>>>,
     /// Set whenever a `DefineFunction` op runs during a request. A new
     /// `CfmlValue::Function` can ONLY be born via that op (closures, arrows,
     /// component methods, and function references all compile to it), so if it
@@ -957,7 +898,7 @@ struct CustomTagState {
 
 impl CfmlVirtualMachine {
     pub fn new(program: BytecodeProgram) -> Self {
-        Self {
+        let mut vm = Self {
             program,
             globals: IndexMap::new(),
             builtins: HashMap::new(),
@@ -1010,10 +951,8 @@ impl CfmlVirtualMachine {
             custom_tag_paths: Vec::new(),
             app_local_mode_modern: false,
             custom_tag_stack: Vec::new(),
-            merged_file_offsets: HashMap::new(),
-            program_swap_depth: 0,
-            program_swap_stack: Vec::new(),
             app_function_table: Vec::new(),
+            fn_registry: Vec::new(),
             app_fn_table_dirty: false,
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
@@ -1038,7 +977,45 @@ impl CfmlVirtualMachine {
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
             cancel_flag: None,
+        };
+        // Register the root program's functions so stored references and
+        // DefineFunction ops resolve by global_id from the first instruction.
+        let root = vm.program.clone();
+        vm.register_program_fns(&root);
+        vm
+    }
+
+    /// Register every function in `prog` into `fn_registry` by its `global_id`
+    /// (idempotent — a cached program registers the same Arc into the same slot).
+    /// Grows the registry as needed; ids are dense across a process so the Vec
+    /// stays sized to the app's distinct-function count.
+    fn register_program_fns(&mut self, prog: &BytecodeProgram) {
+        for f in &prog.functions {
+            self.register_fn(f);
         }
+    }
+
+    /// Register a single function Arc into `fn_registry` by its `global_id`.
+    fn register_fn(&mut self, f: &Arc<BytecodeFunction>) {
+        let id = f.global_id as usize;
+        if id >= self.fn_registry.len() {
+            self.fn_registry.resize(id + 1, None);
+        }
+        if self.fn_registry[id].is_none() {
+            self.fn_registry[id] = Some(Arc::clone(f));
+        }
+    }
+
+    /// Resolve a `global_id` to its `BytecodeFunction` via the dense registry.
+    /// O(1), no hashing, independent of the active `self.program`.
+    #[inline]
+    fn resolve_fn(&self, global_id: i64) -> Option<Arc<BytecodeFunction>> {
+        if global_id < 0 {
+            return None;
+        }
+        self.fn_registry
+            .get(global_id as usize)
+            .and_then(|slot| slot.clone())
     }
 
     /// Overlay `.cfconfig.json` runtime knobs onto a freshly-constructed VM.
@@ -1556,65 +1533,22 @@ impl CfmlVirtualMachine {
         self.execute_function_with_args(&func, args, None)
     }
 
-    /// Swap `new_program` into `self.program`, recording the displaced program
-    /// on `program_swap_stack` (and bumping `program_swap_depth`). Returns the
-    /// new program's `__main__` Arc for the caller to execute. Pair every call
-    /// with exactly one `pop_program_swap`, which restores the displaced
-    /// program. Keeping the displaced programs reachable lets
-    /// `resolve_define_function_target` find the program that owns a
-    /// `DefineFunction` index when a previously-merged function runs while a
-    /// smaller sub-program is swapped in (issue #70).
+    /// Swap `new_program` into `self.program`, registering its functions into
+    /// `fn_registry` by global_id (so they resolve regardless of which program
+    /// is active), and return the displaced program for the caller to restore.
+    /// Pair every call with exactly one `pop_program_swap`. Because function
+    /// identity is the program-independent global_id, the VM no longer needs to
+    /// track a stack of displaced programs to resolve `DefineFunction` ops —
+    /// that was the issue #70 workaround, now obsolete by construction.
     fn push_program_swap(&mut self, new_program: BytecodeProgram) -> BytecodeProgram {
-        let old = std::mem::replace(&mut self.program, new_program);
-        self.program_swap_depth += 1;
-        // Push a CHEAP placeholder; the real displaced program is returned to
-        // the caller (it owns the merge logic). The stack only needs read
-        // access to each enclosing program for index resolution, so we store a
-        // shallow clone of the function-table Arcs (refcount bumps, not deep
-        // copies of the bytecode).
-        self.program_swap_stack.push(BytecodeProgram {
-            functions: old.functions.clone(),
-        });
-        old
+        self.register_program_fns(&new_program);
+        std::mem::replace(&mut self.program, new_program)
     }
 
     /// Undo the most recent `push_program_swap`, restoring `restored` as the
-    /// active program. (The caller owns `restored` because it may have merged
-    /// the sub-program's functions into it first.)
+    /// active program.
     fn pop_program_swap(&mut self, restored: BytecodeProgram) {
-        self.program_swap_stack.pop();
         self.program = restored;
-        self.program_swap_depth -= 1;
-    }
-
-    /// Resolve the `BytecodeFunction` that a `DefineFunction(func_idx)` op
-    /// refers to. Normally `func_idx` indexes the active `self.program`. But
-    /// when a function that was merged into an enclosing program runs while a
-    /// smaller sub-program is swapped in (CFC method dispatched by name during
-    /// a cfinclude / custom tag / cfmodule body), `func_idx` is out of bounds
-    /// for `self.program`. The op's index is valid against the program the
-    /// function was MERGED INTO — which is the program that was active when the
-    /// function's owner (CFC / included file) was loaded, i.e. the nearest
-    /// enclosing swap, NOT necessarily the request root. Example: a CFC `new`ed
-    /// inside an included file merges its methods into that file's sub-program,
-    /// so its closures' indices are valid against that inner program. Probe the
-    /// swap stack INNERMOST-first (top of stack down to root) and take the
-    /// first program whose table contains the index. Returns `None` only if no
-    /// reachable program owns the index (should be impossible for well-formed
-    /// bytecode).
-    fn resolve_define_function_target(&self, func_idx: usize) -> Option<Arc<BytecodeFunction>> {
-        if func_idx < self.program.functions.len() {
-            return Some(Arc::clone(&self.program.functions[func_idx]));
-        }
-        // Innermost-first: the last-pushed enclosing program is the nearest
-        // ancestor and the most likely owner of a freshly-merged function's
-        // child closures.
-        for prog in self.program_swap_stack.iter().rev() {
-            if func_idx < prog.functions.len() {
-                return Some(Arc::clone(&prog.functions[func_idx]));
-            }
-        }
-        None
     }
 
     /// Restore output-capture state when an exception is caught by `handler`.
@@ -1949,12 +1883,6 @@ impl CfmlVirtualMachine {
                         // Capture the current scope so the function retains access to its
                         // defining scope's variables when stored in a struct and called later.
                         // Filter out Function values to avoid recursive reference chains.
-                        let func_idx = self
-                            .program
-                            .functions
-                            .iter()
-                            .position(|f| f.name == bc_func.name)
-                            .unwrap_or(0);
                         let filtered: IndexMap<String, CfmlValue> = locals
                             .iter()
                             .filter(|(_, v)| !matches!(v, CfmlValue::Function(_)))
@@ -1979,7 +1907,7 @@ impl CfmlVirtualMachine {
                                 })
                                 .collect(),
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
-                                CfmlValue::Int(func_idx as i64),
+                                CfmlValue::Int(bc_func.global_id as i64),
                             )),
                             return_type: None,
                             access: cfml_common::dynamic::CfmlAccess::Public,
@@ -2339,13 +2267,11 @@ impl CfmlVirtualMachine {
                         // For user functions, find the bytecode index and capture the
                         // current scope so the function retains access to its defining
                         // scope's variables when stored in a struct and called later.
-                        let (body_val, scope) = if self.user_functions.contains_key(name.as_str()) {
-                            let func_idx =
-                                self.program.functions.iter().position(|f| f.name == *name);
-                            match func_idx {
-                                Some(idx) => (CfmlValue::Int(idx as i64), None),
-                                None => (CfmlValue::Null, None),
-                            }
+                        let (body_val, scope) = if let Some(uf) =
+                            self.user_functions.get(name.as_str())
+                        {
+                            // Reference the function by its stable global_id.
+                            (CfmlValue::Int(uf.global_id as i64), None)
                         } else {
                             (CfmlValue::Null, None)
                         };
@@ -2397,22 +2323,17 @@ impl CfmlVirtualMachine {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        // For user functions (CI match), find bytecode index and capture scope
-                        let (body_val, scope, resolved_name) = if let Some(uf_name) = self
+                        // For user functions (CI match), reference by stable global_id.
+                        let (body_val, scope, resolved_name) = if let Some((uf_name, uf)) = self
                             .user_functions
-                            .keys()
-                            .find(|k| k.to_lowercase() == name_lower)
-                            .cloned()
+                            .iter()
+                            .find(|(k, _)| k.to_lowercase() == name_lower)
                         {
-                            let func_idx = self
-                                .program
-                                .functions
-                                .iter()
-                                .position(|f| f.name.to_lowercase() == name_lower);
-                            match func_idx {
-                                Some(idx) => (CfmlValue::Int(idx as i64), None, uf_name),
-                                None => (CfmlValue::Null, None, uf_name),
-                            }
+                            (
+                                CfmlValue::Int(uf.global_id as i64),
+                                None,
+                                uf_name.clone(),
+                            )
                         } else {
                             (CfmlValue::Null, None, canonical)
                         };
@@ -3837,24 +3758,23 @@ impl CfmlVirtualMachine {
                     }
                 }
 
-                BytecodeOp::DefineFunction(func_idx) => {
-                    let func_idx = *func_idx;
+                BytecodeOp::DefineFunction(global_id) => {
+                    let global_id = *global_id as i64;
                     // A new function value is being created this request, so the
                     // end-of-request re-homing walk has potential work to do.
                     self.app_fn_table_dirty = true;
-                    // Resolve the target function Arc. `func_idx` indexes the
-                    // active program in the common case, but when a previously
-                    // merged function (e.g. a CFC method dispatched by name)
-                    // runs while a smaller sub-program is swapped in, the index
-                    // is out of bounds for `self.program` and must be resolved
-                    // against the enclosing program that owns it (issue #70).
-                    let bc_func_arc = match self.resolve_define_function_target(func_idx) {
+                    // Resolve the target function by its process-stable global_id
+                    // through the registry. This is independent of the active
+                    // `self.program`, so a previously-merged function (e.g. a CFC
+                    // method dispatched by name) that defines a closure while a
+                    // smaller sub-program is swapped in resolves correctly by
+                    // construction — issue #70 cannot recur.
+                    let bc_func_arc = match self.resolve_fn(global_id) {
                         Some(arc) => arc,
                         None => {
                             return Err(self.wrap_error(CfmlError::runtime(format!(
-                                "Internal error: DefineFunction index {} out of bounds (active program has {} functions, no enclosing program owns it)",
-                                func_idx,
-                                self.program.functions.len()
+                                "Internal error: DefineFunction global_id {} is not registered",
+                                global_id
                             ))));
                         }
                     };
@@ -3913,7 +3833,7 @@ impl CfmlVirtualMachine {
                             })
                             .collect(),
                         body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
-                            CfmlValue::Int(func_idx as i64),
+                            CfmlValue::Int(global_id),
                         )),
                         return_type: None,
                         access: cfml_common::dynamic::CfmlAccess::Public,
@@ -4116,9 +4036,7 @@ impl CfmlVirtualMachine {
                                 // Super dispatch — find the parent's function by stored index
                                 let prop = object.get(&method_name).unwrap_or(CfmlValue::Null);
                                 if let CfmlValue::Function(ref f) = &prop {
-                                    // Extract stored bytecode id from function body
-                                    // (raw i64: may be an APP_FN_TAG_BASE-tagged
-                                    // stable id or an ordinary program index).
+                                    // Extract the stored global_id from the body.
                                     let func_idx =
                                         if let cfml_common::dynamic::CfmlClosureBody::Expression(
                                             ref body,
@@ -4161,20 +4079,12 @@ impl CfmlVirtualMachine {
                                     } else {
                                         method_locals.insert("this".to_string(), object.clone());
                                     }
-                                    // Execute directly by id to avoid name
-                                    // collision. App-tagged ids resolve against
-                                    // the stable per-application table; program
-                                    // indices keep exact prior semantics (an
-                                    // out-of-bounds index falls through to the
-                                    // by-name dispatch).
+                                    // Execute directly by global_id to avoid a
+                                    // name collision with the child's override;
+                                    // resolved through the registry, independent
+                                    // of the active program.
                                     self.closure_parent_writeback = None;
-                                    let parent_func = func_idx.and_then(|i| {
-                                        if let Some(app_id) = decode_app_fn_id(i) {
-                                            self.app_function_table.get(app_id).map(Arc::clone)
-                                        } else {
-                                            self.program.functions.get(i as usize).map(Arc::clone)
-                                        }
-                                    });
+                                    let parent_func = func_idx.and_then(|i| self.resolve_fn(i));
                                     let call_result = if let Some(parent_func) = parent_func {
                                         self.execute_function_with_args(
                                             &parent_func,
@@ -4590,7 +4500,7 @@ impl CfmlVirtualMachine {
                     let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
                     match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
                         Ok(sub_program) => {
-                            let mut old_program = self.push_program_swap(sub_program);
+                            let old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
                             self.source_file = Some(resolved.clone());
                             let main_idx = self
@@ -4635,87 +4545,15 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            // Merge included sub-program's non-main functions into old_program
-                            // so that func_idx references (from DefineFunction) remain valid.
-                            // The same included file is merged only once per request: on the
-                            // first include its functions are appended at `base_idx` and the
-                            // offset is cached. Re-including the same file reuses the cached
-                            // offset instead of re-appending (which would otherwise grow
-                            // `program.functions` linearly with the include count). The cache
-                            // is only consulted at the top level (program_swap_depth == 1);
-                            // a nested include merges into a temporary sub-program, so its
-                            // offset is not stable and must not be cached or reused.
-                            let use_cache = self.program_swap_depth == 1;
-                            let sub_func_count = self.program.functions.len();
-                            let cached_base = if use_cache {
-                                self.merged_file_offsets.get(&resolved).copied()
-                            } else {
-                                None
-                            };
-                            let first_merge = cached_base.is_none();
-                            let base_idx = match cached_base {
-                                Some(b) => b,
-                                None => {
-                                    let base = old_program.functions.len();
-                                    for i in 0..sub_func_count {
-                                        if self.program.functions[i].name != "__main__" {
-                                            old_program
-                                                .functions
-                                                .push(self.program.functions[i].clone());
-                                        }
-                                    }
-                                    if use_cache {
-                                        self.merged_file_offsets.insert(resolved.clone(), base);
-                                    }
-                                    base
-                                }
-                            };
-                            // Fix func_idx in any CfmlFunction values stored in locals
-                            // that were created by DefineFunction in the include.
-                            // Sub-program index i → old_program index (base_idx + i - 1)
-                            // (subtract 1 because __main__ at index 0 was skipped).
-                            // This runs on every include because the include body produces
-                            // fresh sub-program-relative Function values in locals/globals
-                            // each time; the offset is stable thanks to the merge cache.
-                            if base_idx > 0 && sub_func_count > 1 {
-                                let offset = base_idx - 1; // -1 because __main__ was skipped
-                                for (_, v) in locals.iter_mut() {
-                                    Self::fixup_included_func_indices(v, base_idx, sub_func_count);
-                                }
-                                for (_, v) in self.globals.iter_mut() {
-                                    Self::fixup_included_func_indices(v, base_idx, sub_func_count);
-                                }
-                                // The DefineFunction bytecode inside the merged functions and
-                                // the user_functions Arc rewiring only need fixing once, when
-                                // the functions are first appended.
-                                if first_merge {
-                                    // Also fix DefineFunction bytecode instructions inside the
-                                    // merged functions — they still reference sub-program indices.
-                                    for fi in base_idx..old_program.functions.len() {
-                                        let func = Arc::make_mut(&mut old_program.functions[fi]);
-                                        for op in func.instructions.iter_mut() {
-                                            if let BytecodeOp::DefineFunction(ref mut idx) = op {
-                                                if *idx > 0 && *idx < sub_func_count {
-                                                    *idx += offset;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Update user_functions entries — they shared the
-                                    // sub-program's Arcs, which still have pre-fixup indices.
-                                    // Point them at the fixed Arcs from old_program so that
-                                    // subsequent calls see the corrected DefineFunction indices.
-                                    for fi in base_idx..old_program.functions.len() {
-                                        let name = old_program.functions[fi].name.clone();
-                                        if self.user_functions.contains_key(&name) {
-                                            self.user_functions.insert(
-                                                name,
-                                                Arc::clone(&old_program.functions[fi]),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            // Functions defined in the included file are already
+                            // resolvable after the swap is popped: each was
+                            // registered into `fn_registry` by its global_id when
+                            // the sub-program was swapped in, and named ones were
+                            // inserted into `user_functions` by their DefineFunction
+                            // op. Stored Function values created in the include
+                            // carry the same stable global_id. So no merge-append
+                            // or index fixup is needed (those existed only to keep
+                            // the old program-relative indices valid).
                             self.pop_program_swap(old_program);
                             self.source_file = old_source;
                             // Propagate include errors through try-catch
@@ -4780,7 +4618,7 @@ impl CfmlVirtualMachine {
                     let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
                     match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
                         Ok(sub_program) => {
-                            let mut old_program = self.push_program_swap(sub_program);
+                            let old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
                             self.source_file = Some(resolved.clone());
                             let main_idx = self
@@ -4813,68 +4651,10 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            // Same merge-dedup as the static-include path: cache the
-                            // merge offset per file at the top level so repeated dynamic
-                            // includes of the same file don't grow program.functions.
-                            let use_cache = self.program_swap_depth == 1;
-                            let sub_func_count = self.program.functions.len();
-                            let cached_base = if use_cache {
-                                self.merged_file_offsets.get(&resolved).copied()
-                            } else {
-                                None
-                            };
-                            let first_merge = cached_base.is_none();
-                            let base_idx = match cached_base {
-                                Some(b) => b,
-                                None => {
-                                    let base = old_program.functions.len();
-                                    for i in 0..sub_func_count {
-                                        if self.program.functions[i].name != "__main__" {
-                                            old_program
-                                                .functions
-                                                .push(self.program.functions[i].clone());
-                                        }
-                                    }
-                                    if use_cache {
-                                        self.merged_file_offsets.insert(resolved.clone(), base);
-                                    }
-                                    base
-                                }
-                            };
-                            if base_idx > 0 && sub_func_count > 1 {
-                                let offset = base_idx - 1;
-                                for (_, v) in locals.iter_mut() {
-                                    Self::fixup_included_func_indices(v, base_idx, sub_func_count);
-                                }
-                                for (_, v) in self.globals.iter_mut() {
-                                    Self::fixup_included_func_indices(v, base_idx, sub_func_count);
-                                }
-                                if first_merge {
-                                    // Fix DefineFunction bytecode indices in merged functions
-                                    for fi in base_idx..old_program.functions.len() {
-                                        let func = Arc::make_mut(&mut old_program.functions[fi]);
-                                        for op in func.instructions.iter_mut() {
-                                            if let BytecodeOp::DefineFunction(ref mut idx) = op {
-                                                if *idx > 0 && *idx < sub_func_count {
-                                                    *idx += offset;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Update user_functions entries with fixed bytecode.
-                                    // Share the Arc with the (now fixed) old_program entry
-                                    // rather than deep-cloning.
-                                    for fi in base_idx..old_program.functions.len() {
-                                        let name = old_program.functions[fi].name.clone();
-                                        if self.user_functions.contains_key(&name) {
-                                            self.user_functions.insert(
-                                                name,
-                                                Arc::clone(&old_program.functions[fi]),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            // No merge-append or index fixup needed: the dynamic
+                            // include's functions are already registered by global_id
+                            // (sub-program swap-in) and by name (DefineFunction), and
+                            // stored Function values carry stable global_ids.
                             self.pop_program_swap(old_program);
                             self.source_file = old_source;
                             if let Err(e) = result {
@@ -5154,27 +4934,14 @@ impl CfmlVirtualMachine {
                     )));
                 }
             }
-            // Fast path: if the function has a stored bytecode index, dispatch directly
-            // (skips all builtin matching for user-defined functions)
+            // Fast path: if the function carries a stored global_id, dispatch
+            // directly (skips all builtin matching for user-defined functions).
+            // Resolution is an O(1) registry index — no hashing — and independent
+            // of the active program; an unregistered id yields `None` and falls
+            // through to the by-name dispatch below.
             if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = func.body {
                 if let CfmlValue::Int(idx) = body.as_ref() {
-                    // Resolve the target. An `APP_FN_TAG_BASE`-tagged id indexes
-                    // the stable per-application table; otherwise it is an
-                    // ordinary per-request program index (unchanged: an
-                    // out-of-bounds program index yields `None` and falls through
-                    // to the by-name dispatch below). A single compare on the hot
-                    // path — no hashing.
-                    let resolved = if let Some(app_id) = decode_app_fn_id(*idx) {
-                        self.app_function_table.get(app_id).map(Arc::clone)
-                    } else {
-                        let pidx = *idx as usize;
-                        if pidx < self.program.functions.len() {
-                            Some(Arc::clone(&self.program.functions[pidx]))
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(user_func) = resolved {
+                    if let Some(user_func) = self.resolve_fn(*idx) {
                         // Handle closure scope merging
                         let effective_locals;
                         let effective_parent = if let Some(ref shared_env) = func.captured_scope {
@@ -7480,16 +7247,10 @@ impl CfmlVirtualMachine {
                                         ) = f.body
                                         {
                                             if let CfmlValue::Int(idx) = body.as_ref() {
-                                                // App-tagged id -> stable table;
-                                                // else program index (unchanged).
-                                                let bf = if let Some(app_id) =
-                                                    decode_app_fn_id(*idx)
-                                                {
-                                                    self.app_function_table.get(app_id)
-                                                } else {
-                                                    self.program.functions.get(*idx as usize)
-                                                };
-                                                bf.map(|f| f.params.clone()).unwrap_or_default()
+                                                // Resolve params by global_id via the registry.
+                                                self.resolve_fn(*idx)
+                                                    .map(|f| f.params.clone())
+                                                    .unwrap_or_default()
                                             } else {
                                                 Vec::new()
                                             }
@@ -7603,16 +7364,10 @@ impl CfmlVirtualMachine {
                                         ) = f.body
                                         {
                                             if let CfmlValue::Int(idx) = body.as_ref() {
-                                                // App-tagged id -> stable table;
-                                                // else program index (unchanged).
-                                                let bf = if let Some(app_id) =
-                                                    decode_app_fn_id(*idx)
-                                                {
-                                                    self.app_function_table.get(app_id)
-                                                } else {
-                                                    self.program.functions.get(*idx as usize)
-                                                };
-                                                bf.map(|f| f.params.clone()).unwrap_or_default()
+                                                // Resolve params by global_id via the registry.
+                                                self.resolve_fn(*idx)
+                                                    .map(|f| f.params.clone())
+                                                    .unwrap_or_default()
                                             } else {
                                                 Vec::new()
                                             }
@@ -10833,161 +10588,20 @@ impl CfmlVirtualMachine {
         result.map(|_| ())
     }
 
-    /// Adjust func_idx values in CfmlFunction bodies within a component struct.
-    /// When sub-program functions are merged into the main program at an offset,
-    /// the stored func_idx values need to be updated to reflect their new positions.
-    /// Also fixes up func_idx values inside captured closure scopes so that
-    /// CFC methods sharing a closure environment reference the correct indices.
-    fn fixup_func_indices(val: &mut CfmlValue, offset: usize) {
-        // Track which captured scopes we've already fixed (they're shared via Arc)
-        let mut fixed_scopes: Vec<usize> = Vec::new();
-        Self::fixup_func_indices_inner(val, offset, &mut fixed_scopes);
-    }
-
-    fn fixup_func_indices_inner(val: &mut CfmlValue, offset: usize, fixed_scopes: &mut Vec<usize>) {
-        match val {
-            CfmlValue::Struct(s) => {
-                // Cycle guard: reference-typed structs can reference themselves
-                // (CFC instance ↔ `__variables`). `fixed_scopes` doubles as the
-                // visited set — struct and captured-scope Arc addresses can't
-                // collide while both are live.
-                let ptr = s.backing_ptr();
-                if fixed_scopes.contains(&ptr) {
-                    return;
-                }
-                fixed_scopes.push(ptr);
-                s.with_write(|m| {
-                    let keys: Vec<String> = m.keys().cloned().collect();
-                    for key in keys {
-                        if let Some(v) = m.get_mut(&key) {
-                            match v {
-                                CfmlValue::Function(ref mut f) => {
-                                    // Update the func_idx stored in the body
-                                    if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                        ref mut body,
-                                    ) = f.body
-                                    {
-                                        if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                            *idx += offset as i64;
-                                        }
-                                    }
-                                    // Also fix up func_idx values inside the captured scope
-                                    if let Some(ref shared_env) = f.captured_scope {
-                                        let ptr = Arc::as_ptr(shared_env) as usize;
-                                        if !fixed_scopes.contains(&ptr) {
-                                            fixed_scopes.push(ptr);
-                                            if let Ok(mut env) = shared_env.write() {
-                                                let env_keys: Vec<String> =
-                                                    env.keys().cloned().collect();
-                                                for ek in env_keys {
-                                                    if let Some(ev) = env.get_mut(&ek) {
-                                                        if let CfmlValue::Function(ref mut ef) = ev {
-                                                            if let cfml_common::dynamic::CfmlClosureBody::Expression(ref mut body) = ef.body {
-                                                                if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                                                    *idx += offset as i64;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                CfmlValue::Struct(_) => {
-                                    Self::fixup_func_indices_inner(v, offset, fixed_scopes);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Fix func_idx for functions that came from a cfinclude sub-program.
-    /// Sub-program func at index i (where i > 0, skipping __main__) is now at
-    /// base_idx + (i - 1) in the merged program.
-    fn fixup_included_func_indices(val: &mut CfmlValue, base_idx: usize, sub_func_count: usize) {
-        match val {
-            CfmlValue::Struct(_) => {
-                // Reference-typed structs can form cycles (a CFC instance and its
-                // `__variables` reference each other); guard against unbounded
-                // recursion with a visited-pointer set.
-                let mut visited: Vec<usize> = Vec::new();
-                Self::fixup_included_func_indices_inner(val, base_idx, sub_func_count, &mut visited);
-            }
-            _ => {}
-        }
-    }
-
-    fn fixup_included_func_indices_inner(
-        val: &mut CfmlValue,
-        base_idx: usize,
-        sub_func_count: usize,
-        visited: &mut Vec<usize>,
-    ) {
-        match val {
-            CfmlValue::Struct(s) => {
-                let ptr = s.backing_ptr();
-                if visited.contains(&ptr) {
-                    return;
-                }
-                visited.push(ptr);
-                s.with_write(|m| {
-                    let keys: Vec<String> = m.keys().cloned().collect();
-                    for key in keys {
-                        if let Some(v) = m.get_mut(&key) {
-                            match v {
-                                CfmlValue::Function(ref mut f) => {
-                                    if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                        ref mut body,
-                                    ) = f.body
-                                    {
-                                        if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                            let i = *idx as usize;
-                                            // Only fix indices that belong to the sub-program
-                                            if i > 0 && i < sub_func_count {
-                                                *idx = (base_idx + i - 1) as i64;
-                                            }
-                                        }
-                                    }
-                                }
-                                CfmlValue::Struct(_) => {
-                                    Self::fixup_included_func_indices_inner(v, base_idx, sub_func_count, visited);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Discovery half of re-homing: walk a value graph (read-only) and, for
-    /// every `Function` whose stored body is a *program* index (not already an
-    /// `APP_FN_TAG_BASE`-tagged stable id), resolve its `Arc` against `program`,
-    /// assign/look-up a stable `app_id` via its `(source_file,name,ordinal)` key
-    /// (appending the `Arc` to `table` on first sight), and record
-    /// `program_idx -> app_tagged_body_int` in `index_map`. The companion
-    /// `remap_func_indices` then rewrites the bodies. Mirrors
-    /// `collect_function_indices`' traversal (same cycle guard via `visited`).
-    #[allow(clippy::too_many_arguments)]
-    fn discover_rehome(
+    /// Walk a value graph (read-only) collecting the `global_id` of every
+    /// reachable `Function` into `ids`. Mirrors the application-scope object
+    /// graph (structs, arrays, query columns, components, captured closure
+    /// scopes) with the same Arc-pointer cycle guard as the old reachability
+    /// walk. Stored bodies already carry stable global_ids, so this only needs
+    /// to *collect* — there is nothing to rewrite.
+    fn collect_app_fn_ids(
         value: &CfmlValue,
-        program: &BytecodeProgram,
-        table: &mut Vec<Arc<BytecodeFunction>>,
-        ids: &mut HashMap<(String, String, u32), usize>,
-        index_map: &mut HashMap<usize, usize>,
+        ids: &mut HashSet<i64>,
         visited: &mut HashSet<(u8, usize)>,
     ) {
         match value {
             CfmlValue::Function(function) => {
-                Self::discover_rehome_function(function, program, table, ids, index_map, visited);
+                Self::collect_app_fn_ids_from_fn(function, ids, visited);
             }
             CfmlValue::Struct(values) => {
                 let ptr = values.backing_ptr();
@@ -10995,7 +10609,7 @@ impl CfmlVirtualMachine {
                     return;
                 }
                 for (_, value) in values.iter() {
-                    Self::discover_rehome(&value, program, table, ids, index_map, visited);
+                    Self::collect_app_fn_ids(&value, ids, visited);
                 }
             }
             CfmlValue::Array(values) => {
@@ -11004,7 +10618,7 @@ impl CfmlVirtualMachine {
                     return;
                 }
                 for value in values.iter() {
-                    Self::discover_rehome(&value, program, table, ids, index_map, visited);
+                    Self::collect_app_fn_ids(&value, ids, visited);
                 }
             }
             CfmlValue::QueryColumn(values) => {
@@ -11013,47 +10627,29 @@ impl CfmlVirtualMachine {
                     return;
                 }
                 for value in values.iter() {
-                    Self::discover_rehome(value, program, table, ids, index_map, visited);
+                    Self::collect_app_fn_ids(value, ids, visited);
                 }
             }
             CfmlValue::Component(component) => {
                 for value in component.properties.values() {
-                    Self::discover_rehome(value, program, table, ids, index_map, visited);
+                    Self::collect_app_fn_ids(value, ids, visited);
                 }
                 for function in component.methods.values() {
-                    Self::discover_rehome_function(
-                        function, program, table, ids, index_map, visited,
-                    );
+                    Self::collect_app_fn_ids_from_fn(function, ids, visited);
                 }
             }
             _ => {}
         }
     }
 
-    fn discover_rehome_function(
+    fn collect_app_fn_ids_from_fn(
         function: &cfml_common::dynamic::CfmlFunction,
-        program: &BytecodeProgram,
-        table: &mut Vec<Arc<BytecodeFunction>>,
-        ids: &mut HashMap<(String, String, u32), usize>,
-        index_map: &mut HashMap<usize, usize>,
+        ids: &mut HashSet<i64>,
         visited: &mut HashSet<(u8, usize)>,
     ) {
         if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = function.body {
-            if let CfmlValue::Int(idx) = body.as_ref() {
-                // Already-app-tagged bodies are stable — leave them.
-                if decode_app_fn_id(*idx).is_none() {
-                    let pidx = *idx as usize;
-                    if let std::collections::hash_map::Entry::Vacant(slot) = index_map.entry(pidx) {
-                        if let Some(arc) = program.functions.get(pidx) {
-                            let key = bytecode_fn_key(arc);
-                            let app_id = *ids.entry(key).or_insert_with(|| {
-                                table.push(Arc::clone(arc));
-                                table.len() - 1
-                            });
-                            slot.insert(encode_app_fn_id(app_id) as usize);
-                        }
-                    }
-                }
+            if let CfmlValue::Int(gid) = body.as_ref() {
+                ids.insert(*gid);
             }
         }
         if let Some(shared_scope) = &function.captured_scope {
@@ -11063,134 +10659,38 @@ impl CfmlVirtualMachine {
             }
             if let Ok(scope) = shared_scope.read() {
                 for value in scope.values() {
-                    Self::discover_rehome(value, program, table, ids, index_map, visited);
+                    Self::collect_app_fn_ids(value, ids, visited);
                 }
             }
         }
     }
 
-    /// Re-home every program-index function reachable from application scope
-    /// into the stable per-application table (`self.app_function_table`), and
-    /// rewrite the live app-scope `Function` bodies to their tagged stable ids.
-    /// After this, the snapshot persisted to `app.variables` carries stable ids
-    /// that resolve identically on any later request without an append or remap.
-    /// Idempotent: functions already re-homed (app-tagged bodies) are untouched.
+    /// Refresh the per-application function table to the `Arc`s reachable from
+    /// application scope, so functions stored there (CFC instances, factories,
+    /// closures) stay resolvable on later requests — even ones that don't reload
+    /// their source file. Stored bodies already carry stable global_ids, so this
+    /// is purely a reachability collect: no body rewriting, no per-request remap.
+    /// Reachability is recomputed each (dirty) request, so abandoned functions
+    /// drop out — bounded growth, no stale retention.
     fn rehome_application_functions(&mut self) {
         let Some(app_scope) = self.application_scope.clone() else {
             return;
         };
-        let mut table = std::mem::take(&mut self.app_function_table);
-        // Reconstruct the key->id index from the table (append-only, so the
-        // index equals first-insertion order and matches what was persisted).
-        let mut ids: HashMap<(String, String, u32), usize> = HashMap::with_capacity(table.len());
-        for (i, f) in table.iter().enumerate() {
-            ids.entry(bytecode_fn_key(f)).or_insert(i);
-        }
-        let mut index_map: HashMap<usize, usize> = HashMap::new();
-        // 1. Discovery: assign app ids for program-index functions.
-        {
-            let mut visited = HashSet::new();
-            app_scope.with_read(|scope| {
-                for value in scope.values() {
-                    Self::discover_rehome(
-                        value,
-                        &self.program,
-                        &mut table,
-                        &mut ids,
-                        &mut index_map,
-                        &mut visited,
-                    );
-                }
-            });
+        let mut ids: HashSet<i64> = HashSet::new();
+        let mut visited = HashSet::new();
+        app_scope.with_read(|scope| {
+            for value in scope.values() {
+                Self::collect_app_fn_ids(value, &mut ids, &mut visited);
+            }
+        });
+        // Carry the Arc for every reachable, currently-registered function.
+        let mut table = Vec::with_capacity(ids.len());
+        for gid in ids {
+            if let Some(arc) = self.resolve_fn(gid) {
+                table.push(arc);
+            }
         }
         self.app_function_table = table;
-        // 2. Rewrite: program index -> tagged stable id, in the live scope.
-        if !index_map.is_empty() {
-            let mut visited = HashSet::new();
-            app_scope.with_write(|scope| {
-                for value in scope.values_mut() {
-                    Self::remap_func_indices(value, &index_map, &mut visited);
-                }
-            });
-        }
-    }
-
-    fn remap_func_indices(
-        val: &mut CfmlValue,
-        index_map: &HashMap<usize, usize>,
-        visited: &mut HashSet<(u8, usize)>,
-    ) {
-        match val {
-            CfmlValue::Function(function) => {
-                if let cfml_common::dynamic::CfmlClosureBody::Expression(ref mut body) =
-                    function.body
-                {
-                    if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                        if let Some(new_idx) = index_map.get(&(*idx as usize)) {
-                            *idx = *new_idx as i64;
-                        }
-                    }
-                }
-                if let Some(shared_scope) = &function.captured_scope {
-                    let ptr = Arc::as_ptr(shared_scope) as usize;
-                    if !visited.insert((3, ptr)) {
-                        return;
-                    }
-                    if let Ok(mut scope) = shared_scope.write() {
-                        let keys: Vec<String> = scope.keys().cloned().collect();
-                        for key in keys {
-                            if let Some(value) = scope.get_mut(&key) {
-                                Self::remap_func_indices(value, index_map, visited);
-                            }
-                        }
-                    }
-                }
-            }
-            CfmlValue::Struct(values) => {
-                let ptr = values.backing_ptr();
-                if !visited.insert((1, ptr)) {
-                    return;
-                }
-                values.with_write(|m| {
-                    for value in m.values_mut() {
-                        Self::remap_func_indices(value, index_map, visited);
-                    }
-                });
-            }
-            CfmlValue::Array(values) => {
-                let ptr = values.backing_ptr();
-                if !visited.insert((2, ptr)) {
-                    return;
-                }
-                values.with_write(|items| {
-                    for value in items.iter_mut() {
-                        Self::remap_func_indices(value, index_map, visited);
-                    }
-                });
-            }
-            CfmlValue::QueryColumn(values) => {
-                let ptr = Arc::as_ptr(values) as usize;
-                if !visited.insert((4, ptr)) {
-                    return;
-                }
-                for value in Arc::make_mut(values).iter_mut() {
-                    Self::remap_func_indices(value, index_map, visited);
-                }
-            }
-            CfmlValue::Component(component) => {
-                for value in component.properties.values_mut() {
-                    Self::remap_func_indices(value, index_map, visited);
-                }
-                for function in component.methods.values_mut() {
-                    let mut value = CfmlValue::Function(Box::new(function.clone()));
-                    Self::remap_func_indices(&mut value, index_map, visited);
-                    if let CfmlValue::Function(updated) = value {
-                        *function = *updated;
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Get default datasource from application scope or request scope
@@ -11591,86 +11091,17 @@ impl CfmlVirtualMachine {
             self.source_file = old_source_file;
             // Capture component body variables
             let component_variables = self.captured_locals.take().unwrap_or_default();
-            // Merge sub-program functions — track base offset for func_idx fixup.
-            // The same CFC file is merged only once per request: on the first
-            // instantiation its functions are appended at `base_idx` and the
-            // offset is cached. Subsequent `new`s of the same file reuse the
-            // cached offset rather than re-appending (which would grow
-            // `program.functions` linearly with the instantiation count). The
-            // cache is only used at the top level (program_swap_depth == 1); a
-            // CFC resolved as a parent while loading a child merges into a
-            // temporary sub-program, so its offset is not stable.
-            let use_cache = self.program_swap_depth == 1;
-            let cached_base = if use_cache {
-                self.merged_file_offsets.get(&cfc_path).copied()
-            } else {
-                None
-            };
-            let sub_funcs = if cached_base.is_none() {
-                Some(self.program.functions.clone())
-            } else {
-                None
-            };
+            // The CFC's functions were registered into `fn_registry` by global_id
+            // when its sub-program was swapped in, and its methods were inserted
+            // into `user_functions` by their DefineFunction ops. Stored method
+            // values on the component struct carry the same stable global_ids. So
+            // there is no merge-append, op remap, or index fixup to do — just
+            // restore the caller's program.
             self.pop_program_swap(old_program);
-            let first_merge = sub_funcs.is_some();
-            let sub_func_count = sub_funcs.as_ref().map(|s| s.len()).unwrap_or(0);
-            let base_idx = if let Some(sub_funcs) = sub_funcs {
-                let base = self.program.functions.len();
-                for func in sub_funcs {
-                    if func.name != "__main__" {
-                        self.program.functions.push(Arc::clone(&func));
-                        if self.user_functions.contains_key(&func.name) {
-                            self.user_functions
-                                .insert(func.name.clone(), Arc::clone(&func));
-                        }
-                    }
-                }
-                if use_cache {
-                    self.merged_file_offsets.insert(cfc_path.clone(), base);
-                }
-                base
-            } else {
-                cached_base.unwrap()
-            };
-            // Remap DefineFunction bytecode ops inside the freshly-merged CFC
-            // methods — they still reference the CFC's own sub-program indices.
-            // Without this, a closure defined inside a CFC method (e.g.
-            // `binder.hasAspects()` doing `mappings.some( (k,m) => m.isAspect() )`)
-            // resolves to a DIFFERENT CFC's function once base_idx > 0 — a
-            // closure-identity collision that mis-fires the callback. Mirrors the
-            // cfinclude merge path; `Arc::make_mut` clones-on-write so the cached
-            // bytecode template is not corrupted. Only needed on first merge.
-            if first_merge && base_idx > 0 && sub_func_count > 1 {
-                let offset = base_idx - 1; // -1 because __main__ (index 0) was skipped
-                let end = self.program.functions.len();
-                for fi in base_idx..end {
-                    let func = Arc::make_mut(&mut self.program.functions[fi]);
-                    for op in func.instructions.iter_mut() {
-                        if let BytecodeOp::DefineFunction(ref mut idx) = op {
-                            if *idx > 0 && *idx < sub_func_count {
-                                *idx += offset;
-                            }
-                        }
-                    }
-                }
-                // Point user_functions at the fixed Arcs (they shared the
-                // sub-program's pre-fixup Arcs).
-                for fi in base_idx..end {
-                    let name = self.program.functions[fi].name.clone();
-                    if self.user_functions.contains_key(&name) {
-                        self.user_functions
-                            .insert(name, Arc::clone(&self.program.functions[fi]));
-                    }
-                }
-            }
-            // Fix up func_idx in the component struct stored in globals
-            // Sub-program functions were at indices [0..N), now at [base_idx..base_idx+N)
             let short_name = class_name.split('.').last().unwrap_or(class_name);
-            // Deep-copy the cached template into an independent instance. Now
-            // that structs are reference-typed, a plain handle clone would let
-            // the in-place `fixup_func_indices` below mutate the *cached
-            // template* (corrupting later instantiations) and would alias state
-            // across instances. The deep copy restores the per-instance
+            // Deep-copy the cached template into an independent instance. Structs
+            // are reference-typed, so a plain handle clone would alias mutable
+            // state across instances; the deep copy restores the per-instance
             // independence the old value-type copy-on-write gave implicitly.
             let mut result = self
                 .globals
@@ -11686,15 +11117,9 @@ impl CfmlVirtualMachine {
                 })
                 .or_else(|| self.globals.get("Anonymous").cloned())
                 .map(|v| v.deep_copy());
-            // Adjust func_idx in all function values.
-            // Sub-program had __main__ at index 0 which was skipped during merge.
-            // So sub-program func at index i is now at base_idx + (i - 1).
-            // The offset to add is (base_idx - 1).
-            if base_idx > 0 {
-                if let Some(ref mut val) = result {
-                    Self::fixup_func_indices(val, base_idx - 1);
-                }
-            }
+            // The component struct's method values carry stable global_ids (set
+            // when the CFC body's DefineFunction ops ran), so no func_idx fixup
+            // is needed here any more.
             // Strip captured_scope from all CFC methods on the component struct.
             // CFC methods are NOT closures — they were compiled in the CFC body
             // context where DefineFunction attaches a captured scope, but that scope
@@ -11739,12 +11164,13 @@ impl CfmlVirtualMachine {
                     if !pre_exec_func_names.contains(func_name)
                         && !existing_keys.contains(&func_name.to_lowercase())
                     {
-                        // Find the func_idx in the merged program
-                        if let Some(idx) = self
+                        // Expose the function if it belongs to this program,
+                        // referencing it by its stable global_id.
+                        if self
                             .program
                             .functions
                             .iter()
-                            .position(|f| f.name == *func_name)
+                            .any(|f| f.name == *func_name)
                         {
                             let cf = CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                                 name: func_name.clone(),
@@ -11764,7 +11190,7 @@ impl CfmlVirtualMachine {
                                     })
                                     .collect(),
                                 body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
-                                    CfmlValue::Int(idx as i64),
+                                    CfmlValue::Int(func_def.global_id as i64),
                                 )),
                                 return_type: None,
                                 access: cfml_common::dynamic::CfmlAccess::Public,
@@ -11780,37 +11206,21 @@ impl CfmlVirtualMachine {
             // unqualified calls inside methods resolve via the normal scope chain.
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 let mut vars_scope: IndexMap<String, CfmlValue> = IndexMap::new();
-                // Add component body variables (non-function values from pseudo-constructor)
-                // Functions from component_variables have sub-program indices that need
-                // fixup (offset = base_idx - 1), and captured_scopes must be stripped.
-                let cv_offset = if base_idx > 0 { base_idx - 1 } else { 0 };
+                // Add component body variables (non-function values from the
+                // pseudo-constructor). Function values carry stable global_ids
+                // (no index fixup needed); strip their captured_scope because CFC
+                // methods resolve via __variables, not closures.
                 for (k, v) in &component_variables {
                     let k_lower = k.to_lowercase();
                     if k_lower == "this" || k_lower == "arguments" || k.starts_with("__") {
                         continue;
                     }
                     if let CfmlValue::Function(ref f) = v {
-                        // Fix body index and strip captured scope
                         let mut clean = f.clone();
                         clean.captured_scope = None;
-                        if let cfml_common::dynamic::CfmlClosureBody::Expression(ref mut body) =
-                            clean.body
-                        {
-                            if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                *idx += cv_offset as i64;
-                            }
-                        }
                         vars_scope.insert(k.clone(), CfmlValue::Function(clean));
                     } else {
-                        // Recursively fix Function indices inside nested Struct values
-                        // (e.g. `variables.encode = { string: function(d) {...} }` —
-                        // encode is a Struct whose `string` Function carries a sub-program
-                        // index that must be offset by cv_offset).
-                        let mut cloned = v.clone();
-                        if cv_offset > 0 {
-                            Self::fixup_func_indices(&mut cloned, cv_offset);
-                        }
-                        vars_scope.insert(k.clone(), cloned);
+                        vars_scope.insert(k.clone(), v.clone());
                     }
                 }
                 // Add all component methods (public + private) to variables scope
@@ -13089,10 +12499,12 @@ impl CfmlVirtualMachine {
             return Err(e);
         }
 
-        let base_idx = self.program.functions.len();
+        // Re-assert by-name registration for the Application.cfc's functions so
+        // lifecycle methods (onApplicationStart, ...) dispatch even under a later
+        // program swap. They are already in `fn_registry` by global_id from the
+        // sub-program swap-in, so no program-index append is needed.
         for func in sub_funcs {
             if func.name != "__main__" {
-                self.program.functions.push(Arc::clone(&func));
                 self.user_functions
                     .insert(func.name.clone(), Arc::clone(&func));
             }
@@ -13128,15 +12540,12 @@ impl CfmlVirtualMachine {
                     })
                     .map(|(_, v)| v.clone())
             });
-        let mut template = match template {
+        let template = match template {
             Some(t) => t,
             None => return Ok(None),
         };
 
-        // Fix up func_idx in the template's function values (sub-program index → merged index)
-        if base_idx > 0 {
-            Self::fixup_func_indices(&mut template, base_idx - 1);
-        }
+        // No func_idx fixup: the template's method values carry stable global_ids.
 
         // Store component body variables as __variables on the template
         // This makes variables.framework etc. accessible to component methods
@@ -13560,10 +12969,9 @@ impl CfmlVirtualMachine {
                 server_state.applications.modify(&app_name, &mut |app| {
                     app.variables.clear();
                     app.started = false;
-                    // Discard the stable function table so a restarted
+                    // Discard the carried function table so a restarted
                     // application re-homes from a clean slate.
                     app.app_function_table.clear();
-                    app.app_function_ids.clear();
                 });
             }
         }
@@ -13756,7 +13164,6 @@ impl CfmlVirtualMachine {
                     started: false,
                     config: config.clone(),
                     app_function_table: Vec::new(),
-                    app_function_ids: HashMap::new(),
                     session_storage: app_session_storage.clone(),
                     app_caches: app_caches.clone(),
                 };
@@ -13765,11 +13172,14 @@ impl CfmlVirtualMachine {
             let app_snapshot = server_state.applications.get(&app_name).unwrap();
             self.current_application_name = Some(app_name.clone());
             self.application_scope = Some(CfmlStruct::new(app_snapshot.variables.clone()));
-            // Load the stable per-application function table by-reference (Arc
-            // clones). App-scope `Function` values whose bodies carry an
-            // `APP_FN_TAG_BASE`-tagged id dispatch through this Vec; its ordering
-            // is stable across requests so no per-request remap is needed.
+            // Carry the app-reachable function Arcs forward and register them
+            // into `fn_registry` by global_id, so an application-scope function
+            // whose source file isn't (re)loaded this request still resolves.
             self.app_function_table = app_snapshot.app_function_table.clone();
+            let carried = self.app_function_table.clone();
+            for f in &carried {
+                self.register_fn(f);
+            }
 
             // 5. onApplicationStart (if not yet started)
             let already_started = app_snapshot.started;
@@ -14006,28 +13416,17 @@ impl CfmlVirtualMachine {
                     self.rehome_application_functions();
                 }
                 if let Some(ref app_scope) = self.application_scope {
-                    // Snapshot AFTER re-homing (so persisted bodies are stable
-                    // ids) and outside the store write, so the application-scope
+                    // Snapshot outside the store write so the application-scope
                     // lock and the applications-store lock never nest.
                     let scope = app_scope.snapshot();
-                    // Only rebuild + persist the function table when it changed.
-                    // The key->id index is rebuilt from the append-only table; a
-                    // worker isolate uses it to rebuild the table from cached
-                    // bytecode (Arcs aren't serializable across isolates).
-                    let table_update = rehomed.then(|| {
-                        let table = self.app_function_table.clone();
-                        let mut ids: HashMap<(String, String, u32), usize> =
-                            HashMap::with_capacity(table.len());
-                        for (i, f) in table.iter().enumerate() {
-                            ids.entry(bytecode_fn_key(f)).or_insert(i);
-                        }
-                        (table, ids)
-                    });
+                    // Only re-persist the carried function table when it changed
+                    // (a function was defined this request); otherwise it is
+                    // byte-identical to what was loaded.
+                    let table_update = rehomed.then(|| self.app_function_table.clone());
                     server_state.applications.modify(&app_name, &mut |app| {
                         app.variables = scope.clone();
-                        if let Some((table, ids)) = table_update.clone() {
+                        if let Some(table) = table_update.clone() {
                             app.app_function_table = table;
-                            app.app_function_ids = ids;
                         }
                     });
                 }
