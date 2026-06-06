@@ -1605,16 +1605,17 @@ impl CfmlVirtualMachine {
         // param. Take the pending list (set by the named-args reorder) so a
         // recursive call doesn't see stale state.
         let extras = self.pending_extra_named_args.take().unwrap_or_default();
-        // Add any args beyond declared params: by name when the callsite was
-        // named, falling back to position (1-based) for purely positional
-        // overflow. Both keys are inserted for named extras so the value is
-        // reachable as `arguments.<name>` AND `arguments[N]`.
+        // Add any args beyond declared params. A named overflow arg is keyed by
+        // name ONLY; a positional overflow arg is keyed by its 1-based position.
+        // (Lucee/ACF/BoxLang: calling a paramless function purely by name yields
+        // an arguments scope of exactly those names — no spurious numeric keys.)
         for i in func.params.len()..args.len() {
             let value = args[i].clone();
             if let Some((_, name)) = extras.iter().find(|(idx, _)| *idx == i) {
-                arguments_map.insert(name.clone(), value.clone());
+                arguments_map.insert(name.clone(), value);
+            } else {
+                arguments_map.insert((i + 1).to_string(), value);
             }
-            arguments_map.insert((i + 1).to_string(), value);
         }
         // Check required parameters
         for (i, param_name) in func.params.iter().enumerate() {
@@ -2896,8 +2897,12 @@ impl CfmlVirtualMachine {
                         // callee's `arguments` scope keeps their names.
                         let mut extras: Vec<(usize, String)> = Vec::new();
                         let args = if let CfmlValue::Function(ref f) = func_ref {
-                            let mut positional =
-                                vec![CfmlValue::Null; f.params.len().max(expanded_names.len())];
+                            // Size to the declared params only; positional overflow
+                            // and unmatched named args are appended below. Padding to
+                            // expanded_names.len() created spurious empty slots that
+                            // leaked into the arguments scope as numeric keys when a
+                            // paramless function was called purely by name.
+                            let mut positional = vec![CfmlValue::Null; f.params.len()];
                             for (i, name) in expanded_names.iter().enumerate() {
                                 let value = if i < expanded_values.len() {
                                     std::mem::replace(&mut expanded_values[i], CfmlValue::Null)
@@ -2905,8 +2910,12 @@ impl CfmlVirtualMachine {
                                     CfmlValue::Null
                                 };
                                 if name.is_empty() {
+                                    // Positional arg: fill its slot, or append when it
+                                    // overflows the declared params.
                                     if i < positional.len() {
                                         positional[i] = value;
+                                    } else {
+                                        positional.push(value);
                                     }
                                     continue;
                                 }
@@ -9105,13 +9114,21 @@ impl CfmlVirtualMachine {
             expanded_values.push(value);
         }
 
-        let mut positional = vec![CfmlValue::Null; func.params.len().max(expanded_names.len())];
+        // Size to the declared params only; positional overflow and unmatched
+        // named args are appended below. Padding to expanded_names.len() created
+        // spurious empty slots that leaked into the arguments scope as numeric
+        // keys when a paramless function was called purely by name.
+        let mut positional = vec![CfmlValue::Null; func.params.len()];
         let mut extras: Vec<(usize, String)> = Vec::new();
         for (i, name) in expanded_names.iter().enumerate() {
             let value = expanded_values.get(i).cloned().unwrap_or(CfmlValue::Null);
             if name.is_empty() {
+                // Positional arg: fill its slot, or append when it overflows the
+                // declared params.
                 if i < positional.len() {
                     positional[i] = value;
+                } else {
+                    positional.push(value);
                 }
                 continue;
             }
