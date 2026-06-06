@@ -65,13 +65,33 @@ CLI (file exec, `-c` inline, `-d` debug, `-r` REPL, `--serve`), WASM target, err
 
 ---
 
+## Query-of-Queries (QoQ)
+
+`queryExecute(sql, params, {dbtype:"query"})` runs in-memory SQL `SELECT` against query
+variables in scope. Pure-Rust engine in `crates/cfml-qoq` (no JDBC/HSQLDB). Supported:
+
+- `SELECT` (incl. `*`, `table.*`, aliases), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`
+  (multi-key, ASC/DESC), `DISTINCT`
+- Joins: `INNER` / `LEFT` / `RIGHT` / `FULL` `[OUTER] JOIN ... ON`, `CROSS` and comma joins
+- Subqueries: `IN (SELECT …)`, scalar `(SELECT …)` in the SELECT list, derived `FROM (SELECT …) AS t`
+- `UNION` / `UNION ALL`, `CASE`, `CAST`/`CONVERT`, `BETWEEN`, `LIKE [ESCAPE]`, `IN (…)`, `IS [NOT] NULL`
+- Params: positional `?` and named `:name` (from the array/struct 2nd arg, incl. `cfqueryparam`)
+- `returntype` = `query` (default) / `array` / `struct`
+- Built-in scalar + aggregate SQL functions; **extensible** via `register_native_qoq_fn`
+  (native Rust) and `queryRegisterFunction(name, udf[, "aggregate"])` (CFML UDFs in SQL)
+- Native `CfmlValue` types preserved through projection; ORDER BY parallelised (rayon, non-wasm)
+
+Lucee QoQ lacks `LIMIT`/`OFFSET`, scalar subqueries, derived tables and `CASE` (it uses `TOP`);
+RustCFML supports those as a BoxLang-faithful superset — see `docs/known-issues.md`.
+
+---
+
 ## Remaining Work
 
 ### Low Priority
 - (none currently)
 
 ### Explicitly Unsupported
-- **Query-of-Queries (QoQ)**: SQL SELECT on in-memory query objects is not supported
 - Image functions (80+), Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway, JWT
 - cfschedule, cfwddx
 

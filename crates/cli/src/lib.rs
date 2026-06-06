@@ -24,6 +24,8 @@ use cfml_vm::{CfmlVirtualMachine, ServerState, ThreadHandle, ThreadSeed, compile
 pub use cfml_common::dynamic::{CfmlNative, CfmlValue as Value};
 pub use cfml_common::vm::{CfmlError, CfmlResult};
 pub use cfml_vm::CfmlVirtualMachine as Vm;
+// QoQ function registration for native modules (`vm.register_native_qoq_fn`).
+pub use cfml_qoq::function::QoQFnKind;
 // Re-exported so module authors can construct `Value::strukt(IndexMap::new())`
 // without declaring indexmap as a separate dep.
 pub use indexmap::IndexMap;

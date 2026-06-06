@@ -368,5 +368,13 @@ try { include "core/test_get_function_called_name.cfm"; } catch (any e) { writeO
 //     getComponentMetadata (Lucee parity) — the surface WireBox delegation reads.
 try { include "oop/test_delegate_annotation_metadata.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_delegate_annotation_metadata.cfm | " & e.message & chr(10)); }
 
+// --- Query of Queries ---
+try { include "qoq/test_qoq_select.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_select.cfm | " & e.message & chr(10)); }
+try { include "qoq/test_qoq_aggregates.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_aggregates.cfm | " & e.message & chr(10)); }
+try { include "qoq/test_qoq_joins.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_joins.cfm | " & e.message & chr(10)); }
+try { include "qoq/test_qoq_subqueries_union.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_subqueries_union.cfm | " & e.message & chr(10)); }
+try { include "qoq/test_qoq_custom_functions.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_custom_functions.cfm | " & e.message & chr(10)); }
+try { include "qoq/test_qoq_rustcfml_ext.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_rustcfml_ext.cfm | " & e.message & chr(10)); }
+
 printSummary();
 </cfscript>

@@ -58,6 +58,9 @@ function:
 pub fn register(vm: &mut rustcfml_cli::Vm) {
     vm.register_native_fn("myFn", my_fn);
     vm.register_native_class("MyClass", my_class_new);
+    // QoQ functions: callable as BIFs AND inside Query-of-Queries SQL.
+    vm.register_native_qoq_fn("myHash", my_hash, rustcfml_cli::QoQFnKind::Scalar);
+    vm.register_native_qoq_fn("myAgg",  my_agg,  rustcfml_cli::QoQFnKind::Aggregate);
 }
 ```
 

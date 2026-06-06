@@ -411,6 +411,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("queryColumnData".into(), fn_query_column_data as BuiltinFunction);
     f.insert("queryColumnArray".into(), fn_query_column_data as BuiltinFunction);  // alias
     f.insert("queryCurrentRow".into(), fn_query_current_row as BuiltinFunction);
+    // QoQ custom-function registration (VM-intercepted).
+    f.insert("queryRegisterFunction".into(), fn_query_register_function_stub as BuiltinFunction);
 
     // ---- Query value list functions ----
     f.insert("valueList".into(), fn_value_list as BuiltinFunction);
@@ -4439,6 +4441,12 @@ fn fn_query_set_row(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_ho_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("Query higher-order function requires VM-level closure support and was not intercepted.".to_string()))
+}
+
+fn fn_query_register_function_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime(
+        "queryRegisterFunction requires VM-level intercept and was not intercepted.".to_string(),
+    ))
 }
 
 // ===============================================

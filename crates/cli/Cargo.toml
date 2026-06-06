@@ -25,6 +25,7 @@ cfml-common = { workspace = true }
 cfml-config = { workspace = true }
 cfml-compiler = { workspace = true }
 cfml-codegen = { workspace = true }
+cfml-qoq = { workspace = true }
 cfml-vm = { workspace = true, features = ["s3"] }
 indexmap = { workspace = true }
 cfml-stdlib = { workspace = true, features = ["default", "all-databases", "s3"] }

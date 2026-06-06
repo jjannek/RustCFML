@@ -1,0 +1,22 @@
+[package]
+name = "cfml-qoq"
+description = "Query-of-Queries engine for RustCFML — in-memory SQL SELECT execution against CfmlQuery objects. Pure Rust, optimised for the subset of SQL needed by CFML QoQ."
+keywords = ["cfml", "coldfusion", "qoq", "query-of-queries", "rustcfml"]
+categories = ["compilers", "database"]
+readme = "../../README.md"
+documentation = "https://docs.rs/cfml-qoq"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+cfml-common = { workspace = true }
+indexmap = { workspace = true }
+
+# Rayon parallelism is host-only: the wasm32 targets (cfml-worker, rustcfml-wasm)
+# transitively depend on this crate and must not pull in rayon.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1"

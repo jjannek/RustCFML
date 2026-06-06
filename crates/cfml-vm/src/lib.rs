@@ -4,6 +4,7 @@ use cfml_codegen::{BytecodeFunction, BytecodeOp, BytecodeProgram, CmpOp};
 use cfml_common::dynamic::{CfmlStruct, CfmlValue};
 use cfml_common::vfs::{RealFs, Vfs};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -711,6 +712,12 @@ pub struct CfmlVirtualMachine {
     /// to produce a fresh `CfmlValue::NativeObject`.
     pub native_classes: HashMap<String, NativeConstructor>,
 
+    /// Query-of-Queries function registry: native scalar/aggregate functions
+    /// registered via `register_native_qoq_fn`, plus CFML UDFs/closures
+    /// registered at runtime via `queryRegisterFunction`. Used inside
+    /// `queryExecute(sql, params, {dbtype:"query"})`.
+    pub qoq_registry: QoQFunctionRegistry,
+
     // ── Runtime knobs sourced from `.cfconfig.json`. Seeded by the CLI from
     // ServerState.cfconfig at VM construction time; Application.cfc `this.*`
     // can override at app scope (handled in extract_app_config). Builtins
@@ -961,6 +968,7 @@ impl CfmlVirtualMachine {
             pending_extra_named_args: None,
             pending_called_name: None,
             native_classes: HashMap::new(),
+            qoq_registry: QoQFunctionRegistry::new(),
             // Compiled-in runtime defaults. `apply_cfconfig` overlays the
             // user's `.cfconfig.json` values when a VM is constructed via
             // the serve / CLI path that has a ServerState.
@@ -1315,6 +1323,91 @@ impl CfmlVirtualMachine {
                 captured_scope: None,
             })),
         );
+    }
+
+    /// Register a native function that is callable both as an ordinary BIF and
+    /// inside QoQ SQL (`SELECT myFn(col) FROM q`). Scalar functions receive
+    /// per-row values; aggregate functions receive each argument as a
+    /// `CfmlValue::Array` over the partition.
+    pub fn register_native_qoq_fn(&mut self, name: &str, f: QoQFn, kind: QoQFnKind) {
+        self.register_native_fn(name, f);
+        self.qoq_registry.register_native(name, f, kind);
+    }
+
+    /// Execute a Query-of-Queries (`dbtype="query"`) request: parse the SQL,
+    /// resolve its source query variables from scope, run the engine, and apply
+    /// the requested `returntype`.
+    fn execute_qoq(
+        &mut self,
+        sql: &str,
+        params_arg: &CfmlValue,
+        return_type: &str,
+        column_key: Option<String>,
+        parent_locals: &IndexMap<String, CfmlValue>,
+    ) -> CfmlResult {
+        let stmt = cfml_qoq::parse(sql)
+            .map_err(|e| CfmlError::runtime(format!("Query of Queries syntax error: {}", e)))?;
+
+        // Resolve each referenced query variable from scope (owned clones, so
+        // the borrow can't collide with the &mut self UDF callback below).
+        let names = cfml_qoq::base_table_names(&stmt);
+        let owned: Vec<(String, cfml_common::dynamic::CfmlQuery)> = names
+            .iter()
+            .filter_map(|n| self.find_query_in_scope(n, parent_locals).map(|q| (n.clone(), q)))
+            .collect();
+        let sources: Vec<(String, &cfml_common::dynamic::CfmlQuery)> =
+            owned.iter().map(|(n, q)| (n.clone(), q)).collect();
+
+        let params = build_qoq_params(params_arg);
+
+        // The engine may invoke CFML UDFs; `call_function` needs `&mut self`, so
+        // take the registry out to avoid borrowing self both ways, then restore.
+        let registry = std::mem::take(&mut self.qoq_registry);
+        let result = {
+            let mut udf = |func: &CfmlValue, args: Vec<CfmlValue>| {
+                self.call_function(func, args, parent_locals)
+            };
+            cfml_qoq::execute(&stmt, &sources, &params, &registry, &mut udf)
+        };
+        self.qoq_registry = registry;
+
+        let query_val = result?;
+        Ok(convert_query_return(query_val, return_type, column_key.as_deref()))
+    }
+
+    /// Find a `CfmlValue::Query` bound to `name` in the active scope chain
+    /// (local/arguments → variables → request → application), returning an owned
+    /// clone of the query.
+    fn find_query_in_scope(
+        &self,
+        name: &str,
+        parent_locals: &IndexMap<String, CfmlValue>,
+    ) -> Option<cfml_common::dynamic::CfmlQuery> {
+        let lower = name.to_lowercase();
+        if let Some(CfmlValue::Query(q)) = parent_locals
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == lower)
+            .map(|(_, v)| v)
+        {
+            return Some((**q).clone());
+        }
+        if let Some(CfmlValue::Query(q)) = self
+            .globals
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == lower)
+            .map(|(_, v)| v)
+        {
+            return Some((**q).clone());
+        }
+        if let Some(CfmlValue::Query(q)) = self.request_scope.get_ci(&lower) {
+            return Some(*q);
+        }
+        if let Some(app) = self.application_scope.as_ref() {
+            if let Some(CfmlValue::Query(q)) = app.get_ci(&lower) {
+                return Some(*q);
+            }
+        }
+        None
     }
 
     fn build_stack_trace(&self) -> Vec<cfml_common::vm::StackFrame> {
@@ -5167,6 +5260,7 @@ impl CfmlVirtualMachine {
                 | "isdefined"
                 | "__cfparam"
                 | "queryexecute"
+                | "queryregisterfunction"
                 | "__cftransaction_start"
                 | "__cftransaction_commit"
                 | "__cftransaction_rollback"
@@ -7419,7 +7513,61 @@ impl CfmlVirtualMachine {
                         ));
                     }
                 }
+                "queryregisterfunction" => {
+                    // queryRegisterFunction(name, udf [, type]) — register a CFML
+                    // UDF/closure for use inside QoQ SQL. type: scalar|aggregate.
+                    let fname = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    let func = args.get(1).cloned().unwrap_or(CfmlValue::Null);
+                    let kind = match args.get(2).map(|v| v.as_string().to_lowercase()).as_deref() {
+                        Some("aggregate") => QoQFnKind::Aggregate,
+                        _ => QoQFnKind::Scalar,
+                    };
+                    if fname.is_empty() {
+                        return Err(CfmlError::runtime(
+                            "queryRegisterFunction: a function name is required".to_string(),
+                        ));
+                    }
+                    if !matches!(func, CfmlValue::Function(_) | CfmlValue::Closure(_)) {
+                        return Err(CfmlError::runtime(
+                            "queryRegisterFunction: the second argument must be a function or closure"
+                                .to_string(),
+                        ));
+                    }
+                    self.qoq_registry.register_custom(&fname, func, kind);
+                    return Ok(CfmlValue::Null);
+                }
                 "queryexecute" => {
+                    // Query of Queries: dbtype="query" runs against in-memory
+                    // query variables instead of a datasource.
+                    let is_qoq = match args.get(2) {
+                        Some(CfmlValue::Struct(opts)) => opts
+                            .get_ci("dbtype")
+                            .map(|v| v.as_string().eq_ignore_ascii_case("query"))
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if is_qoq {
+                        let sql = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                        let params_arg = args.get(1).cloned().unwrap_or(CfmlValue::Null);
+                        let (return_type, column_key) = match args.get(2) {
+                            Some(CfmlValue::Struct(opts)) => {
+                                let rt = opts
+                                    .get_ci("returntype")
+                                    .map(|v| v.as_string().to_lowercase())
+                                    .unwrap_or_else(|| "query".to_string());
+                                let ck = opts.get_ci("columnkey").map(|v| v.as_string());
+                                (rt, ck)
+                            }
+                            _ => ("query".to_string(), None),
+                        };
+                        return self.execute_qoq(
+                            &sql,
+                            &params_arg,
+                            &return_type,
+                            column_key,
+                            parent_locals,
+                        );
+                    }
                     // Resolve a per-application datasource (this.datasources /
                     // per-app cfconfig) to its connection URL before any path
                     // below sees the args. No-op when this request has none.
@@ -14026,5 +14174,67 @@ mod app_cfc_discovery_tests {
             CfmlVirtualMachine::app_cfc_start_dir(None, cwd),
             PathBuf::from("/work")
         );
+    }
+}
+
+// ── Query-of-Queries helpers ────────────────────────────────────────────
+
+/// Build engine bind parameters from the `queryExecute` params argument: an
+/// Array → positional, a Struct → named. `cfqueryparam`-style `{value: …}`
+/// wrappers are unwrapped to their underlying value.
+fn build_qoq_params(arg: &CfmlValue) -> cfml_qoq::QoQParams {
+    let mut params = cfml_qoq::QoQParams::none();
+    match arg {
+        CfmlValue::Array(a) => {
+            params.positional = a.iter().map(|v| unwrap_query_param(&v)).collect();
+        }
+        CfmlValue::Struct(s) => {
+            for (k, v) in s.iter() {
+                params.named.insert(k, unwrap_query_param(&v));
+            }
+        }
+        _ => {}
+    }
+    params
+}
+
+/// Unwrap a `cfqueryparam` struct (`{value: x, cfsqltype: …}`) to its value.
+fn unwrap_query_param(v: &CfmlValue) -> CfmlValue {
+    if let CfmlValue::Struct(s) = v {
+        if let Some(inner) = s.get_ci("value") {
+            return inner;
+        }
+    }
+    v.clone()
+}
+
+/// Apply `returntype` to a QoQ result query: `array` → array of row structs,
+/// `struct` (with `columnkey`) → struct keyed by that column, else the query.
+fn convert_query_return(value: CfmlValue, return_type: &str, column_key: Option<&str>) -> CfmlValue {
+    match return_type {
+        "array" => {
+            if let CfmlValue::Query(query) = &value {
+                let rows: Vec<CfmlValue> =
+                    query.rows.iter().map(|r| CfmlValue::strukt(r.clone())).collect();
+                return CfmlValue::array(rows);
+            }
+            value
+        }
+        "struct" => {
+            if let (CfmlValue::Query(query), Some(key)) = (&value, column_key) {
+                let mut out: IndexMap<String, CfmlValue> = IndexMap::new();
+                for r in &query.rows {
+                    let k = r
+                        .iter()
+                        .find(|(c, _)| c.eq_ignore_ascii_case(key))
+                        .map(|(_, v)| v.as_string())
+                        .unwrap_or_default();
+                    out.insert(k, CfmlValue::strukt(r.clone()));
+                }
+                return CfmlValue::strukt(out);
+            }
+            value
+        }
+        _ => value,
     }
 }

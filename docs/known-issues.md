@@ -128,6 +128,29 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
 | `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
 
+## 9. Query-of-Queries — RustCFML/BoxLang superset 🏗
+
+QoQ (`queryExecute(..., {dbtype:"query"})`) follows BoxLang and accepts SQL that **Lucee's
+QoQ rejects**. Same query, *more* accepted — not a wrong-result divergence — but such SQL is
+**not portable back to Lucee**:
+
+| Feature | RustCFML | Lucee QoQ |
+|---|---|---|
+| `LIMIT n [OFFSET m]` | ✅ | ❌ (uses `SELECT TOP n`) |
+| `CASE … WHEN … END` (searched + simple) | ✅ | ❌ |
+| Scalar subquery in the SELECT list | ✅ | ❌ |
+| Derived table `FROM (SELECT …) AS t` | ✅ | ❌ |
+| Custom SQL functions (`queryRegisterFunction`) | ✅ | ❌ |
+
+`SELECT TOP n`, `IN (SELECT …)`, all JOIN types, `UNION`, params, `LENGTH()` etc. work on both.
+Cross-engine tests live in `tests/qoq/test_qoq_{select,aggregates,joins,subqueries_union}.cfm`
+(green on both); superset-only coverage is probe-gated in `test_qoq_rustcfml_ext.cfm` /
+`test_qoq_custom_functions.cfm` (skipped where unsupported).
+
+**Correlated subqueries** (a subquery referencing the outer row) are **not** supported — subqueries
+are executed once (uncorrelated); this matches typical QoQ usage. Errors loudly if a referenced
+table/column is missing.
+
 ---
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
