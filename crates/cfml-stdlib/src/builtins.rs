@@ -14,7 +14,7 @@
 //! - Query functions
 //! - System functions
 
-use cfml_common::dynamic::{CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlStruct, CfmlValue};
+use cfml_common::dynamic::{CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use std::collections::HashMap;
 use indexmap::IndexMap;
@@ -4044,14 +4044,16 @@ fn serialize_value(val: &CfmlValue) -> String {
             format!("{{{}}}", items.join(","))
         }
         CfmlValue::Query(q) => {
-            let rows: Vec<String> = q.rows.iter().map(|row| {
-                let fields: Vec<String> = q.columns.iter().map(|col| {
-                    let val = row.get(col).unwrap_or(&CfmlValue::Null);
-                    format!("\"{}\":{}", col.replace('"', "\\\""), serialize_value(val))
+            q.with_read(|d| {
+                let rows: Vec<String> = d.rows.iter().map(|row| {
+                    let fields: Vec<String> = d.columns.iter().map(|col| {
+                        let val = row.get(col).unwrap_or(&CfmlValue::Null);
+                        format!("\"{}\":{}", col.replace('"', "\\\""), serialize_value(val))
+                    }).collect();
+                    format!("{{{}}}", fields.join(","))
                 }).collect();
-                format!("{{{}}}", fields.join(","))
-            }).collect();
-            format!("[{}]", rows.join(","))
+                format!("[{}]", rows.join(","))
+            })
         }
         CfmlValue::NativeObject(obj) => {
             // Native Rust-backed objects don't have a JSON representation by
@@ -4112,7 +4114,7 @@ fn fn_is_json(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
     if args.is_empty() {
-        return Ok(CfmlValue::Query(Box::new(CfmlQuery::new(Vec::new()))));
+        return Ok(CfmlValue::Query(CfmlQuery::new(Vec::new())));
     }
     // queryNew("col1,col2") or queryNew(["col1","col2"])
     let columns: Vec<String> = match &args[0] {
@@ -4120,7 +4122,7 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlValue::Array(arr) => arr.iter().map(|v| v.as_string()).collect(),
         _ => Vec::new(),
     };
-    let mut query = CfmlQuery::new(columns.clone());
+    let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::new();
     // 3rd arg: initial data as array of arrays or array of structs
     if args.len() >= 3 {
         if let CfmlValue::Array(data_rows) = &args[2] {
@@ -4134,10 +4136,10 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
                                 row.insert(columns[i].clone(), val.clone());
                             }
                         }
-                        query.rows.push(row);
+                        rows.push(row);
                     }
                     CfmlValue::Struct(s) => {
-                        query.rows.push(s.snapshot());
+                        rows.push(s.snapshot());
                     }
                     _ => {
                         // Single-column shortcut: wrap scalar in a row
@@ -4145,38 +4147,51 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
                         if !columns.is_empty() {
                             row.insert(columns[0].clone(), row_data.clone());
                         }
-                        query.rows.push(row);
+                        rows.push(row);
                     }
                 }
             }
         }
     }
-    Ok(CfmlValue::Query(Box::new(query)))
+    Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)))
 }
 
 fn fn_query_add_row(args: Vec<CfmlValue>) -> CfmlResult {
+    // Reference-typed: mutate the shared handle in place (the caller's query
+    // grows), then return it. The VM normally intercepts `queryAddRow` (returning
+    // the new row count); this builtin is the fallback path.
     if let Some(CfmlValue::Query(q)) = args.first() {
-        let mut result = q.clone();
         let num_rows = if args.len() >= 2 {
             match &args[1] {
                 CfmlValue::Int(n) => *n as usize,
                 CfmlValue::Struct(data) => {
-                    let mut row = IndexMap::new();
-                    for (k, v) in data.iter() {
-                        row.insert(k.clone(), v.clone());
-                    }
-                    result.rows.push(row);
-                    return Ok(CfmlValue::Query(result));
+                    q.add_row(data.snapshot());
+                    return Ok(CfmlValue::Query(q.clone()));
                 }
-                CfmlValue::Array(rows) => {
-                    for item in rows.iter() {
-                        if let CfmlValue::Struct(data) = item {
-                            result.rows.push(data.snapshot());
-                        } else {
-                            result.rows.push(IndexMap::new());
+                CfmlValue::Array(items) => {
+                    // Lucee semantics: array-of-arrays → one positional row per
+                    // inner array; array-of-structs → one row per struct; a flat
+                    // array of scalars → a single positional row.
+                    let items = items.snapshot();
+                    let cols = q.columns();
+                    let all_arrays = !items.is_empty()
+                        && items.iter().all(|it| matches!(it, CfmlValue::Array(_)));
+                    if all_arrays {
+                        for it in &items {
+                            if let CfmlValue::Array(vals) = it {
+                                q.add_row(positional_query_row(&cols, &vals.snapshot()));
+                            }
                         }
+                    } else if items.iter().all(|it| matches!(it, CfmlValue::Struct(_))) {
+                        for it in &items {
+                            if let CfmlValue::Struct(s) = it {
+                                q.add_row(s.snapshot());
+                            }
+                        }
+                    } else {
+                        q.add_row(positional_query_row(&cols, &items));
                     }
-                    return Ok(CfmlValue::Query(result));
+                    return Ok(CfmlValue::Query(q.clone()));
                 }
                 _ => 1,
             }
@@ -4184,29 +4199,36 @@ fn fn_query_add_row(args: Vec<CfmlValue>) -> CfmlResult {
             1
         };
         for _ in 0..num_rows {
-            result.rows.push(IndexMap::new());
+            q.add_row(IndexMap::new());
         }
-        Ok(CfmlValue::Query(result))
+        Ok(CfmlValue::Query(q.clone()))
     } else {
         Ok(CfmlValue::Null)
     }
 }
 
+/// Map positional cell values onto a query's columns (extra values dropped,
+/// missing filled with Null) for `queryAddRow` with array input.
+fn positional_query_row(columns: &[String], values: &[CfmlValue]) -> IndexMap<String, CfmlValue> {
+    let mut row = IndexMap::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        row.insert(col.clone(), values.get(i).cloned().unwrap_or(CfmlValue::Null));
+    }
+    row
+}
+
 fn fn_query_set_cell(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut result = q.clone();
             let column = args[1].as_string();
             let value = args[2].clone();
             let row_idx = if args.len() >= 4 {
                 (get_int(&args, 3) as usize).saturating_sub(1)
             } else {
-                result.rows.len().saturating_sub(1)
+                q.row_count().saturating_sub(1)
             };
-            if row_idx < result.rows.len() {
-                result.rows[row_idx].insert(column, value);
-            }
-            return Ok(CfmlValue::Query(result));
+            q.set_cell(row_idx, column, value);
+            return Ok(CfmlValue::Query(q.clone()));
         }
     }
     Ok(CfmlValue::Null)
@@ -4215,17 +4237,17 @@ fn fn_query_set_cell(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_add_column(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut result = q.clone();
+            let mut data = q.with_read(|d| d.clone());
             let col_name = args[1].as_string();
-            result.columns.push(col_name.clone());
+            data.columns.push(col_name.clone());
             if let Some(CfmlValue::Array(values)) = args.get(2) {
                 for (i, val) in values.iter().enumerate() {
-                    if i < result.rows.len() {
-                        result.rows[i].insert(col_name.clone(), val.clone());
+                    if i < data.rows.len() {
+                        data.rows[i].insert(col_name.clone(), val.clone());
                     }
                 }
             }
-            return Ok(CfmlValue::Query(result));
+            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
     }
     Ok(CfmlValue::Null)
@@ -4235,10 +4257,10 @@ fn fn_query_get_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
             let row_idx = (get_int(&args, 1) as usize).saturating_sub(1);
-            if row_idx < q.rows.len() {
-                return Ok(CfmlValue::strukt(q.rows[row_idx].clone()));
+            if let Some(row) = q.get_row(row_idx) {
+                return Ok(CfmlValue::strukt(row));
             }
-            return Err(CfmlError::runtime(format!("queryGetRow: row {} is out of range (query has {} rows)", row_idx + 1, q.rows.len())));
+            return Err(CfmlError::runtime(format!("queryGetRow: row {} is out of range (query has {} rows)", row_idx + 1, q.row_count())));
         }
     }
     Err(CfmlError::runtime("queryGetRow requires a query and row number".to_string()))
@@ -4253,9 +4275,9 @@ fn fn_query_get_cell(args: Vec<CfmlValue>) -> CfmlResult {
             } else {
                 0
             };
-            if row_idx < q.rows.len() {
+            if let Some(row) = q.get_row(row_idx) {
                 let col_lower = column.to_lowercase();
-                for (k, v) in &q.rows[row_idx] {
+                for (k, v) in &row {
                     if k.to_lowercase() == col_lower {
                         return Ok(v.clone());
                     }
@@ -4270,14 +4292,14 @@ fn fn_query_get_cell(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_record_count(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        Some(CfmlValue::Query(q)) => Ok(CfmlValue::Int(q.rows.len() as i64)),
+        Some(CfmlValue::Query(q)) => Ok(CfmlValue::Int(q.row_count() as i64)),
         _ => Ok(CfmlValue::Int(0)),
     }
 }
 
 fn fn_query_column_count(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        Some(CfmlValue::Query(q)) => Ok(CfmlValue::Int(q.columns.len() as i64)),
+        Some(CfmlValue::Query(q)) => Ok(CfmlValue::Int(q.column_count() as i64)),
         _ => Ok(CfmlValue::Int(0)),
     }
 }
@@ -4285,7 +4307,7 @@ fn fn_query_column_count(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_column_list(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
         // columnList reports column names uppercased, matching Lucee/ACF.
-        Some(CfmlValue::Query(q)) => Ok(CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(","))),
+        Some(CfmlValue::Query(q)) => Ok(CfmlValue::String(q.column_list())),
         _ => Ok(CfmlValue::String(String::new())),
     }
 }
@@ -4293,11 +4315,11 @@ fn fn_query_column_list(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_delete_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut result = q.clone();
+            let mut data = q.with_read(|d| d.clone());
             let row_idx = (get_int(&args, 1) as usize).saturating_sub(1);
-            if row_idx < result.rows.len() {
-                result.rows.remove(row_idx);
-                return Ok(CfmlValue::Query(result));
+            if row_idx < data.rows.len() {
+                data.rows.remove(row_idx);
+                return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
             }
             return Err(CfmlError::runtime(format!("queryDeleteRow: row {} is out of range", row_idx + 1)));
         }
@@ -4308,16 +4330,16 @@ fn fn_query_delete_row(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_delete_column(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut result = q.clone();
+            let mut data = q.with_read(|d| d.clone());
             let col_name = args[1].as_string().to_lowercase();
-            result.columns.retain(|c| c.to_lowercase() != col_name);
-            for row in &mut result.rows {
+            data.columns.retain(|c| c.to_lowercase() != col_name);
+            for row in &mut data.rows {
                 let key_to_remove: Option<String> = row.keys().find(|k| k.to_lowercase() == col_name).cloned();
                 if let Some(key) = key_to_remove {
                     row.shift_remove(&key);
                 }
             }
-            return Ok(CfmlValue::Query(result));
+            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
     }
     Ok(CfmlValue::Null)
@@ -4326,17 +4348,19 @@ fn fn_query_delete_column(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_append(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let (CfmlValue::Query(q1), CfmlValue::Query(q2)) = (&args[0], &args[1]) {
-            let mut result = q1.clone();
-            for col in &q2.columns {
-                let col_lower = col.to_lowercase();
-                if !result.columns.iter().any(|c| c.to_lowercase() == col_lower) {
-                    result.columns.push(col.clone());
+            let mut data = q1.with_read(|d| d.clone());
+            q2.with_read(|d2| {
+                for col in &d2.columns {
+                    let col_lower = col.to_lowercase();
+                    if !data.columns.iter().any(|c| c.to_lowercase() == col_lower) {
+                        data.columns.push(col.clone());
+                    }
                 }
-            }
-            for row in &q2.rows {
-                result.rows.push(row.clone());
-            }
-            return Ok(CfmlValue::Query(result));
+                for row in &d2.rows {
+                    data.rows.push(row.clone());
+                }
+            });
+            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
     }
     Err(CfmlError::runtime("queryAppend() requires two query arguments".to_string()))
@@ -4345,20 +4369,20 @@ fn fn_query_append(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut result = q.clone();
+            let mut data = q.with_read(|d| d.clone());
             let position = (get_int(&args, 2) as usize).saturating_sub(1);
-            if position > result.rows.len() {
+            if position > data.rows.len() {
                 return Err(CfmlError::runtime(format!(
                     "queryInsertAt: position {} is out of range (query has {} rows)",
-                    position + 1, result.rows.len()
+                    position + 1, data.rows.len()
                 )));
             }
             let row_data: IndexMap<String, CfmlValue> = match &args[1] {
-                CfmlValue::Struct(data) => data.snapshot(),
+                CfmlValue::Struct(d) => d.snapshot(),
                 _ => IndexMap::new(),
             };
-            result.rows.insert(position, row_data);
-            return Ok(CfmlValue::Query(result));
+            data.rows.insert(position, row_data);
+            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
     }
     Err(CfmlError::runtime("queryInsertAt() requires a query, row data, and position".to_string()))
@@ -4367,17 +4391,19 @@ fn fn_query_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_prepend(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let (CfmlValue::Query(q1), CfmlValue::Query(q2)) = (&args[0], &args[1]) {
-            let mut result = q1.clone();
-            for col in &q2.columns {
-                let col_lower = col.to_lowercase();
-                if !result.columns.iter().any(|c| c.to_lowercase() == col_lower) {
-                    result.columns.push(col.clone());
+            let mut data = q1.with_read(|d| d.clone());
+            let mut new_rows = q2.with_read(|d2| {
+                for col in &d2.columns {
+                    let col_lower = col.to_lowercase();
+                    if !data.columns.iter().any(|c| c.to_lowercase() == col_lower) {
+                        data.columns.push(col.clone());
+                    }
                 }
-            }
-            let mut new_rows = q2.rows.clone();
-            new_rows.append(&mut result.rows);
-            result.rows = new_rows;
-            return Ok(CfmlValue::Query(result));
+                d2.rows.clone()
+            });
+            new_rows.append(&mut data.rows);
+            data.rows = new_rows;
+            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
     }
     Err(CfmlError::runtime("queryPrepend() requires two query arguments".to_string()))
@@ -4385,9 +4411,9 @@ fn fn_query_prepend(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_reverse(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Query(q)) = args.first() {
-        let mut result = q.clone();
-        result.rows.reverse();
-        return Ok(CfmlValue::Query(result));
+        let mut data = q.with_read(|d| d.clone());
+        data.rows.reverse();
+        return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
     }
     Err(CfmlError::runtime("queryReverse() requires a query argument".to_string()))
 }
@@ -4395,23 +4421,23 @@ fn fn_query_reverse(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_row_swap(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut result = q.clone();
+            let mut data = q.with_read(|d| d.clone());
             let row1 = (get_int(&args, 1) as usize).saturating_sub(1);
             let row2 = (get_int(&args, 2) as usize).saturating_sub(1);
-            if row1 >= result.rows.len() {
+            if row1 >= data.rows.len() {
                 return Err(CfmlError::runtime(format!(
                     "queryRowSwap: row1 {} is out of range (query has {} rows)",
-                    row1 + 1, result.rows.len()
+                    row1 + 1, data.rows.len()
                 )));
             }
-            if row2 >= result.rows.len() {
+            if row2 >= data.rows.len() {
                 return Err(CfmlError::runtime(format!(
                     "queryRowSwap: row2 {} is out of range (query has {} rows)",
-                    row2 + 1, result.rows.len()
+                    row2 + 1, data.rows.len()
                 )));
             }
-            result.rows.swap(row1, row2);
-            return Ok(CfmlValue::Query(result));
+            data.rows.swap(row1, row2);
+            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
     }
     Err(CfmlError::runtime("queryRowSwap() requires a query and two row numbers".to_string()))
@@ -4420,20 +4446,20 @@ fn fn_query_row_swap(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_set_row(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 3 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut result = q.clone();
+            let mut data = q.with_read(|d| d.clone());
             let row_idx = (get_int(&args, 1) as usize).saturating_sub(1);
-            if row_idx >= result.rows.len() {
+            if row_idx >= data.rows.len() {
                 return Err(CfmlError::runtime(format!(
                     "querySetRow: row {} is out of range (query has {} rows)",
-                    row_idx + 1, result.rows.len()
+                    row_idx + 1, data.rows.len()
                 )));
             }
             let row_data: IndexMap<String, CfmlValue> = match &args[2] {
-                CfmlValue::Struct(data) => data.snapshot(),
+                CfmlValue::Struct(d) => d.snapshot(),
                 _ => IndexMap::new(),
             };
-            result.rows[row_idx] = row_data;
-            return Ok(CfmlValue::Query(result));
+            data.rows[row_idx] = row_data;
+            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
     }
     Err(CfmlError::runtime("querySetRow() requires a query, row number, and row data".to_string()))
@@ -5185,7 +5211,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                     "attributes".to_string(),
                     "mode".to_string(),
                 ];
-                let mut q = cfml_common::dynamic::CfmlQuery::new(columns);
+                let q = cfml_common::dynamic::CfmlQuery::new(columns);
                 for e in entries {
                     if let Entry::Row { name, directory, size, is_dir } = e {
                         let mut row = indexmap::IndexMap::new();
@@ -5196,10 +5222,10 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                         row.insert("dateLastModified".to_string(), CfmlValue::String(String::new()));
                         row.insert("attributes".to_string(), CfmlValue::String(String::new()));
                         row.insert("mode".to_string(), CfmlValue::String(String::new()));
-                        q.rows.push(row);
+                        q.add_row(row);
                     }
                 }
-                Ok(CfmlValue::Query(Box::new(q)))
+                Ok(CfmlValue::Query(q))
             } else {
                 let files: Vec<CfmlValue> = entries.into_iter().filter_map(|e| {
                     if let Entry::Scalar(v) = e { Some(v) } else { None }
@@ -7805,12 +7831,11 @@ fn build_query_result(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue
             Ok(CfmlValue::strukt(IndexMap::new()))
         }
     } else {
-        let query = CfmlQuery {
+        Ok(CfmlValue::Query(CfmlQuery::from_parts_sql(
             columns,
             rows,
-            sql: Some(sql.to_string()),
-        };
-        Ok(CfmlValue::Query(Box::new(query)))
+            Some(sql.to_string()),
+        )))
     }
 }
 
@@ -8058,12 +8083,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
 
             list_dir(Path::new(&directory), &filter, recurse, &mut rows)?;
 
-            let query = CfmlQuery {
-                columns,
-                rows,
-                sql: None,
-            };
-            Ok(CfmlValue::Query(Box::new(query)))
+            Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)))
         }
         "create" => {
             fs::create_dir_all(&directory).map_err(|e| {
@@ -9660,8 +9680,7 @@ fn fn_dollar_format(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_column_exists(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Query(q)) => {
-            let col = get_str(&args, 1).to_uppercase();
-            let exists = q.columns.iter().any(|c| c.to_uppercase() == col);
+            let exists = q.has_column_ci(&get_str(&args, 1));
             Ok(CfmlValue::Bool(exists))
         }
         _ => Err(CfmlError::runtime("queryColumnExists() requires a query".to_string())),
@@ -9672,22 +9691,21 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Query(q)) => {
             let offset = (get_int(&args, 1) as usize).saturating_sub(1);
-            let length = if args.len() > 2 {
-                get_int(&args, 2) as usize
-            } else {
-                q.rows.len().saturating_sub(offset)
-            };
-            let end = std::cmp::min(offset + length, q.rows.len());
-            let sliced_rows = if offset < q.rows.len() {
-                q.rows[offset..end].to_vec()
-            } else {
-                Vec::new()
-            };
-            Ok(CfmlValue::Query(Box::new(CfmlQuery {
-                columns: q.columns.clone(),
-                rows: sliced_rows,
-                sql: None,
-            })))
+            let sliced = q.with_read(|d| {
+                let length = if args.len() > 2 {
+                    get_int(&args, 2) as usize
+                } else {
+                    d.rows.len().saturating_sub(offset)
+                };
+                let end = std::cmp::min(offset + length, d.rows.len());
+                let rows = if offset < d.rows.len() {
+                    d.rows[offset..end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                CfmlQueryData { columns: d.columns.clone(), rows, sql: None }
+            });
+            Ok(CfmlValue::Query(CfmlQuery::from_data(sliced)))
         }
         _ => Err(CfmlError::runtime("querySlice() requires a query".to_string())),
     }
@@ -9707,19 +9725,21 @@ fn fn_query_column_data(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Query(q)) => {
             let col = get_str(&args, 1);
-            let col_upper = col.to_uppercase();
-            let actual_col = q.columns.iter()
-                .find(|c| c.to_uppercase() == col_upper)
-                .cloned()
-                .unwrap_or(col);
-            let values: Vec<CfmlValue> = q.rows.iter()
-                .map(|row| {
-                    row.iter()
-                        .find(|(k, _)| k.to_uppercase() == actual_col.to_uppercase())
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(CfmlValue::String(String::new()))
-                })
-                .collect();
+            let values = q.with_read(|d| {
+                let col_upper = col.to_uppercase();
+                let actual_col = d.columns.iter()
+                    .find(|c| c.to_uppercase() == col_upper)
+                    .cloned()
+                    .unwrap_or_else(|| col.clone());
+                d.rows.iter()
+                    .map(|row| {
+                        row.iter()
+                            .find(|(k, _)| k.to_uppercase() == actual_col.to_uppercase())
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(CfmlValue::String(String::new()))
+                    })
+                    .collect::<Vec<CfmlValue>>()
+            });
             Ok(CfmlValue::array(values))
         }
         _ => Err(CfmlError::runtime("queryColumnData() requires a query".to_string())),
@@ -10999,7 +11019,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 "compressedsize".to_string(), "type".to_string(),
                 "datelastmodified".to_string(), "comment".to_string(), "crc".to_string(),
             ];
-            let mut query = cfml_common::dynamic::CfmlQuery::new(columns);
+            let query = cfml_common::dynamic::CfmlQuery::new(columns);
 
             for i in 0..archive.len() {
                 let entry = archive.by_index(i).map_err(|e| CfmlError::runtime(e.to_string()))?;
@@ -11018,10 +11038,10 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                 row.insert("datelastmodified".to_string(), CfmlValue::String(String::new()));
                 row.insert("comment".to_string(), CfmlValue::String(entry.comment().to_string()));
                 row.insert("crc".to_string(), CfmlValue::Int(entry.crc32() as i64));
-                query.rows.push(row);
+                query.add_row(row);
             }
 
-            Ok(CfmlValue::Query(Box::new(query)))
+            Ok(CfmlValue::Query(query))
         }
         "read" => {
             if file_path.is_empty() || entry_path.is_empty() {

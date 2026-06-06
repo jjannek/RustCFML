@@ -8,10 +8,11 @@
 //! simple projection) → DISTINCT → (statement level) UNION → ORDER BY →
 //! LIMIT/OFFSET.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use cfml_common::dynamic::{CfmlQuery, CfmlValue};
+use cfml_common::dynamic::{CfmlQuery, CfmlQueryData, CfmlValue};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 
@@ -20,8 +21,21 @@ use crate::compare::{compare_total, group_key, sql_equal};
 use crate::function::{QoQFnKind, QoQFunctionRegistry};
 use crate::functions;
 use crate::intersection::build_intersections;
-use crate::like::like_match;
+use crate::like::{self, like_match};
 use crate::table::{QoQTable, TableSet};
+
+/// Upper bound on materialised join row-combinations before the engine refuses
+/// (catchable error) rather than risk exhausting memory. Filtered `JOIN … ON`
+/// keeps intersections small and is unaffected; an unfiltered N-table comma
+/// join over a huge table is what this stops. ~30M × small Vec ≈ a few hundred MB.
+const MAX_INTERSECTIONS: usize = 30_000_000;
+
+/// Above this many rows, the per-row WHERE filter and projection fan out across
+/// cores with rayon — but only when the statement is "pure" (no custom CFML UDF
+/// and no subquery anywhere), so evaluation never needs the non-`Send` VM
+/// callback. Non-wasm only.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_ROW_THRESHOLD: usize = 10_000;
 
 /// Bind parameters supplied to a parameterised QoQ query.
 #[derive(Debug, Default)]
@@ -57,14 +71,254 @@ pub fn execute(
     udf: &mut dyn FnMut(&CfmlValue, Vec<CfmlValue>) -> CfmlResult,
 ) -> CfmlResult {
     let Statement::Select(select) = stmt;
-    let mut engine = Engine {
+    // A statement is parallel-eligible only if no expression anywhere calls a
+    // custom CFML UDF and there are no subqueries/derived tables — i.e. row
+    // evaluation never needs the (non-`Send`) VM callback or a recursive run.
+    let parallel = is_parallel_safe(select, registry);
+    // Pre-compile every constant-pattern LIKE once (keyed by the pattern node's
+    // address) so the per-row filter reuses it instead of recompiling per row.
+    let like_cache = build_like_cache(select);
+    // The sequential invoker owns the VM callback behind a `RefCell` so the
+    // engine's methods can be `&self` (the only thing that ever needed `&mut`).
+    let seq = SeqInvoker {
+        udf: RefCell::new(udf),
+    };
+    let engine = Engine {
         sources,
         params,
         registry,
-        udf,
+        inv: &seq,
+        parallel,
+        like_cache: &like_cache,
     };
     let query = engine.run_statement(select)?;
-    Ok(CfmlValue::Query(Box::new(query)))
+    Ok(CfmlValue::Query(CfmlQuery::from_data(query)))
+}
+
+/// The one side-effecting operation expression evaluation needs that the
+/// parallel path must not perform: invoking a custom CFML UDF through the VM.
+/// (Subqueries are handled by `Engine::run_statement` directly, so they don't
+/// need to go through the invoker.) The sequential path uses [`SeqInvoker`];
+/// the parallel path uses [`PureInvoker`], which is `Sync` and rejects the call
+/// (unreachable — purity is checked before the parallel path is taken).
+trait Invoker {
+    fn invoke_custom(&self, f: &CfmlValue, args: Vec<CfmlValue>) -> CfmlResult;
+}
+
+/// Sequential invoker: forwards to the VM callback. Holds it behind a `RefCell`
+/// so the engine is `&self` throughout; single-threaded, so the borrow is never
+/// contended.
+struct SeqInvoker<'a> {
+    udf: RefCell<&'a mut dyn FnMut(&CfmlValue, Vec<CfmlValue>) -> CfmlResult>,
+}
+
+impl Invoker for SeqInvoker<'_> {
+    fn invoke_custom(&self, f: &CfmlValue, args: Vec<CfmlValue>) -> CfmlResult {
+        let mut udf = self.udf.borrow_mut();
+        (&mut **udf)(f, args)
+    }
+}
+
+/// Pure invoker for the parallel path: zero-sized and `Sync`. Reaching either
+/// method means the purity check was wrong, so it's a hard internal error.
+/// Only the rayon path constructs it, so it doesn't exist on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
+struct PureInvoker;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Invoker for PureInvoker {
+    fn invoke_custom(&self, _f: &CfmlValue, _args: Vec<CfmlValue>) -> CfmlResult {
+        Err(CfmlError::runtime(
+            "Query of Queries: custom function reached the parallel path (internal error)".to_string(),
+        ))
+    }
+}
+
+/// Whether `stmt` can be evaluated on the parallel (pure) path: no expression
+/// calls a registered custom UDF, and there are no subqueries or derived tables.
+fn is_parallel_safe(stmt: &SelectStatement, registry: &QoQFunctionRegistry) -> bool {
+    select_is_pure(stmt, registry)
+}
+
+fn select_is_pure(s: &SelectStatement, reg: &QoQFunctionRegistry) -> bool {
+    core_is_pure(&s.body, reg)
+        && s.unions.iter().all(|u| core_is_pure(&u.select, reg))
+        && s.order_by.iter().all(|ob| expr_is_pure(&ob.expr, reg))
+}
+
+fn core_is_pure(c: &SelectCore, reg: &QoQFunctionRegistry) -> bool {
+    // A derived table (subquery in FROM) forces the sequential path.
+    if let Some(from) = &c.from {
+        if !tableref_is_pure(from, reg) {
+            return false;
+        }
+    }
+    c.joins.iter().all(|j| {
+        tableref_is_pure(&j.table, reg) && j.on.as_ref().map(|on| expr_is_pure(on, reg)).unwrap_or(true)
+    }) && c.where_clause.as_ref().map(|w| expr_is_pure(w, reg)).unwrap_or(true)
+        && c.group_by.iter().all(|g| expr_is_pure(g, reg))
+        && c.having.as_ref().map(|h| expr_is_pure(h, reg)).unwrap_or(true)
+        && c.columns.iter().all(|col| expr_is_pure(&col.expr, reg))
+}
+
+fn tableref_is_pure(t: &TableRef, _reg: &QoQFunctionRegistry) -> bool {
+    matches!(t, TableRef::Named { .. })
+}
+
+fn expr_is_pure(e: &Expr, reg: &QoQFunctionRegistry) -> bool {
+    match e {
+        // A custom UDF call needs the VM callback → not parallel-safe.
+        Expr::Function { name, args, .. } => {
+            reg.get_custom(name).is_none() && args.iter().all(|a| expr_is_pure(a, reg))
+        }
+        // Any subquery forces the sequential path.
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } => false,
+        Expr::Binary { left, right, .. } => expr_is_pure(left, reg) && expr_is_pure(right, reg),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_is_pure(expr, reg)
+        }
+        Expr::Case { operand, whens, else_expr } => {
+            operand.as_ref().map(|o| expr_is_pure(o, reg)).unwrap_or(true)
+                && whens.iter().all(|w| expr_is_pure(&w.when, reg) && expr_is_pure(&w.then, reg))
+                && else_expr.as_ref().map(|e| expr_is_pure(e, reg)).unwrap_or(true)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_is_pure(expr, reg) && list.iter().all(|e| expr_is_pure(e, reg))
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_is_pure(expr, reg) && expr_is_pure(low, reg) && expr_is_pure(high, reg)
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            expr_is_pure(expr, reg)
+                && expr_is_pure(pattern, reg)
+                && escape.as_ref().map(|e| expr_is_pure(e, reg)).unwrap_or(true)
+        }
+        Expr::Star { .. } | Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) => true,
+    }
+}
+
+/// Walk the statement and pre-compile every LIKE whose pattern (and escape, if
+/// any) is a constant literal, keyed by the pattern `Expr` node's address. The
+/// per-row `eval_like` then reuses the compiled matcher instead of recompiling.
+fn build_like_cache(stmt: &SelectStatement) -> HashMap<usize, like::Compiled> {
+    let mut cache = HashMap::new();
+    collect_likes_select(stmt, &mut cache);
+    cache
+}
+
+fn collect_likes_select(s: &SelectStatement, cache: &mut HashMap<usize, like::Compiled>) {
+    collect_likes_core(&s.body, cache);
+    for u in &s.unions {
+        collect_likes_core(&u.select, cache);
+    }
+    for ob in &s.order_by {
+        collect_likes_expr(&ob.expr, cache);
+    }
+}
+
+fn collect_likes_core(c: &SelectCore, cache: &mut HashMap<usize, like::Compiled>) {
+    if let Some(TableRef::Derived { select, .. }) = &c.from {
+        collect_likes_select(select, cache);
+    }
+    for j in &c.joins {
+        if let TableRef::Derived { select, .. } = &j.table {
+            collect_likes_select(select, cache);
+        }
+        if let Some(on) = &j.on {
+            collect_likes_expr(on, cache);
+        }
+    }
+    if let Some(w) = &c.where_clause {
+        collect_likes_expr(w, cache);
+    }
+    for g in &c.group_by {
+        collect_likes_expr(g, cache);
+    }
+    if let Some(h) = &c.having {
+        collect_likes_expr(h, cache);
+    }
+    for col in &c.columns {
+        collect_likes_expr(&col.expr, cache);
+    }
+}
+
+fn collect_likes_expr(e: &Expr, cache: &mut HashMap<usize, like::Compiled>) {
+    match e {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_likes_expr(expr, cache);
+            collect_likes_expr(pattern, cache);
+            if let Some(es) = escape {
+                collect_likes_expr(es, cache);
+            }
+            // Cache only when the pattern is a non-NULL literal and the escape
+            // (if present) is also a literal — i.e. constant for the whole query.
+            if let Expr::Literal(pv) = &**pattern {
+                if !matches!(pv, CfmlValue::Null) {
+                    let esc = match escape.as_deref() {
+                        None => Some(None),
+                        Some(Expr::Literal(ev)) => Some(ev.as_string().chars().next()),
+                        Some(_) => None, // non-literal escape → can't pre-compile
+                    };
+                    if let Some(esc) = esc {
+                        let key = (&**pattern) as *const Expr as usize;
+                        cache.insert(key, like::compile(&pv.as_string(), esc));
+                    }
+                }
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_likes_expr(left, cache);
+            collect_likes_expr(right, cache);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_likes_expr(expr, cache)
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_likes_expr(a, cache);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                collect_likes_expr(o, cache);
+            }
+            for w in whens {
+                collect_likes_expr(&w.when, cache);
+                collect_likes_expr(&w.then, cache);
+            }
+            if let Some(e) = else_expr {
+                collect_likes_expr(e, cache);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_likes_expr(expr, cache);
+            for e in list {
+                collect_likes_expr(e, cache);
+            }
+        }
+        Expr::InSubquery { expr, select, .. } => {
+            collect_likes_expr(expr, cache);
+            collect_likes_select(select, cache);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_likes_expr(expr, cache);
+            collect_likes_expr(low, cache);
+            collect_likes_expr(high, cache);
+        }
+        Expr::ScalarSubquery(select) => collect_likes_select(select, cache),
+        Expr::Star { .. } | Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) => {}
+    }
 }
 
 /// Collect every named (query-variable) table referenced anywhere in the
@@ -204,17 +458,25 @@ struct CoreResult {
     sort_keys: Vec<Vec<CfmlValue>>,
 }
 
-struct Engine<'a> {
+struct Engine<'a, I: Invoker> {
     sources: &'a [(String, &'a CfmlQuery)],
     params: &'a QoQParams,
     registry: &'a QoQFunctionRegistry,
-    udf: &'a mut dyn FnMut(&CfmlValue, Vec<CfmlValue>) -> CfmlResult,
+    inv: &'a I,
+    /// Whether the whole statement is parallel-safe (set once in `execute`).
+    /// Only read by the rayon path, so it's dead on wasm32.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    parallel: bool,
+    /// Constant LIKE patterns pre-compiled once, keyed by the pattern `Expr`
+    /// node's address. Read-only (built before execution), so it's shared
+    /// across the rayon parallel filter without locking.
+    like_cache: &'a HashMap<usize, like::Compiled>,
 }
 
-impl Engine<'_> {
+impl<'a, I: Invoker> Engine<'a, I> {
     // ── Statement / core ───────────────────────────────────────────────
 
-    fn run_statement(&mut self, stmt: &SelectStatement) -> Result<CfmlQuery, CfmlError> {
+    fn run_statement(&self, stmt: &SelectStatement) -> Result<CfmlQueryData, CfmlError> {
         // ORDER BY keys are computed in-context only for the single-core case;
         // for UNION, ordering is by output column post-merge.
         let body_order: &[OrderByExpr] = if stmt.unions.is_empty() {
@@ -255,7 +517,7 @@ impl Engine<'_> {
     }
 
     fn run_core(
-        &mut self,
+        &self,
         core: &SelectCore,
         order_by: &[OrderByExpr],
     ) -> Result<CoreResult, CfmlError> {
@@ -302,7 +564,7 @@ impl Engine<'_> {
     }
 
     fn run_no_from(
-        &mut self,
+        &self,
         core: &SelectCore,
         order_by: &[OrderByExpr],
     ) -> Result<CoreResult, CfmlError> {
@@ -329,7 +591,7 @@ impl Engine<'_> {
         })
     }
 
-    fn resolve_tables(&mut self, core: &SelectCore) -> Result<TableSet, CfmlError> {
+    fn resolve_tables(&self, core: &SelectCore) -> Result<TableSet, CfmlError> {
         let mut ts = TableSet::new();
         if let Some(from) = &core.from {
             ts.add(self.resolve_table_ref(from)?);
@@ -340,7 +602,7 @@ impl Engine<'_> {
         Ok(ts)
     }
 
-    fn resolve_table_ref(&mut self, tref: &TableRef) -> Result<QoQTable, CfmlError> {
+    fn resolve_table_ref(&self, tref: &TableRef) -> Result<QoQTable, CfmlError> {
         match tref {
             TableRef::Named { name, alias } => {
                 let query = self
@@ -355,17 +617,18 @@ impl Engine<'_> {
                         ))
                     })?;
                 let binding = alias.clone().unwrap_or_else(|| name.clone());
-                Ok(QoQTable::from_query(&binding, query))
+                // Read the shared source handle under a guard once, column-major.
+                Ok(query.with_read(|d| QoQTable::from_query_data(&binding, d)))
             }
             TableRef::Derived { select, alias } => {
                 let q = self.run_statement(select)?;
-                Ok(QoQTable::from_query(alias, &q))
+                Ok(QoQTable::from_query_data(alias, &q))
             }
         }
     }
 
     fn build_core_intersections(
-        &mut self,
+        &self,
         core: &SelectCore,
         tables: &TableSet,
     ) -> Result<Vec<Vec<usize>>, CfmlError> {
@@ -374,7 +637,7 @@ impl Engine<'_> {
         let joins = &core.joins;
         let mut on_err: Option<CfmlError> = None;
 
-        let inters = build_intersections(&row_counts, &join_types, |k, cand| {
+        let result = build_intersections(&row_counts, &join_types, MAX_INTERSECTIONS, |k, cand| {
             if on_err.is_some() {
                 return false;
             }
@@ -390,14 +653,36 @@ impl Engine<'_> {
             }
         });
 
-        match on_err {
-            Some(e) => Err(e),
-            None => Ok(inters),
+        if let Some(e) = on_err {
+            return Err(e);
+        }
+        result.map_err(|size| {
+            CfmlError::runtime(format!(
+                "Query of Queries: join would materialise {} row combinations, exceeding the limit \
+                 of {}. Add an explicit `JOIN ... ON` (filtered as it builds) or reduce the data.",
+                size, MAX_INTERSECTIONS
+            ))
+        })
+    }
+
+    /// A `Sync` companion engine sharing this query's tables/params/registry but
+    /// using the pure (UDF-rejecting) invoker — the evaluator handed to rayon.
+    /// Only built when `self.parallel` (the statement is pure), so its `eval`
+    /// never reaches `invoke_custom`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pure_engine<'p>(&'p self, pure: &'p PureInvoker) -> Engine<'p, PureInvoker> {
+        Engine {
+            sources: self.sources,
+            params: self.params,
+            registry: self.registry,
+            inv: pure,
+            parallel: false,
+            like_cache: self.like_cache,
         }
     }
 
     fn filter_where(
-        &mut self,
+        &self,
         intersections: Vec<Vec<usize>>,
         where_clause: &Option<Expr>,
         tables: &TableSet,
@@ -405,6 +690,23 @@ impl Engine<'_> {
         let Some(expr) = where_clause else {
             return Ok(intersections);
         };
+        // Pure statement + many rows → evaluate the predicate across cores.
+        // `into_par_iter().collect()` preserves order; `flatten` drops the
+        // rows that didn't match.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.parallel && intersections.len() >= PARALLEL_ROW_THRESHOLD {
+            use rayon::prelude::*;
+            let pure = PureInvoker;
+            let pe = self.pure_engine(&pure);
+            let kept: Result<Vec<Option<Vec<usize>>>, CfmlError> = intersections
+                .into_par_iter()
+                .map(|inter| {
+                    let v = pe.eval(expr, tables, RowCtx::Row(&inter))?;
+                    Ok(if is_truthy(&v) { Some(inter) } else { None })
+                })
+                .collect();
+            return Ok(kept?.into_iter().flatten().collect());
+        }
         let mut out = Vec::new();
         for inter in intersections {
             let v = self.eval(expr, tables, RowCtx::Row(&inter))?;
@@ -416,12 +718,36 @@ impl Engine<'_> {
     }
 
     fn exec_simple(
-        &mut self,
+        &self,
         select_cols: &[SelectColumn],
         intersections: &[Vec<usize>],
         tables: &TableSet,
         order_by: &[OrderByExpr],
     ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>), CfmlError> {
+        // Pure statement + many rows → project (and build sort keys) per row
+        // across cores. `par_iter().collect()` preserves row order.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.parallel && intersections.len() >= PARALLEL_ROW_THRESHOLD {
+            use rayon::prelude::*;
+            let pure = PureInvoker;
+            let pe = self.pure_engine(&pure);
+            let built: Result<Vec<(Vec<CfmlValue>, Vec<CfmlValue>)>, CfmlError> = intersections
+                .par_iter()
+                .map(|inter| {
+                    let mut row = Vec::with_capacity(select_cols.len());
+                    for sc in select_cols {
+                        row.push(pe.eval(&sc.expr, tables, RowCtx::Row(inter))?);
+                    }
+                    let mut key = Vec::with_capacity(order_by.len());
+                    for ob in order_by {
+                        key.push(pe.order_key(ob, tables, RowCtx::Row(inter), &row)?);
+                    }
+                    Ok((row, key))
+                })
+                .collect();
+            let (rows, keys): (Vec<_>, Vec<_>) = built?.into_iter().unzip();
+            return Ok((rows, keys));
+        }
         let mut rows = Vec::with_capacity(intersections.len());
         let mut keys = Vec::with_capacity(intersections.len());
         for inter in intersections {
@@ -440,7 +766,7 @@ impl Engine<'_> {
     }
 
     fn exec_aggregate(
-        &mut self,
+        &self,
         core: &SelectCore,
         select_cols: &[SelectColumn],
         intersections: &[Vec<usize>],
@@ -479,7 +805,7 @@ impl Engine<'_> {
     }
 
     fn partition(
-        &mut self,
+        &self,
         intersections: &[Vec<usize>],
         group_by: &[Expr],
         tables: &TableSet,
@@ -499,7 +825,7 @@ impl Engine<'_> {
     /// The sort-key value for one ORDER BY item. A bare integer literal is a
     /// 1-based reference into the projected row; otherwise evaluate the expr.
     fn order_key(
-        &mut self,
+        &self,
         ob: &OrderByExpr,
         tables: &TableSet,
         ctx: RowCtx,
@@ -515,7 +841,7 @@ impl Engine<'_> {
     /// Order a UNION's merged rows by output column (position / name / expr over
     /// the output columns).
     fn order_by_output(
-        &mut self,
+        &self,
         rows: &mut Vec<Vec<CfmlValue>>,
         columns: &[String],
         order_by: &[OrderByExpr],
@@ -546,7 +872,7 @@ impl Engine<'_> {
 
     // ── Expression evaluation (dual-path via RowCtx) ────────────────────
 
-    fn eval(&mut self, expr: &Expr, tables: &TableSet, ctx: RowCtx) -> CfmlResult {
+    fn eval(&self, expr: &Expr, tables: &TableSet, ctx: RowCtx) -> CfmlResult {
         match expr {
             Expr::Literal(v) => Ok(v.clone()),
 
@@ -671,7 +997,7 @@ impl Engine<'_> {
     }
 
     fn eval_binary(
-        &mut self,
+        &self,
         left: &Expr,
         op: BinaryOp,
         right: &Expr,
@@ -704,7 +1030,7 @@ impl Engine<'_> {
     }
 
     fn eval_case(
-        &mut self,
+        &self,
         operand: Option<&Expr>,
         whens: &[WhenThen],
         else_expr: Option<&Expr>,
@@ -736,7 +1062,7 @@ impl Engine<'_> {
     }
 
     fn eval_in_list(
-        &mut self,
+        &self,
         expr: &Expr,
         negated: bool,
         list: &[Expr],
@@ -760,7 +1086,7 @@ impl Engine<'_> {
     }
 
     fn eval_in_subquery(
-        &mut self,
+        &self,
         expr: &Expr,
         negated: bool,
         select: &SelectStatement,
@@ -784,7 +1110,7 @@ impl Engine<'_> {
     }
 
     fn eval_between(
-        &mut self,
+        &self,
         expr: &Expr,
         negated: bool,
         low: &Expr,
@@ -806,7 +1132,7 @@ impl Engine<'_> {
     }
 
     fn eval_like(
-        &mut self,
+        &self,
         expr: &Expr,
         negated: bool,
         pattern: &Expr,
@@ -815,19 +1141,30 @@ impl Engine<'_> {
         ctx: RowCtx,
     ) -> CfmlResult {
         let v = self.eval(expr, tables, ctx)?;
+        if matches!(v, CfmlValue::Null) {
+            return Ok(CfmlValue::Null);
+        }
+        let text = v.as_string();
+        // Constant pattern: use the once-per-query pre-compiled matcher (keyed by
+        // the pattern node's address), avoiding a recompile on every row.
+        let key = pattern as *const Expr as usize;
+        if let Some(compiled) = self.like_cache.get(&key) {
+            return Ok(CfmlValue::Bool(compiled.matches(&text) ^ negated));
+        }
+        // Dynamic pattern (or a NULL literal, which isn't cached): evaluate it.
         let p = self.eval(pattern, tables, ctx)?;
-        if matches!(v, CfmlValue::Null) || matches!(p, CfmlValue::Null) {
+        if matches!(p, CfmlValue::Null) {
             return Ok(CfmlValue::Null);
         }
         let esc = match escape {
             Some(e) => self.eval(e, tables, ctx)?.as_string().chars().next(),
             None => None,
         };
-        let matched = like_match(&v.as_string(), &p.as_string(), esc);
+        let matched = like_match(&text, &p.as_string(), esc);
         Ok(CfmlValue::Bool(matched ^ negated))
     }
 
-    fn eval_scalar_subquery(&mut self, select: &SelectStatement) -> CfmlResult {
+    fn eval_scalar_subquery(&self, select: &SelectStatement) -> CfmlResult {
         let q = self.run_statement(select)?;
         let Some(first_col) = q.columns.first() else {
             return Ok(CfmlValue::Null);
@@ -840,7 +1177,7 @@ impl Engine<'_> {
     }
 
     fn subquery_first_column(
-        &mut self,
+        &self,
         select: &SelectStatement,
     ) -> Result<Vec<CfmlValue>, CfmlError> {
         let q = self.run_statement(select)?;
@@ -856,7 +1193,7 @@ impl Engine<'_> {
 
     // ── Function dispatch ───────────────────────────────────────────────
 
-    fn call_scalar_fn(&mut self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
+    fn call_scalar_fn(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
         // 1. built-in scalar
         if let Some(r) = functions::call_scalar(name, &args) {
             return r;
@@ -867,7 +1204,7 @@ impl Engine<'_> {
         }
         // 3. custom CFML UDF (scalar)
         if let Some((cfval, QoQFnKind::Scalar)) = self.registry.get_custom(name).cloned() {
-            return (self.udf)(&cfval, args);
+            return self.inv.invoke_custom(&cfval, args);
         }
         Err(CfmlError::runtime(format!(
             "Query of Queries: unknown function '{}'",
@@ -876,7 +1213,7 @@ impl Engine<'_> {
     }
 
     fn eval_aggregate_call(
-        &mut self,
+        &self,
         name: &str,
         args: &[Expr],
         distinct: bool,
@@ -949,7 +1286,7 @@ impl Engine<'_> {
             return f(arrays);
         }
         if let Some((cfval, QoQFnKind::Aggregate)) = self.registry.get_custom(&lname).cloned() {
-            return (self.udf)(&cfval, arrays);
+            return self.inv.invoke_custom(&cfval, arrays);
         }
         Err(CfmlError::runtime(format!(
             "Query of Queries: unknown aggregate function '{}'",
@@ -958,7 +1295,7 @@ impl Engine<'_> {
     }
 
     fn collect_arg(
-        &mut self,
+        &self,
         arg: &Expr,
         tables: &TableSet,
         partition: &[Vec<usize>],
@@ -1221,14 +1558,25 @@ fn arith(l: &CfmlValue, op: BinaryOp, r: &CfmlValue) -> CfmlResult {
     if matches!(l, CfmlValue::Null) || matches!(r, CfmlValue::Null) {
         return Ok(CfmlValue::Null);
     }
-    // Integer-preserving for + - * % when both sides are integers.
+    // `+` is numeric when BOTH operands coerce to numbers (Lucee QoQ: '10'+'5'
+    // = 15), otherwise string concatenation (name+dept = "JohnIT", name+5 =
+    // "John5"). Matches SQL-Server-style `+` overloading.
+    if op == BinaryOp::Add {
+        match (functions::to_f64(l), functions::to_f64(r)) {
+            (Some(a), Some(b)) => {
+                if let (CfmlValue::Int(x), CfmlValue::Int(y)) = (l, r) {
+                    if let Some(v) = x.checked_add(*y) {
+                        return Ok(CfmlValue::Int(v));
+                    }
+                }
+                return Ok(integral_or_double(a + b));
+            }
+            _ => return Ok(CfmlValue::String(l.as_string() + &r.as_string())),
+        }
+    }
+    // Sub / Mul / Mod — integer-preserving when both sides are integers.
     if let (CfmlValue::Int(a), CfmlValue::Int(b)) = (l, r) {
         match op {
-            BinaryOp::Add => {
-                if let Some(v) = a.checked_add(*b) {
-                    return Ok(CfmlValue::Int(v));
-                }
-            }
             BinaryOp::Sub => {
                 if let Some(v) = a.checked_sub(*b) {
                     return Ok(CfmlValue::Int(v));
@@ -1251,7 +1599,6 @@ fn arith(l: &CfmlValue, op: BinaryOp, r: &CfmlValue) -> CfmlResult {
     let a = functions::to_f64(l).ok_or_else(|| non_numeric(l))?;
     let b = functions::to_f64(r).ok_or_else(|| non_numeric(r))?;
     let res = match op {
-        BinaryOp::Add => a + b,
         BinaryOp::Sub => a - b,
         BinaryOp::Mul => a * b,
         BinaryOp::Div => {
@@ -1268,11 +1615,20 @@ fn arith(l: &CfmlValue, op: BinaryOp, r: &CfmlValue) -> CfmlResult {
         }
         _ => unreachable!(),
     };
-    // Render an integral double result as Int (preserve native types).
-    if res.fract() == 0.0 && res.abs() < 9.0e15 && op != BinaryOp::Div {
-        Ok(CfmlValue::Int(res as i64))
+    // Render an integral result as Int (preserve native types); division stays Double.
+    if op != BinaryOp::Div {
+        Ok(integral_or_double(res))
     } else {
         Ok(CfmlValue::Double(res))
+    }
+}
+
+/// An integral f64 becomes `Int` (preserve native types), else `Double`.
+fn integral_or_double(n: f64) -> CfmlValue {
+    if n.fract() == 0.0 && n.abs() < 9.0e15 {
+        CfmlValue::Int(n as i64)
+    } else {
+        CfmlValue::Double(n)
     }
 }
 
@@ -1353,16 +1709,20 @@ fn derive_column_names(columns: &[SelectColumn]) -> Vec<String> {
     names
 }
 
-fn build_query(columns: Vec<String>, rows: Vec<Vec<CfmlValue>>) -> CfmlQuery {
-    let mut q = CfmlQuery::new(columns.clone());
+fn build_query(columns: Vec<String>, rows: Vec<Vec<CfmlValue>>) -> CfmlQueryData {
+    let mut out_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let mut map = IndexMap::with_capacity(columns.len());
         for (i, c) in columns.iter().enumerate() {
             map.insert(c.clone(), row.get(i).cloned().unwrap_or(CfmlValue::Null));
         }
-        q.rows.push(map);
+        out_rows.push(map);
     }
-    q
+    CfmlQueryData {
+        columns,
+        rows: out_rows,
+        sql: None,
+    }
 }
 
 // ── DISTINCT / ORDER BY / LIMIT ─────────────────────────────────────────

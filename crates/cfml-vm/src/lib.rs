@@ -1,7 +1,7 @@
 //! CFML Virtual Machine - Bytecode execution engine
 
 use cfml_codegen::{BytecodeFunction, BytecodeOp, BytecodeProgram, CmpOp};
-use cfml_common::dynamic::{CfmlStruct, CfmlValue};
+use cfml_common::dynamic::{CfmlQuery, CfmlStruct, CfmlValue};
 use cfml_common::vfs::{RealFs, Vfs};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
@@ -1384,12 +1384,14 @@ impl CfmlVirtualMachine {
         parent_locals: &IndexMap<String, CfmlValue>,
     ) -> Option<cfml_common::dynamic::CfmlQuery> {
         let lower = name.to_lowercase();
+        // Cloning a query handle shares the Arc (cheap) — the QoQ engine only
+        // reads the source tables, so sharing is correct and avoids a deep copy.
         if let Some(CfmlValue::Query(q)) = parent_locals
             .iter()
             .find(|(k, _)| k.to_lowercase() == lower)
             .map(|(_, v)| v)
         {
-            return Some((**q).clone());
+            return Some(q.clone());
         }
         if let Some(CfmlValue::Query(q)) = self
             .globals
@@ -1397,14 +1399,14 @@ impl CfmlVirtualMachine {
             .find(|(k, _)| k.to_lowercase() == lower)
             .map(|(_, v)| v)
         {
-            return Some((**q).clone());
+            return Some(q.clone());
         }
         if let Some(CfmlValue::Query(q)) = self.request_scope.get_ci(&lower) {
-            return Some(*q);
+            return Some(q);
         }
         if let Some(app) = self.application_scope.as_ref() {
             if let Some(CfmlValue::Query(q)) = app.get_ci(&lower) {
-                return Some(*q);
+                return Some(q);
             }
         }
         None
@@ -1580,29 +1582,16 @@ impl CfmlVirtualMachine {
             }
             CfmlValue::Query(q) => {
                 if name.eq_ignore_ascii_case("recordcount") {
-                    CfmlValue::Int(q.rows.len() as i64)
+                    CfmlValue::Int(q.row_count() as i64)
                 } else if name.eq_ignore_ascii_case("columnlist") {
                     // columnList reports column names uppercased, matching Lucee/ACF.
-                    CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(","))
+                    CfmlValue::String(q.column_list())
+                } else if let Some(col_data) = q.column_values_ci(name) {
+                    // QueryColumn proxy: acts as Array for indexing/iteration
+                    // but stringifies to first row (Lucee parity).
+                    CfmlValue::QueryColumn(std::sync::Arc::new(col_data))
                 } else {
-                    let is_col = q.columns.iter().any(|c| c.eq_ignore_ascii_case(name));
-                    if is_col {
-                        let col_data: Vec<CfmlValue> = q
-                            .rows
-                            .iter()
-                            .map(|row| {
-                                row.iter()
-                                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or(CfmlValue::Null)
-                            })
-                            .collect();
-                        // QueryColumn proxy: acts as Array for indexing/iteration
-                        // but stringifies to first row (Lucee parity).
-                        CfmlValue::QueryColumn(std::sync::Arc::new(col_data))
-                    } else {
-                        CfmlValue::Null
-                    }
+                    CfmlValue::Null
                 }
             }
             _ => obj.get(name).unwrap_or(CfmlValue::Null),
@@ -3614,32 +3603,17 @@ impl CfmlVirtualMachine {
                             CfmlValue::Query(q) => {
                                 match name.to_lowercase().as_str() {
                                     "recordcount" => {
-                                        stack.push(CfmlValue::Int(q.rows.len() as i64));
+                                        stack.push(CfmlValue::Int(q.row_count() as i64));
                                     }
                                     "columnlist" => {
                                         // Uppercase column names, matching Lucee/ACF columnList.
-                                        stack.push(CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
+                                        stack.push(CfmlValue::String(q.column_list()));
                                     }
                                     _ => {
                                         // Column access: q.columnName returns a QueryColumn
                                         // proxy — acts as Array for indexing/iteration/length,
                                         // but stringifies to the first row (Lucee parity).
-                                        let col_lower = name.to_lowercase();
-                                        let is_col =
-                                            q.columns.iter().any(|c| c.to_lowercase() == col_lower);
-                                        if is_col {
-                                            let col_data: Vec<CfmlValue> = q
-                                                .rows
-                                                .iter()
-                                                .map(|row| {
-                                                    row.iter()
-                                                        .find(|(k, _)| {
-                                                            k.to_lowercase() == col_lower
-                                                        })
-                                                        .map(|(_, v)| v.clone())
-                                                        .unwrap_or(CfmlValue::Null)
-                                                })
-                                                .collect();
+                                        if let Some(col_data) = q.column_values_ci(name) {
                                             stack.push(CfmlValue::QueryColumn(std::sync::Arc::new(col_data)));
                                         } else {
                                             stack.push(CfmlValue::Null);
@@ -4527,9 +4501,9 @@ impl CfmlVirtualMachine {
                             CfmlValue::Query(q) => {
                                 // Iterating over a query: convert to array of row structs
                                 let rows: Vec<CfmlValue> = q
-                                    .rows
-                                    .iter()
-                                    .map(|row| CfmlValue::strukt(row.clone()))
+                                    .rows()
+                                    .into_iter()
+                                    .map(CfmlValue::strukt)
                                     .collect();
                                 stack.push(CfmlValue::array(rows));
                             }
@@ -5111,24 +5085,22 @@ impl CfmlVirtualMachine {
                 }
             }
 
-            // queryAppend: mutates the first query in-place, returns boolean.
+            // queryAppend: mutates the first query in-place (reference-typed —
+            // the shared handle propagates to the caller), returns boolean.
             if name_lower == "queryappend" {
                 if let (Some(CfmlValue::Query(q1)), Some(CfmlValue::Query(q2))) =
                     (args.first(), args.get(1))
                 {
-                    let mut merged = q1.clone();
-                    for col in &q2.columns {
-                        let col_lower = col.to_lowercase();
-                        if !merged.columns.iter().any(|c| c.to_lowercase() == col_lower) {
-                            merged.columns.push(col.clone());
+                    let (q2_cols, q2_rows) = q2.with_read(|d| (d.columns.clone(), d.rows.clone()));
+                    q1.with_write(|d| {
+                        for col in &q2_cols {
+                            let col_lower = col.to_lowercase();
+                            if !d.columns.iter().any(|c| c.to_lowercase() == col_lower) {
+                                d.columns.push(col.clone());
+                            }
                         }
-                    }
-                    for row in &q2.rows {
-                        merged.rows.push(row.clone());
-                    }
-                    self.arg_ref_writeback = Some(vec![
-                        ("0".to_string(), CfmlValue::Query(merged)),
-                    ]);
+                        d.rows.extend(q2_rows);
+                    });
                     return Ok(CfmlValue::Bool(true));
                 }
                 return Ok(CfmlValue::Bool(false));
@@ -5144,24 +5116,26 @@ impl CfmlVirtualMachine {
                         CfmlValue::Double(d) => *d as usize,
                         _ => 0,
                     };
-                    if pos >= 1 && pos <= q.rows.len() {
-                        let mut modified = q.clone();
-                        let mut row: IndexMap<String, CfmlValue> = IndexMap::new();
-                        for col in &modified.columns {
-                            let col_lower = col.to_lowercase();
-                            let val = new_row
-                                .iter()
-                                .find(|(k, _)| k.to_lowercase() == col_lower)
-                                .map(|(_, v)| v.clone())
-                                .unwrap_or(CfmlValue::Null);
-                            row.insert(col.clone(), val);
+                    let new_row = new_row.snapshot();
+                    let ok = q.with_write(|d| {
+                        if pos >= 1 && pos <= d.rows.len() {
+                            let mut row: IndexMap<String, CfmlValue> = IndexMap::new();
+                            for col in &d.columns {
+                                let col_lower = col.to_lowercase();
+                                let val = new_row
+                                    .iter()
+                                    .find(|(k, _)| k.to_lowercase() == col_lower)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or(CfmlValue::Null);
+                                row.insert(col.clone(), val);
+                            }
+                            d.rows[pos - 1] = row;
+                            true
+                        } else {
+                            false
                         }
-                        modified.rows[pos - 1] = row;
-                        self.arg_ref_writeback = Some(vec![
-                            ("0".to_string(), CfmlValue::Query(modified)),
-                        ]);
-                        return Ok(CfmlValue::Bool(true));
-                    }
+                    });
+                    return Ok(CfmlValue::Bool(ok));
                 }
                 return Ok(CfmlValue::Bool(false));
             }
@@ -6175,9 +6149,9 @@ impl CfmlVirtualMachine {
                                 }
                             }
                             CfmlValue::Query(q) => {
-                                for (i, row) in q.rows.iter().enumerate() {
+                                for (i, row) in q.rows().into_iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::strukt(row.clone()));
+                                    cb_args.push(CfmlValue::strukt(row));
                                     cb_args.push(CfmlValue::Int((i + 1) as i64));
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6523,9 +6497,11 @@ impl CfmlVirtualMachine {
                     if let (Some(q_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Query(q) = q_val {
                             let callback = callback.clone();
-                            for (i, row) in q.rows.iter().enumerate() {
+                            // Snapshot rows before the loop: the callback may
+                            // re-enter and touch this same query.
+                            for (i, row) in q.rows().into_iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::strukt(row.clone()));
+                                cb_args.push(CfmlValue::strukt(row));
                                 cb_args.push(CfmlValue::Int((i + 1) as i64));
                                 cb_args.push(q_val.clone());
                                 self.closure_parent_writeback = None;
@@ -6543,8 +6519,9 @@ impl CfmlVirtualMachine {
                     if let (Some(q_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Query(q) = q_val {
                             let callback = callback.clone();
-                            let mut new_rows = Vec::with_capacity(q.rows.len());
-                            for (i, row) in q.rows.iter().enumerate() {
+                            let snapshot = q.rows();
+                            let mut new_rows = Vec::with_capacity(snapshot.len());
+                            for (i, row) in snapshot.into_iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::strukt(row.clone()));
                                 cb_args.push(CfmlValue::Int((i + 1) as i64));
@@ -6558,13 +6535,12 @@ impl CfmlVirtualMachine {
                                 if let CfmlValue::Struct(s) = mapped {
                                     new_rows.push(s.snapshot());
                                 } else {
-                                    new_rows.push(row.clone());
+                                    new_rows.push(row);
                                 }
                             }
-                            let mut result = q.clone();
-                            result.rows = new_rows;
+                            // queryMap returns a NEW, independent query.
                             self.arg_ref_writeback = None;
-                            return Ok(CfmlValue::Query(result));
+                            return Ok(CfmlValue::Query(CfmlQuery::from_parts(q.columns(), new_rows)));
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -6574,7 +6550,7 @@ impl CfmlVirtualMachine {
                         if let CfmlValue::Query(q) = q_val {
                             let callback = callback.clone();
                             let mut new_rows = Vec::new();
-                            for (i, row) in q.rows.iter().enumerate() {
+                            for (i, row) in q.rows().into_iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::strukt(row.clone()));
                                 cb_args.push(CfmlValue::Int((i + 1) as i64));
@@ -6585,13 +6561,12 @@ impl CfmlVirtualMachine {
                                     Self::write_back_to_captured_scope(&callback, wb);
                                 }
                                 if keep.is_true() {
-                                    new_rows.push(row.clone());
+                                    new_rows.push(row);
                                 }
                             }
-                            let mut result = q.clone();
-                            result.rows = new_rows;
+                            // queryFilter returns a NEW, independent query.
                             self.arg_ref_writeback = None;
-                            return Ok(CfmlValue::Query(result));
+                            return Ok(CfmlValue::Query(CfmlQuery::from_parts(q.columns(), new_rows)));
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -6601,10 +6576,10 @@ impl CfmlVirtualMachine {
                         if let CfmlValue::Query(q) = q_val {
                             let mut acc = args.get(2).cloned().unwrap_or(CfmlValue::Null);
                             let callback = callback.clone();
-                            for (i, row) in q.rows.iter().enumerate() {
+                            for (i, row) in q.rows().into_iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(4);
                                 cb_args.push(acc.clone());
-                                cb_args.push(CfmlValue::strukt(row.clone()));
+                                cb_args.push(CfmlValue::strukt(row));
                                 cb_args.push(CfmlValue::Int((i + 1) as i64));
                                 cb_args.push(q_val.clone());
                                 self.closure_parent_writeback = None;
@@ -6623,7 +6598,7 @@ impl CfmlVirtualMachine {
                     if let (Some(q_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Query(q) = q_val {
                             let callback = callback.clone();
-                            let mut rows = q.rows.clone();
+                            let mut rows = q.rows();
                             // Bubble sort (closure calls can't be used with sort_by)
                             let n = rows.len();
                             for i in 0..n {
@@ -6647,10 +6622,11 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            let mut result = q.clone();
-                            result.rows = rows;
+                            // querySort sorts IN PLACE (reference-typed): write the
+                            // ordered rows back to the shared handle, return it.
+                            q.with_write(|d| d.rows = rows);
                             self.arg_ref_writeback = None;
-                            return Ok(CfmlValue::Query(result));
+                            return Ok(CfmlValue::Query(q.clone()));
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -6659,9 +6635,9 @@ impl CfmlVirtualMachine {
                     if let (Some(q_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Query(q) = q_val {
                             let callback = callback.clone();
-                            for (i, row) in q.rows.iter().enumerate() {
+                            for (i, row) in q.rows().into_iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::strukt(row.clone()));
+                                cb_args.push(CfmlValue::strukt(row));
                                 cb_args.push(CfmlValue::Int((i + 1) as i64));
                                 cb_args.push(q_val.clone());
                                 self.closure_parent_writeback = None;
@@ -6685,9 +6661,9 @@ impl CfmlVirtualMachine {
                     if let (Some(q_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Query(q) = q_val {
                             let callback = callback.clone();
-                            for (i, row) in q.rows.iter().enumerate() {
+                            for (i, row) in q.rows().into_iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::strukt(row.clone()));
+                                cb_args.push(CfmlValue::strukt(row));
                                 cb_args.push(CfmlValue::Int((i + 1) as i64));
                                 cb_args.push(q_val.clone());
                                 self.closure_parent_writeback = None;
@@ -6708,63 +6684,74 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Bool(true));
                 }
                 "queryaddrow" => {
-                    // Mutate query in place (like Lucee/BoxLang), return new row count
+                    // Reference-typed: push rows onto the shared handle IN PLACE
+                    // (O(1) per row — this is what makes building an N-row query
+                    // O(n) instead of O(n²)). The caller's query sees the rows
+                    // through the shared Arc, so no writeback is needed.
                     if let Some(CfmlValue::Query(q)) = args.first() {
-                        let mut result = q.clone();
                         if args.len() >= 2 {
                             match &args[1] {
                                 CfmlValue::Int(n) => {
                                     for _ in 0..*n {
-                                        result.rows.push(IndexMap::new());
+                                        q.add_row(IndexMap::new());
                                     }
                                 }
                                 CfmlValue::Struct(data) => {
-                                    result.rows.push(data.snapshot());
+                                    q.add_row(data.snapshot());
                                 }
-                                CfmlValue::Array(rows) => {
-                                    for item in rows.iter() {
-                                        if let CfmlValue::Struct(data) = item {
-                                            result.rows.push(data.snapshot());
-                                        } else {
-                                            result.rows.push(IndexMap::new());
+                                CfmlValue::Array(items) => {
+                                    // Lucee semantics: array-of-arrays → one
+                                    // positional row per inner array; array-of-
+                                    // structs → one row per struct; a flat array
+                                    // of scalars → a single positional row.
+                                    let items = items.snapshot();
+                                    let cols = q.columns();
+                                    let all_arrays = !items.is_empty()
+                                        && items.iter().all(|it| matches!(it, CfmlValue::Array(_)));
+                                    if all_arrays {
+                                        for it in &items {
+                                            if let CfmlValue::Array(vals) = it {
+                                                q.add_row(positional_row(&cols, &vals.snapshot()));
+                                            }
                                         }
+                                    } else if items.iter().all(|it| matches!(it, CfmlValue::Struct(_))) {
+                                        for it in &items {
+                                            if let CfmlValue::Struct(s) = it {
+                                                q.add_row(s.snapshot());
+                                            }
+                                        }
+                                    } else {
+                                        q.add_row(positional_row(&cols, &items));
                                     }
                                 }
                                 _ => {
-                                    result.rows.push(IndexMap::new());
+                                    q.add_row(IndexMap::new());
                                 }
                             }
                         } else {
-                            result.rows.push(IndexMap::new());
+                            q.add_row(IndexMap::new());
                         }
-                        let row_count = result.rows.len() as i64;
-                        // Write mutated query back to caller via arg_ref_writeback
-                        self.arg_ref_writeback =
-                            Some(vec![("0".to_string(), CfmlValue::Query(result))]);
-                        return Ok(CfmlValue::Int(row_count));
+                        self.arg_ref_writeback = None;
+                        return Ok(CfmlValue::Int(q.row_count() as i64));
                     }
                     return Ok(CfmlValue::Int(0));
                 }
                 "querysetcell" => {
-                    // Mutate query in place (like Lucee/BoxLang), return true
+                    // Reference-typed: set the cell on the shared handle in place.
                     if args.len() >= 3 {
                         if let CfmlValue::Query(q) = &args[0] {
-                            let mut result = q.clone();
                             let column = args[1].as_string();
                             let value = args[2].clone();
                             let row_idx = if args.len() >= 4 {
                                 match &args[3] {
                                     CfmlValue::Int(n) => (*n as usize).saturating_sub(1),
-                                    _ => result.rows.len().saturating_sub(1),
+                                    _ => q.row_count().saturating_sub(1),
                                 }
                             } else {
-                                result.rows.len().saturating_sub(1)
+                                q.row_count().saturating_sub(1)
                             };
-                            if row_idx < result.rows.len() {
-                                result.rows[row_idx].insert(column, value);
-                            }
-                            self.arg_ref_writeback =
-                                Some(vec![("0".to_string(), CfmlValue::Query(result))]);
+                            q.set_cell(row_idx, column, value);
+                            self.arg_ref_writeback = None;
                             return Ok(CfmlValue::Bool(true));
                         }
                     }
@@ -9822,19 +9809,19 @@ impl CfmlVirtualMachine {
             },
             CfmlValue::Query(q) => match method_lower.as_str() {
                 "recordcount" | "len" | "size" => {
-                    return Ok(CfmlValue::Int(q.rows.len() as i64));
+                    return Ok(CfmlValue::Int(q.row_count() as i64));
                 }
                 "columnlist" => {
                     // Uppercase column names, matching Lucee/ACF columnList.
-                    return Ok(CfmlValue::String(q.columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
+                    return Ok(CfmlValue::String(q.column_list()));
                 }
                 "addrow" => Some("queryAddRow"),
                 "getrow" => Some("queryGetRow"),
                 "each" => {
                     if let Some(callback) = extra_args.first().cloned() {
-                        for (i, row) in q.rows.iter().enumerate() {
+                        for (i, row) in q.rows().into_iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::strukt(row.clone()));
+                            cb_args.push(CfmlValue::strukt(row));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -9848,8 +9835,9 @@ impl CfmlVirtualMachine {
                 }
                 "map" => {
                     if let Some(callback) = extra_args.first().cloned() {
-                        let mut new_rows = Vec::with_capacity(q.rows.len());
-                        for (i, row) in q.rows.iter().enumerate() {
+                        let snapshot = q.rows();
+                        let mut new_rows = Vec::with_capacity(snapshot.len());
+                        for (i, row) in snapshot.into_iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::strukt(row.clone()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
@@ -9863,19 +9851,17 @@ impl CfmlVirtualMachine {
                             if let CfmlValue::Struct(s) = mapped {
                                 new_rows.push(s.snapshot());
                             } else {
-                                new_rows.push(row.clone());
+                                new_rows.push(row);
                             }
                         }
-                        let mut result = q.clone();
-                        result.rows = new_rows;
-                        return Ok(CfmlValue::Query(result));
+                        return Ok(CfmlValue::Query(CfmlQuery::from_parts(q.columns(), new_rows)));
                     }
                     return Ok(object.clone());
                 }
                 "filter" => {
                     if let Some(callback) = extra_args.first().cloned() {
                         let mut new_rows = Vec::new();
-                        for (i, row) in q.rows.iter().enumerate() {
+                        for (i, row) in q.rows().into_iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::strukt(row.clone()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
@@ -9886,22 +9872,20 @@ impl CfmlVirtualMachine {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
                             if keep.is_true() {
-                                new_rows.push(row.clone());
+                                new_rows.push(row);
                             }
                         }
-                        let mut result = q.clone();
-                        result.rows = new_rows;
-                        return Ok(CfmlValue::Query(result));
+                        return Ok(CfmlValue::Query(CfmlQuery::from_parts(q.columns(), new_rows)));
                     }
                     return Ok(object.clone());
                 }
                 "reduce" => {
                     if let Some(callback) = extra_args.first().cloned() {
                         let mut acc = extra_args.get(1).cloned().unwrap_or(CfmlValue::Null);
-                        for (i, row) in q.rows.iter().enumerate() {
+                        for (i, row) in q.rows().into_iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(4);
                             cb_args.push(acc.clone());
-                            cb_args.push(CfmlValue::strukt(row.clone()));
+                            cb_args.push(CfmlValue::strukt(row));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -9916,7 +9900,7 @@ impl CfmlVirtualMachine {
                 }
                 "sort" => {
                     if let Some(callback) = extra_args.first().cloned() {
-                        let mut rows = q.rows.clone();
+                        let mut rows = q.rows();
                         let n = rows.len();
                         for i in 0..n {
                             for j in 0..n.saturating_sub(1 + i) {
@@ -9939,17 +9923,17 @@ impl CfmlVirtualMachine {
                                 }
                             }
                         }
-                        let mut result = q.clone();
-                        result.rows = rows;
-                        return Ok(CfmlValue::Query(result));
+                        // Member .sort() sorts the receiver IN PLACE (reference-typed).
+                        q.with_write(|d| d.rows = rows);
+                        return Ok(object.clone());
                     }
                     return Ok(object.clone());
                 }
                 "some" => {
                     if let Some(callback) = extra_args.first().cloned() {
-                        for (i, row) in q.rows.iter().enumerate() {
+                        for (i, row) in q.rows().into_iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::strukt(row.clone()));
+                            cb_args.push(CfmlValue::strukt(row));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -9968,9 +9952,9 @@ impl CfmlVirtualMachine {
                 }
                 "every" => {
                     if let Some(callback) = extra_args.first().cloned() {
-                        for (i, row) in q.rows.iter().enumerate() {
+                        for (i, row) in q.rows().into_iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::strukt(row.clone()));
+                            cb_args.push(CfmlValue::strukt(row));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -10365,17 +10349,10 @@ impl CfmlVirtualMachine {
             // Functions with the same name are considered equal for writeback diffing
             // since function definitions don't change at runtime.
             (CfmlValue::Function(a), CfmlValue::Function(b)) => a.name == b.name,
-            (CfmlValue::Query(a), CfmlValue::Query(b)) => {
-                a.columns == b.columns
-                    && a.rows.len() == b.rows.len()
-                    && a.rows.iter().zip(b.rows.iter()).all(|(ra, rb)| {
-                        ra.len() == rb.len()
-                            && ra.iter().all(|(k, v)| {
-                                rb.get(k)
-                                    .map_or(false, |bv| Self::values_equal_shallow_depth(v, bv, depth + 1))
-                            })
-                    })
-            }
+            // Queries are reference-typed: identity is equality (two handles onto
+            // the same backing). Used only by the writeback diff, which no longer
+            // tracks queries anyway.
+            (CfmlValue::Query(a), CfmlValue::Query(b)) => a.ptr_eq(b),
             (CfmlValue::Binary(a), CfmlValue::Binary(b)) => a == b,
             // NativeObjects: pointer identity. Two refs to the same Arc are
             // equal; otherwise treat as different (the underlying Rust state
@@ -10402,14 +10379,14 @@ impl CfmlVirtualMachine {
         for (i, param_name) in func.params.iter().enumerate() {
             if let Some(val) = locals.get(param_name.as_str()) {
                 match val {
-                    // Arrays and structs are reference-typed now: in-place
-                    // mutations through the parameter already propagate to the
-                    // caller via the shared handle, so writing the parameter's
-                    // value back is unnecessary — and WRONG when the parameter
-                    // was *reassigned* (`a = [9]`), which CFML scopes to the
-                    // local only. Only the still-value-typed Query/Component
-                    // need the simulated pass-by-reference.
-                    CfmlValue::Query(_) | CfmlValue::Component(_) => {
+                    // Arrays, structs AND queries are reference-typed now:
+                    // in-place mutations through the parameter already propagate
+                    // to the caller via the shared handle, so writing the
+                    // parameter's value back is unnecessary — and WRONG when the
+                    // parameter was *reassigned* (`a = [9]` / `q = queryNew()`),
+                    // which CFML scopes to the local only. Only the still-value-
+                    // typed Component needs the simulated pass-by-reference.
+                    CfmlValue::Component(_) => {
                         writeback.push((i.to_string(), val.clone()));
                     }
                     _ => {}
@@ -12147,7 +12124,7 @@ impl CfmlVirtualMachine {
     /// tagged `__type="query"`) means `isQuery()`, `queryColumnExists()`, and
     /// row access all behave like the reference engine.
     fn build_directory_query(entries: &[(String, String, bool)], fallback_dir: &str) -> CfmlValue {
-        let mut query = cfml_common::dynamic::CfmlQuery::new(vec![
+        let query = cfml_common::dynamic::CfmlQuery::new(vec![
             "name".to_string(),
             "size".to_string(),
             "type".to_string(),
@@ -12186,9 +12163,9 @@ impl CfmlVirtualMachine {
             row.insert("attributes".to_string(), CfmlValue::String(String::new()));
             row.insert("mode".to_string(), CfmlValue::String(String::new()));
             row.insert("directory".to_string(), CfmlValue::String(directory));
-            query.rows.push(row);
+            query.add_row(row);
         }
-        CfmlValue::Query(Box::new(query))
+        CfmlValue::Query(query)
     }
 
     fn resolve_directory_path_with_mappings(&self, path: &str) -> Option<String> {
@@ -14208,6 +14185,16 @@ fn unwrap_query_param(v: &CfmlValue) -> CfmlValue {
     v.clone()
 }
 
+/// Map positional cell values to a query's columns (extra values dropped,
+/// missing ones filled with Null) — used by `queryAddRow` with array input.
+fn positional_row(columns: &[String], values: &[CfmlValue]) -> IndexMap<String, CfmlValue> {
+    let mut row = IndexMap::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        row.insert(col.clone(), values.get(i).cloned().unwrap_or(CfmlValue::Null));
+    }
+    row
+}
+
 /// Apply `returntype` to a QoQ result query: `array` → array of row structs,
 /// `struct` (with `columnkey`) → struct keyed by that column, else the query.
 fn convert_query_return(value: CfmlValue, return_type: &str, column_key: Option<&str>) -> CfmlValue {
@@ -14215,7 +14202,7 @@ fn convert_query_return(value: CfmlValue, return_type: &str, column_key: Option<
         "array" => {
             if let CfmlValue::Query(query) = &value {
                 let rows: Vec<CfmlValue> =
-                    query.rows.iter().map(|r| CfmlValue::strukt(r.clone())).collect();
+                    query.rows().into_iter().map(CfmlValue::strukt).collect();
                 return CfmlValue::array(rows);
             }
             value
@@ -14223,13 +14210,13 @@ fn convert_query_return(value: CfmlValue, return_type: &str, column_key: Option<
         "struct" => {
             if let (CfmlValue::Query(query), Some(key)) = (&value, column_key) {
                 let mut out: IndexMap<String, CfmlValue> = IndexMap::new();
-                for r in &query.rows {
+                for r in query.rows() {
                     let k = r
                         .iter()
                         .find(|(c, _)| c.eq_ignore_ascii_case(key))
                         .map(|(_, v)| v.as_string())
                         .unwrap_or_default();
-                    out.insert(k, CfmlValue::strukt(r.clone()));
+                    out.insert(k, CfmlValue::strukt(r));
                 }
                 return CfmlValue::strukt(out);
             }

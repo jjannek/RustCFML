@@ -4,7 +4,7 @@
 //! Uses the linear-time iterative wildcard algorithm (single backtrack point
 //! per `%`), so it cannot blow up on pathological patterns like `%%%%a`.
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum Elem {
     /// `%`
     Any,
@@ -14,9 +14,19 @@ enum Elem {
     Lit(char),
 }
 
+/// A LIKE pattern compiled to its element sequence. Compiling once and calling
+/// [`Compiled::matches`] per row avoids recompiling a constant pattern on every
+/// row (the QoQ engine pre-compiles literal patterns once per query). `Send +
+/// Sync`, so the shared compiled-pattern cache is safe to read across the rayon
+/// parallel filter.
+#[derive(Debug)]
+pub struct Compiled {
+    elems: Vec<Elem>,
+}
+
 /// Compile a LIKE pattern into elements, honouring the escape char (the char
 /// after `escape` is always a literal, even `%`/`_`).
-fn compile(pattern: &str, escape: Option<char>) -> Vec<Elem> {
+pub fn compile(pattern: &str, escape: Option<char>) -> Compiled {
     let esc = escape.map(|c| c.to_ascii_lowercase());
     let mut elems = Vec::new();
     let mut chars = pattern.chars();
@@ -37,7 +47,7 @@ fn compile(pattern: &str, escape: Option<char>) -> Vec<Elem> {
             }
         }
     }
-    elems
+    Compiled { elems }
 }
 
 #[inline]
@@ -46,49 +56,57 @@ fn lower(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-/// Does `text` match the LIKE `pattern`? Case-insensitive.
-pub fn like_match(text: &str, pattern: &str, escape: Option<char>) -> bool {
-    let pat = compile(pattern, escape);
-    let txt: Vec<char> = text.chars().map(lower).collect();
+impl Compiled {
+    /// Does `text` match this compiled LIKE pattern? Case-insensitive.
+    pub fn matches(&self, text: &str) -> bool {
+        let pat = &self.elems;
+        let txt: Vec<char> = text.chars().map(lower).collect();
 
-    let mut i = 0usize; // index into txt
-    let mut j = 0usize; // index into pat
-    let mut star_j: Option<usize> = None;
-    let mut star_i = 0usize;
+        let mut i = 0usize; // index into txt
+        let mut j = 0usize; // index into pat
+        let mut star_j: Option<usize> = None;
+        let mut star_i = 0usize;
 
-    while i < txt.len() {
-        match pat.get(j) {
-            Some(Elem::Lit(c)) if *c == txt[i] => {
-                i += 1;
-                j += 1;
-            }
-            Some(Elem::One) => {
-                i += 1;
-                j += 1;
-            }
-            Some(Elem::Any) => {
-                star_j = Some(j);
-                star_i = i;
-                j += 1;
-            }
-            _ => {
-                // mismatch: backtrack to the last `%`, consuming one more char
-                if let Some(sj) = star_j {
-                    j = sj + 1;
-                    star_i += 1;
-                    i = star_i;
-                } else {
-                    return false;
+        while i < txt.len() {
+            match pat.get(j) {
+                Some(Elem::Lit(c)) if *c == txt[i] => {
+                    i += 1;
+                    j += 1;
+                }
+                Some(Elem::One) => {
+                    i += 1;
+                    j += 1;
+                }
+                Some(Elem::Any) => {
+                    star_j = Some(j);
+                    star_i = i;
+                    j += 1;
+                }
+                _ => {
+                    // mismatch: backtrack to the last `%`, consuming one more char
+                    if let Some(sj) = star_j {
+                        j = sj + 1;
+                        star_i += 1;
+                        i = star_i;
+                    } else {
+                        return false;
+                    }
                 }
             }
         }
-    }
 
-    // consume trailing `%`
-    while matches!(pat.get(j), Some(Elem::Any)) {
-        j += 1;
+        // consume trailing `%`
+        while matches!(pat.get(j), Some(Elem::Any)) {
+            j += 1;
+        }
+        j == pat.len()
     }
-    j == pat.len()
+}
+
+/// Compile-and-match in one call. Convenience for non-hot paths and tests; the
+/// engine's per-row path uses a pre-compiled [`Compiled`] instead.
+pub fn like_match(text: &str, pattern: &str, escape: Option<char>) -> bool {
+    compile(pattern, escape).matches(text)
 }
 
 #[cfg(test)]

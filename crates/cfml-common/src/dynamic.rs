@@ -388,14 +388,18 @@ pub enum CfmlValue {
     Struct(CfmlStruct),
     Closure(Box<CfmlClosure>),
     Component(Box<CfmlComponent>),
-    // Boxed (PR-A): inline these large variants pinned `CfmlValue` at 112 B —
-    // `CfmlFunction` is 112 B on its own and `CfmlQuery` 72 B. Boxing both makes
-    // them 8 B pointers and drops the enum to 32 B (String-dominated), shrinking
-    // the operand stack and every scope/struct map ~3.6×. Box deref-coerces, so
-    // field/method reads are unchanged; only construction (`Box::new`) and
-    // move-out destructures (`*b`) needed touching.
+    // Boxed (PR-A): inlining `CfmlFunction` (112 B) pinned `CfmlValue` at 112 B;
+    // boxing it makes it an 8 B pointer and drops the enum to 32 B (String-
+    // dominated), shrinking the operand stack and every scope/struct map ~3.6×.
+    // Box deref-coerces, so field/method reads are unchanged; only construction
+    // (`Box::new`) and move-out destructures (`*b`) needed touching. (`Query` is
+    // no longer boxed — it's now an 8 B `Arc` handle, reference-typed.)
     Function(Box<CfmlFunction>),
-    Query(Box<CfmlQuery>),
+    /// Reference-typed query (Lucee/BoxLang semantics): a shared, interior-
+    /// mutable handle. `b = a` aliases (a mutation through either is visible
+    /// through both); `duplicate(a)` deep-copies. The `Arc` is the indirection,
+    /// so no `Box` is needed. See `CfmlQuery`.
+    Query(CfmlQuery),
     Binary(Vec<u8>),
     /// Instance of a Rust-backed class registered via
     /// `CfmlVirtualMachine::register_native_class`. Method dispatch goes
@@ -479,7 +483,7 @@ impl CfmlValue {
             CfmlValue::Closure(_) => true,
             CfmlValue::Component(_) => true,
             CfmlValue::Function(_) => true,
-            CfmlValue::Query(q) => !q.rows.is_empty(),
+            CfmlValue::Query(q) => !q.is_empty(),
             CfmlValue::Binary(b) => !b.is_empty(),
             CfmlValue::NativeObject(_) => true,
         }
@@ -687,6 +691,28 @@ impl CfmlValue {
                 visited.pop();
                 out
             }
+            // Queries are reference-typed, so `duplicate()` must break the
+            // shared handle: snapshot the data (releases the lock), deep-copy
+            // every cell, and wrap in a fresh backing store.
+            CfmlValue::Query(q) => {
+                let ptr = q.backing_ptr();
+                if visited.contains(&ptr) {
+                    return self.clone();
+                }
+                visited.push(ptr);
+                let (columns, rows, sql) =
+                    q.with_read(|d| (d.columns.clone(), d.rows.clone(), d.sql.clone()));
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|(k, v)| (k, v.deep_copy_guarded(visited)))
+                            .collect()
+                    })
+                    .collect();
+                visited.pop();
+                CfmlValue::Query(CfmlQuery::from_parts_sql(columns, rows, sql))
+            }
             other => other.clone(),
         }
     }
@@ -748,6 +774,10 @@ impl CfmlValue {
                 a.iter()
                     .all(|(k, v)| b.get(k).map(|bv| v.eq(bv)).unwrap_or(false))
             }
+            // Queries compare by reference identity (Lucee errors on query
+            // comparison; pointer-equality is the safe, useful answer — two
+            // handles onto the same data are equal, distinct queries are not).
+            (CfmlValue::Query(a), CfmlValue::Query(b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -834,20 +864,198 @@ pub enum CfmlAccess {
     Remote,
 }
 
-#[derive(Debug, Clone)]
-pub struct CfmlQuery {
+/// Row-major backing data for a CFML query — the store behind the shared
+/// [`CfmlQuery`] handle. Held directly (no lock) by the QoQ engine while it
+/// builds a result; wrapped in a `CfmlQuery` handle at the value boundary.
+#[derive(Debug, Clone, Default)]
+pub struct CfmlQueryData {
     pub columns: Vec<String>,
     pub rows: Vec<IndexMap<String, CfmlValue>>,
     pub sql: Option<String>,
 }
 
+/// Shared, interior-mutable backing for a CFML query — the query analogue of
+/// [`CfmlArray`]/[`CfmlStruct`], giving queries Lucee/BoxLang-style **reference
+/// semantics**. Cloning a `CfmlQuery` bumps the `Arc` (it does NOT copy the
+/// rows), so `b = a` makes `a` and `b` two handles onto the *same* data; a
+/// mutation through either (e.g. `queryAddRow`) is visible through both, and
+/// passing a query to a function lets the callee mutate the caller's query.
+/// `duplicate(q)` makes an independent copy (see `CfmlValue::deep_copy`).
+///
+/// Crucially this also makes `q.addRow(...)` an **O(1)** in-place push instead
+/// of the old value-typed clone-the-whole-query-per-row (which made building an
+/// N-row query O(n²)).
+///
+/// All locking lives behind this type's methods so callers (especially
+/// `cfml-stdlib`, which doesn't depend on `parking_lot`) never hold a raw guard.
+/// Lock discipline (parking_lot is NOT reentrant): a method takes a guard, does
+/// one thing, drops it. Never call back into VM/user code while a guard is held.
+/// Anything iterate-then-call must `rows()`/`columns()` (snapshot) first.
+#[derive(Clone)]
+pub struct CfmlQuery(Arc<PlRwLock<CfmlQueryData>>);
+
 impl CfmlQuery {
+    /// A query with the given columns and no rows.
     pub fn new(columns: Vec<String>) -> Self {
-        Self {
+        CfmlQuery(Arc::new(PlRwLock::new(CfmlQueryData {
             columns,
             rows: Vec::new(),
             sql: None,
+        })))
+    }
+
+    /// Wrap an already-built data block (e.g. a QoQ result) into a handle.
+    #[inline]
+    pub fn from_data(data: CfmlQueryData) -> Self {
+        CfmlQuery(Arc::new(PlRwLock::new(data)))
+    }
+
+    /// Build from columns + rows (sql = None).
+    pub fn from_parts(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue>>) -> Self {
+        CfmlQuery::from_data(CfmlQueryData { columns, rows, sql: None })
+    }
+
+    /// Build from columns + rows + originating SQL.
+    pub fn from_parts_sql(
+        columns: Vec<String>,
+        rows: Vec<IndexMap<String, CfmlValue>>,
+        sql: Option<String>,
+    ) -> Self {
+        CfmlQuery::from_data(CfmlQueryData { columns, rows, sql })
+    }
+
+    /// Two handles onto the same backing store (reference identity).
+    #[inline]
+    pub fn ptr_eq(&self, other: &CfmlQuery) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Stable identity of the shared backing store, for cycle detection.
+    #[inline]
+    pub fn backing_ptr(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+
+    /// Snapshot of the column names, in order.
+    #[inline]
+    pub fn columns(&self) -> Vec<String> {
+        self.0.read().columns.clone()
+    }
+
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.0.read().columns.len()
+    }
+
+    #[inline]
+    pub fn row_count(&self) -> usize {
+        self.0.read().rows.len()
+    }
+
+    /// True when the query has no rows.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.read().rows.is_empty()
+    }
+
+    /// Case-insensitive column presence check.
+    pub fn has_column_ci(&self, name: &str) -> bool {
+        self.0.read().columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+    }
+
+    /// Uppercased, comma-joined column list (Lucee/ACF `columnList` convention).
+    pub fn column_list(&self) -> String {
+        self.0
+            .read()
+            .columns
+            .iter()
+            .map(|c| c.to_uppercase())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// A point-in-time copy of the rows.
+    #[inline]
+    pub fn rows(&self) -> Vec<IndexMap<String, CfmlValue>> {
+        self.0.read().rows.clone()
+    }
+
+    /// Snapshot of a single 0-based row, or `None` if out of range.
+    pub fn get_row(&self, row0: usize) -> Option<IndexMap<String, CfmlValue>> {
+        self.0.read().rows.get(row0).cloned()
+    }
+
+    /// All values for a column (case-insensitive), one per row, in row order.
+    /// `None` if the column doesn't exist. Used to build a `QueryColumn` proxy.
+    pub fn column_values_ci(&self, name: &str) -> Option<Vec<CfmlValue>> {
+        let g = self.0.read();
+        if !g.columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+            return None;
         }
+        Some(
+            g.rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(CfmlValue::Null)
+                })
+                .collect(),
+        )
+    }
+
+    /// Append a row in place (interior mutability — visible to all aliases).
+    /// This is the **O(1)** push that fixes the old O(n²) query build.
+    #[inline]
+    pub fn add_row(&self, row: IndexMap<String, CfmlValue>) {
+        self.0.write().rows.push(row);
+    }
+
+    /// Set a cell at 0-based `row0` for `column` (in place). Returns false if
+    /// the row is out of range.
+    pub fn set_cell(&self, row0: usize, column: String, value: CfmlValue) -> bool {
+        let mut g = self.0.write();
+        if row0 < g.rows.len() {
+            g.rows[row0].insert(column, value);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn sql(&self) -> Option<String> {
+        self.0.read().sql.clone()
+    }
+
+    pub fn set_sql(&self, sql: Option<String>) {
+        self.0.write().sql = sql;
+    }
+
+    /// Run a closure with shared (read) access to the backing data. MUST NOT
+    /// touch this same query again, and MUST NOT call back into VM/user code.
+    #[inline]
+    pub fn with_read<R>(&self, f: impl FnOnce(&CfmlQueryData) -> R) -> R {
+        f(&self.0.read())
+    }
+
+    /// Run a closure with exclusive (write) access. Same re-entrancy caveat.
+    #[inline]
+    pub fn with_write<R>(&self, f: impl FnOnce(&mut CfmlQueryData) -> R) -> R {
+        f(&mut self.0.write())
+    }
+}
+
+/// Debug delegates to the backing data so output matches the pre-handle
+/// representation (`CfmlQuery { columns, rows, sql }`).
+impl fmt::Debug for CfmlQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let d = self.0.read();
+        f.debug_struct("CfmlQuery")
+            .field("columns", &d.columns)
+            .field("rows", &d.rows)
+            .field("sql", &d.sql)
+            .finish()
     }
 }
 
@@ -895,10 +1103,11 @@ impl serde::Serialize for CfmlValue {
                 map.end()
             }
             CfmlValue::Query(q) => {
+                let d = q.0.read();
                 let mut map = s.serialize_map(Some(3))?;
                 map.serialize_entry("_cftype", "query")?;
-                map.serialize_entry("columns", &q.columns)?;
-                let rows: Vec<std::collections::HashMap<&str, &CfmlValue>> = q
+                map.serialize_entry("columns", &d.columns)?;
+                let rows: Vec<std::collections::HashMap<&str, &CfmlValue>> = d
                     .rows
                     .iter()
                     .map(|row| row.iter().map(|(k, v)| (k.as_str(), v)).collect())
@@ -988,15 +1197,15 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                     if let Some(CfmlValue::Array(cols)) = map.get("columns") {
                         let columns: Vec<String> =
                             cols.snapshot().iter().map(|v| v.as_string()).collect();
-                        let mut query = CfmlQuery::new(columns.clone());
-                        if let Some(CfmlValue::Array(rows)) = map.get("rows") {
-                            for row_val in rows.snapshot() {
+                        let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::new();
+                        if let Some(CfmlValue::Array(row_arr)) = map.get("rows") {
+                            for row_val in row_arr.snapshot() {
                                 if let CfmlValue::Struct(row_map) = row_val {
-                                    query.rows.push(row_map.snapshot());
+                                    rows.push(row_map.snapshot());
                                 }
                             }
                         }
-                        return Ok(CfmlValue::Query(Box::new(query)));
+                        return Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)));
                     }
                 }
                 _ => {}
@@ -1024,7 +1233,8 @@ mod size_probe {
         let cfml_value = size_of::<CfmlValue>();
         eprintln!("size_of::<CfmlValue>()      = {cfml_value} B");
         eprintln!("size_of::<CfmlFunction>()   = {} B", size_of::<CfmlFunction>());
-        eprintln!("size_of::<CfmlQuery>()      = {} B", size_of::<CfmlQuery>());
+        eprintln!("size_of::<CfmlQuery>()      = {} B (Arc handle)", size_of::<CfmlQuery>());
+        eprintln!("size_of::<CfmlQueryData>()  = {} B", size_of::<CfmlQueryData>());
         eprintln!("size_of::<CfmlComponent>()  = {} B", size_of::<CfmlComponent>());
         eprintln!("size_of::<CfmlClosure>()    = {} B", size_of::<CfmlClosure>());
 

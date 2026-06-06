@@ -18,13 +18,14 @@ use crate::ast::JoinType;
 pub fn build_intersections<F>(
     table_rows: &[usize],
     join_types: &[JoinType],
+    max_size: usize,
     mut eval_on: F,
-) -> Vec<Vec<usize>>
+) -> Result<Vec<Vec<usize>>, usize>
 where
     F: FnMut(usize, &[usize]) -> bool,
 {
     if table_rows.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Seed with the first table's rows.
@@ -32,6 +33,14 @@ where
 
     for (k, &jt) in join_types.iter().enumerate() {
         let right_rows = table_rows[k + 1];
+        // Guard against materialising an unbounded cross-product (e.g. an
+        // N-table comma join over a huge table). The pre-fold upper bound is
+        // exact for CROSS and a worst case for filtered joins, so ON-filtered
+        // joins (which keep `inters` small) are not penalised.
+        let upper_bound = inters.len().saturating_mul(right_rows);
+        if upper_bound > max_size {
+            return Err(upper_bound);
+        }
         let width = k + 1; // number of tables already in each intersection
         let mut next: Vec<Vec<usize>> = Vec::new();
 
@@ -114,12 +123,21 @@ where
         inters = next;
     }
 
-    inters
+    Ok(inters)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test wrapper with an unbounded size guard.
+    fn build<F: FnMut(usize, &[usize]) -> bool>(
+        rows: &[usize],
+        jts: &[JoinType],
+        f: F,
+    ) -> Vec<Vec<usize>> {
+        build_intersections(rows, jts, usize::MAX, f).unwrap()
+    }
 
     // ON that matches when the two most-recent indices are equal (a "diagonal").
     fn diag(_k: usize, cand: &[usize]) -> bool {
@@ -133,39 +151,39 @@ mod tests {
 
     #[test]
     fn single_table() {
-        assert_eq!(build_intersections(&[3], &[], always), vec![vec![1], vec![2], vec![3]]);
-        assert!(build_intersections(&[0], &[], always).is_empty());
+        assert_eq!(build(&[3], &[], always), vec![vec![1], vec![2], vec![3]]);
+        assert!(build(&[0], &[], always).is_empty());
     }
 
     #[test]
     fn cross_join() {
-        let got = build_intersections(&[2, 2], &[JoinType::Cross], always);
+        let got = build(&[2, 2], &[JoinType::Cross], always);
         assert_eq!(got, vec![vec![1, 1], vec![1, 2], vec![2, 1], vec![2, 2]]);
     }
 
     #[test]
     fn inner_join_filters() {
-        let got = build_intersections(&[3, 3], &[JoinType::Inner], diag);
+        let got = build(&[3, 3], &[JoinType::Inner], diag);
         assert_eq!(got, vec![vec![1, 1], vec![2, 2], vec![3, 3]]);
     }
 
     #[test]
     fn left_join_null_fills_unmatched() {
         // right table has only 2 rows, so left row 3 has no diagonal match.
-        let got = build_intersections(&[3, 2], &[JoinType::Left], diag);
+        let got = build(&[3, 2], &[JoinType::Left], diag);
         assert_eq!(got, vec![vec![1, 1], vec![2, 2], vec![3, 0]]);
     }
 
     #[test]
     fn right_join_null_fills_unmatched() {
         // left table has only 2 rows, so right row 3 has no diagonal match.
-        let got = build_intersections(&[2, 3], &[JoinType::Right], diag);
+        let got = build(&[2, 3], &[JoinType::Right], diag);
         assert_eq!(got, vec![vec![1, 1], vec![2, 2], vec![0, 3]]);
     }
 
     #[test]
     fn full_join_null_fills_both_sides() {
-        let got = build_intersections(&[3, 3], &[JoinType::Full], |_, c| {
+        let got = build(&[3, 3], &[JoinType::Full], |_, c| {
             // match left row i with right row i, but only for i in {1,2}
             let n = c.len();
             n >= 2 && c[n - 1] == c[n - 2] && c[n - 1] <= 2
@@ -180,7 +198,7 @@ mod tests {
 
     #[test]
     fn three_table_cross() {
-        let got = build_intersections(&[2, 2, 2], &[JoinType::Cross, JoinType::Cross], always);
+        let got = build(&[2, 2, 2], &[JoinType::Cross, JoinType::Cross], always);
         assert_eq!(got.len(), 8);
         assert_eq!(got[0], vec![1, 1, 1]);
         assert_eq!(got[7], vec![2, 2, 2]);

@@ -125,5 +125,28 @@ assert("querySetRow replaced age", row2.age, 77);
 row1 = queryGetRow(q, 1);
 assert("querySetRow row 1 unchanged", row1.name, "Alice");
 
+// =========================================
+// queryAddRow positional array forms (Lucee-compatible)
+// =========================================
+// Flat array of scalars = one positional row.
+qa = queryNew("name,age", "varchar,integer");
+queryAddRow(qa, ["Frank", 41]);
+assert("addRow flat array: count", qa.recordCount, 1);
+assert("addRow flat array: name", queryGetRow(qa, 1).name, "Frank");
+assert("addRow flat array: age", queryGetRow(qa, 1).age, 41);
+
+// Array of arrays = one positional row per inner array.
+qb = queryNew("name,age", "varchar,integer");
+qb.addRow([ ["Grace", 22], ["Heidi", 33] ]);
+assert("addRow array-of-arrays: count", qb.recordCount, 2);
+assert("addRow array-of-arrays: row1", queryGetRow(qb, 1).name, "Grace");
+assert("addRow array-of-arrays: row2 age", queryGetRow(qb, 2).age, 33);
+
+// Array of structs still works (one row per struct).
+qc = queryNew("name,age", "varchar,integer");
+queryAddRow(qc, [ {name:"Ivan", age:50}, {name:"Judy", age:60} ]);
+assert("addRow array-of-structs: count", qc.recordCount, 2);
+assert("addRow array-of-structs: row2", queryGetRow(qc, 2).name, "Judy");
+
 suiteEnd();
 </cfscript>

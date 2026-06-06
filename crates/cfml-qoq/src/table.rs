@@ -4,7 +4,7 @@
 //! sentinel** for outer joins (a missing row on one side of a LEFT/RIGHT/FULL
 //! join). `get(0, _)` therefore returns `Null`.
 
-use cfml_common::dynamic::{CfmlQuery, CfmlValue};
+use cfml_common::dynamic::{CfmlQueryData, CfmlValue};
 
 /// A source table converted to column-major layout for O(1) cell access.
 #[derive(Debug, Clone)]
@@ -19,8 +19,10 @@ pub struct QoQTable {
 }
 
 impl QoQTable {
-    /// Build from a `CfmlQuery` (row-major → column-major, a one-time O(R·C) cost).
-    pub fn from_query(name: &str, query: &CfmlQuery) -> Self {
+    /// Build from query data (row-major → column-major, a one-time O(R·C) cost).
+    /// For a source `CfmlQuery` handle, read it under a guard first:
+    /// `query.with_read(|d| QoQTable::from_query_data(name, d))`.
+    pub fn from_query_data(name: &str, query: &CfmlQueryData) -> Self {
         let col_count = query.columns.len();
         let row_count = query.rows.len();
         let mut data: Vec<Vec<CfmlValue>> = (0..col_count)

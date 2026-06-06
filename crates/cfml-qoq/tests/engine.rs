@@ -13,13 +13,13 @@ fn s(v: &str) -> CfmlValue {
 }
 
 fn query(cols: &[&str], rows: &[&[CfmlValue]]) -> CfmlQuery {
-    let mut q = CfmlQuery::new(cols.iter().map(|c| c.to_string()).collect());
+    let q = CfmlQuery::new(cols.iter().map(|c| c.to_string()).collect());
     for r in rows {
         let mut m = IndexMap::new();
         for (idx, c) in cols.iter().enumerate() {
             m.insert(c.to_string(), r[idx].clone());
         }
-        q.rows.push(m);
+        q.add_row(m);
     }
     q
 }
@@ -44,13 +44,12 @@ fn run_p(
     let CfmlValue::Query(q) = result else {
         panic!("expected Query result");
     };
-    let cols = q.columns.clone();
+    let cols = q.columns();
     let rows = q
-        .rows
+        .rows()
         .iter()
         .map(|r| {
-            q.columns
-                .iter()
+            cols.iter()
                 .map(|c| r.get(c).map(|v| v.as_string()).unwrap_or_default())
                 .collect::<Vec<_>>()
         })
@@ -274,4 +273,57 @@ fn select_without_from() {
     // WHERE 1=0 with FROM -> empty; just check it doesn't error and columns resolve.
     assert_eq!(cols, vec!["three", "greeting"]);
     assert!(rows.is_empty());
+}
+
+/// Crosses the rayon PARALLEL_ROW_THRESHOLD (10k) so WHERE filtering and
+/// projection run in parallel. Verifies the parallel path preserves row order
+/// and filters correctly — i.e. it produces exactly the sequential result.
+#[test]
+fn parallel_filter_and_order_preserves_results() {
+    // 15k rows: id = 1..=15000, name = "n{id}".
+    let mut q = CfmlQuery::new(vec!["id".to_string(), "name".to_string()]);
+    for n in 1..=15000i64 {
+        let mut m = IndexMap::new();
+        m.insert("id".to_string(), CfmlValue::Int(n));
+        m.insert("name".to_string(), CfmlValue::String(format!("n{}", n)));
+        q.add_row(m);
+    }
+    // Filter to id > 5000 (10000 rows), ordered DESC.
+    let (cols, rows) = run("SELECT id, name FROM big WHERE id > 5000 ORDER BY id DESC", &[("big", &q)]);
+    assert_eq!(cols, vec!["id", "name"]);
+    assert_eq!(rows.len(), 10000);
+    // ORDER BY id DESC: first row is the largest id, last is 5001.
+    assert_eq!(rows[0], vec!["15000".to_string(), "n15000".to_string()]);
+    assert_eq!(rows[9999], vec!["5001".to_string(), "n5001".to_string()]);
+    // Strictly descending and contiguous (no rows dropped/duplicated/reordered).
+    for (offset, row) in rows.iter().enumerate() {
+        let expected = 15000 - offset as i64;
+        assert_eq!(row[0], expected.to_string(), "row {} out of order", offset);
+    }
+}
+
+/// Same threshold-crossing data through a grouped aggregate (which stays
+/// sequential) — guards that the purity gate doesn't corrupt the aggregate path
+/// when parallel filtering feeds it.
+#[test]
+fn parallel_filter_into_aggregate() {
+    let mut q = CfmlQuery::new(vec!["id".to_string(), "bucket".to_string()]);
+    for n in 1..=12000i64 {
+        let mut m = IndexMap::new();
+        m.insert("id".to_string(), CfmlValue::Int(n));
+        m.insert("bucket".to_string(), CfmlValue::Int(n % 3));
+        q.add_row(m);
+    }
+    let (cols, rows) = run(
+        "SELECT bucket, COUNT(*) AS c FROM big WHERE id > 6000 GROUP BY bucket ORDER BY bucket",
+        &[("big", &q)],
+    );
+    assert_eq!(cols, vec!["bucket", "c"]);
+    // id 6001..=12000 = 6000 rows, evenly split across 3 buckets = 2000 each.
+    assert_eq!(rows.len(), 3);
+    let total: i64 = rows.iter().map(|r| r[1].parse::<i64>().unwrap()).sum();
+    assert_eq!(total, 6000);
+    for r in &rows {
+        assert_eq!(r[1], "2000", "bucket {} count", r[0]);
+    }
 }
