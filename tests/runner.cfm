@@ -175,6 +175,7 @@ try { include "tags/test_tags_whitespace.cfm"; } catch (any e) { writeOutput("ER
 // --- Includes ---
 try { include "includes/test_variables_scope_includes.cfm"; } catch (any e) { writeOutput("ERROR | includes/test_variables_scope_includes.cfm | " & e.message & chr(10)); }
 try { include "includes/test_named_args_includes.cfm"; } catch (any e) { writeOutput("ERROR | includes/test_named_args_includes.cfm | " & e.message & chr(10)); }
+try { include "includes/test_closure_in_swapped_program.cfm"; } catch (any e) { writeOutput("ERROR | includes/test_closure_in_swapped_program.cfm | " & e.message & chr(10)); }
 
 // --- Lifecycle / server request fixtures ---
 try { include "lifecycle/test_application_mapping_coverage.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_mapping_coverage.cfm | " & e.message & chr(10)); }

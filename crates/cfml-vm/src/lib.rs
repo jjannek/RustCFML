@@ -661,6 +661,22 @@ pub struct CfmlVirtualMachine {
     /// temporary sub-program, so their offsets are not stable and must not be
     /// cached.
     program_swap_depth: usize,
+    /// Stack of programs swapped OUT by an active swap site (cfinclude, CFC
+    /// load, custom-tag/cfmodule, Application.cfc). Entry 0 is the request's
+    /// top-level (root) program; later entries are nested swaps (LIFO). While a
+    /// sub-program is active in `self.program`, a `user_functions`-registered
+    /// function (e.g. a CFC method) may run whose body carries a
+    /// `DefineFunction(idx)` baked against the program it was MERGED into. A
+    /// merge folds functions into whichever program was active when the owner
+    /// (CFC / included file) loaded — the nearest enclosing swap, NOT
+    /// necessarily the root (e.g. a CFC `new`ed inside an include merges into
+    /// that include's sub-program). That `idx` is out of bounds for the tiny
+    /// swapped-in sub-program, so `resolve_define_function_target` probes this
+    /// stack INNERMOST-first (nearest enclosing down to root) to find the
+    /// program that actually owns the index — root-first would risk matching a
+    /// different function that happens to occupy that slot in an outer program.
+    /// Maintained by `push_program_swap`/`pop_program_swap`.
+    program_swap_stack: Vec<BytecodeProgram>,
     /// In-memory cache: key -> (value, optional expiry instant)
     pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
@@ -931,6 +947,7 @@ impl CfmlVirtualMachine {
             custom_tag_stack: Vec::new(),
             merged_file_offsets: HashMap::new(),
             program_swap_depth: 0,
+            program_swap_stack: Vec::new(),
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
             sandbox: false,
@@ -1470,6 +1487,67 @@ impl CfmlVirtualMachine {
     fn execute_function_by_index(&mut self, func_idx: usize, args: Vec<CfmlValue>) -> CfmlResult {
         let func = self.program.functions[func_idx].clone();
         self.execute_function_with_args(&func, args, None)
+    }
+
+    /// Swap `new_program` into `self.program`, recording the displaced program
+    /// on `program_swap_stack` (and bumping `program_swap_depth`). Returns the
+    /// new program's `__main__` Arc for the caller to execute. Pair every call
+    /// with exactly one `pop_program_swap`, which restores the displaced
+    /// program. Keeping the displaced programs reachable lets
+    /// `resolve_define_function_target` find the program that owns a
+    /// `DefineFunction` index when a previously-merged function runs while a
+    /// smaller sub-program is swapped in (issue #70).
+    fn push_program_swap(&mut self, new_program: BytecodeProgram) -> BytecodeProgram {
+        let old = std::mem::replace(&mut self.program, new_program);
+        self.program_swap_depth += 1;
+        // Push a CHEAP placeholder; the real displaced program is returned to
+        // the caller (it owns the merge logic). The stack only needs read
+        // access to each enclosing program for index resolution, so we store a
+        // shallow clone of the function-table Arcs (refcount bumps, not deep
+        // copies of the bytecode).
+        self.program_swap_stack.push(BytecodeProgram {
+            functions: old.functions.clone(),
+        });
+        old
+    }
+
+    /// Undo the most recent `push_program_swap`, restoring `restored` as the
+    /// active program. (The caller owns `restored` because it may have merged
+    /// the sub-program's functions into it first.)
+    fn pop_program_swap(&mut self, restored: BytecodeProgram) {
+        self.program_swap_stack.pop();
+        self.program = restored;
+        self.program_swap_depth -= 1;
+    }
+
+    /// Resolve the `BytecodeFunction` that a `DefineFunction(func_idx)` op
+    /// refers to. Normally `func_idx` indexes the active `self.program`. But
+    /// when a function that was merged into an enclosing program runs while a
+    /// smaller sub-program is swapped in (CFC method dispatched by name during
+    /// a cfinclude / custom tag / cfmodule body), `func_idx` is out of bounds
+    /// for `self.program`. The op's index is valid against the program the
+    /// function was MERGED INTO — which is the program that was active when the
+    /// function's owner (CFC / included file) was loaded, i.e. the nearest
+    /// enclosing swap, NOT necessarily the request root. Example: a CFC `new`ed
+    /// inside an included file merges its methods into that file's sub-program,
+    /// so its closures' indices are valid against that inner program. Probe the
+    /// swap stack INNERMOST-first (top of stack down to root) and take the
+    /// first program whose table contains the index. Returns `None` only if no
+    /// reachable program owns the index (should be impossible for well-formed
+    /// bytecode).
+    fn resolve_define_function_target(&self, func_idx: usize) -> Option<Arc<BytecodeFunction>> {
+        if func_idx < self.program.functions.len() {
+            return Some(Arc::clone(&self.program.functions[func_idx]));
+        }
+        // Innermost-first: the last-pushed enclosing program is the nearest
+        // ancestor and the most likely owner of a freshly-merged function's
+        // child closures.
+        for prog in self.program_swap_stack.iter().rev() {
+            if func_idx < prog.functions.len() {
+                return Some(Arc::clone(&prog.functions[func_idx]));
+            }
+        }
+        None
     }
 
     /// Restore output-capture state when an exception is caught by `handler`.
@@ -3694,11 +3772,25 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::DefineFunction(func_idx) => {
                     let func_idx = *func_idx;
-                    let func_name = self.program.functions[func_idx].name.clone();
-                    self.user_functions.insert(
-                        func_name.clone(),
-                        Arc::clone(&self.program.functions[func_idx]),
-                    );
+                    // Resolve the target function Arc. `func_idx` indexes the
+                    // active program in the common case, but when a previously
+                    // merged function (e.g. a CFC method dispatched by name)
+                    // runs while a smaller sub-program is swapped in, the index
+                    // is out of bounds for `self.program` and must be resolved
+                    // against the enclosing program that owns it (issue #70).
+                    let bc_func_arc = match self.resolve_define_function_target(func_idx) {
+                        Some(arc) => arc,
+                        None => {
+                            return Err(self.wrap_error(CfmlError::runtime(format!(
+                                "Internal error: DefineFunction index {} out of bounds (active program has {} functions, no enclosing program owns it)",
+                                func_idx,
+                                self.program.functions.len()
+                            ))));
+                        }
+                    };
+                    let func_name = bc_func_arc.name.clone();
+                    self.user_functions
+                        .insert(func_name.clone(), Arc::clone(&bc_func_arc));
                     // Create or reuse a shared closure environment so all closures
                     // defined in this function invocation share the same mutable state.
                     // On first definition, seed directly from locals; on subsequent
@@ -3732,7 +3824,7 @@ impl CfmlVirtualMachine {
                         }
                     };
                     // Push function reference — encode func_idx in body for super dispatch
-                    let bc_func_ref = &self.program.functions[func_idx];
+                    let bc_func_ref = &bc_func_arc;
                     stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                         name: func_name,
                         params: bc_func_ref
@@ -4419,8 +4511,7 @@ impl CfmlVirtualMachine {
                     let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
                     match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
                         Ok(sub_program) => {
-                            let mut old_program = std::mem::replace(&mut self.program, sub_program);
-                            self.program_swap_depth += 1;
+                            let mut old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
                             self.source_file = Some(resolved.clone());
                             let main_idx = self
@@ -4546,8 +4637,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            self.program = old_program;
-                            self.program_swap_depth -= 1;
+                            self.pop_program_swap(old_program);
                             self.source_file = old_source;
                             // Propagate include errors through try-catch
                             if let Err(e) = result {
@@ -4611,8 +4701,7 @@ impl CfmlVirtualMachine {
                     let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
                     match compile_file_cached(&resolved, cache, self.vfs.as_ref()) {
                         Ok(sub_program) => {
-                            let mut old_program = std::mem::replace(&mut self.program, sub_program);
-                            self.program_swap_depth += 1;
+                            let mut old_program = self.push_program_swap(sub_program);
                             let old_source = self.source_file.clone();
                             self.source_file = Some(resolved.clone());
                             let main_idx = self
@@ -4707,8 +4796,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            self.program = old_program;
-                            self.program_swap_depth -= 1;
+                            self.pop_program_swap(old_program);
                             self.source_file = old_source;
                             if let Err(e) = result {
                                 if Self::is_control_flow_error(&e) {
@@ -10623,8 +10711,7 @@ impl CfmlVirtualMachine {
         let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
         let sub_program = compile_file_cached(template_path, cache, self.vfs.as_ref())?;
 
-        let old_program = std::mem::replace(&mut self.program, sub_program);
-        self.program_swap_depth += 1;
+        let old_program = self.push_program_swap(sub_program);
         let old_source = self.source_file.clone();
         self.source_file = Some(template_path.to_string());
 
@@ -10639,8 +10726,7 @@ impl CfmlVirtualMachine {
         let saved_try_stack = std::mem::take(&mut self.try_stack);
         let result = self.execute_function_with_args(&tag_func, Vec::new(), Some(tag_locals));
         self.try_stack = saved_try_stack;
-        self.program = old_program;
-        self.program_swap_depth -= 1;
+        self.pop_program_swap(old_program);
         self.source_file = old_source;
 
         result.map(|_| ())
@@ -11353,8 +11439,7 @@ impl CfmlVirtualMachine {
 
         let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
         if let Ok(sub_program) = compile_file_cached(&cfc_path, cache, self.vfs.as_ref()) {
-            let old_program = std::mem::replace(&mut self.program, sub_program);
-            self.program_swap_depth += 1;
+            let old_program = self.push_program_swap(sub_program);
             // Set source_file to CFC path so parent resolution works relative to CFC
             let old_source_file = self.source_file.clone();
             self.source_file = Some(cfc_path.clone());
@@ -11439,8 +11524,7 @@ impl CfmlVirtualMachine {
             } else {
                 None
             };
-            self.program = old_program;
-            self.program_swap_depth -= 1;
+            self.pop_program_swap(old_program);
             let first_merge = sub_funcs.is_some();
             let sub_func_count = sub_funcs.as_ref().map(|s| s.len()).unwrap_or(0);
             let base_idx = if let Some(sub_funcs) = sub_funcs {
@@ -12889,8 +12973,7 @@ impl CfmlVirtualMachine {
         };
 
         // Save current program, swap in sub-program
-        let old_program = std::mem::replace(&mut self.program, sub_program);
-        self.program_swap_depth += 1;
+        let old_program = self.push_program_swap(sub_program);
         let main_idx = self
             .program
             .functions
@@ -12911,8 +12994,7 @@ impl CfmlVirtualMachine {
 
         // Merge sub-program functions into main program
         let sub_funcs = self.program.functions.clone();
-        self.program = old_program;
-        self.program_swap_depth -= 1;
+        self.pop_program_swap(old_program);
 
         // If the pseudo-constructor threw, surface it now (after restoring the
         // program) so the request fails rather than falling through to the page.
