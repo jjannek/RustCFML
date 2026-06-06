@@ -732,6 +732,16 @@ pub struct CfmlVirtualMachine {
     /// volatile `self.program.functions`, so its identity is stable across page
     /// rebuilds and program swaps with no per-request remap.
     app_function_table: Vec<Arc<BytecodeFunction>>,
+    /// Set whenever a `DefineFunction` op runs during a request. A new
+    /// `CfmlValue::Function` can ONLY be born via that op (closures, arrows,
+    /// component methods, and function references all compile to it), so if it
+    /// never fires this request, no function created this request can have
+    /// entered application scope — every app-reachable function is already
+    /// stable-tagged from an earlier request and the end-of-request re-homing
+    /// walk is a guaranteed no-op. Gating the walk on this flag lets a request
+    /// that defines no function skip the app-scope graph traversal entirely.
+    /// Reset at the start of `execute_with_lifecycle`.
+    app_fn_table_dirty: bool,
     /// In-memory cache: key -> (value, optional expiry instant)
     pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
@@ -1004,6 +1014,7 @@ impl CfmlVirtualMachine {
             program_swap_depth: 0,
             program_swap_stack: Vec::new(),
             app_function_table: Vec::new(),
+            app_fn_table_dirty: false,
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
             sandbox: false,
@@ -3828,6 +3839,9 @@ impl CfmlVirtualMachine {
 
                 BytecodeOp::DefineFunction(func_idx) => {
                     let func_idx = *func_idx;
+                    // A new function value is being created this request, so the
+                    // end-of-request re-homing walk has potential work to do.
+                    self.app_fn_table_dirty = true;
                     // Resolve the target function Arc. `func_idx` indexes the
                     // active program in the common case, but when a previously
                     // merged function (e.g. a CFC method dispatched by name)
@@ -13567,6 +13581,9 @@ impl CfmlVirtualMachine {
     pub fn execute_with_lifecycle(&mut self) -> CfmlResult {
         self.application_stopped = false;
         self.current_application_name = None;
+        // No function defined yet this request; the re-homing walk is skipped
+        // unless a DefineFunction op flips this.
+        self.app_fn_table_dirty = false;
 
         // 1. Find Application.cfc
         let app_cfc_path = self.find_application_cfc();
@@ -13977,25 +13994,41 @@ impl CfmlVirtualMachine {
                 // any later request — no per-request append, no remap, and the
                 // stale-index bug class is gone by construction. Idempotent:
                 // functions already re-homed on an earlier request are untouched.
-                self.rehome_application_functions();
+                //
+                // Skip the whole walk when no function was defined this request:
+                // the table cannot have gained anything (a `Function` value is
+                // only born via a DefineFunction op), so it is byte-identical to
+                // what was loaded and needs no re-persist. The application-scope
+                // *variables* are still written back below, since non-function
+                // app state may have changed.
+                let rehomed = self.app_fn_table_dirty;
+                if rehomed {
+                    self.rehome_application_functions();
+                }
                 if let Some(ref app_scope) = self.application_scope {
                     // Snapshot AFTER re-homing (so persisted bodies are stable
                     // ids) and outside the store write, so the application-scope
                     // lock and the applications-store lock never nest.
                     let scope = app_scope.snapshot();
-                    let table = self.app_function_table.clone();
-                    // Rebuild the key->id index from the append-only table; the
-                    // worker uses it to rebuild the table per isolate from cached
+                    // Only rebuild + persist the function table when it changed.
+                    // The key->id index is rebuilt from the append-only table; a
+                    // worker isolate uses it to rebuild the table from cached
                     // bytecode (Arcs aren't serializable across isolates).
-                    let mut ids: HashMap<(String, String, u32), usize> =
-                        HashMap::with_capacity(table.len());
-                    for (i, f) in table.iter().enumerate() {
-                        ids.entry(bytecode_fn_key(f)).or_insert(i);
-                    }
+                    let table_update = rehomed.then(|| {
+                        let table = self.app_function_table.clone();
+                        let mut ids: HashMap<(String, String, u32), usize> =
+                            HashMap::with_capacity(table.len());
+                        for (i, f) in table.iter().enumerate() {
+                            ids.entry(bytecode_fn_key(f)).or_insert(i);
+                        }
+                        (table, ids)
+                    });
                     server_state.applications.modify(&app_name, &mut |app| {
                         app.variables = scope.clone();
-                        app.app_function_table = table.clone();
-                        app.app_function_ids = ids.clone();
+                        if let Some((table, ids)) = table_update.clone() {
+                            app.app_function_table = table;
+                            app.app_function_ids = ids;
+                        }
                     });
                 }
             }
