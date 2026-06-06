@@ -142,14 +142,13 @@ fn application_stop_clears_shared_application_state() {
          stopMarker set in the same request before the call)"
     );
     assert!(
-        stopped_app.cached_functions.is_empty(),
-        "applicationStop() must discard cached lifecycle functions"
+        stopped_app.app_function_table.is_empty(),
+        "applicationStop() must discard the stable function table"
     );
     assert!(
-        stopped_app.cached_function_indices.is_empty(),
-        "applicationStop() must discard the cached function index map"
+        stopped_app.app_function_ids.is_empty(),
+        "applicationStop() must discard the function-table id index"
     );
-    assert_eq!(0, stopped_app.cached_functions_original_offset);
 
     // The next request must re-fire onApplicationStart, producing a brand-new
     // seed — proving the lifecycle genuinely restarted rather than reusing a

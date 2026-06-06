@@ -1,14 +1,17 @@
 //! Regression coverage: cross-request dispatch of application-scoped functions.
 //!
-//! A stored CfmlValue::Function dispatches through a bare numeric index into the
-//! per-request `program.functions` table (lib.rs:4208-4212). Anything stored in
-//! application scope and called on a LATER request therefore relies on the
-//! cached_functions carry + remap_func_indices machinery to stay correct when
-//! the function-table layout shifts between requests.
+//! A stored CfmlValue::Function originally dispatched through a bare numeric
+//! index into the per-request `program.functions` table, so anything stored in
+//! application scope and called on a LATER request would dangle once the
+//! function-table layout shifted. The stable-function-identity redesign re-homes
+//! app-reachable functions into a per-application table keyed by a stable
+//! `(source_file, name, ordinal)` identity, rewriting their stored bodies to a
+//! tagged stable id — so cross-request dispatch is now correct by construction.
 //!
-//! Each request below forces a DIFFERENT table size (0 / 6 / 12 page UDFs) so the
-//! restored app-scope functions land at a different offset every time, exercising
-//! the graph shapes a real app uses:
+//! Each request below forces a DIFFERENT page table size (0 / 6 / 12 page UDFs)
+//! so a layout shift WOULD have stranded the old per-request indices; with stable
+//! ids the app-scope functions still resolve. Exercises the graph shapes a real
+//! app uses:
 //!   * flat services sharing init/read/save/checkAccess     (name collisions)
 //!   * a service whose read() is INHERITED from a base CFC  (parent merge)
 //!   * a service NESTED inside an app-scope struct          (struct walk)

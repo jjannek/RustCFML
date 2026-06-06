@@ -1,10 +1,15 @@
-//! Regression coverage for Application.cfc cached bytecode functions.
+//! Regression coverage for the stable per-application function table.
 //!
-//! Application scope can hold long-lived CFC instances. The VM caches the
-//! bytecode functions reachable from that scope so those instances remain
-//! callable on later requests. When a request overwrites an app-scope CFC, the
-//! cache must drop the old function bodies instead of retaining both old and
-//! new copies forever.
+//! Application scope can hold long-lived CFC instances. The VM re-homes the
+//! bytecode functions reachable from that scope into a per-application,
+//! append-only table (`ApplicationState::app_function_table`) keyed by a
+//! stable `(source_file, name, ordinal)` identity, so those instances remain
+//! callable on later requests via a stable id that never needs remapping.
+//! Because the table is keyed by that stable identity, re-instantiating the
+//! same CFC (the `overwrite` fixture) or re-creating a per-request CFC (the
+//! `sparse` fixture) reuses the existing ids instead of appending duplicates —
+//! so the table stays bounded by the number of *distinct* functions in the
+//! codebase, never growing per request.
 
 use cfml_codegen::{compiler::CfmlCompiler, BytecodeProgram};
 use cfml_common::dynamic::CfmlValue;
@@ -68,12 +73,12 @@ fn run_request_with_expected_output(
     assert_eq!(expected_output, vm.output_buffer.trim());
 }
 
-fn cached_function_count(server_state: &ServerState) -> usize {
+fn app_function_table_size(server_state: &ServerState) -> usize {
     server_state
         .applications
         .get(APP_NAME)
         .expect("application state should exist")
-        .cached_functions
+        .app_function_table
         .len()
 }
 
@@ -137,24 +142,24 @@ fn overwritten_application_scope_cfc_does_not_grow_function_cache() {
     let server_state = ServerState::with_production(false);
 
     run_request(&server_state, vfs.clone());
-    let first_count = cached_function_count(&server_state);
+    let first_count = app_function_table_size(&server_state);
     assert!(
         first_count > 0,
-        "test fixture must cache at least one app-scope CFC function"
+        "test fixture must re-home at least one app-scope CFC function"
     );
 
     run_request(&server_state, vfs.clone());
     assert_eq!(
         first_count,
-        cached_function_count(&server_state),
-        "cached functions should not grow after the first repeated request"
+        app_function_table_size(&server_state),
+        "stable function table must not grow when the same CFC is re-instantiated"
     );
 
     run_request(&server_state, vfs);
     assert_eq!(
         first_count,
-        cached_function_count(&server_state),
-        "cached functions should remain stable across repeated overwrites"
+        app_function_table_size(&server_state),
+        "stable function table should remain bounded across repeated overwrites"
     );
 }
 
@@ -164,23 +169,23 @@ fn persistent_and_overwritten_application_cfc_functions_are_cached_sparsely() {
     let server_state = ServerState::with_production(false);
 
     run_request_with_expected_output(&server_state, vfs.clone(), "okok");
-    let first_count = cached_function_count(&server_state);
+    let first_count = app_function_table_size(&server_state);
     assert!(
         first_count > 1,
-        "test fixture must cache persistent and per-request app-scope CFC functions"
+        "test fixture must re-home persistent and per-request app-scope CFC functions"
     );
 
     run_request_with_expected_output(&server_state, vfs.clone(), "okok");
     assert_eq!(
         first_count,
-        cached_function_count(&server_state),
-        "sparse cache must not retain stale functions between persistent and overwritten CFCs"
+        app_function_table_size(&server_state),
+        "stable table must reuse ids for persistent and re-created CFCs, not duplicate them"
     );
 
     run_request_with_expected_output(&server_state, vfs, "okok");
     assert_eq!(
         first_count,
-        cached_function_count(&server_state),
-        "sparse cache should remain stable across repeated mixed app-scope CFCs"
+        app_function_table_size(&server_state),
+        "stable table should remain bounded across repeated mixed app-scope CFCs"
     );
 }

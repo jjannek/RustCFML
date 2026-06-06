@@ -32,6 +32,49 @@ pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 /// immediately.
 const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
 
+/// Tag base for stored-function bodies that reference the per-application stable
+/// function table (`ApplicationState::app_function_table` /
+/// `CfmlVirtualMachine::app_function_table`) rather than the volatile
+/// per-request `self.program.functions`. A `CfmlClosureBody::Expression(Int(n))`
+/// with `n >= APP_FN_TAG_BASE` means "app-table id `n - APP_FN_TAG_BASE`"; any
+/// smaller `n` is an ordinary program-table index. The base is chosen far above
+/// any plausible program function count so the two ranges never collide, while
+/// staying well inside `i64` so the existing `CfmlValue::Int` encoding is reused
+/// unchanged (no new value variant, no serialization change). Decoding is a
+/// single compare + branch — no hashing on the dispatch hot path.
+const APP_FN_TAG_BASE: i64 = 1 << 48;
+
+/// Encode a stable application-table id into a stored-function body integer.
+#[inline]
+fn encode_app_fn_id(app_id: usize) -> i64 {
+    APP_FN_TAG_BASE + app_id as i64
+}
+
+/// If `body_int` is an app-table-tagged id, return the app id; else `None`
+/// (it is an ordinary program-table index).
+#[inline]
+fn decode_app_fn_id(body_int: i64) -> Option<usize> {
+    if body_int >= APP_FN_TAG_BASE {
+        Some((body_int - APP_FN_TAG_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+/// Serialization-stable identity for a bytecode function: `(source_file, name,
+/// ordinal)`. Deterministic for a given source, so re-homing the same function
+/// twice (this request or a later one) maps to the same `app_id`, and a worker
+/// isolate can rebuild the table from cached bytecode. `source_file` is `None`
+/// only for in-memory/CLI compiles and `__main__`, neither of which is ever
+/// re-homed from application scope.
+fn bytecode_fn_key(f: &BytecodeFunction) -> (String, String, u32) {
+    (
+        f.source_file.clone().unwrap_or_default(),
+        f.name.clone(),
+        f.ordinal,
+    )
+}
+
 /// Persistent application state, keyed by app name.
 #[derive(Clone)]
 pub struct ApplicationState {
@@ -39,16 +82,19 @@ pub struct ApplicationState {
     pub variables: IndexMap<String, CfmlValue>,
     pub started: bool,
     pub config: IndexMap<String, CfmlValue>,
-    /// Bytecode functions added during onApplicationStart (factory, resources, etc.).
-    /// Only the delta (functions added after load_application_cfc) is cached.
-    pub cached_functions: Vec<std::sync::Arc<cfml_codegen::compiler::BytecodeFunction>>,
-    /// Original program indices for `cached_functions`.
-    /// Restoring app-scope CFCs has to remap each sparse original index to the
-    /// compact position where the cached functions are appended for a request.
-    pub cached_function_indices: Vec<usize>,
-    /// Legacy contiguous-cache anchor. Used only for application states created
-    /// before `cached_function_indices` existed in this process.
-    pub cached_functions_original_offset: usize,
+    /// Stable per-application function table (Option A of the stable-function-
+    /// identity redesign). Append-only and monotonic: once a function reachable
+    /// from application scope is re-homed here it keeps its `app_id` (its index
+    /// in this Vec) for the lifetime of the application, surviving page-program
+    /// rebuilds and program swaps. Stored `CfmlValue::Function` bodies that have
+    /// been re-homed encode `APP_FN_TAG_BASE + app_id` instead of a volatile
+    /// per-request program index, so dispatch never needs a per-request remap.
+    pub app_function_table: Vec<std::sync::Arc<cfml_codegen::compiler::BytecodeFunction>>,
+    /// `(source_file, name, ordinal) -> app_id` index over `app_function_table`.
+    /// The key is the serialization-stable identity (Option B's key) so re-homing
+    /// the same function twice is idempotent and a worker isolate can rebuild the
+    /// table deterministically from cached bytecode.
+    pub app_function_ids: HashMap<(String, String, u32), usize>,
     /// Value of `this.sessionStorage` from Application.cfc — name of the cache to use
     /// for session storage. Overrides the server-wide `.cfconfig.json` setting.
     pub session_storage: Option<String>,
@@ -397,8 +443,10 @@ pub fn compile_file_cached(
             ))
         })?;
 
-    // Compile
-    let compiler = cfml_codegen::compiler::CfmlCompiler::new();
+    // Compile. Stamp the source path onto every function so app-scope-reachable
+    // functions carry a stable `(source_file, name, ordinal)` identity.
+    let compiler =
+        cfml_codegen::compiler::CfmlCompiler::new().with_source_file(Some(path.to_string()));
     let program = compiler.compile(ast);
 
     // Cache the result
@@ -677,6 +725,13 @@ pub struct CfmlVirtualMachine {
     /// different function that happens to occupy that slot in an outer program.
     /// Maintained by `push_program_swap`/`pop_program_swap`.
     program_swap_stack: Vec<BytecodeProgram>,
+    /// Per-request handle on the application's stable function table
+    /// (`ApplicationState::app_function_table`). Loaded by-reference (Arc clones)
+    /// at request start. A stored `CfmlValue::Function` whose body encodes
+    /// `APP_FN_TAG_BASE + app_id` dispatches through this Vec instead of the
+    /// volatile `self.program.functions`, so its identity is stable across page
+    /// rebuilds and program swaps with no per-request remap.
+    app_function_table: Vec<Arc<BytecodeFunction>>,
     /// In-memory cache: key -> (value, optional expiry instant)
     pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
@@ -948,6 +1003,7 @@ impl CfmlVirtualMachine {
             merged_file_offsets: HashMap::new(),
             program_swap_depth: 0,
             program_swap_stack: Vec::new(),
+            app_function_table: Vec::new(),
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
             sandbox: false,
@@ -4046,14 +4102,16 @@ impl CfmlVirtualMachine {
                                 // Super dispatch — find the parent's function by stored index
                                 let prop = object.get(&method_name).unwrap_or(CfmlValue::Null);
                                 if let CfmlValue::Function(ref f) = &prop {
-                                    // Extract stored bytecode index from function body
+                                    // Extract stored bytecode id from function body
+                                    // (raw i64: may be an APP_FN_TAG_BASE-tagged
+                                    // stable id or an ordinary program index).
                                     let func_idx =
                                         if let cfml_common::dynamic::CfmlClosureBody::Expression(
                                             ref body,
                                         ) = f.body
                                         {
                                             if let CfmlValue::Int(idx) = body.as_ref() {
-                                                Some(*idx as usize)
+                                                Some(*idx)
                                             } else {
                                                 None
                                             }
@@ -4089,19 +4147,26 @@ impl CfmlVirtualMachine {
                                     } else {
                                         method_locals.insert("this".to_string(), object.clone());
                                     }
-                                    // Execute directly by index to avoid name collision
+                                    // Execute directly by id to avoid name
+                                    // collision. App-tagged ids resolve against
+                                    // the stable per-application table; program
+                                    // indices keep exact prior semantics (an
+                                    // out-of-bounds index falls through to the
+                                    // by-name dispatch).
                                     self.closure_parent_writeback = None;
-                                    let call_result = if let Some(idx) = func_idx {
-                                        if idx < self.program.functions.len() {
-                                            let parent_func = self.program.functions[idx].clone();
-                                            self.execute_function_with_args(
-                                                &parent_func,
-                                                args,
-                                                Some(&method_locals),
-                                            )
+                                    let parent_func = func_idx.and_then(|i| {
+                                        if let Some(app_id) = decode_app_fn_id(i) {
+                                            self.app_function_table.get(app_id).map(Arc::clone)
                                         } else {
-                                            self.call_function(&prop, args, &method_locals)
+                                            self.program.functions.get(i as usize).map(Arc::clone)
                                         }
+                                    });
+                                    let call_result = if let Some(parent_func) = parent_func {
+                                        self.execute_function_with_args(
+                                            &parent_func,
+                                            args,
+                                            Some(&method_locals),
+                                        )
                                     } else {
                                         self.call_function(&prop, args, &method_locals)
                                     };
@@ -5079,9 +5144,23 @@ impl CfmlVirtualMachine {
             // (skips all builtin matching for user-defined functions)
             if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = func.body {
                 if let CfmlValue::Int(idx) = body.as_ref() {
-                    let idx = *idx as usize;
-                    if idx < self.program.functions.len() {
-                        let user_func = Arc::clone(&self.program.functions[idx]);
+                    // Resolve the target. An `APP_FN_TAG_BASE`-tagged id indexes
+                    // the stable per-application table; otherwise it is an
+                    // ordinary per-request program index (unchanged: an
+                    // out-of-bounds program index yields `None` and falls through
+                    // to the by-name dispatch below). A single compare on the hot
+                    // path — no hashing.
+                    let resolved = if let Some(app_id) = decode_app_fn_id(*idx) {
+                        self.app_function_table.get(app_id).map(Arc::clone)
+                    } else {
+                        let pidx = *idx as usize;
+                        if pidx < self.program.functions.len() {
+                            Some(Arc::clone(&self.program.functions[pidx]))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(user_func) = resolved {
                         // Handle closure scope merging
                         let effective_locals;
                         let effective_parent = if let Some(ref shared_env) = func.captured_scope {
@@ -7387,12 +7466,16 @@ impl CfmlVirtualMachine {
                                         ) = f.body
                                         {
                                             if let CfmlValue::Int(idx) = body.as_ref() {
-                                                let idx = *idx as usize;
-                                                if idx < self.program.functions.len() {
-                                                    self.program.functions[idx].params.clone()
+                                                // App-tagged id -> stable table;
+                                                // else program index (unchanged).
+                                                let bf = if let Some(app_id) =
+                                                    decode_app_fn_id(*idx)
+                                                {
+                                                    self.app_function_table.get(app_id)
                                                 } else {
-                                                    Vec::new()
-                                                }
+                                                    self.program.functions.get(*idx as usize)
+                                                };
+                                                bf.map(|f| f.params.clone()).unwrap_or_default()
                                             } else {
                                                 Vec::new()
                                             }
@@ -7506,12 +7589,16 @@ impl CfmlVirtualMachine {
                                         ) = f.body
                                         {
                                             if let CfmlValue::Int(idx) = body.as_ref() {
-                                                let idx = *idx as usize;
-                                                if idx < self.program.functions.len() {
-                                                    self.program.functions[idx].params.clone()
+                                                // App-tagged id -> stable table;
+                                                // else program index (unchanged).
+                                                let bf = if let Some(app_id) =
+                                                    decode_app_fn_id(*idx)
+                                                {
+                                                    self.app_function_table.get(app_id)
                                                 } else {
-                                                    Vec::new()
-                                                }
+                                                    self.program.functions.get(*idx as usize)
+                                                };
+                                                bf.map(|f| f.params.clone()).unwrap_or_default()
                                             } else {
                                                 Vec::new()
                                             }
@@ -10867,95 +10954,26 @@ impl CfmlVirtualMachine {
         }
     }
 
-    /// Adjust func_idx values by a delta for indices >= min_index.
-    /// Used when restoring cached functions at a different program offset
-    /// than where they were originally inserted.
-    fn adjust_func_indices(val: &mut CfmlValue, min_index: usize, delta: i64) {
-        // Reference-typed structs/arrays can form cycles; guard the walk.
-        let mut visited: Vec<usize> = Vec::new();
-        Self::adjust_func_indices_inner(val, min_index, delta, &mut visited);
-    }
-
-    fn adjust_func_indices_inner(
-        val: &mut CfmlValue,
-        min_index: usize,
-        delta: i64,
-        visited: &mut Vec<usize>,
-    ) {
-        match val {
-            CfmlValue::Struct(s) => {
-                let ptr = s.backing_ptr();
-                if visited.contains(&ptr) {
-                    return;
-                }
-                visited.push(ptr);
-                s.with_write(|m| {
-                    let keys: Vec<String> = m.keys().cloned().collect();
-                    for key in keys {
-                        if let Some(v) = m.get_mut(&key) {
-                            match v {
-                                CfmlValue::Function(ref mut f) => {
-                                    if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                        ref mut body,
-                                    ) = f.body
-                                    {
-                                        if let CfmlValue::Int(ref mut idx) = body.as_mut() {
-                                            if *idx >= min_index as i64 {
-                                                *idx += delta;
-                                            }
-                                        }
-                                    }
-                                }
-                                CfmlValue::Struct(_) | CfmlValue::Array(_) => {
-                                    Self::adjust_func_indices_inner(v, min_index, delta, visited);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                });
-            }
-            CfmlValue::Array(arr) => {
-                let ptr = arr.backing_ptr();
-                if visited.contains(&ptr) {
-                    return;
-                }
-                visited.push(ptr);
-                arr.with_write(|v| {
-                    for item in v.iter_mut() {
-                        Self::adjust_func_indices_inner(item, min_index, delta, visited);
-                    }
-                });
-            }
-            _ => {}
-        }
-    }
-
-    fn application_scope_function_indices(scope: &IndexMap<String, CfmlValue>) -> Vec<usize> {
-        let mut indices = Vec::new();
-        let mut seen_indices = HashSet::new();
-        let mut visited = HashSet::new();
-        for value in scope.values() {
-            Self::collect_function_indices(value, &mut indices, &mut seen_indices, &mut visited);
-        }
-        indices.sort_unstable();
-        indices
-    }
-
-    fn collect_function_indices(
+    /// Discovery half of re-homing: walk a value graph (read-only) and, for
+    /// every `Function` whose stored body is a *program* index (not already an
+    /// `APP_FN_TAG_BASE`-tagged stable id), resolve its `Arc` against `program`,
+    /// assign/look-up a stable `app_id` via its `(source_file,name,ordinal)` key
+    /// (appending the `Arc` to `table` on first sight), and record
+    /// `program_idx -> app_tagged_body_int` in `index_map`. The companion
+    /// `remap_func_indices` then rewrites the bodies. Mirrors
+    /// `collect_function_indices`' traversal (same cycle guard via `visited`).
+    #[allow(clippy::too_many_arguments)]
+    fn discover_rehome(
         value: &CfmlValue,
-        indices: &mut Vec<usize>,
-        seen_indices: &mut HashSet<usize>,
+        program: &BytecodeProgram,
+        table: &mut Vec<Arc<BytecodeFunction>>,
+        ids: &mut HashMap<(String, String, u32), usize>,
+        index_map: &mut HashMap<usize, usize>,
         visited: &mut HashSet<(u8, usize)>,
     ) {
         match value {
             CfmlValue::Function(function) => {
-                Self::collect_function_indices_from_function(
-                    function,
-                    indices,
-                    seen_indices,
-                    visited,
-                );
+                Self::discover_rehome_function(function, program, table, ids, index_map, visited);
             }
             CfmlValue::Struct(values) => {
                 let ptr = values.backing_ptr();
@@ -10963,7 +10981,7 @@ impl CfmlVirtualMachine {
                     return;
                 }
                 for (_, value) in values.iter() {
-                    Self::collect_function_indices(&value, indices, seen_indices, visited);
+                    Self::discover_rehome(&value, program, table, ids, index_map, visited);
                 }
             }
             CfmlValue::Array(values) => {
@@ -10972,7 +10990,7 @@ impl CfmlVirtualMachine {
                     return;
                 }
                 for value in values.iter() {
-                    Self::collect_function_indices(&value, indices, seen_indices, visited);
+                    Self::discover_rehome(&value, program, table, ids, index_map, visited);
                 }
             }
             CfmlValue::QueryColumn(values) => {
@@ -10981,19 +10999,16 @@ impl CfmlVirtualMachine {
                     return;
                 }
                 for value in values.iter() {
-                    Self::collect_function_indices(value, indices, seen_indices, visited);
+                    Self::discover_rehome(value, program, table, ids, index_map, visited);
                 }
             }
             CfmlValue::Component(component) => {
                 for value in component.properties.values() {
-                    Self::collect_function_indices(value, indices, seen_indices, visited);
+                    Self::discover_rehome(value, program, table, ids, index_map, visited);
                 }
                 for function in component.methods.values() {
-                    Self::collect_function_indices_from_function(
-                        function,
-                        indices,
-                        seen_indices,
-                        visited,
+                    Self::discover_rehome_function(
+                        function, program, table, ids, index_map, visited,
                     );
                 }
             }
@@ -11001,17 +11016,29 @@ impl CfmlVirtualMachine {
         }
     }
 
-    fn collect_function_indices_from_function(
+    fn discover_rehome_function(
         function: &cfml_common::dynamic::CfmlFunction,
-        indices: &mut Vec<usize>,
-        seen_indices: &mut HashSet<usize>,
+        program: &BytecodeProgram,
+        table: &mut Vec<Arc<BytecodeFunction>>,
+        ids: &mut HashMap<(String, String, u32), usize>,
+        index_map: &mut HashMap<usize, usize>,
         visited: &mut HashSet<(u8, usize)>,
     ) {
         if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = function.body {
             if let CfmlValue::Int(idx) = body.as_ref() {
-                let idx = *idx as usize;
-                if seen_indices.insert(idx) {
-                    indices.push(idx);
+                // Already-app-tagged bodies are stable — leave them.
+                if decode_app_fn_id(*idx).is_none() {
+                    let pidx = *idx as usize;
+                    if let std::collections::hash_map::Entry::Vacant(slot) = index_map.entry(pidx) {
+                        if let Some(arc) = program.functions.get(pidx) {
+                            let key = bytecode_fn_key(arc);
+                            let app_id = *ids.entry(key).or_insert_with(|| {
+                                table.push(Arc::clone(arc));
+                                table.len() - 1
+                            });
+                            slot.insert(encode_app_fn_id(app_id) as usize);
+                        }
+                    }
                 }
             }
         }
@@ -11022,9 +11049,55 @@ impl CfmlVirtualMachine {
             }
             if let Ok(scope) = shared_scope.read() {
                 for value in scope.values() {
-                    Self::collect_function_indices(value, indices, seen_indices, visited);
+                    Self::discover_rehome(value, program, table, ids, index_map, visited);
                 }
             }
+        }
+    }
+
+    /// Re-home every program-index function reachable from application scope
+    /// into the stable per-application table (`self.app_function_table`), and
+    /// rewrite the live app-scope `Function` bodies to their tagged stable ids.
+    /// After this, the snapshot persisted to `app.variables` carries stable ids
+    /// that resolve identically on any later request without an append or remap.
+    /// Idempotent: functions already re-homed (app-tagged bodies) are untouched.
+    fn rehome_application_functions(&mut self) {
+        let Some(app_scope) = self.application_scope.clone() else {
+            return;
+        };
+        let mut table = std::mem::take(&mut self.app_function_table);
+        // Reconstruct the key->id index from the table (append-only, so the
+        // index equals first-insertion order and matches what was persisted).
+        let mut ids: HashMap<(String, String, u32), usize> = HashMap::with_capacity(table.len());
+        for (i, f) in table.iter().enumerate() {
+            ids.entry(bytecode_fn_key(f)).or_insert(i);
+        }
+        let mut index_map: HashMap<usize, usize> = HashMap::new();
+        // 1. Discovery: assign app ids for program-index functions.
+        {
+            let mut visited = HashSet::new();
+            app_scope.with_read(|scope| {
+                for value in scope.values() {
+                    Self::discover_rehome(
+                        value,
+                        &self.program,
+                        &mut table,
+                        &mut ids,
+                        &mut index_map,
+                        &mut visited,
+                    );
+                }
+            });
+        }
+        self.app_function_table = table;
+        // 2. Rewrite: program index -> tagged stable id, in the live scope.
+        if !index_map.is_empty() {
+            let mut visited = HashSet::new();
+            app_scope.with_write(|scope| {
+                for value in scope.values_mut() {
+                    Self::remap_func_indices(value, &index_map, &mut visited);
+                }
+            });
         }
     }
 
@@ -13473,9 +13546,10 @@ impl CfmlVirtualMachine {
                 server_state.applications.modify(&app_name, &mut |app| {
                     app.variables.clear();
                     app.started = false;
-                    app.cached_functions.clear();
-                    app.cached_function_indices.clear();
-                    app.cached_functions_original_offset = 0;
+                    // Discard the stable function table so a restarted
+                    // application re-homes from a clean slate.
+                    app.app_function_table.clear();
+                    app.app_function_ids.clear();
                 });
             }
         }
@@ -13664,9 +13738,8 @@ impl CfmlVirtualMachine {
                     variables: IndexMap::new(),
                     started: false,
                     config: config.clone(),
-                    cached_functions: Vec::new(),
-                    cached_function_indices: Vec::new(),
-                    cached_functions_original_offset: 0,
+                    app_function_table: Vec::new(),
+                    app_function_ids: HashMap::new(),
                     session_storage: app_session_storage.clone(),
                     app_caches: app_caches.clone(),
                 };
@@ -13675,6 +13748,11 @@ impl CfmlVirtualMachine {
             let app_snapshot = server_state.applications.get(&app_name).unwrap();
             self.current_application_name = Some(app_name.clone());
             self.application_scope = Some(CfmlStruct::new(app_snapshot.variables.clone()));
+            // Load the stable per-application function table by-reference (Arc
+            // clones). App-scope `Function` values whose bodies carry an
+            // `APP_FN_TAG_BASE`-tagged id dispatch through this Vec; its ordering
+            // is stable across requests so no per-request remap is needed.
+            self.app_function_table = app_snapshot.app_function_table.clone();
 
             // 5. onApplicationStart (if not yet started)
             let already_started = app_snapshot.started;
@@ -13689,106 +13767,25 @@ impl CfmlVirtualMachine {
                         app.started = true;
                     });
 
-                // Record how many functions exist before onApplicationStart.
-                // Everything beyond this index was added by onApplicationStart
-                // (e.g. factory components, resource CFCs).
-                let funcs_before = self.program.functions.len();
-
-                match self.call_lifecycle_method(&mut template, "onApplicationStart", vec![]) {
-                    Ok(_) => {
-                        // Cache only the functions ADDED during onApplicationStart.
-                        let funcs_after = self.program.functions.len();
-                        if funcs_after > funcs_before {
-                            if let Some(ref server_state) = self.server_state.clone() {
-                                let new_funcs: Vec<_> =
-                                    self.program.functions[funcs_before..].to_vec();
-                                server_state.applications.modify(&app_name, &mut |app| {
-                                    app.cached_functions = new_funcs.clone();
-                                    app.cached_function_indices =
-                                        (funcs_before..funcs_after).collect();
-                                    app.cached_functions_original_offset = funcs_before;
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = self.call_lifecycle_method(
-                            &mut template,
-                            "onError",
-                            vec![
-                                CfmlValue::String(e.message.clone()),
-                                CfmlValue::String("onApplicationStart".to_string()),
-                            ],
-                        );
-                        return Err(e);
-                    }
-                }
-            } else {
-                // Restore cached functions from onApplicationStart (and any
-                // subsequent requests that grew the program — see the request-end
-                // refresh below). Append them to the current program (which
-                // already has the page's functions + Application.cfc functions
-                // from load_application_cfc).
-                let cached = app_snapshot.cached_functions.clone();
-                let cached_indices = app_snapshot.cached_function_indices.clone();
-                let original_offset = app_snapshot.cached_functions_original_offset;
-                if !cached.is_empty() {
-                    let new_offset = self.program.functions.len();
-                    // Register restored application-scope functions by name so
-                    // they stay callable when the active program is swapped out
-                    // (e.g. inside a cfmodule / custom-tag body, whose tiny
-                    // sub-program lacks these functions). The func_idx fast path
-                    // resolves them for a regular page call, but a swapped program
-                    // makes that index point elsewhere; dispatch then falls back to
-                    // the user_functions by-name lookup. On a COLD request
-                    // createObject (in onApplicationStart) already populates
-                    // user_functions this way — this mirrors that on WARM restore so
-                    // an application-scope CFC's method (application.svc.ping())
-                    // resolves identically from inside a custom tag.
-                    for func in &cached {
-                        if func.name != "__main__" {
-                            self.user_functions
-                                .insert(func.name.clone(), Arc::clone(func));
-                        }
-                    }
-                    self.program.functions.extend(cached);
-
-                    // If functions ended up at a different offset than originally,
-                    // fix up function indices in the application scope values.
-                    if !cached_indices.is_empty() {
-                        let index_map: HashMap<usize, usize> = cached_indices
-                            .iter()
-                            .enumerate()
-                            .map(|(position, original_idx)| (*original_idx, new_offset + position))
-                            .collect();
-                        if let Some(ref app_scope) = self.application_scope {
-                            app_scope.with_write(|scope| {
-                                let keys: Vec<String> = scope.keys().cloned().collect();
-                                let mut visited = HashSet::new();
-                                for key in keys {
-                                    if let Some(val) = scope.get_mut(&key) {
-                                        Self::remap_func_indices(val, &index_map, &mut visited);
-                                    }
-                                }
-                            });
-                        }
-                    } else if new_offset != original_offset {
-                        let index_delta = new_offset as i64 - original_offset as i64;
-                        if let Some(ref app_scope) = self.application_scope {
-                            app_scope.with_write(|scope| {
-                                let keys: Vec<String> = scope.keys().cloned().collect();
-                                for key in keys {
-                                    if let Some(val) = scope.get_mut(&key) {
-                                        Self::adjust_func_indices(
-                                            val,
-                                            original_offset,
-                                            index_delta,
-                                        );
-                                    }
-                                }
-                            });
-                        }
-                    }
+                // Functions created during onApplicationStart (factory beans,
+                // resource CFCs) that stay reachable from application scope are
+                // re-homed into the stable function table by the end-of-request
+                // pass; no separate "delta added during start" cache is needed,
+                // and a warm request needs no append/remap — app-scope `Function`
+                // bodies already hold stable ids resolved via the table loaded at
+                // request start.
+                if let Err(e) =
+                    self.call_lifecycle_method(&mut template, "onApplicationStart", vec![])
+                {
+                    let _ = self.call_lifecycle_method(
+                        &mut template,
+                        "onError",
+                        vec![
+                            CfmlValue::String(e.message.clone()),
+                            CfmlValue::String("onApplicationStart".to_string()),
+                        ],
+                    );
+                    return Err(e);
                 }
             }
         } else {
@@ -13973,51 +13970,32 @@ impl CfmlVirtualMachine {
         // function cache from the just-cleared scope.
         if !self.application_stopped {
             if let Some(ref server_state) = self.server_state.clone() {
+                // Re-home every function reachable from application scope into
+                // the stable per-application table, rewriting their live
+                // app-scope bodies to tagged stable ids. After this the snapshot
+                // persisted below carries stable ids that resolve identically on
+                // any later request — no per-request append, no remap, and the
+                // stale-index bug class is gone by construction. Idempotent:
+                // functions already re-homed on an earlier request are untouched.
+                self.rehome_application_functions();
                 if let Some(ref app_scope) = self.application_scope {
-                    // Snapshot first so we never hold the application-scope lock
-                    // across the applications-store write below — keeps the two
-                    // locks strictly un-nested (no ordering hazard).
+                    // Snapshot AFTER re-homing (so persisted bodies are stable
+                    // ids) and outside the store write, so the application-scope
+                    // lock and the applications-store lock never nest.
                     let scope = app_scope.snapshot();
-                    // Refresh the function cache to the bytecode functions still
-                    // reachable from application scope, so long-lived CFCs,
-                    // factories and closures stay callable on later requests.
-                    // Reachability is recomputed from the current scope every
-                    // request, so functions whose app-scope values were
-                    // overwritten/abandoned during the request drop out — no
-                    // stale retention, no unbounded growth.
-                    //
-                    // This deliberately carries EVERY reachable function, including
-                    // those whose bytecode lives in Application.cfc or the page
-                    // itself (i.e. below the onApplicationStart offset). A closure
-                    // or function reference defined there and stored in application
-                    // scope still holds a volatile per-request `func_idx`; unless it
-                    // is carried and remapped on restore it dangles to whatever
-                    // occupies that slot on the next request once a differently
-                    // sized page shifts the table layout.
-                    let function_indices: Vec<usize> =
-                        Self::application_scope_function_indices(&scope)
-                            .into_iter()
-                            .filter(|idx| *idx < self.program.functions.len())
-                            .collect();
-                    // Clone only the reachable function Arcs, not the whole table.
-                    let cached_functions: Vec<_> = function_indices
-                        .iter()
-                        .map(|idx| self.program.functions[*idx].clone())
-                        .collect();
-                    // Legacy field — the restore path keys off cached_function_indices;
-                    // keep it as the minimum reachable index for the fallback path.
-                    let original_offset = function_indices.first().copied().unwrap_or(0);
+                    let table = self.app_function_table.clone();
+                    // Rebuild the key->id index from the append-only table; the
+                    // worker uses it to rebuild the table per isolate from cached
+                    // bytecode (Arcs aren't serializable across isolates).
+                    let mut ids: HashMap<(String, String, u32), usize> =
+                        HashMap::with_capacity(table.len());
+                    for (i, f) in table.iter().enumerate() {
+                        ids.entry(bytecode_fn_key(f)).or_insert(i);
+                    }
                     server_state.applications.modify(&app_name, &mut |app| {
                         app.variables = scope.clone();
-                        if function_indices.is_empty() {
-                            app.cached_functions_original_offset = 0;
-                            app.cached_function_indices.clear();
-                            app.cached_functions.clear();
-                        } else {
-                            app.cached_functions_original_offset = original_offset;
-                            app.cached_function_indices = function_indices.clone();
-                            app.cached_functions = cached_functions.clone();
-                        }
+                        app.app_function_table = table.clone();
+                        app.app_function_ids = ids.clone();
                     });
                 }
             }

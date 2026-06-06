@@ -73,6 +73,10 @@ pub struct CfmlCompiler {
     /// closure also inherits `None` and falls back to the application
     /// default at runtime).
     current_fn_local_mode: Option<bool>,
+    /// Source file path this program is being compiled from, stamped onto every
+    /// `BytecodeFunction` so app-scope functions carry a stable, serializable
+    /// identity. `None` for in-memory/CLI direct compiles.
+    source_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +97,13 @@ pub struct BytecodeFunction {
     pub has_default: Vec<bool>,
     pub instructions: Vec<BytecodeOp>,
     pub source_file: Option<String>,
+    /// Stable per-file ordinal: the function's index within the program it was
+    /// compiled into. Deterministic for a given source (compilation order is
+    /// fixed), so `(source_file, name, ordinal)` is a stable, serialization-safe
+    /// identity for a function — used as the re-homing key for the per-application
+    /// stable function table (see `ApplicationState::app_function_table`). The
+    /// `__main__` entry is ordinal 0.
+    pub ordinal: u32,
     /// Lucee `localMode` for this function. `Some(true)` = modern (unscoped
     /// writes stay in `local`), `Some(false)` = classic (unscoped writes go
     /// to `variables`/`__variables`). `None` = inherit at runtime from the
@@ -319,6 +330,7 @@ impl CfmlCompiler {
                     has_default: Vec::new(),
                     instructions: Vec::new(),
                     source_file: None,
+                    ordinal: 0,
                     declared_local_mode: None,
                 })],
             },
@@ -326,7 +338,16 @@ impl CfmlCompiler {
             finally_stack: Vec::new(),
             function_depth: 0,
             current_fn_local_mode: None,
+            source_file: None,
         }
+    }
+
+    /// Builder: stamp the source file path onto this program's functions so
+    /// they carry a stable `(source_file, name, ordinal)` identity. Used by
+    /// `compile_file_cached`; the CLI direct-compile path leaves it `None`.
+    pub fn with_source_file(mut self, source_file: Option<String>) -> Self {
+        self.source_file = source_file;
+        self
     }
 
     /// Flatten a member-access chain like a.b.c into "a.b.c" for dotted new expressions.
@@ -2005,7 +2026,8 @@ impl CfmlCompiler {
             required_params: func.params.iter().map(|p| p.required).collect(),
             has_default: func.params.iter().map(|p| p.default.is_some()).collect(),
             instructions: func_instructions,
-            source_file: None,
+            source_file: self.source_file.clone(),
+            ordinal: self.program.functions.len() as u32,
             declared_local_mode: declared_mode,
         };
 
@@ -2198,7 +2220,8 @@ impl CfmlCompiler {
                         BytecodeOp::GetProperty(prop.name.clone()),
                         BytecodeOp::Return,
                     ],
-                    source_file: None,
+                    source_file: self.source_file.clone(),
+                    ordinal: self.program.functions.len() as u32,
                     declared_local_mode: None,
                 };
                 let getter_idx = self.program.functions.len();
@@ -2241,7 +2264,8 @@ impl CfmlCompiler {
                         BytecodeOp::LoadLocal("this".to_string()),
                         BytecodeOp::Return,
                     ],
-                    source_file: None,
+                    source_file: self.source_file.clone(),
+                    ordinal: self.program.functions.len() as u32,
                     declared_local_mode: None,
                 };
                 let setter_idx = self.program.functions.len();
@@ -2973,7 +2997,8 @@ impl CfmlCompiler {
                     required_params: closure.params.iter().map(|p| p.required).collect(),
                     has_default: closure.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
-                    source_file: None,
+                    source_file: self.source_file.clone(),
+                    ordinal: self.program.functions.len() as u32,
                     declared_local_mode: effective_declared,
                 };
 
@@ -3016,7 +3041,8 @@ impl CfmlCompiler {
                     required_params: arrow.params.iter().map(|p| p.required).collect(),
                     has_default: arrow.params.iter().map(|p| p.default.is_some()).collect(),
                     instructions: func_instructions,
-                    source_file: None,
+                    source_file: self.source_file.clone(),
+                    ordinal: self.program.functions.len() as u32,
                     declared_local_mode: arrow_effective,
                 };
 
