@@ -129,5 +129,42 @@ try {
 assertTrue("cfmail script: parsed and dispatched (body ran OR threw)",
     mailBodyRan OR mailThrew);
 
+// ------------------------------------------------------------
+// cfquery(...) { body }   (issue #68)
+// ------------------------------------------------------------
+// The script-call form must parse its `{ ... }` as a statement block — not a
+// struct literal — so the body can build the SQL dynamically. This is the
+// pattern Wheels' database adapter uses. Core assertion: a function wrapping a
+// script cfquery (with statements + control flow in the body) PARSES, proven
+// by the function being defined, regardless of whether a DB is reachable.
+buildScriptQuery = function(required string ds, boolean onlyAlpha = true) {
+    cfquery(name = "local.q", datasource = "#arguments.ds#") {
+        writeOutput("SELECT name FROM cfqtest WHERE 1 = 1");
+        if (arguments.onlyAlpha) { writeOutput(" AND name = 'alpha'"); }
+        writeOutput(" ORDER BY id");
+    }
+    return local.q;
+};
+assertTrue("cfquery script: body parses as a statement block (function defined)",
+    isCustomFunction(buildScriptQuery));
+
+// Behavioral check when SQLite is available (skipped otherwise, matching
+// tests/tags/test_tags_cfquery_control_tags.cfm).
+cfqDs = "sqlite://" & getTempDirectory() & "/rustcfml_scriptq_" & createUUID() & ".sqlite";
+cfqSkip = false;
+try {
+    queryExecute("CREATE TABLE cfqtest (id INTEGER PRIMARY KEY, name TEXT)", [], { datasource: cfqDs });
+    queryExecute("INSERT INTO cfqtest (id, name) VALUES (1, 'alpha'), (2, 'beta')", [], { datasource: cfqDs });
+} catch (any e) {
+    cfqSkip = true;
+    assertTrue("cfquery script behavioral checks skipped (no sqlite): " & e.message, true);
+}
+if (NOT cfqSkip) {
+    assert("cfquery script: dynamic body filters rows (onlyAlpha)",
+        valueList(buildScriptQuery(cfqDs, true).name), "alpha");
+    assert("cfquery script: dynamic body unfiltered",
+        valueList(buildScriptQuery(cfqDs, false).name), "alpha,beta");
+}
+
 suiteEnd();
 </cfscript>

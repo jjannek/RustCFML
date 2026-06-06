@@ -898,7 +898,7 @@ impl Parser {
         if let Token::Identifier(ref nm) = self.peek(0).clone() {
             let nlow = nm.to_lowercase();
             let is_body_tag = matches!(nlow.as_str(),
-                "cfsavecontent" | "cflock" | "cftransaction" | "cfmail");
+                "cfsavecontent" | "cflock" | "cftransaction" | "cfmail" | "cfquery");
             if is_body_tag && matches!(self.peek(1), Token::LParen) {
                 let saved = self.current;
                 self.advance(); // tag name
@@ -1785,6 +1785,39 @@ impl Parser {
         Ok(attrs)
     }
 
+    /// Build an assignment target from a (possibly scoped/dotted) name —
+    /// "q" → Variable, "local.q"/"request.data.q" → a StructAccess chain — so
+    /// the write flows through normal struct-assignment codegen. Mirrors the
+    /// dotted-name handling in `lower_param_default`.
+    fn assign_target_from_dotted(&self, var_name: &str, loc: SourceLocation) -> AssignTarget {
+        match var_name.find('.') {
+            None => AssignTarget::Variable(var_name.to_string()),
+            Some(dot_pos) => {
+                let root = var_name[..dot_pos].to_string();
+                let rest = &var_name[dot_pos + 1..];
+                let parts: Vec<&str> = rest.split('.').collect();
+                let mut expr = Expression::Identifier(Identifier { name: root.clone(), location: loc });
+                for part in parts.iter().take(parts.len() - 1) {
+                    expr = Expression::MemberAccess(Box::new(MemberAccess {
+                        object: Box::new(expr),
+                        member: part.to_string(),
+                        null_safe: false,
+                        location: loc,
+                    }));
+                }
+                let last_part = parts.last().unwrap().to_string();
+                if parts.len() == 1 {
+                    AssignTarget::StructAccess(
+                        Box::new(Expression::Identifier(Identifier { name: root, location: loc })),
+                        last_part,
+                    )
+                } else {
+                    AssignTarget::StructAccess(Box::new(expr), last_part)
+                }
+            }
+        }
+    }
+
     /// Lower a script-call-with-body form (`cfsavecontent(...) { ... }`,
     /// `cflock(...) { ... }`, `cftransaction(...) { ... }`, `cfmail(...) { ... }`)
     /// into the same AST shape the angle-bracket tag forms produce.
@@ -1827,6 +1860,70 @@ impl Parser {
                         arguments: vec![],
                         location: loc,
                     })),
+                    operator: AssignOp::Equal,
+                    location: loc,
+                }));
+                CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
+            }
+            "cfquery" => {
+                // Script cfquery(name="q", datasource="ds", ...) { body } mirrors
+                // the dynamic angle-bracket <cfquery> path: the body runs inside a
+                // savecontent capture (so its output builds the SQL string) while
+                // any cfqueryparam appends to __cfquery_params, then queryExecute
+                // runs the captured SQL. Without this, the trailing `{ ... }` was
+                // mis-parsed as a struct literal (issue #68).
+                let query_name = attrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("name"))
+                    .and_then(|(_, v)| match v {
+                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
+                        Expression::Identifier(id) => Some(id.name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "queryResult".to_string());
+                // Options struct: every attribute except `name` (datasource,
+                // returntype, …) — queryExecute's third argument.
+                let opts_struct = Expression::Struct(Struct {
+                    pairs: attrs.iter()
+                        .filter(|(k, _)| !k.eq_ignore_ascii_case("name"))
+                        .map(|(k, v)| (
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String(k.clone()),
+                                location: loc,
+                            }),
+                            v.clone(),
+                        ))
+                        .collect(),
+                    ordered: false,
+                    location: loc,
+                });
+                let call = |name: &str, arguments: Vec<Expression>| Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier { name: name.to_string(), location: loc })),
+                    arguments,
+                    location: loc,
+                }));
+                let mut stmts = vec![
+                    // __cfquery_params = [];
+                    Statement::Assignment(Assignment {
+                        target: AssignTarget::Variable("__cfquery_params".to_string()),
+                        value: Expression::Array(Array { elements: vec![], location: loc }),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    }),
+                    // __cfsavecontent_start();
+                    Statement::Expression(ExpressionStatement {
+                        expr: call("__cfsavecontent_start", vec![]),
+                        location: loc,
+                    }),
+                ];
+                stmts.extend(body);
+                // NAME = queryExecute(__cfsavecontent_end(), __cfquery_params, OPTS);
+                stmts.push(Statement::Assignment(Assignment {
+                    target: self.assign_target_from_dotted(&query_name, loc),
+                    value: call("queryExecute", vec![
+                        call("__cfsavecontent_end", vec![]),
+                        Expression::Identifier(Identifier { name: "__cfquery_params".to_string(), location: loc }),
+                        opts_struct,
+                    ]),
                     operator: AssignOp::Equal,
                     location: loc,
                 }));
