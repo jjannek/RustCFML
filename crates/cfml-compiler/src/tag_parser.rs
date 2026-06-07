@@ -1063,13 +1063,12 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cflog" => {
             let mut parts = Vec::new();
+            // Route through format_attr_value so a mixed literal+#expr# value
+            // (e.g. text="took #n#ms") interpolates correctly. strip_hashes only
+            // handled a value that is entirely one #expr#; a mixed value emitted
+            // malformed script and failed to parse.
             for (k, v) in &attrs {
-                let val = strip_hashes(v);
-                if val != *v {
-                    parts.push(format!("{}: {}", k, val));
-                } else {
-                    parts.push(format!("{}: \"{}\"", k, v.replace('"', "\\\"")));
-                }
+                parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
             }
             (format!("__cflog({{ {} }});\n", parts.join(", ")), tag_end - start)
         }
@@ -1350,13 +1349,12 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         }
         "cfmail" => {
             let mut opts = Vec::new();
+            // Route through format_attr_value so a mixed literal+#expr# value
+            // (e.g. subject="Order #id# shipped") interpolates correctly, the
+            // same as cfthrow/cfargument/cffile. strip_hashes only handled a
+            // value that is entirely one #expr#.
             for (k, v) in &attrs {
-                let val = strip_hashes(v);
-                if val != *v {
-                    opts.push(format!("{}: {}", k, val));
-                } else {
-                    opts.push(format!("{}: \"{}\"", k, v.replace('"', "\\\"")));
-                }
+                opts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
             }
 
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfmail") {
