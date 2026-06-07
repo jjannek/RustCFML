@@ -12,6 +12,10 @@ use std::time::SystemTime;
 
 pub mod application_store;
 mod java_shims;
+/// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
+/// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+mod jit;
 #[cfg(feature = "s3")]
 mod s3_vfs;
 pub mod session_store;
@@ -768,6 +772,13 @@ pub struct CfmlVirtualMachine {
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Optional Cranelift JIT engine. `Some` only under `--features jit` on a
+    /// native target when not disabled via `RUSTCFML_JIT=0`. Consulted at the
+    /// top of `execute_function_with_args`; the interpreter is always the
+    /// fallback, so this never changes behaviour. Field absent entirely when
+    /// the feature is off.
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    jit: Option<jit::JitEngine>,
 }
 
 /// Constructor signature for a Rust-backed class registered via
@@ -985,12 +996,22 @@ impl CfmlVirtualMachine {
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
             cancel_flag: None,
+            #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+            jit: jit::JitEngine::maybe_new(),
         };
         // Register the root program's functions so stored references and
         // DefineFunction ops resolve by global_id from the first instruction.
         let root = vm.program.clone();
         vm.register_program_fns(&root);
         vm
+    }
+
+    /// Number of user functions the JIT has compiled to native code so far.
+    /// `0` when the `jit` feature is off or the engine is disabled. Exposed for
+    /// observability and tests that need to confirm the JIT actually fired.
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    pub fn jit_compiled_count(&self) -> usize {
+        self.jit.as_ref().map_or(0, |j| j.compiled_count())
     }
 
     /// Register every function in `prog` into `fn_registry` by its `global_id`
@@ -1656,6 +1677,20 @@ impl CfmlVirtualMachine {
         args: Vec<CfmlValue>,
         parent_scope: Option<&IndexMap<String, CfmlValue>>,
     ) -> CfmlResult {
+        // Tier-1 JIT fast path. Returns `Some` only when a compiled native body
+        // ran to completion for these exact (all-Int) arguments; otherwise this
+        // falls through to the interpreter unchanged. `func`/`args` are the
+        // caller's, not borrowed from `self.jit`, so there is no borrow conflict;
+        // with the feature off the whole block compiles away. See `jit/mod.rs`.
+        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+        {
+            if let Some(engine) = self.jit.as_mut() {
+                if let Some(result) = engine.try_call(func, &args) {
+                    return result;
+                }
+            }
+        }
+
         // Guard against runaway recursion — checked before allocating locals
         // to avoid blowing the native Rust stack.
         //

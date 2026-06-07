@@ -34,6 +34,18 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
 
+# Cranelift JIT backend. Optional, native-only: the `jit` feature turns these
+# on, and they are gated off wasm32 entirely so enabling `jit` on a wasm target
+# is a build-time impossibility (mirrors MatchBox). The interpreter is always
+# the default and the universal fallback; nothing here changes a default build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustc-hash = { workspace = true, optional = true }
+cranelift-jit = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-codegen = { workspace = true, optional = true }
+cranelift-frontend = { workspace = true, optional = true }
+cranelift-native = { workspace = true, optional = true }
+
 [dev-dependencies]
 cfml-stdlib = { workspace = true, default-features = false }
 
@@ -45,3 +57,16 @@ std = []
 # fall back to the synchronous-inline cfthread path (no std::thread on wasm32).
 real-threads = []
 s3 = ["dep:cfml-stdlib", "cfml-stdlib/s3"]
+# Multi-tier Cranelift JIT. Opt-in (build with `--features jit`); runtime
+# kill-switch `RUSTCFML_JIT=0` disables a compiled-in JIT at startup. All JIT
+# code is gated `not(target_arch = "wasm32")` and the wasm crates depend on
+# cfml-vm with default-features = false, so wasm can never pull Cranelift in —
+# build-time impossibility there. See crates/cfml-vm/src/jit/.
+jit = [
+    "dep:rustc-hash",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-native",
+]
