@@ -365,7 +365,7 @@ fn parse_import_tag(chars: &[char], start: usize, len: usize, imports: &mut std:
             .cloned()
     }).unwrap_or_else(|| format!("{}.cfm", tag_name.to_lowercase()));
     let path = format!("{}/{}", taglib.trim_end_matches('/'), tag_file);
-    let path_expr = format!("\"{}\"", path.replace('"', "\\\""));
+    let path_expr = format!("\"{}\"", escape_for_string_literal(&path));
 
     // Build attributes struct
     let mut attr_parts = Vec::new();
@@ -842,13 +842,13 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let mut parts = Vec::new();
             for (k, v) in &attrs {
                 let raw = v.trim();
-                if raw.starts_with('#') && raw.ends_with('#') && raw.len() > 2 {
-                    // Dynamic expression: strip hashes, emit bare
-                    parts.push(format!("{}: {}", k, strip_hashes(raw)));
-                } else if raw.parse::<f64>().is_ok() {
+                if raw.parse::<f64>().is_ok() {
                     parts.push(format!("{}: {}", k, raw));
                 } else {
-                    parts.push(format!("{}: \"{}\"", k, raw.replace('"', "\\\"")));
+                    // format_attr_value handles whole-value #expr#, mixed
+                    // literal+#expr# (e.g. statustext="Error #code#"), and embedded
+                    // quotes (doubled, not backslash-escaped).
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
             (format!("__cfheader({{ {} }});\n", parts.join(", ")), tag_end - start)
@@ -869,7 +869,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 } else if k == "variable" {
                     parts.push(format!("{}: {}", k, val));
                 } else {
-                    parts.push(format!("{}: \"{}\"", k, val.replace('"', "\\\"")));
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
             (format!("__cfcontent({{ {} }});\n", parts.join(", ")), tag_end - start)
@@ -880,9 +880,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let mut parts = Vec::new();
             for (k, v) in &attrs {
                 let raw = v.trim();
-                if raw.starts_with('#') && raw.ends_with('#') && raw.len() > 2 {
-                    parts.push(format!("{}: {}", k, strip_hashes(raw)));
-                } else if raw.parse::<f64>().is_ok() {
+                if raw.parse::<f64>().is_ok() {
                     parts.push(format!("{}: {}", k, raw));
                 } else {
                     let lower = raw.to_lowercase();
@@ -891,7 +889,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     } else if lower == "false" || lower == "no" {
                         parts.push(format!("{}: false", k));
                     } else {
-                        parts.push(format!("{}: \"{}\"", k, raw.replace('"', "\\\"")));
+                        // url="/page?id=#id#" and other mixed literal+#expr#
+                        // values interpolate; embedded quotes are doubled.
+                        parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                     }
                 }
             }
@@ -907,19 +907,15 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     continue;
                 }
                 let raw = v.trim();
-                if raw.starts_with('#') && raw.ends_with('#') && raw.len() > 2 {
-                    parts.push(format!("{}: {}", k, strip_hashes(raw)));
+                let lower = raw.to_lowercase();
+                if lower == "true" || lower == "yes" {
+                    parts.push(format!("{}: true", k));
+                } else if lower == "false" || lower == "no" {
+                    parts.push(format!("{}: false", k));
+                } else if raw.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, raw));
                 } else {
-                    let lower = raw.to_lowercase();
-                    if lower == "true" || lower == "yes" {
-                        parts.push(format!("{}: true", k));
-                    } else if lower == "false" || lower == "no" {
-                        parts.push(format!("{}: false", k));
-                    } else if raw.parse::<f64>().is_ok() {
-                        parts.push(format!("{}: {}", k, raw));
-                    } else {
-                        parts.push(format!("{}: \"{}\"", k, raw.replace('"', "\\\"")));
-                    }
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
             let call = format!("cfdirectory({{ {} }})", parts.join(", "));
@@ -937,19 +933,15 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             for (k, v) in &attrs {
                 if k == "name" || k == "variable" { continue; }
                 let raw = v.trim();
-                if raw.starts_with('#') && raw.ends_with('#') && raw.len() > 2 {
-                    parts.push(format!("{}: {}", k, strip_hashes(raw)));
+                let lower = raw.to_lowercase();
+                if lower == "true" || lower == "yes" {
+                    parts.push(format!("{}: true", k));
+                } else if lower == "false" || lower == "no" {
+                    parts.push(format!("{}: false", k));
+                } else if raw.parse::<f64>().is_ok() {
+                    parts.push(format!("{}: {}", k, raw));
                 } else {
-                    let lower = raw.to_lowercase();
-                    if lower == "true" || lower == "yes" {
-                        parts.push(format!("{}: true", k));
-                    } else if lower == "false" || lower == "no" {
-                        parts.push(format!("{}: false", k));
-                    } else if raw.parse::<f64>().is_ok() {
-                        parts.push(format!("{}: {}", k, raw));
-                    } else {
-                        parts.push(format!("{}: \"{}\"", k, raw.replace('"', "\\\"")));
-                    }
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
             let call = format!("cfzip({{ {} }})", parts.join(", "));
@@ -1110,7 +1102,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 } else if v.parse::<f64>().is_ok() {
                     parts.push(format!("{}: {}", k, v));
                 } else {
-                    parts.push(format!("{}: \"{}\"", k, v.replace('"', "\\\"")));
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
             (format!("__cfsetting({{ {} }});\n", parts.join(", ")), tag_end - start)
@@ -1138,12 +1130,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 } else if v.parse::<f64>().is_ok() {
                     parts.push(format!("{}: {}", k, v));
                 } else {
-                    let val = strip_hashes(v);
-                    if val != *v {
-                        parts.push(format!("{}: {}", k, val));
-                    } else {
-                        parts.push(format!("{}: \"{}\"", k, v.replace('"', "\\\"")));
-                    }
+                    parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                 }
             }
             (format!("__cfcookie({{ {} }});\n", parts.join(", ")), tag_end - start)
@@ -1166,7 +1153,8 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     } else if lower == "false" || lower == "no" {
                         lock_parts.push(format!("{}: false", k));
                     } else {
-                        lock_parts.push(format!("{}: \"{}\"", k, v.replace('"', "\\\"")));
+                        // name="lock_#id#" and other interpolated values.
+                        lock_parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
                     }
                 }
                 let lock_args = format!("{{ {} }}", lock_parts.join(", "));
@@ -1276,12 +1264,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         "cfcache" => {
             let mut parts = Vec::new();
             for (k, v) in &attrs {
-                let val = strip_hashes(v);
-                if val != *v {
-                    parts.push(format!("{}: {}", k, val));
-                } else {
-                    parts.push(format!("{}: \"{}\"", k, v.replace('"', "\\\"")));
-                }
+                parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
             }
             (format!("__cfcache({{ {} }});\n", parts.join(", ")), tag_end - start)
         }
@@ -1293,12 +1276,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let timeout = attrs.get("timeout").cloned();
 
             let mut opts = Vec::new();
-            let name_stripped = strip_hashes(&name_attr);
-            if name_attr != name_stripped {
-                opts.push(format!("name: {}", name_stripped));
-            } else {
-                opts.push(format!("name: \"{}\"", name_attr));
-            }
+            opts.push(format!("name: {}", format_attr_value(&name_attr, quoted.contains("name"))));
             // arguments/timeout may carry #expr# interpolation inside an
             // otherwise-literal quoted value; route them through format_attr_value
             // like cfhttp's attributes. (The old path emitted timeout verbatim —
@@ -1321,7 +1299,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let body_trimmed = body.trim();
                 if !body_trimmed.is_empty() {
-                    opts.push(format!("body: \"{}\"", body_trimmed.replace('"', "\\\"").replace('\n', "\\n")));
+                    opts.push(format!("body: \"{}\"", body_trimmed.replace('"', "\"\"").replace('\n', "\\n")));
                 }
                 if let Some(ref var) = variable {
                     let mut result = format!("__cfexec_tmp = __cfexecute({{ {} }});\n", opts.join(", "));
@@ -1392,7 +1370,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // Use remaining body (after stripping child tags) as body text
                 let body_text = remaining_body.trim();
                 if !body_text.is_empty() {
-                    opts.push(format!("body: \"{}\"", body_text.replace('"', "\\\"").replace('\n', "\\n")));
+                    opts.push(format!("body: \"{}\"", body_text.replace('"', "\"\"").replace('\n', "\\n")));
                 }
 
                 (format!("__cfmail({{ {} }});\n", opts.join(", ")), close_end - start)
@@ -1480,12 +1458,10 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let params_arr: Vec<String> = proc_params.iter().map(|p| {
                     let mut parts = Vec::new();
                     if let Some(ref v) = p.value {
-                        let stripped = strip_hashes(v);
-                        if stripped != *v {
-                            parts.push(format!("value: {}", stripped));
-                        } else {
-                            parts.push(format!("value: \"{}\"", v.replace('"', "\\\"")));
-                        }
+                        // cfprocparam value="..." is a quoted attribute; route
+                        // through format_attr_value so mixed literal+#expr# values
+                        // interpolate and embedded quotes are doubled.
+                        parts.push(format!("value: {}", format_attr_value(v, true)));
                     }
                     if let Some(ref t) = p.cfsqltype {
                         parts.push(format!("cfsqltype: \"{}\"", t));
@@ -1515,7 +1491,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         "cfthread" => {
             let action = attrs.get("action").cloned().unwrap_or_else(|| "run".to_string()).to_lowercase();
             let thread_name = attrs.get("name").cloned().unwrap_or_else(|| "thread1".to_string());
-            let thread_name_expr = format!("\"{}\"", thread_name.replace('"', "\\\""));
+            let thread_name_expr = format_attr_value(&thread_name, quoted.contains("name"));
 
             match action.as_str() {
                 "run" => {
@@ -1538,9 +1514,9 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                             })
                             .map(|(k, v)| {
                                 format!(
-                                    "\"{}\": \"{}\"",
-                                    k.replace('"', "\\\""),
-                                    v.replace('"', "\\\"")
+                                    "\"{}\": {}",
+                                    k.replace('"', "\"\""),
+                                    format_attr_value(v, quoted.contains(k.as_str()))
                                 )
                             })
                             .collect();
@@ -1563,7 +1539,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     // shared `thread_name` defaults to "thread1", so the join
                     // arm must consult the raw attribute rather than the default.)
                     let join_name = match attrs.get("name") {
-                        Some(n) => format!("\"{}\"", n.replace('"', "\\\"")),
+                        Some(n) => format_attr_value(n, quoted.contains("name")),
                         None => "\"\"".to_string(),
                     };
                     (format!("__cfthread_join({}, {});\n", join_name, timeout), tag_end - start)
@@ -1602,7 +1578,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     .cloned()
                     .unwrap_or_else(|| "unknown".to_string());
                 return (
-                    format!("throw(\"cfimport without taglib is not implemented ({}). Only CFML taglib imports are supported.\");\n", detail.replace('"', "\\\"" )),
+                    format!("throw(\"cfimport without taglib is not implemented ({}). Only CFML taglib imports are supported.\");\n", escape_for_string_literal(&detail)),
                     tag_end - start,
                 );
             }
@@ -1910,15 +1886,16 @@ fn quote_if_needed(s: &str) -> String {
     let looks_like_path = s.starts_with('/') && !s.contains('(')
         && (s.contains('.') && s.split('/').all(|seg| seg.is_empty() || seg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')));
     if looks_like_path {
-        return format!("\"{}\"", s.replace('"', "\\\""));
+        return format!("\"{}\"", escape_for_string_literal(s));
     }
     if s.contains('(') || s.contains('+') || s.contains('-') || s.contains('*')
         || s.contains('/') || s.contains('&') || s.contains('.') || s.contains('[')
     {
         return s.to_string();
     }
-    // Otherwise, quote it
-    format!("\"{}\"", s.replace('"', "\\\""))
+    // Otherwise, quote it. Embedded quotes are doubled (CFML escape), not
+    // backslash-escaped — the script lexer ends a string at a lone `"`.
+    format!("\"{}\"", escape_for_string_literal(s))
 }
 
 /// Escape backslashes inside string literals in tag body expressions.
@@ -2319,7 +2296,7 @@ fn parse_cfswitch_body(body: &str, imports: &mut std::collections::HashMap<Strin
                         if v.parse::<f64>().is_ok() {
                             v
                         } else {
-                            format!("\"{}\"", v.replace('"', "\\\""))
+                            format!("\"{}\"", escape_for_string_literal(&v))
                         }
                     }).collect();
                     result.push_str(&format!("case {}: \n{}break;\n", quoted_values.join(", "), case_script));
@@ -2392,12 +2369,7 @@ fn parse_cffile_tag(
             let mut parts = Vec::new();
             for (k, v) in attrs {
                 if k == "action" { continue; }
-                let val = strip_hashes(v);
-                if val != *v {
-                    parts.push(format!("{}: {}", k, val));
-                } else {
-                    parts.push(format!("{}: \"{}\"", k, v.replace('"', "\\\"")));
-                }
+                parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
             }
             (format!("{}({{ {} }});\n", func, parts.join(", ")), consumed)
         }
@@ -2487,7 +2459,7 @@ fn parse_cfqueryparam_attrs(tag_attrs: &std::collections::HashMap<String, String
         "\"\"".to_string()
     } else if !value_raw.contains('#') {
         // Pure literal string
-        format!("\"{}\"", value_raw.replace('"', "\\\""))
+        format!("\"{}\"", escape_for_string_literal(&value_raw))
     } else {
         let trimmed = value_raw.trim();
         let is_pure_expr = trimmed.starts_with('#')
@@ -2500,8 +2472,9 @@ fn parse_cfqueryparam_attrs(tag_attrs: &std::collections::HashMap<String, String
         } else {
             // Mixed literal text + #expr# interpolation — emit as a quoted
             // CFML string with hashes intact; the lexer handles `#expr#`
-            // interpolation inside double-quoted strings.
-            format!("\"{}\"", value_raw.replace('"', "\\\""))
+            // interpolation inside double-quoted strings. Quotes are doubled
+            // (escape_for_string_literal), not backslash-escaped.
+            format!("\"{}\"", escape_for_string_literal(&value_raw))
         }
     };
 
@@ -2938,7 +2911,7 @@ fn parse_cfmailpart_tags(body: &str) -> (Vec<String>, String) {
                                 part_parts.push(format!("charset: \"{}\"", c));
                             }
                             let content_trimmed = content.trim();
-                            part_parts.push(format!("body: \"{}\"", content_trimmed.replace('"', "\\\"").replace('\n', "\\n")));
+                            part_parts.push(format!("body: \"{}\"", content_trimmed.replace('"', "\"\"").replace('\n', "\\n")));
                             parts.push(format!("{{ {} }}", part_parts.join(", ")));
 
                             i += close_len;
