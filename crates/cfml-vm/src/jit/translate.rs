@@ -24,17 +24,28 @@
 
 use cfml_codegen::{BytecodeOp, BytecodeFunction, CmpOp};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 
 use super::analysis::{Kind, Plan};
 use super::CompiledFn;
 
 const I64: types::Type = types::I64;
 const F64: types::Type = types::F64;
+
+/// `extern "C"` shims registered with the JIT module so emitted IR can call
+/// them. Defining them in Rust (rather than relying on a libc/libm symbol) keeps
+/// behaviour bit-exact with the interpreter (Rust `%` on `f64` is IEEE-754
+/// `frem`, and `f64::powf` is the same primitive `to_number(.).powf(..)` uses).
+extern "C" fn cfml_fmod(a: f64, b: f64) -> f64 {
+    a % b
+}
+extern "C" fn cfml_pow(a: f64, b: f64) -> f64 {
+    a.powf(b)
+}
 
 /// Owns the Cranelift module (and thus all executable memory it allocates) plus
 /// a reusable `FunctionBuilderContext`.
@@ -43,6 +54,9 @@ pub struct Backend {
     fbc: FunctionBuilderContext,
     /// Monotonic counter for unique per-function symbol names.
     func_counter: u32,
+    /// Pre-declared `fn(f64, f64) -> f64` shims (`cfml_fmod`, `cfml_pow`).
+    fmod_id: FuncId,
+    pow_id: FuncId,
 }
 
 impl Backend {
@@ -59,12 +73,34 @@ impl Backend {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .map_err(|e| e.to_string())?;
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let module = JITModule::new(builder);
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // Register our Rust shims so emitted IR can call them by name. Both are
+        // `extern "C" fn(f64, f64) -> f64`; addresses live in this crate for the
+        // life of the process, so the cast is safe.
+        builder.symbol("cfml_fmod", cfml_fmod as *const u8);
+        builder.symbol("cfml_pow", cfml_pow as *const u8);
+        let mut module = JITModule::new(builder);
+
+        // Declare them once in the module; emitted functions reference these
+        // FuncIds via `declare_func_in_func` and then `call`.
+        let make_ff_f = |module: &mut JITModule, name: &str| -> Result<FuncId, String> {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(F64));
+            sig.params.push(AbiParam::new(F64));
+            sig.returns.push(AbiParam::new(F64));
+            module
+                .declare_function(name, Linkage::Import, &sig)
+                .map_err(|e| e.to_string())
+        };
+        let fmod_id = make_ff_f(&mut module, "cfml_fmod")?;
+        let pow_id = make_ff_f(&mut module, "cfml_pow")?;
+
         Ok(Self {
             module,
             fbc: FunctionBuilderContext::new(),
             func_counter: 0,
+            fmod_id,
+            pow_id,
         })
     }
 
@@ -77,6 +113,11 @@ impl Backend {
         ctx.func.signature.params.push(AbiParam::new(I64)); // nargs (unused; checked in Rust)
         ctx.func.signature.params.push(AbiParam::new(ptr_ty)); // bail
         ctx.func.signature.returns.push(AbiParam::new(I64));
+
+        // Import the shim FuncIds into this function's IR namespace so we can
+        // emit `call`s to them. Done before the builder borrows `ctx.func`.
+        let fmod_ref = self.module.declare_func_in_func(self.fmod_id, &mut ctx.func);
+        let pow_ref = self.module.declare_func_in_func(self.pow_id, &mut ctx.func);
 
         {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut self.fbc);
@@ -110,9 +151,16 @@ impl Backend {
                     b.def_var(var, zero_i);
                 }
             }
-            // Bind args positionally into their param slots (always Int).
+            // Bind args positionally into their param slots. The args buffer
+            // holds 8 raw bytes per slot — an `i64` for Int params, the bit-cast
+            // of an `f64` for Float params (see `run_compiled`).
             for (i, &slot) in plan.param_slots.iter().enumerate() {
-                let v = b.ins().load(I64, MemFlags::new(), args_ptr, (i * 8) as i32);
+                let off = (i * 8) as i32;
+                let v = if plan.slot_kind[slot] == Kind::Float {
+                    b.ins().load(F64, MemFlags::new(), args_ptr, off)
+                } else {
+                    b.ins().load(I64, MemFlags::new(), args_ptr, off)
+                };
                 b.def_var(vars[slot], v);
             }
             b.ins().jump(cl_blocks[0], &[]);
@@ -174,17 +222,42 @@ impl Backend {
                             stack.push((b.ins().fdiv(a, d), Kind::Float));
                         }
 
-                        // `%` — Int,Int only (guard 0 / INT_MIN÷-1). Float modulo
-                        // is rejected by the analysis (no Cranelift frem).
+                        // `%` — Int,Int → wrapping `srem` (guarded against 0 /
+                        // INT_MIN÷-1). Any float operand promotes both to f64
+                        // and calls the `cfml_fmod` shim (matches the
+                        // interpreter's `f64 %` on mixed/float operands).
                         BytecodeOp::Mod => {
                             let (rhs, rk) = stack.pop().ok_or("jit: stack underflow")?;
                             let (lhs, lk) = stack.pop().ok_or("jit: stack underflow")?;
                             if lk == Kind::Float || rk == Kind::Float {
-                                return Err("jit: float modulo unsupported".into());
+                                let a = to_f64(&mut b, lhs, lk);
+                                let d = to_f64(&mut b, rhs, rk);
+                                let call = b.ins().call(fmod_ref, &[a, d]);
+                                let r = b.inst_results(call)[0];
+                                stack.push((r, Kind::Float));
+                            } else {
+                                let cont = guard_int_div(&mut b, bail_block, lhs, rhs);
+                                b.switch_to_block(cont);
+                                stack.push((b.ins().srem(lhs, rhs), Kind::Int));
                             }
-                            let cont = guard_int_div(&mut b, bail_block, lhs, rhs);
-                            b.switch_to_block(cont);
-                            stack.push((b.ins().srem(lhs, rhs), Kind::Int));
+                        }
+
+                        // `^` — always Double. Promote both operands to f64 and
+                        // call the `cfml_pow` shim (matches `f64::powf` used by
+                        // the interpreter).
+                        BytecodeOp::Pow => {
+                            let (rhs, rk) = stack.pop().ok_or("jit: stack underflow")?;
+                            let (lhs, lk) = stack.pop().ok_or("jit: stack underflow")?;
+                            if !matches!(lk, Kind::Int | Kind::Float)
+                                || !matches!(rk, Kind::Int | Kind::Float)
+                            {
+                                return Err("jit: pow operand not numeric".into());
+                            }
+                            let a = to_f64(&mut b, lhs, lk);
+                            let d = to_f64(&mut b, rhs, rk);
+                            let call = b.ins().call(pow_ref, &[a, d]);
+                            let r = b.inst_results(call)[0];
+                            stack.push((r, Kind::Float));
                         }
 
                         // `\` — always Int; float operands truncate toward zero.

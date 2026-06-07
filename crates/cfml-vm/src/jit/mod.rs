@@ -53,10 +53,11 @@ enum CacheEntry {
     Compiled(CompiledFn, bool),
 }
 
-/// Invocation counters keyed by `BytecodeFunction.global_id`. A function becomes
-/// a compilation candidate once its count reaches `threshold`.
+/// Invocation counters keyed by `(global_id, signature)` — each call
+/// specialization warms up independently. A `(func, kinds)` pair becomes a
+/// compilation candidate once its count reaches `threshold`.
 struct HotnessTracker {
-    counts: FxHashMap<u32, u32>,
+    counts: FxHashMap<CacheKey, u32>,
     threshold: u32,
 }
 
@@ -65,11 +66,11 @@ impl HotnessTracker {
         Self { counts: FxHashMap::default(), threshold }
     }
 
-    /// Record one invocation of `global_id`; return `true` exactly once, on the
-    /// call that crosses the threshold, so compilation is attempted a single
-    /// time. After that the count is parked at `threshold + 1`.
-    fn record_and_is_hot(&mut self, global_id: u32) -> bool {
-        let c = self.counts.entry(global_id).or_insert(0);
+    /// Record one invocation of `key`; return `true` exactly once, on the call
+    /// that crosses the threshold, so compilation is attempted a single time.
+    /// After that the count is parked at `threshold + 1`.
+    fn record_and_is_hot(&mut self, key: CacheKey) -> bool {
+        let c = self.counts.entry(key).or_insert(0);
         if *c > self.threshold {
             return false;
         }
@@ -78,11 +79,37 @@ impl HotnessTracker {
     }
 }
 
+/// Composite cache key: `(global_id, signature)` where `signature` packs
+/// `(nargs, float_bitmap)` so each `(func, param-kind-tuple)` specialization
+/// caches independently. A Float bit is set when the corresponding argument
+/// arrived as `CfmlValue::Double`. Limited to 32 params (anything larger is
+/// not a JIT candidate today; we bail to the interpreter).
+type CacheKey = (u32, u64);
+
+const MAX_JIT_PARAMS: usize = 32;
+
+/// Build the cache signature for a call. The low 32 bits hold `nargs`, the
+/// high 32 bits a bitmap where bit `i` = 1 means `args[i]` is `Double`.
+fn signature_for(args: &[CfmlValue]) -> Option<u64> {
+    if args.len() > MAX_JIT_PARAMS {
+        return None;
+    }
+    let mut mask: u64 = 0;
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            CfmlValue::Int(_) => {}
+            CfmlValue::Double(_) => mask |= 1u64 << i,
+            _ => return None,
+        }
+    }
+    Some(((mask as u64) << 32) | (args.len() as u64))
+}
+
 /// The JIT engine, owned by the VM (one per VM instance; child cfthread VMs get
 /// their own). Holds the Cranelift module that owns all executable memory, the
 /// reusable compilation context, the per-function cache, and the profiler.
 pub struct JitEngine {
-    cache: FxHashMap<u32, CacheEntry>,
+    cache: FxHashMap<CacheKey, CacheEntry>,
     hot: HotnessTracker,
     backend: translate::Backend,
 }
@@ -129,10 +156,12 @@ impl JitEngine {
     /// `None` and the caller proceeds with the interpreter — so this can never
     /// change behaviour, only skip interpretation when it is provably equivalent.
     pub fn try_call(&mut self, func: &BytecodeFunction, args: &[CfmlValue]) -> Option<CfmlResult> {
-        let id = func.global_id;
+        // Bail immediately if any arg isn't numeric, or if there are too many.
+        let sig = signature_for(args)?;
+        let key: CacheKey = (func.global_id, sig);
 
-        // Fast path: already-known outcome.
-        match self.cache.get(&id) {
+        // Fast path: already-known outcome for this exact signature.
+        match self.cache.get(&key) {
             Some(CacheEntry::Unjittable) => return None,
             Some(CacheEntry::Compiled(f, ret_float)) => {
                 return run_compiled(*f, func, args, *ret_float)
@@ -140,13 +169,23 @@ impl JitEngine {
             None => {}
         }
 
-        // Not cached yet — only act once the function is hot.
-        if !self.hot.record_and_is_hot(id) {
+        // Not cached yet — only act once this (func, signature) is hot.
+        if !self.hot.record_and_is_hot(key) {
             return None;
         }
 
+        // Build the param-kind vector that drives this specialization.
+        let mut kinds: Vec<analysis::Kind> = Vec::with_capacity(args.len());
+        for a in args {
+            kinds.push(match a {
+                CfmlValue::Int(_) => analysis::Kind::Int,
+                CfmlValue::Double(_) => analysis::Kind::Float,
+                _ => return None, // unreachable given signature_for, but defensive
+            });
+        }
+
         // Crossed the threshold: analyse + (maybe) compile, exactly once.
-        let entry = match analysis::analyze(func) {
+        let entry = match analysis::analyze(func, &kinds) {
             Some(plan) => {
                 let ret_float = matches!(plan.ret_kind, analysis::Kind::Float);
                 match self.backend.compile(func, &plan) {
@@ -160,17 +199,19 @@ impl JitEngine {
             CacheEntry::Compiled(f, ret_float) => run_compiled(*f, func, args, *ret_float),
             CacheEntry::Unjittable => None,
         };
-        self.cache.insert(id, entry);
+        self.cache.insert(key, entry);
         run
     }
 }
 
 /// Marshal `args` across the ABI boundary and invoke a compiled body.
 ///
-/// Returns `None` (→ interpret) unless every argument is a `CfmlValue::Int`, the
-/// argument count matches the function's arity, and the callee did not set the
-/// bail flag. On success the `i64` result is re-wrapped as `CfmlValue::Int`, or
-/// as `CfmlValue::Double` (via `f64::from_bits`) when `ret_float` is set.
+/// Returns `None` (→ interpret) unless every argument is a numeric
+/// `CfmlValue::Int` or `CfmlValue::Double`, the argument count matches the
+/// function's arity, and the callee did not set the bail flag. `Double` args
+/// cross as `f64::to_bits` so the compiled prologue can `load F64` directly.
+/// On success the `i64` result is re-wrapped as `CfmlValue::Int`, or as
+/// `CfmlValue::Double` (via `f64::from_bits`) when `ret_float` is set.
 fn run_compiled(
     f: CompiledFn,
     func: &BytecodeFunction,
@@ -186,7 +227,8 @@ fn run_compiled(
     for a in args {
         match a {
             CfmlValue::Int(i) => raw.push(*i),
-            _ => return None, // non-integer argument → let the interpreter handle it
+            CfmlValue::Double(d) => raw.push(d.to_bits() as i64),
+            _ => return None, // non-numeric argument → let the interpreter handle it
         }
     }
     let mut bail: i64 = 0;
@@ -220,10 +262,16 @@ mod tests {
             .clone()
     }
 
+    /// Test-helper: default kind vector — every declared param pinned to Int.
+    fn int_kinds(func: &BytecodeFunction) -> Vec<analysis::Kind> {
+        func.params.iter().map(|_| analysis::Kind::Int).collect()
+    }
+
     /// Analyse + compile `func`, then invoke the native body with `args`.
     /// Returns `(result, bailed)`.
     fn jit_run(func: &BytecodeFunction, args: &[i64]) -> (i64, bool) {
-        let plan = analysis::analyze(func).expect("function should be JIT-eligible");
+        let kinds = int_kinds(func);
+        let plan = analysis::analyze(func, &kinds).expect("function should be JIT-eligible");
         let mut backend = translate::Backend::new().expect("backend init");
         let ptr = backend.compile(func, &plan).expect("compile");
         let mut bail: i64 = 0;
@@ -235,13 +283,35 @@ mod tests {
     /// the returned bits as `f64` (mirroring `run_compiled`'s ret-float path).
     /// Returns `(f64, bailed)`.
     fn jit_run_f64(func: &BytecodeFunction, args: &[i64]) -> (f64, bool) {
-        let plan = analysis::analyze(func).expect("function should be JIT-eligible");
+        let kinds = int_kinds(func);
+        let plan = analysis::analyze(func, &kinds).expect("function should be JIT-eligible");
         assert_eq!(plan.ret_kind, analysis::Kind::Float, "expected a Float return");
         let mut backend = translate::Backend::new().expect("backend init");
         let ptr = backend.compile(func, &plan).expect("compile");
         let mut bail: i64 = 0;
         let r = unsafe { ptr(args.as_ptr(), args.len() as i64, &mut bail as *mut i64) };
         (f64::from_bits(r as u64), bail != 0)
+    }
+
+    /// Analyse + compile `func` with a caller-chosen kind tuple (each `Kind`
+    /// matches one declared param). `args` carries raw 8-byte slots — Int as
+    /// i64, Double as `f64::to_bits` (mirroring `run_compiled`'s marshaling).
+    fn jit_run_kinds(
+        func: &BytecodeFunction,
+        kinds: &[analysis::Kind],
+        args: &[i64],
+    ) -> (f64, bool, bool) {
+        let plan = analysis::analyze(func, kinds).expect("function should be JIT-eligible");
+        let ret_float = plan.ret_kind == analysis::Kind::Float;
+        let mut backend = translate::Backend::new().expect("backend init");
+        let ptr = backend.compile(func, &plan).expect("compile");
+        let mut bail: i64 = 0;
+        let r = unsafe { ptr(args.as_ptr(), args.len() as i64, &mut bail as *mut i64) };
+        if ret_float {
+            (f64::from_bits(r as u64), ret_float, bail != 0)
+        } else {
+            (r as f64, ret_float, bail != 0)
+        }
     }
 
     #[test]
@@ -339,6 +409,61 @@ mod tests {
         assert!(!bailed);
         let expected = 1.0 + 0.5 + 1.0 / 3.0 + 0.25;
         assert!((r - expected).abs() < 1e-12, "got {r}, want {expected}");
+    }
+
+    #[test]
+    fn double_param_runs_specialised() {
+        // function f(a, b) { return a * b + 1; }  with a=Double, b=Int.
+        // The fixpoint upgrades the result to Float; ret_kind = Float.
+        let f = compile_fn("function f(a, b) { return a * b + 1; }", "f");
+        let kinds = [analysis::Kind::Float, analysis::Kind::Int];
+        let raw: [i64; 2] = [2.5_f64.to_bits() as i64, 4];
+        let (r, ret_float, bailed) = jit_run_kinds(&f, &kinds, &raw);
+        assert!(!bailed);
+        assert!(ret_float, "result of float*int+int is Float");
+        assert_eq!(r, 11.0);
+    }
+
+    #[test]
+    fn double_param_pure_int_op_still_returns_double() {
+        // function f(a) { return a + 1; }  with a=Double.
+        let f = compile_fn("function f(a) { return a + 1; }", "f");
+        let kinds = [analysis::Kind::Float];
+        let raw: [i64; 1] = [(-3.25_f64).to_bits() as i64];
+        let (r, ret_float, _) = jit_run_kinds(&f, &kinds, &raw);
+        assert!(ret_float);
+        assert_eq!(r, -2.25);
+    }
+
+    #[test]
+    fn float_mod_matches_fmod() {
+        // function fm(a) { return (a / 1) % 0.3; }  → Double via cfml_fmod shim.
+        // `(a/1)` forces Float on the lhs while keeping an int-typed param.
+        let f = compile_fn("function fm(a) { return (a / 1) % 0.3; }", "fm");
+        let (r, bailed) = jit_run_f64(&f, &[2]);
+        assert!(!bailed);
+        // 2.0 % 0.3 in IEEE-754: 2.0 = 6*0.3 + 0.2, but fmod truncates toward 0.
+        let expected = 2.0_f64 % 0.3_f64;
+        assert!((r - expected).abs() < 1e-12, "got {r}, want {expected}");
+    }
+
+    #[test]
+    fn pow_matches_powf() {
+        // function p(a, b) { return a ^ b; }  → Double via cfml_pow shim.
+        let f = compile_fn("function p(a, b) { return a ^ b; }", "p");
+        assert_eq!(jit_run_f64(&f, &[2, 10]).0, 1024.0);
+        assert_eq!(jit_run_f64(&f, &[3, 0]).0, 1.0);
+        let (r, _) = jit_run_f64(&f, &[5, 3]);
+        assert_eq!(r, 125.0);
+    }
+
+    #[test]
+    fn pow_with_float_operand() {
+        // function p(a) { return (a / 1) ^ 0.5; }  → sqrt(a)
+        let f = compile_fn("function p(a) { return (a / 1) ^ 0.5; }", "p");
+        let (r, bailed) = jit_run_f64(&f, &[16]);
+        assert!(!bailed);
+        assert_eq!(r, 4.0);
     }
 
     #[test]

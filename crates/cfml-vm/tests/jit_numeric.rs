@@ -103,6 +103,37 @@ fn jit_result_matches_interpreter_across_inputs() {
 }
 
 #[test]
+fn double_arg_kernel_jits_and_matches_interpreter() {
+    // Pass a `Double` argument across the ABI boundary. With Option-B
+    // follow-ups landed, the param slot specialises to Float and the JIT runs;
+    // before, the engine bailed and the interpreter handled every call.
+    let src = r#"
+        function area(r) { return r * r * 3.14159; }
+        out = "";
+        for (k = 1; k <= 60; k++) { out = out & area(2.5) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "JIT Double-arg output must equal the interpreter");
+    assert!(compiled >= 1, "expected area() to be JIT-compiled");
+}
+
+#[test]
+fn pow_kernel_jits_and_matches_interpreter() {
+    let src = r#"
+        function p(a, b) { return a ^ b + a % 3; }
+        out = "";
+        for (k = 1; k <= 60; k++) { out = out & p(7, 3) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "JIT pow output must equal the interpreter");
+    assert!(compiled >= 1, "expected p() to be JIT-compiled");
+}
+
+#[test]
 fn float_kernel_jits_and_matches_interpreter() {
     // A Double-returning kernel (the `/` operator + a Float accumulator with an
     // Int loop counter). The interpreter (JIT off) is the oracle; the JIT-on run

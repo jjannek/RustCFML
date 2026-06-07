@@ -127,13 +127,23 @@ fn is_reserved_scope(name: &str) -> bool {
     )
 }
 
-/// Decide whether `func` can be compiled. `None` ⇒ keep on the interpreter.
-pub fn analyze(func: &BytecodeFunction) -> Option<Plan> {
+/// Decide whether `func` can be compiled for a specific *call signature* (one
+/// [`Kind`] per declared parameter; `Bool` is rejected by the caller). `None`
+/// ⇒ keep on the interpreter. Different signatures produce independent
+/// specializations — each `(func, param_kinds)` pair is its own cache entry.
+pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
     if func.name == "__main__" {
         return None;
     }
     // Args are bound positionally; defaulted params need the runtime preamble.
     if func.has_default.iter().any(|d| *d) {
+        return None;
+    }
+    if param_kinds.len() != func.params.len() {
+        return None;
+    }
+    // Only numeric kinds are admissible for ABI params.
+    if param_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
         return None;
     }
 
@@ -270,6 +280,7 @@ pub fn analyze(func: &BytecodeFunction) -> Option<Plan> {
                 | BytecodeOp::Mul
                 | BytecodeOp::Div
                 | BytecodeOp::Mod
+                | BytecodeOp::Pow
                 | BytecodeOp::IntDiv
                 | BytecodeOp::Negate
                 | BytecodeOp::Eq
@@ -345,7 +356,12 @@ pub fn analyze(func: &BytecodeFunction) -> Option<Plan> {
 
     // ── 4. Slot-kind fixpoint (monotonic Int → Float upgrades) ──────────────
     let nslots = locals.len();
-    let mut slot_kind = vec![Kind::Int; nslots]; // params + all locals start Int
+    let mut slot_kind = vec![Kind::Int; nslots]; // locals start Int
+    // Seed param slots from the call signature: a `Double` argument makes its
+    // param slot `Float`. The fixpoint can still upgrade non-param locals.
+    for (i, &p) in param_slots.iter().enumerate() {
+        slot_kind[p] = param_kinds[i];
+    }
     loop {
         let mut changed = false;
         for blk in &plan_blocks {
@@ -362,10 +378,12 @@ pub fn analyze(func: &BytecodeFunction) -> Option<Plan> {
         }
     }
 
-    // Param slots must stay Int — they arrive as integers across the ABI. A
-    // float reassignment of a param is a path-dependent type the JIT can't model.
-    for &p in &param_slots {
-        if slot_kind[p] == Kind::Float {
+    // A param slot's final kind must equal its seeded ABI kind. The fixpoint
+    // only upgrades Int → Float, so this only fires when an `Int` param is
+    // reassigned to a `Float` result (a path-dependent type the monomorphic
+    // JIT can't model). A `Float` param stays `Float` by construction.
+    for (i, &p) in param_slots.iter().enumerate() {
+        if slot_kind[p] != param_kinds[i] {
             return None;
         }
     }
@@ -535,15 +553,22 @@ fn simulate_block(
                 let a = pop!();
                 stack.push(num_bin_kind(a, b)?);
             }
-            // `%`: Int,Int → Int. Cranelift has no float-remainder instruction
-            // (it's a libcall), so a float modulo rejects the whole function.
+            // `%`: Int,Int → Int (`srem`); any float operand → Float (via the
+            // `cfml_fmod` libcall shim — see translate.rs).
             BytecodeOp::Mod => {
                 let b = pop!();
                 let a = pop!();
-                match num_bin_kind(a, b)? {
-                    Kind::Int => stack.push(Kind::Int),
-                    _ => return None,
+                stack.push(num_bin_kind(a, b)?);
+            }
+            // `^`: always Float (interpreter uses `f64::powf` on `to_number(.)`
+            // of either operand). Translated as a call to the `cfml_pow` shim.
+            BytecodeOp::Pow => {
+                let b = pop!();
+                let a = pop!();
+                if !a.is_num() || !b.is_num() {
+                    return None;
                 }
+                stack.push(Kind::Float);
             }
             // `/` always yields a Double; operands must be numeric.
             BytecodeOp::Div => {
@@ -654,6 +679,12 @@ mod tests {
     use super::*;
     use cfml_codegen::CmpOp;
 
+    /// Test-helper: analyse with every declared param pinned to `Int`.
+    fn analyze_int(f: &BytecodeFunction) -> Option<Plan> {
+        let kinds: Vec<Kind> = f.params.iter().map(|_| Kind::Int).collect();
+        analyze(f, &kinds)
+    }
+
     fn mkfn(params: &[&str], instrs: Vec<BytecodeOp>) -> BytecodeFunction {
         BytecodeFunction {
             name: "f".to_string(),
@@ -680,7 +711,7 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        let plan = analyze(&f).expect("should be JIT-eligible");
+        let plan = analyze_int(&f).expect("should be JIT-eligible");
         assert_eq!(plan.param_slots.len(), 2);
         assert!(plan.slot_of("A").is_some(), "case-insensitive local lookup");
         assert_eq!(plan.ret_kind, Kind::Int);
@@ -692,19 +723,19 @@ mod tests {
             &[],
             vec![BytecodeOp::LoadLocal("variables".into()), BytecodeOp::Return],
         );
-        assert!(analyze(&f).is_none());
+        assert!(analyze_int(&f).is_none());
     }
 
     #[test]
     fn rejects_unsupported_op() {
         let f = mkfn(&[], vec![BytecodeOp::String("x".into()), BytecodeOp::Return]);
-        assert!(analyze(&f).is_none());
+        assert!(analyze_int(&f).is_none());
     }
 
     #[test]
     fn rejects_read_before_assign() {
         let f = mkfn(&[], vec![BytecodeOp::LoadLocal("x".into()), BytecodeOp::Return]);
-        assert!(analyze(&f).is_none());
+        assert!(analyze_int(&f).is_none());
     }
 
     #[test]
@@ -718,13 +749,13 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        assert!(analyze(&f).is_none());
+        assert!(analyze_int(&f).is_none());
     }
 
     #[test]
     fn rejects_void_via_trailing_null() {
         let f = mkfn(&[], vec![BytecodeOp::Null, BytecodeOp::Return]);
-        assert!(analyze(&f).is_none());
+        assert!(analyze_int(&f).is_none());
     }
 
     #[test]
@@ -738,7 +769,7 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        assert!(analyze(&f).is_some(), "dead Null epilogue must not disqualify");
+        assert!(analyze_int(&f).is_some(), "dead Null epilogue must not disqualify");
     }
 
     #[test]
@@ -760,7 +791,7 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        assert!(analyze(&f).is_some());
+        assert!(analyze_int(&f).is_some());
     }
 
     #[test]
@@ -775,7 +806,7 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        let plan = analyze(&f).expect("float divide should be eligible");
+        let plan = analyze_int(&f).expect("float divide should be eligible");
         assert_eq!(plan.ret_kind, Kind::Float);
     }
 
@@ -795,7 +826,7 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        let plan = analyze(&f).expect("float accumulator should be eligible");
+        let plan = analyze_int(&f).expect("float accumulator should be eligible");
         assert_eq!(plan.ret_kind, Kind::Float);
         assert_eq!(plan.slot_kind[plan.slot_of("s").unwrap()], Kind::Float);
     }
@@ -814,7 +845,26 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        assert!(analyze(&f).is_none(), "path-dependent slot type must reject");
+        assert!(analyze_int(&f).is_none(), "path-dependent slot type must reject");
+    }
+
+    #[test]
+    fn accepts_float_seeded_param() {
+        // function f(a) { return a / 2; }  with `a` seeded as Float (caller
+        // passed a Double). Slot is Float from the start; no path-dependent
+        // type arises.
+        let f = mkfn(
+            &["a"],
+            vec![
+                BytecodeOp::LoadLocal("a".into()),
+                BytecodeOp::Integer(2),
+                BytecodeOp::Div,
+                BytecodeOp::Return,
+            ],
+        );
+        let plan = analyze(&f, &[Kind::Float]).expect("float-seeded param accepted");
+        assert_eq!(plan.ret_kind, Kind::Float);
+        assert_eq!(plan.slot_kind[plan.param_slots[0]], Kind::Float);
     }
 
     #[test]
@@ -831,6 +881,6 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        assert!(analyze(&f).is_none(), "float-reassigned param must reject");
+        assert!(analyze_int(&f).is_none(), "float-reassigned param must reject");
     }
 }
