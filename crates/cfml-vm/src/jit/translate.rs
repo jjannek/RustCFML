@@ -31,6 +31,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use super::analysis::{Kind, Plan};
+use super::builtins::{self, SHIMS};
 use super::CompiledFn;
 
 const I64: types::Type = types::I64;
@@ -57,6 +58,10 @@ pub struct Backend {
     /// Pre-declared `fn(f64, f64) -> f64` shims (`cfml_fmod`, `cfml_pow`).
     fmod_id: FuncId,
     pow_id: FuncId,
+    /// Per-entry `FuncId` for every shim in [`SHIMS`] (parallel slice). Each
+    /// `compile()` turns these into per-function `FuncRef`s via
+    /// `declare_func_in_func`.
+    shim_ids: Vec<FuncId>,
 }
 
 impl Backend {
@@ -79,6 +84,12 @@ impl Backend {
         // life of the process, so the cast is safe.
         builder.symbol("cfml_fmod", cfml_fmod as *const u8);
         builder.symbol("cfml_pow", cfml_pow as *const u8);
+        // Register every allowlisted builtin shim (Option A — Tier-1 native
+        // calls). Each is a pure `extern "C"` Rust fn whose semantics mirror
+        // the interpreter's `cfml-stdlib::builtins::fn_*` entry.
+        for shim in SHIMS {
+            builder.symbol(shim.sym, shim.addr);
+        }
         let mut module = JITModule::new(builder);
 
         // Declare them once in the module; emitted functions reference these
@@ -95,12 +106,32 @@ impl Backend {
         let fmod_id = make_ff_f(&mut module, "cfml_fmod")?;
         let pow_id = make_ff_f(&mut module, "cfml_pow")?;
 
+        // Declare the allowlisted builtin shims, each with a signature derived
+        // from its `args_abi` / `ret_kind`. The order matches `SHIMS` so the
+        // analysis' shim index can be reused as a slice index here.
+        let shim_ids: Vec<FuncId> = SHIMS
+            .iter()
+            .map(|shim| {
+                let mut sig = Signature::new(module.target_config().default_call_conv);
+                for k in shim.args_abi {
+                    sig.params
+                        .push(AbiParam::new(if *k == Kind::Float { F64 } else { I64 }));
+                }
+                sig.returns
+                    .push(AbiParam::new(if shim.ret_kind == Kind::Float { F64 } else { I64 }));
+                module
+                    .declare_function(shim.sym, Linkage::Import, &sig)
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             module,
             fbc: FunctionBuilderContext::new(),
             func_counter: 0,
             fmod_id,
             pow_id,
+            shim_ids,
         })
     }
 
@@ -118,6 +149,14 @@ impl Backend {
         // emit `call`s to them. Done before the builder borrows `ctx.func`.
         let fmod_ref = self.module.declare_func_in_func(self.fmod_id, &mut ctx.func);
         let pow_ref = self.module.declare_func_in_func(self.pow_id, &mut ctx.func);
+        // Parallel to SHIMS — only the entries the function actually calls
+        // get used, but importing all of them is cheap and keeps indexing
+        // straight-through.
+        let shim_refs: Vec<_> = self
+            .shim_ids
+            .iter()
+            .map(|id| self.module.declare_func_in_func(*id, &mut ctx.func))
+            .collect();
 
         {
             let mut b = FunctionBuilder::new(&mut ctx.func, &mut self.fbc);
@@ -386,6 +425,51 @@ impl Backend {
 
                         BytecodeOp::DeclareLocal(_) => {}
                         BytecodeOp::LineInfo(_, _) => {}
+
+                        // Push a marker for a known builtin. The dummy `Value`
+                        // is never consumed by IR — `Call` reads the kind tag,
+                        // resolves the overload via `lookup_overload`, and
+                        // emits the actual `call` against the matching FuncRef.
+                        BytecodeOp::LoadGlobal(name) => {
+                            let canon = builtins::canonical_name(name)
+                                .ok_or("jit: LoadGlobal of non-allowlist name reached codegen")?;
+                            let placeholder = b.ins().iconst(I64, 0);
+                            stack.push((placeholder, Kind::Builtin(canon)));
+                        }
+                        BytecodeOp::Call(n) => {
+                            if stack.len() < n + 1 {
+                                return Err("jit: stack underflow on Call".into());
+                            }
+                            let split = stack.len() - n;
+                            let raw_args: Vec<(Value, Kind)> = stack.split_off(split);
+                            let (_marker_val, marker_kind) =
+                                stack.pop().ok_or("jit: missing builtin marker")?;
+                            let name = match marker_kind {
+                                Kind::Builtin(n) => n,
+                                _ => return Err("jit: Call without a builtin marker".into()),
+                            };
+                            let arg_kinds: Vec<Kind> = raw_args.iter().map(|(_, k)| *k).collect();
+                            let shim_idx = builtins::lookup_overload(name, &arg_kinds)
+                                .ok_or("jit: no shim overload for call")?;
+                            let shim = &SHIMS[shim_idx];
+                            // Convert each arg from its operand kind to the
+                            // shim's ABI kind. `to_i64` saturates floats, `to_f64`
+                            // promotes ints — the same conversions the rest of
+                            // the JIT already uses on numeric boundaries.
+                            let mut cl_args: Vec<Value> = Vec::with_capacity(raw_args.len());
+                            for (idx, (v, k)) in raw_args.into_iter().enumerate() {
+                                let abi = shim.args_abi[idx];
+                                let conv = if abi == Kind::Float {
+                                    to_f64(&mut b, v, k)
+                                } else {
+                                    to_i64(&mut b, v, k)
+                                };
+                                cl_args.push(conv);
+                            }
+                            let call = b.ins().call(shim_refs[shim_idx], &cl_args);
+                            let r = b.inst_results(call)[0];
+                            stack.push((r, shim.ret_kind));
+                        }
 
                         other => return Err(format!("jit: unsupported op reached codegen: {other:?}")),
                     }

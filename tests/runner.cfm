@@ -27,6 +27,7 @@ try { include "core/test_cfloop_negative_step.cfm"; } catch (any e) { writeOutpu
 try { include "core/test_cfloop_array_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_array_item_index.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_collection_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_collection_item_index.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_handling.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_handling.cfm | " & e.message & chr(10)); }
+try { include "core/test_builtin_shadowing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_builtin_shadowing.cfm | " & e.message & chr(10)); }
 try { include "core/test_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arrow_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arrow_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arguments_writeback.cfm | " & e.message & chr(10)); }

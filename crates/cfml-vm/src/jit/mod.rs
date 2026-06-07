@@ -29,6 +29,7 @@ use cfml_common::vm::CfmlResult;
 use rustc_hash::FxHashMap;
 
 mod analysis;
+mod builtins;
 mod translate;
 
 /// ABI of every Tier-1 compiled function.
@@ -49,8 +50,12 @@ enum CacheEntry {
     Unjittable,
     /// Successfully compiled; call this pointer. The `bool` is `true` when the
     /// function's return kind is `Float` (the `i64` the body returns is the
-    /// `f64` result's bit pattern, re-wrapped as `CfmlValue::Double`).
-    Compiled(CompiledFn, bool),
+    /// `f64` result's bit pattern, re-wrapped as `CfmlValue::Double`). The
+    /// `Vec` lists every allowlisted builtin name the compiled body calls — at
+    /// every invocation the engine re-checks the live VM and bails if any of
+    /// those names has been shadowed (user-defined fn, global), so a runtime
+    /// `function abs(x) { … }` still wins.
+    Compiled(CompiledFn, bool, Vec<&'static str>),
 }
 
 /// Invocation counters keyed by `(global_id, signature)` — each call
@@ -148,6 +153,16 @@ impl JitEngine {
             .count()
     }
 
+    /// Convenience for tests: a no-op shadowing checker (nothing is shadowed).
+    #[cfg(test)]
+    fn try_call_unshadowed(
+        &mut self,
+        func: &BytecodeFunction,
+        args: &[CfmlValue],
+    ) -> Option<CfmlResult> {
+        self.try_call(func, args, &mut |_| false)
+    }
+
     /// The dispatch hook, called at the top of `execute_function_with_args`.
     ///
     /// Returns `Some(result)` only when a compiled native body ran to completion
@@ -155,7 +170,12 @@ impl JitEngine {
     /// `args not all Int`, `arity mismatch`, or a runtime `bail`) it returns
     /// `None` and the caller proceeds with the interpreter — so this can never
     /// change behaviour, only skip interpretation when it is provably equivalent.
-    pub fn try_call(&mut self, func: &BytecodeFunction, args: &[CfmlValue]) -> Option<CfmlResult> {
+    pub fn try_call(
+        &mut self,
+        func: &BytecodeFunction,
+        args: &[CfmlValue],
+        is_shadowed: &mut dyn FnMut(&str) -> bool,
+    ) -> Option<CfmlResult> {
         // Bail immediately if any arg isn't numeric, or if there are too many.
         let sig = signature_for(args)?;
         let key: CacheKey = (func.global_id, sig);
@@ -163,8 +183,15 @@ impl JitEngine {
         // Fast path: already-known outcome for this exact signature.
         match self.cache.get(&key) {
             Some(CacheEntry::Unjittable) => return None,
-            Some(CacheEntry::Compiled(f, ret_float)) => {
-                return run_compiled(*f, func, args, *ret_float)
+            Some(CacheEntry::Compiled(f, ret_float, names)) => {
+                // Shadowing guard — a user-defined `abs` (etc.) defined after
+                // the JIT cached this body must still take precedence.
+                for n in names {
+                    if is_shadowed(n) {
+                        return None;
+                    }
+                }
+                return run_compiled(*f, func, args, *ret_float);
             }
             None => {}
         }
@@ -188,15 +215,24 @@ impl JitEngine {
         let entry = match analysis::analyze(func, &kinds) {
             Some(plan) => {
                 let ret_float = matches!(plan.ret_kind, analysis::Kind::Float);
+                let names = plan.referenced_builtins.clone();
                 match self.backend.compile(func, &plan) {
-                    Ok(ptr) => CacheEntry::Compiled(ptr, ret_float),
+                    Ok(ptr) => CacheEntry::Compiled(ptr, ret_float, names),
                     Err(_) => CacheEntry::Unjittable,
                 }
             }
             None => CacheEntry::Unjittable,
         };
         let run = match &entry {
-            CacheEntry::Compiled(f, ret_float) => run_compiled(*f, func, args, *ret_float),
+            CacheEntry::Compiled(f, ret_float, names) => {
+                // Same shadowing guard as the fast path — applies to the very
+                // first call after compilation too.
+                if names.iter().any(|n| is_shadowed(n)) {
+                    None
+                } else {
+                    run_compiled(*f, func, args, *ret_float)
+                }
+            }
             CacheEntry::Unjittable => None,
         };
         self.cache.insert(key, entry);
@@ -464,6 +500,111 @@ mod tests {
         let (r, bailed) = jit_run_f64(&f, &[16]);
         assert!(!bailed);
         assert_eq!(r, 4.0);
+    }
+
+    // ── Option A: JIT → native builtin calls ────────────────────────────────
+
+    #[test]
+    fn abs_int_overload_returns_int() {
+        // function f(a) { return abs(a); }  → Int result (the Int overload)
+        let f = compile_fn("function f(a) { return abs(a); }", "f");
+        assert_eq!(jit_run(&f, &[5]), (5, false));
+        assert_eq!(jit_run(&f, &[-5]), (5, false));
+        assert_eq!(jit_run(&f, &[0]), (0, false));
+    }
+
+    #[test]
+    fn abs_float_overload_returns_double() {
+        // function f(a) { return abs(a / 1); }  → forces Float, calls
+        // cfml_abs_f64, returns Double.
+        let f = compile_fn("function f(a) { return abs(a / 1); }", "f");
+        let (r, bailed) = jit_run_f64(&f, &[-7]);
+        assert!(!bailed);
+        assert_eq!(r, 7.0);
+    }
+
+    #[test]
+    fn min_returns_double_even_for_ints() {
+        // CFML's `min(3, 5)` returns Double(3.0). The JIT must match.
+        let f = compile_fn("function f(a, b) { return min(a, b); }", "f");
+        let (r, bailed) = jit_run_f64(&f, &[3, 5]);
+        assert!(!bailed);
+        assert_eq!(r, 3.0);
+        assert_eq!(jit_run_f64(&f, &[10, 4]).0, 4.0);
+    }
+
+    #[test]
+    fn max_returns_double() {
+        let f = compile_fn("function f(a, b) { return max(a, b); }", "f");
+        assert_eq!(jit_run_f64(&f, &[3, 5]).0, 5.0);
+        assert_eq!(jit_run_f64(&f, &[-3, -10]).0, -3.0);
+    }
+
+    #[test]
+    fn nested_builtin_calls_compose() {
+        // function f(a) { return max(abs(a), 5); }
+        // -7 → max(7, 5) → 7.0; 2 → max(2, 5) → 5.0
+        let f = compile_fn("function f(a) { return max(abs(a), 5); }", "f");
+        assert_eq!(jit_run_f64(&f, &[-7]).0, 7.0);
+        assert_eq!(jit_run_f64(&f, &[2]).0, 5.0);
+    }
+
+    #[test]
+    fn builtin_inside_loop_matches() {
+        // function f(n) { var t = 0; for (var i = 1; i <= n; i++) { t = t + abs(i - 3); } return t; }
+        let f = compile_fn(
+            "function f(n) { var t = 0; for (var i = 1; i <= n; i++) { t = t + abs(i - 3); } return t; }",
+            "f",
+        );
+        // |1-3|+|2-3|+|3-3|+|4-3|+|5-3| = 2+1+0+1+2 = 6
+        assert_eq!(jit_run(&f, &[5]), (6, false));
+    }
+
+    #[test]
+    fn unknown_builtin_rejects() {
+        // `sin` isn't in the allowlist — analysis must reject.
+        let f = compile_fn("function f(a) { return sin(a); }", "f");
+        let kinds = int_kinds(&f);
+        assert!(analysis::analyze(&f, &kinds).is_none());
+    }
+
+    #[test]
+    fn referenced_builtins_recorded() {
+        // The plan must list every allowlisted name the body calls.
+        let f = compile_fn(
+            "function f(a, b) { return max(abs(a), min(b, 10)); }",
+            "f",
+        );
+        let plan = analysis::analyze(&f, &int_kinds(&f)).expect("eligible");
+        let names: std::collections::BTreeSet<&str> =
+            plan.referenced_builtins.iter().copied().collect();
+        let expected: std::collections::BTreeSet<&str> = ["abs", "max", "min"].into_iter().collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn shadow_check_short_circuits_jit() {
+        // First compile so the engine has a cached entry; then call try_call
+        // with a shadow-checker that fires for "abs" — must return None.
+        let f = compile_fn("function f(a) { return abs(a); }", "f");
+        let mut engine = JitEngine {
+            cache: rustc_hash::FxHashMap::default(),
+            hot: HotnessTracker::new(0), // any non-cached call compiles on the first hit
+            backend: translate::Backend::new().expect("backend"),
+        };
+        let args = vec![CfmlValue::Int(-7)];
+        // First call: not hot yet (record_and_is_hot returns true at threshold+1
+        // == 1, since threshold=0 → fires on the 1st call).
+        let _ = engine.try_call_unshadowed(&f, &args);
+        // Now compiled. With shadowing, must bail.
+        let mut sh = |n: &str| n.eq_ignore_ascii_case("abs");
+        assert!(engine.try_call(&f, &args, &mut sh).is_none());
+        // Without shadowing, still works.
+        let r = engine
+            .try_call_unshadowed(&f, &args)
+            .expect("compiled path must run")
+            .expect("no runtime error");
+        assert!(matches!(r, CfmlValue::Int(7)));
     }
 
     #[test]

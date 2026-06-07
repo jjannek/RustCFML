@@ -1684,8 +1684,60 @@ impl CfmlVirtualMachine {
         // with the feature off the whole block compiles away. See `jit/mod.rs`.
         #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
         {
+            // The shadowing guard makes sure a user-defined function or
+            // global with the same name as an allowlisted builtin (e.g.
+            // `function abs(x) { … }`) wins over the JIT's native call. We
+            // peek directly at the VM's lookup tables; matches the
+            // case-insensitive lookup the interpreter does in LoadGlobal.
+            // Borrowing `self.jit` and `self.user_functions` / `self.globals`
+            // simultaneously is fine via split borrows on the field pattern,
+            // but to keep it simple we snapshot the field references first.
+            let user_functions = &self.user_functions;
+            let globals = &self.globals;
             if let Some(engine) = self.jit.as_mut() {
-                if let Some(result) = engine.try_call(func, &args) {
+                // A canonical builtin entry in `globals` is the no-op wrapper
+                // `Function{ body: Expression(Null), params: [], captured_scope: None }`
+                // produced by `cfml_stdlib::create_builtin_func`. Anything else
+                // for an allowlist name (a user-assigned value, a redefined
+                // function, etc.) is real shadowing — we must bail so the
+                // interpreter resolves the user's version through LoadGlobal's
+                // normal lookup order. User-defined `function abs(){}` lives in
+                // `user_functions` *behind* the globals entry in CFML's lookup,
+                // so by itself it doesn't shadow — but we still bail on it as
+                // a conservative second guard: the user clearly intended an
+                // override, and the analysis is cheap.
+                let is_canonical_builtin_wrapper = |v: &CfmlValue| -> bool {
+                    if let CfmlValue::Function(f) = v {
+                        if !f.params.is_empty() || f.captured_scope.is_some() {
+                            return false;
+                        }
+                        let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
+                        return matches!(
+                            body,
+                            cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
+                        );
+                    }
+                    false
+                };
+                let mut is_shadowed = |name: &str| -> bool {
+                    let lower = name.to_ascii_lowercase();
+                    let ufn_hit = user_functions.contains_key(name)
+                        || user_functions.keys().any(|k| k.eq_ignore_ascii_case(&lower));
+                    if ufn_hit {
+                        return true;
+                    }
+                    let g = globals.get(name).or_else(|| {
+                        globals
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+                            .map(|(_, v)| v)
+                    });
+                    match g {
+                        Some(v) => !is_canonical_builtin_wrapper(v),
+                        None => false,
+                    }
+                };
+                if let Some(result) = engine.try_call(func, &args, &mut is_shadowed) {
                     return result;
                 }
             }
@@ -3881,6 +3933,24 @@ impl CfmlVirtualMachine {
                         }
                     };
                     let func_name = bc_func_arc.name.clone();
+                    // Lucee parity: a named function declaration that collides
+                    // with a built-in function is a compile/parse-time error in
+                    // Lucee (`AbstrCFMLScriptTransformer.funcStatement` throws
+                    // "The name [X] is already used by a built in Function"). We
+                    // don't have a separate compile pass that owns the builtin
+                    // set, so we enforce the same rule the first time the
+                    // DefineFunction op runs — fires on script load, which is
+                    // UX-equivalent. Skip synthesized names so closures, arrow
+                    // functions, and `__main__` are unaffected: only `function
+                    // abs(x) { … }`-style decls are rejected.
+                    if !func_name.starts_with("__")
+                        && self.builtins.contains_key(func_name.as_str())
+                    {
+                        return Err(self.wrap_error(CfmlError::runtime(format!(
+                            "The name [{}] is already used by a built in Function",
+                            func_name
+                        ))));
+                    }
                     self.user_functions
                         .insert(func_name.clone(), Arc::clone(&bc_func_arc));
                     // Create or reuse a shared closure environment so all closures

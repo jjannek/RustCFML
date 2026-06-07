@@ -40,6 +40,8 @@
 use cfml_codegen::{BytecodeOp, BytecodeFunction};
 use std::collections::{BTreeSet, HashMap};
 
+use super::builtins;
+
 /// A reachable basic block: the half-open instruction range `[start, end)`.
 pub struct Block {
     pub start: usize,
@@ -57,10 +59,17 @@ pub enum Kind {
     /// A boolean (comparison or logical result). May only be consumed by a
     /// branch or another logical/comparison op — never stored or returned.
     Bool,
+    /// A reference to an allowlisted builtin function pushed by
+    /// `LoadGlobal(name)`. The string is the lowercased CFML name; overload
+    /// resolution against [`builtins::SHIMS`] happens at the matching
+    /// `Call(n)` when actual arg kinds are known. `Builtin` is non-numeric,
+    /// so existing arithmetic / comparison / storage paths reject it just
+    /// like `Bool` — only `Call` consumes it.
+    Builtin(&'static str),
 }
 
 impl Kind {
-    /// `true` for the numeric kinds (everything but `Bool`).
+    /// `true` for the numeric kinds (everything but `Bool` / `Builtin`).
     fn is_num(self) -> bool {
         matches!(self, Kind::Int | Kind::Float)
     }
@@ -93,6 +102,11 @@ pub struct Plan {
     pub blocks: Vec<Block>,
     /// Leader ip → index into `blocks`.
     pub block_at: HashMap<usize, usize>,
+    /// Lowercased allowlist names referenced via `LoadGlobal` anywhere in the
+    /// reachable code. The engine re-checks each one against the live VM at
+    /// every call so a runtime user-defined `abs` (or a `globals["abs"]` entry)
+    /// shadows the JIT'd path and forces interpretation.
+    pub referenced_builtins: Vec<&'static str>,
 }
 
 impl Plan {
@@ -265,6 +279,7 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
         Write(usize),
     }
     let mut block_events: Vec<Vec<Ev>> = vec![Vec::new(); plan_blocks.len()];
+    let mut referenced_builtins: BTreeSet<&'static str> = BTreeSet::new();
 
     for (bidx, blk) in plan_blocks.iter().enumerate() {
         let events = &mut block_events[bidx];
@@ -348,7 +363,24 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
                     intern(name, &mut locals, &mut local_slot);
                 }
 
-                // everything else (Null, Concat, Pow, calls, heap, …)
+                // LoadGlobal(name) is allowed only for allowlisted builtin
+                // names. The Call(n) op that immediately consumes it handles
+                // overload resolution against actual arg kinds.
+                BytecodeOp::LoadGlobal(name) => {
+                    let canon = builtins::canonical_name(name);
+                    match canon {
+                        Some(n) => {
+                            referenced_builtins.insert(n);
+                        }
+                        None => return None,
+                    }
+                }
+                // Call(n) is supported only as a builtin call (no UDF dispatch).
+                // simulate_block enforces that the n+1th stack slot is a
+                // `Kind::Builtin(_)` and that the arg kinds match some overload.
+                BytecodeOp::Call(_) => {}
+
+                // everything else (Null, Concat, heap, CallNamed, …)
                 _ => return None,
             }
         }
@@ -480,6 +512,7 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
         ret_kind,
         blocks: plan_blocks,
         block_at: plan_block_at,
+        referenced_builtins: referenced_builtins.into_iter().collect(),
     })
 }
 
@@ -516,6 +549,18 @@ fn simulate_block(
             }
         };
     }
+    // Pop one value but reject a `Builtin` ref — `Kind::Builtin(_)` is a
+    // marker that only `BytecodeOp::Call` is allowed to consume; any other op
+    // attempting to use it disqualifies the whole function.
+    macro_rules! pop_value {
+        () => {{
+            let k = pop!();
+            if matches!(k, Kind::Builtin(_)) {
+                return None;
+            }
+            k
+        }};
+    }
 
     for ip in blk.start..blk.end {
         match &code[ip] {
@@ -528,7 +573,7 @@ fn simulate_block(
             }
             BytecodeOp::StoreLocal(name) => {
                 let s = slot_index(name)?;
-                let v = pop!();
+                let v = pop_value!();
                 if v == Kind::Bool {
                     return None; // a boolean must never enter a local
                 }
@@ -602,17 +647,17 @@ fn simulate_block(
             | BytecodeOp::Lte
             | BytecodeOp::Gt
             | BytecodeOp::Gte => {
-                let _ = pop!();
-                let _ = pop!();
+                let _ = pop_value!();
+                let _ = pop_value!();
                 stack.push(Kind::Bool);
             }
             BytecodeOp::And | BytecodeOp::Or | BytecodeOp::Xor => {
-                let _ = pop!();
-                let _ = pop!();
+                let _ = pop_value!();
+                let _ = pop_value!();
                 stack.push(Kind::Bool);
             }
             BytecodeOp::Not => {
-                let _ = pop!();
+                let _ = pop_value!();
                 stack.push(Kind::Bool);
             }
 
@@ -638,7 +683,7 @@ fn simulate_block(
 
             BytecodeOp::Jump(_) => {}
             BytecodeOp::JumpIfFalse(_) | BytecodeOp::JumpIfTrue(_) => {
-                let _ = pop!();
+                let _ = pop_value!();
             }
 
             BytecodeOp::Pop => {
@@ -646,11 +691,14 @@ fn simulate_block(
             }
             BytecodeOp::Dup => {
                 let k = *stack.last()?;
+                if matches!(k, Kind::Builtin(_)) {
+                    return None; // a builtin ref must flow directly into Call
+                }
                 stack.push(k);
             }
 
             BytecodeOp::Return => {
-                let v = pop!();
+                let v = pop_value!();
                 if v == Kind::Bool {
                     return None;
                 }
@@ -663,6 +711,35 @@ fn simulate_block(
             }
 
             BytecodeOp::DeclareLocal(_) | BytecodeOp::LineInfo(_, _) => {}
+
+            // Push the (already-validated, allowlisted) builtin reference.
+            // The actual overload — and thus the result kind — isn't picked
+            // until `Call(n)` sees the concrete arg kinds.
+            BytecodeOp::LoadGlobal(name) => {
+                let canon = builtins::canonical_name(name)?;
+                stack.push(Kind::Builtin(canon));
+            }
+            BytecodeOp::Call(n) => {
+                // Stack shape (top first): arg_n, …, arg_1, Builtin(name).
+                if stack.len() < n + 1 {
+                    return None;
+                }
+                let split = stack.len() - n;
+                let arg_kinds: Vec<Kind> = stack[split..].to_vec();
+                // Every arg must be a concrete numeric kind — no nested
+                // builtin refs, no booleans (so `min(x>y, z)` is rejected).
+                if arg_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
+                    return None;
+                }
+                stack.truncate(split);
+                let builtin = stack.pop()?;
+                let name = match builtin {
+                    Kind::Builtin(n) => n,
+                    _ => return None,
+                };
+                let shim_idx = builtins::lookup_overload(name, &arg_kinds)?;
+                stack.push(builtins::SHIMS[shim_idx].ret_kind);
+            }
 
             _ => return None,
         }

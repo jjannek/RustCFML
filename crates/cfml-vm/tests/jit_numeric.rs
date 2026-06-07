@@ -153,3 +153,34 @@ fn float_kernel_jits_and_matches_interpreter() {
     assert_eq!(out, oracle, "JIT float output must equal the interpreter");
     assert!(compiled >= 1, "expected stat() to be JIT-compiled");
 }
+
+#[test]
+fn builtin_calls_jit_and_match_interpreter() {
+    // Exercises Option A: JIT → native builtin calls. abs() picks the Int
+    // overload (returning Int); min() / max() always return Double; nesting
+    // (abs(i - 5)) inside the loop body is the realistic shape.
+    let src = r#"
+        function score(n) {
+            var t = 0;
+            for (var i = 1; i <= n; i++) { t = t + abs(i - 5); }
+            return min(max(t, 1), 100);
+        }
+        out = "";
+        for (k = 1; k <= 60; k++) { out = out & score(8) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "JIT builtin-call output must equal the interpreter");
+    assert!(compiled >= 1, "expected score() to be JIT-compiled");
+}
+
+// (engine-level shadow guard is covered by the `shadow_check_short_circuits_jit`
+//  unit test in `crates/cfml-vm/src/jit/mod.rs`. A full e2e shadowing test
+//  isn't included here because RustCFML's `LoadGlobal` lookup order resolves
+//  bare-name calls to the canonical builtin wrapper in `vm.globals` before any
+//  user `function abs(){…}` or `abs = ...` reassignment — so the language
+//  doesn't currently expose a path to actually shadow an Option-A builtin name
+//  from CFML source. The guard remains as defence-in-depth: if/when CFML adds
+//  user-overridable globals for builtin names, no JIT correctness regression
+//  will follow.)
