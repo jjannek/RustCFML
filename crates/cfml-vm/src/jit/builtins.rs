@@ -95,6 +95,82 @@ extern "C" fn cfml_max_f64(a: f64, b: f64) -> f64 {
     a.max(b)
 }
 
+// ── Single-arg pure-math shims ────────────────────────────────────────────
+// Every shim below is `extern "C"` and mirrors a `cfml-stdlib::builtins::fn_*`
+// entry verbatim. Operand is always promoted to `f64` at the ABI boundary
+// (`KindReq::Numeric` / `Kind::Float`), matching `get_float(args, 0)` in the
+// interpreter. Return is `f64` for math functions and `i64` for the rounding /
+// sign / truncation family — same as the interpreter's `CfmlValue::Double`
+// vs `CfmlValue::Int`.
+
+/// `fn_floor` — `x.floor() as i64`. CFML returns an `Int`.
+extern "C" fn cfml_floor_i64(x: f64) -> i64 {
+    x.floor() as i64
+}
+
+/// `fn_ceiling` — `x.ceil() as i64`. CFML returns an `Int`.
+extern "C" fn cfml_ceiling_i64(x: f64) -> i64 {
+    x.ceil() as i64
+}
+
+/// `fn_round` (1-arg form only) — half-up toward positive infinity, matching
+/// Lucee/Adobe's `Math.round`. Bit-exact with `(x + 0.5).floor() as i64`.
+/// Rust's `f64::round` is half-away-from-zero, which would diverge on negatives.
+/// CFML returns `Int`.
+extern "C" fn cfml_round_i64(x: f64) -> i64 {
+    (x + 0.5).floor() as i64
+}
+
+/// `fn_sgn` — `1` / `-1` / `0` for positive / negative / zero. CFML returns `Int`.
+extern "C" fn cfml_sgn_i64(x: f64) -> i64 {
+    if x > 0.0 {
+        1
+    } else if x < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// `fn_fix` — truncate toward zero. `x.trunc() as i64`. CFML returns `Int`.
+extern "C" fn cfml_fix_i64(x: f64) -> i64 {
+    x.trunc() as i64
+}
+
+/// `fn_sqr` — square root. CFML uses the name `sqr` (not `sqrt`).
+extern "C" fn cfml_sqr_f64(x: f64) -> f64 {
+    x.sqrt()
+}
+
+extern "C" fn cfml_exp_f64(x: f64) -> f64 {
+    x.exp()
+}
+/// `fn_log` — natural log (`ln`). CFML's `log` IS the natural log.
+extern "C" fn cfml_log_f64(x: f64) -> f64 {
+    x.ln()
+}
+extern "C" fn cfml_log10_f64(x: f64) -> f64 {
+    x.log10()
+}
+extern "C" fn cfml_sin_f64(x: f64) -> f64 {
+    x.sin()
+}
+extern "C" fn cfml_cos_f64(x: f64) -> f64 {
+    x.cos()
+}
+extern "C" fn cfml_tan_f64(x: f64) -> f64 {
+    x.tan()
+}
+extern "C" fn cfml_asin_f64(x: f64) -> f64 {
+    x.asin()
+}
+extern "C" fn cfml_acos_f64(x: f64) -> f64 {
+    x.acos()
+}
+extern "C" fn cfml_atan_f64(x: f64) -> f64 {
+    x.atan()
+}
+
 /// The complete shim table. Order matters for `lookup_overload`: more specific
 /// signatures (e.g. `abs(Int)`) must precede broader ones (`abs(Numeric)`).
 pub static SHIMS: &[Shim] = &[
@@ -129,6 +205,128 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_max_f64",
         addr: cfml_max_f64 as *const u8,
+    },
+    // ── Single-arg numeric → Int (rounding / sign / truncation) ──────────
+    Shim {
+        name: "floor",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Int,
+        sym: "cfml_floor_i64",
+        addr: cfml_floor_i64 as *const u8,
+    },
+    Shim {
+        name: "ceiling",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Int,
+        sym: "cfml_ceiling_i64",
+        addr: cfml_ceiling_i64 as *const u8,
+    },
+    Shim {
+        name: "round",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Int,
+        sym: "cfml_round_i64",
+        addr: cfml_round_i64 as *const u8,
+    },
+    Shim {
+        name: "sgn",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Int,
+        sym: "cfml_sgn_i64",
+        addr: cfml_sgn_i64 as *const u8,
+    },
+    Shim {
+        name: "fix",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Int,
+        sym: "cfml_fix_i64",
+        addr: cfml_fix_i64 as *const u8,
+    },
+    // ── Single-arg numeric → Float (transcendentals) ─────────────────────
+    Shim {
+        name: "sqr",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_sqr_f64",
+        addr: cfml_sqr_f64 as *const u8,
+    },
+    Shim {
+        name: "exp",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_exp_f64",
+        addr: cfml_exp_f64 as *const u8,
+    },
+    Shim {
+        name: "log",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_log_f64",
+        addr: cfml_log_f64 as *const u8,
+    },
+    Shim {
+        name: "log10",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_log10_f64",
+        addr: cfml_log10_f64 as *const u8,
+    },
+    Shim {
+        name: "sin",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_sin_f64",
+        addr: cfml_sin_f64 as *const u8,
+    },
+    Shim {
+        name: "cos",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_cos_f64",
+        addr: cfml_cos_f64 as *const u8,
+    },
+    Shim {
+        name: "tan",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_tan_f64",
+        addr: cfml_tan_f64 as *const u8,
+    },
+    Shim {
+        name: "asin",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_asin_f64",
+        addr: cfml_asin_f64 as *const u8,
+    },
+    Shim {
+        name: "acos",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_acos_f64",
+        addr: cfml_acos_f64 as *const u8,
+    },
+    Shim {
+        name: "atan",
+        args_req: &[KindReq::Numeric],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_atan_f64",
+        addr: cfml_atan_f64 as *const u8,
     },
 ];
 

@@ -825,8 +825,11 @@ mod tests {
 
     #[test]
     fn unknown_builtin_rejects() {
-        // `sin` isn't in the allowlist — analysis must reject.
-        let f = compile_fn("function f(a) { return sin(a); }", "f");
+        // `len` is a real CFML builtin but not in the JIT shim allowlist —
+        // analysis must reject. (`sin` was the original choice but it's been
+        // promoted into the allowlist; pick a name that can't be JIT'd
+        // because its semantics aren't pure-numeric.)
+        let f = compile_fn("function f(a) { return len(a); }", "f");
         let kinds = int_kinds(&f);
         assert!(analysis::analyze(&f, &kinds).is_none());
     }

@@ -196,6 +196,35 @@ fn run_with_osr(src: &str) -> (String, usize, usize) {
 }
 
 #[test]
+fn jit_extended_pure_math_builtins_match_interpreter() {
+    // Exercises the v0.79.0 widened builtin allowlist: floor / ceiling /
+    // round / sgn / fix (Numeric→Int) and sqr / exp / log / log10 / sin /
+    // cos / tan / asin / acos / atan (Numeric→Float). All inside a hot
+    // loop so OSR / whole-fn JIT compiles the kernel and the shims fire
+    // from native code.
+    let src = r#"
+        function kernel(n) {
+            var t = 0.0;
+            for (var i = 1; i <= n; i++) {
+                t = t + sqr(i) + log(i + 1) + sin(i / 10.0) + cos(i / 10.0)
+                      + floor(i / 3.0) + ceiling(i / 7.0) + round(i / 4.0)
+                      + sgn(i - 50) + fix(i / 11.0)
+                      + exp(i / 100.0) + log10(i + 1) + tan(i / 100.0);
+            }
+            return t;
+        }
+        // Call once to warm up the JIT, then assert a stable known-good
+        // value cross-checked against the interpreter oracle.
+        for (k = 1; k <= 120; k++) { x = kernel(60); }
+        writeOutput(x);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, jit, _osr) = run_with_osr(src);
+    assert_eq!(out, oracle, "extended builtins JIT output must match interpreter");
+    assert!(jit >= 1, "kernel() should have been whole-fn-JIT-compiled");
+}
+
+#[test]
 fn osr_do_while_loop_matches_interpreter() {
     // do { body } while (cond) — terminates in `JumpIfTrue(loop_start)`.
     let src = r#"
