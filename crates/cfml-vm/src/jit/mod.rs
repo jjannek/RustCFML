@@ -28,13 +28,17 @@ use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::CfmlResult;
 use indexmap::IndexMap;
 use rustc_hash::FxHashMap;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::ptr;
 use std::sync::{Arc, RwLock};
 
 mod analysis;
 mod builtins;
 mod osr;
 mod translate;
+
+pub use analysis::UdfRefBinding;
 
 /// ABI of every Tier-1 compiled function.
 ///
@@ -52,14 +56,24 @@ pub type CompiledFn = unsafe extern "C" fn(args: *const i64, nargs: i64, bail: *
 enum CacheEntry {
     /// The static analysis rejected this function; never attempt it again.
     Unjittable,
-    /// Successfully compiled; call this pointer. The `bool` is `true` when the
-    /// function's return kind is `Float` (the `i64` the body returns is the
-    /// `f64` result's bit pattern, re-wrapped as `CfmlValue::Double`). The
-    /// `Vec` lists every allowlisted builtin name the compiled body calls — at
-    /// every invocation the engine re-checks the live VM and bails if any of
-    /// those names has been shadowed (user-defined fn, global), so a runtime
-    /// `function abs(x) { … }` still wins.
-    Compiled(CompiledFn, bool, Vec<&'static str>),
+    /// Successfully compiled; call this pointer.
+    /// * `ret_float` — `true` when the function's return kind is `Float`
+    ///   (the `i64` the body returns is the `f64` result's bit pattern,
+    ///   re-wrapped as `CfmlValue::Double`).
+    /// * `builtins` — every allowlisted builtin name the compiled body
+    ///   calls; the engine re-checks each one against the live VM on every
+    ///   invocation so a runtime `function abs(x) { … }` still wins.
+    /// * `udfs` — every UDF callee the compiled body references
+    ///   (deduped by `(global_id, sig)`). The engine re-checks each at every
+    ///   invocation so a stale binding (callee re-registered, recompiled
+    ///   with a different sig, or evicted) forces a fallback to the
+    ///   interpreter for the whole call.
+    Compiled {
+        ptr: CompiledFn,
+        ret_float: bool,
+        builtins: Vec<&'static str>,
+        udfs: Vec<UdfRefBinding>,
+    },
 }
 
 /// Invocation counters keyed by `(global_id, signature)` — each call
@@ -112,6 +126,118 @@ fn signature_for(args: &[CfmlValue]) -> Option<u64> {
         }
     }
     Some(((mask as u64) << 32) | (args.len() as u64))
+}
+
+/// Build the same cache signature directly from an analysis [`analysis::Kind`]
+/// vector. Mirrors [`signature_for`] but works at JIT-analysis time when
+/// concrete `CfmlValue`s aren't on hand. Returns `None` if any kind isn't a
+/// concrete numeric (only `Int`/`Float` map to ABI params).
+fn sig_from_kinds(kinds: &[analysis::Kind]) -> Option<u64> {
+    if kinds.len() > MAX_JIT_PARAMS {
+        return None;
+    }
+    let mut mask: u64 = 0;
+    for (i, k) in kinds.iter().enumerate() {
+        match k {
+            analysis::Kind::Int => {}
+            analysis::Kind::Float => mask |= 1u64 << i,
+            _ => return None,
+        }
+    }
+    Some((mask << 32) | (kinds.len() as u64))
+}
+
+/// Static metadata about a user-defined function. Returned by the
+/// `udf_lookup` callback passed into [`JitEngine::try_call`]. Lets the JIT
+/// resolve a `LoadGlobal(name)` to a stable `(global_id, arity)` pair
+/// without dragging the VM's `user_functions` map through this crate.
+#[derive(Clone, Copy, Debug)]
+pub struct UdfMeta {
+    pub global_id: u32,
+    pub nparams: usize,
+}
+
+/// Revalidate a UDF binding captured at compile time against the current
+/// cache. The binding becomes stale when the callee is re-registered
+/// (different `global_id`), is evicted, or hasn't been recompiled for this
+/// signature. Mirrors the existing `is_shadowed` check for builtins.
+fn udf_binding_still_valid(
+    cache: &FxHashMap<CacheKey, CacheEntry>,
+    binding: UdfRefBinding,
+) -> bool {
+    match cache.get(&(binding.global_id, binding.sig)) {
+        Some(CacheEntry::Compiled { ret_float, .. }) => *ret_float == binding.ret_float,
+        _ => false,
+    }
+}
+
+// ── UDF→UDF dispatch: thread-local engine pointer + libcall ──────────────────
+//
+// The compiled body of a JIT'd caller invokes `cfml_call_jit_udf` (defined
+// in `translate.rs` as an `extern "C"`) for every UDF callsite. That
+// dispatcher needs to consult the engine's cache, but the compiled function
+// ABI doesn't carry an engine pointer. Instead, `try_call` stashes
+// `*const JitEngine` in a thread-local for the duration of the compiled
+// call (including any nested JIT→JIT recursion) and the dispatcher reads
+// it. The pointer is immutable while a body is running: cache inserts only
+// happen between outer `try_call` invocations (OSR is interpreter-driven,
+// so it can't fire while a whole-function JIT body is executing).
+
+thread_local! {
+    static ENGINE_PTR: Cell<*const JitEngine> = const { Cell::new(ptr::null()) };
+}
+
+/// Stash `engine` as the active dispatch context, run `f`, then restore the
+/// previous value. Restoring (rather than clearing) supports nested
+/// `try_call` invocations from outside the JIT — e.g., a non-JIT'd CFML fn
+/// calls a JIT'd helper which interpreter-calls back into the VM which
+/// reaches another `try_call`. The outer pointer must be reinstated on
+/// return; otherwise a re-entry up the chain would see a stale or null
+/// pointer.
+fn run_compiled_with_engine(
+    engine: &JitEngine,
+    f: CompiledFn,
+    func: &BytecodeFunction,
+    args: &[CfmlValue],
+    ret_float: bool,
+) -> Option<CfmlResult> {
+    let prev = ENGINE_PTR.with(|c| c.replace(engine as *const JitEngine));
+    let result = run_compiled(f, func, args, ret_float);
+    ENGINE_PTR.with(|c| c.set(prev));
+    result
+}
+
+/// The actual dispatcher behind `cfml_call_jit_udf` in `translate.rs`. Looks
+/// up `(global_id, sig)` in the active engine's cache and either calls the
+/// compiled body or signals a bail (cache miss / wrong sig).
+pub(crate) fn dispatch_jit_udf(
+    global_id: u32,
+    sig: u64,
+    args: *const i64,
+    nargs: i64,
+    bail: *mut i64,
+) -> i64 {
+    let engine_ptr = ENGINE_PTR.with(|c| c.get());
+    if engine_ptr.is_null() {
+        // Defensive: should never happen because the compiled body is only
+        // called inside `run_compiled_with_engine`. Bail anyway so we
+        // degrade gracefully.
+        unsafe { *bail = 1 };
+        return 0;
+    }
+    // SAFETY: `engine_ptr` was set by `run_compiled_with_engine` immediately
+    // before the compiled body started running and is restored on return.
+    // The engine outlives the call (it owns the JITModule and thus the
+    // compiled code itself). The dispatcher only reads `cache`; no mutating
+    // reentrancy is possible.
+    let engine = unsafe { &*engine_ptr };
+    match engine.cache.get(&(global_id, sig)) {
+        Some(CacheEntry::Compiled { ptr, .. }) => unsafe { (*ptr)(args, nargs, bail) },
+        _ => {
+            unsafe { *bail = 1 };
+            0
+        }
+    }
 }
 
 /// Composite key for the per-loop OSR cache: `(global_id, region_start_ip)`.
@@ -199,7 +325,7 @@ impl JitEngine {
     pub fn compiled_count(&self) -> usize {
         self.cache
             .values()
-            .filter(|e| matches!(e, CacheEntry::Compiled(..)))
+            .filter(|e| matches!(e, CacheEntry::Compiled { .. }))
             .count()
     }
 
@@ -210,7 +336,7 @@ impl JitEngine {
         func: &BytecodeFunction,
         args: &[CfmlValue],
     ) -> Option<CfmlResult> {
-        self.try_call(func, args, &mut |_| false)
+        self.try_call(func, args, &mut |_| false, &|_| None)
     }
 
     /// The dispatch hook, called at the top of `execute_function_with_args`.
@@ -225,6 +351,7 @@ impl JitEngine {
         func: &BytecodeFunction,
         args: &[CfmlValue],
         is_shadowed: &mut dyn FnMut(&str) -> bool,
+        udf_lookup: &dyn Fn(&str) -> Option<UdfMeta>,
     ) -> Option<CfmlResult> {
         // Bail immediately if any arg isn't numeric, or if there are too many.
         let sig = signature_for(args)?;
@@ -233,15 +360,26 @@ impl JitEngine {
         // Fast path: already-known outcome for this exact signature.
         match self.cache.get(&key) {
             Some(CacheEntry::Unjittable) => return None,
-            Some(CacheEntry::Compiled(f, ret_float, names)) => {
+            Some(CacheEntry::Compiled { ptr, ret_float, builtins, udfs }) => {
                 // Shadowing guard — a user-defined `abs` (etc.) defined after
                 // the JIT cached this body must still take precedence.
-                for n in names {
+                for n in builtins {
                     if is_shadowed(n) {
                         return None;
                     }
                 }
-                return run_compiled(*f, func, args, *ret_float);
+                // UDF binding validation: every referenced callee must still
+                // be Compiled with the matching signature. A drift here
+                // means the callee has been redefined, evicted, or a name
+                // now resolves to a different global_id.
+                for u in udfs {
+                    if !udf_binding_still_valid(&self.cache, *u) {
+                        return None;
+                    }
+                }
+                let ptr = *ptr;
+                let rf = *ret_float;
+                return run_compiled_with_engine(self, ptr, func, args, rf);
             }
             None => {}
         }
@@ -261,32 +399,94 @@ impl JitEngine {
             });
         }
 
-        // Crossed the threshold: analyse + (maybe) compile, exactly once.
-        let entry = match analysis::analyze(func, &kinds) {
-            Some(plan) => {
-                let ret_float = matches!(plan.ret_kind, analysis::Kind::Float);
-                let names = plan.referenced_builtins.clone();
-                match self.backend.compile(func, &plan) {
-                    Ok(ptr) => CacheEntry::Compiled(ptr, ret_float, names),
-                    Err(_) => CacheEntry::Unjittable,
+        // ── Analyse with a UDF resolver that consults this engine's cache.
+        //
+        // Self-recursion is admitted optimistically: when the callee's
+        // (global_id, sig) matches the caller's, the resolver answers
+        // `Some(ret_float=false)` so the operand-stack typing proceeds
+        // assuming an Int return. A Float-returning self-recursive function
+        // would have an inconsistent operand-stack typing and is rejected
+        // by the post-analysis self-call kind check below.
+        let entry = {
+            let cache_ref = &self.cache;
+            let caller_gid = func.global_id;
+            let caller_sig = sig;
+            let resolver =
+                |name: &str, arg_kinds: &[analysis::Kind]| -> Option<UdfRefBinding> {
+                    let meta = udf_lookup(name)?;
+                    if meta.nparams != arg_kinds.len() {
+                        return None;
+                    }
+                    let callee_sig = sig_from_kinds(arg_kinds)?;
+                    // Self-call: same fn + same sig as the specialization
+                    // we're compiling. Optimistically assume Int return; the
+                    // post-check below catches the Float-returning case.
+                    if meta.global_id == caller_gid && callee_sig == caller_sig {
+                        return Some(UdfRefBinding {
+                            global_id: caller_gid,
+                            sig: caller_sig,
+                            ret_float: false,
+                        });
+                    }
+                    // Foreign UDF: must already be a Compiled cache entry.
+                    match cache_ref.get(&(meta.global_id, callee_sig)) {
+                        Some(CacheEntry::Compiled { ret_float, .. }) => Some(UdfRefBinding {
+                            global_id: meta.global_id,
+                            sig: callee_sig,
+                            ret_float: *ret_float,
+                        }),
+                        _ => None,
+                    }
+                };
+            match analysis::analyze(func, &kinds, &resolver) {
+                Some(plan) => {
+                    let ret_float = matches!(plan.ret_kind, analysis::Kind::Float);
+                    // Self-recursion kind check: if the body's actual return
+                    // kind is Float but a self-call was typed Int, the
+                    // resolver's optimistic answer was wrong. Reject.
+                    let self_call_mistyped = ret_float
+                        && plan
+                            .referenced_udfs
+                            .iter()
+                            .any(|u| u.global_id == caller_gid && u.sig == caller_sig);
+                    if self_call_mistyped {
+                        CacheEntry::Unjittable
+                    } else {
+                        let builtins = plan.referenced_builtins.clone();
+                        let udfs = plan.referenced_udfs.clone();
+                        match self.backend.compile(func, &plan) {
+                            Ok(ptr) => CacheEntry::Compiled { ptr, ret_float, builtins, udfs },
+                            Err(_) => CacheEntry::Unjittable,
+                        }
+                    }
                 }
+                None => CacheEntry::Unjittable,
             }
-            None => CacheEntry::Unjittable,
         };
-        let run = match &entry {
-            CacheEntry::Compiled(f, ret_float, names) => {
-                // Same shadowing guard as the fast path — applies to the very
-                // first call after compilation too.
-                if names.iter().any(|n| is_shadowed(n)) {
-                    None
-                } else {
-                    run_compiled(*f, func, args, *ret_float)
-                }
-            }
-            CacheEntry::Unjittable => None,
-        };
+
+        // Insert into the cache BEFORE running so a self-recursive body
+        // finds itself in `dispatch_jit_udf` on its very first invocation.
         self.cache.insert(key, entry);
-        run
+
+        // Re-fetch + run, applying the same shadowing/UDF-validity checks
+        // as the fast path. (Cache lookup is cheap; this keeps the
+        // post-insert run path single-source-of-truth.)
+        match self.cache.get(&key) {
+            Some(CacheEntry::Compiled { ptr, ret_float, builtins, udfs }) => {
+                if builtins.iter().any(|n| is_shadowed(n)) {
+                    return None;
+                }
+                for u in udfs {
+                    if !udf_binding_still_valid(&self.cache, *u) {
+                        return None;
+                    }
+                }
+                let ptr = *ptr;
+                let rf = *ret_float;
+                run_compiled_with_engine(self, ptr, func, args, rf)
+            }
+            _ => None,
+        }
     }
 
     /// Try to run a hot loop natively via OSR. Returns:
@@ -570,7 +770,7 @@ mod tests {
     /// Returns `(result, bailed)`.
     fn jit_run(func: &BytecodeFunction, args: &[i64]) -> (i64, bool) {
         let kinds = int_kinds(func);
-        let plan = analysis::analyze(func, &kinds).expect("function should be JIT-eligible");
+        let plan = analysis::analyze_no_udfs(func, &kinds).expect("function should be JIT-eligible");
         let mut backend = translate::Backend::new().expect("backend init");
         let ptr = backend.compile(func, &plan).expect("compile");
         let mut bail: i64 = 0;
@@ -583,7 +783,7 @@ mod tests {
     /// Returns `(f64, bailed)`.
     fn jit_run_f64(func: &BytecodeFunction, args: &[i64]) -> (f64, bool) {
         let kinds = int_kinds(func);
-        let plan = analysis::analyze(func, &kinds).expect("function should be JIT-eligible");
+        let plan = analysis::analyze_no_udfs(func, &kinds).expect("function should be JIT-eligible");
         assert_eq!(plan.ret_kind, analysis::Kind::Float, "expected a Float return");
         let mut backend = translate::Backend::new().expect("backend init");
         let ptr = backend.compile(func, &plan).expect("compile");
@@ -600,7 +800,7 @@ mod tests {
         kinds: &[analysis::Kind],
         args: &[i64],
     ) -> (f64, bool, bool) {
-        let plan = analysis::analyze(func, kinds).expect("function should be JIT-eligible");
+        let plan = analysis::analyze_no_udfs(func, kinds).expect("function should be JIT-eligible");
         let ret_float = plan.ret_kind == analysis::Kind::Float;
         let mut backend = translate::Backend::new().expect("backend init");
         let ptr = backend.compile(func, &plan).expect("compile");
@@ -831,7 +1031,7 @@ mod tests {
         // because its semantics aren't pure-numeric.)
         let f = compile_fn("function f(a) { return len(a); }", "f");
         let kinds = int_kinds(&f);
-        assert!(analysis::analyze(&f, &kinds).is_none());
+        assert!(analysis::analyze_no_udfs(&f, &kinds).is_none());
     }
 
     #[test]
@@ -841,7 +1041,7 @@ mod tests {
             "function f(a, b) { return max(abs(a), min(b, 10)); }",
             "f",
         );
-        let plan = analysis::analyze(&f, &int_kinds(&f)).expect("eligible");
+        let plan = analysis::analyze_no_udfs(&f, &int_kinds(&f)).expect("eligible");
         let names: std::collections::BTreeSet<&str> =
             plan.referenced_builtins.iter().copied().collect();
         let expected: std::collections::BTreeSet<&str> = ["abs", "max", "min"].into_iter().collect();
@@ -867,7 +1067,7 @@ mod tests {
         let _ = engine.try_call_unshadowed(&f, &args);
         // Now compiled. With shadowing, must bail.
         let mut sh = |n: &str| n.eq_ignore_ascii_case("abs");
-        assert!(engine.try_call(&f, &args, &mut sh).is_none());
+        assert!(engine.try_call(&f, &args, &mut sh, &|_| None).is_none());
         // Without shadowing, still works.
         let r = engine
             .try_call_unshadowed(&f, &args)

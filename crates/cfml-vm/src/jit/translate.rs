@@ -24,7 +24,9 @@
 
 use cfml_codegen::{BytecodeOp, BytecodeFunction, CmpOp};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Signature, Value};
+use cranelift_codegen::ir::{
+    types, AbiParam, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind, Value,
+};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -48,6 +50,25 @@ extern "C" fn cfml_pow(a: f64, b: f64) -> f64 {
     a.powf(b)
 }
 
+/// Dispatch a UDF→UDF call from inside a JIT'd body. The thread-local engine
+/// pointer (set by `JitEngine::try_call`) is consulted to look up the
+/// callee's compiled `(global_id, sig)` entry. On a cache miss, a kind
+/// mismatch, or any failure path the caller sets `*bail = 1` and returns 0 —
+/// the outer `try_call` then propagates the bail and falls back to the
+/// interpreter for the entire call chain.
+#[no_mangle]
+extern "C" fn cfml_call_jit_udf(
+    global_id: i64,
+    sig: i64,
+    args: *const i64,
+    nargs: i64,
+    bail: *mut i64,
+) -> i64 {
+    // Widened ABI: global_id arrives as i64 to dodge cross-platform
+    // small-int ABI ambiguity. Truncate to u32 here.
+    crate::jit::dispatch_jit_udf(global_id as u32, sig as u64, args, nargs, bail)
+}
+
 /// Owns the Cranelift module (and thus all executable memory it allocates) plus
 /// a reusable `FunctionBuilderContext`. Fields are `pub(super)` so the `osr`
 /// sibling module can declare additional functions in the same `JITModule`
@@ -60,6 +81,9 @@ pub struct Backend {
     /// Pre-declared `fn(f64, f64) -> f64` shims (`cfml_fmod`, `cfml_pow`).
     pub(super) fmod_id: FuncId,
     pub(super) pow_id: FuncId,
+    /// Pre-declared `fn(u32, u64, *const i64, i64, *mut i64) -> i64` shim for
+    /// dispatching JIT'd UDF→UDF calls (see `cfml_call_jit_udf`).
+    pub(super) udf_dispatch_id: FuncId,
     /// Per-entry `FuncId` for every shim in [`SHIMS`] (parallel slice). Each
     /// `compile()` turns these into per-function `FuncRef`s via
     /// `declare_func_in_func`.
@@ -86,6 +110,7 @@ impl Backend {
         // life of the process, so the cast is safe.
         builder.symbol("cfml_fmod", cfml_fmod as *const u8);
         builder.symbol("cfml_pow", cfml_pow as *const u8);
+        builder.symbol("cfml_call_jit_udf", cfml_call_jit_udf as *const u8);
         // Register every allowlisted builtin shim (Option A — Tier-1 native
         // calls). Each is a pure `extern "C"` Rust fn whose semantics mirror
         // the interpreter's `cfml-stdlib::builtins::fn_*` entry.
@@ -107,6 +132,25 @@ impl Backend {
         };
         let fmod_id = make_ff_f(&mut module, "cfml_fmod")?;
         let pow_id = make_ff_f(&mut module, "cfml_pow")?;
+
+        // `cfml_call_jit_udf`:
+        //   fn(global_id: u32, sig: u64, args: *const i64, nargs: i64, bail: *mut i64) -> i64
+        // u32 and u64 are both ABI'd as I64 on x86_64/aarch64 here — the
+        // dispatcher truncates `global_id` itself. Keeping all integer args at
+        // I64 sidesteps any cross-platform ABI ambiguity around small ints.
+        let udf_dispatch_id = {
+            let ptr_ty = module.target_config().pointer_type();
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(I64)); // global_id (widened to i64)
+            sig.params.push(AbiParam::new(I64)); // sig
+            sig.params.push(AbiParam::new(ptr_ty)); // args
+            sig.params.push(AbiParam::new(I64)); // nargs
+            sig.params.push(AbiParam::new(ptr_ty)); // bail
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_call_jit_udf", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
 
         // Declare the allowlisted builtin shims, each with a signature derived
         // from its `args_abi` / `ret_kind`. The order matches `SHIMS` so the
@@ -133,12 +177,35 @@ impl Backend {
             func_counter: 0,
             fmod_id,
             pow_id,
+            udf_dispatch_id,
             shim_ids,
         })
     }
 
     /// Compile `func` per `plan` to native code, returning a callable pointer.
     pub fn compile(&mut self, func: &BytecodeFunction, plan: &Plan) -> Result<CompiledFn, String> {
+        // Inner block: any `?` or `return Err` aborts the body without calling
+        // `FunctionBuilder::finalize`, leaving `self.fbc` in a partially-built
+        // state. The next `FunctionBuilder::new` then panics on an
+        // `is_empty()` assertion. Catch the result here and on any error
+        // reinitialise `self.fbc` so a future compile starts clean. This
+        // never observes a successful compile (finalize was called inside
+        // the block); only the failure path pays the cost.
+        let result = self.compile_inner(func, plan);
+        if let Err(ref e) = result {
+            self.fbc = FunctionBuilderContext::new();
+            if std::env::var("RUSTCFML_JIT_DEBUG").is_ok() {
+                eprintln!("[jit] compile failed for {}: {}", func.name, e);
+            }
+        }
+        result
+    }
+
+    fn compile_inner(
+        &mut self,
+        func: &BytecodeFunction,
+        plan: &Plan,
+    ) -> Result<CompiledFn, String> {
         let ptr_ty = self.module.target_config().pointer_type();
         let mut ctx = self.module.make_context();
         // Signature: (args: *const i64, nargs: i64, bail: *mut i64) -> i64
@@ -151,6 +218,9 @@ impl Backend {
         // emit `call`s to them. Done before the builder borrows `ctx.func`.
         let fmod_ref = self.module.declare_func_in_func(self.fmod_id, &mut ctx.func);
         let pow_ref = self.module.declare_func_in_func(self.pow_id, &mut ctx.func);
+        let udf_dispatch_ref = self
+            .module
+            .declare_func_in_func(self.udf_dispatch_id, &mut ctx.func);
         // Parallel to SHIMS — only the entries the function actually calls
         // get used, but importing all of them is cheap and keeps indexing
         // straight-through.
@@ -174,6 +244,33 @@ impl Backend {
                 .map(|k| b.declare_var(if *k == Kind::Float { F64 } else { I64 }))
                 .collect();
             let bail_var = b.declare_var(ptr_ty);
+
+            // Stack slot for marshalling UDF→UDF call arguments. Sized for
+            // the widest call this function makes; only allocated when the
+            // body actually calls another UDF.
+            let udf_args_slot = if !plan.udf_call_at.is_empty() {
+                let max_call_args = plan
+                    .udf_call_at
+                    .keys()
+                    .map(|&ip| match &func.instructions[ip] {
+                        BytecodeOp::Call(n) => *n,
+                        _ => 0,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if max_call_args == 0 {
+                    None
+                } else {
+                    let bytes = (max_call_args * 8) as u32;
+                    Some(b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        bytes,
+                        3, // log2(8) — i64-aligned
+                    )))
+                }
+            } else {
+                None
+            };
 
             // ── Prologue ────────────────────────────────────────────────────
             b.append_block_params_for_function_params(entry);
@@ -428,15 +525,20 @@ impl Backend {
                         BytecodeOp::DeclareLocal(_) => {}
                         BytecodeOp::LineInfo(_, _) => {}
 
-                        // Push a marker for a known builtin. The dummy `Value`
-                        // is never consumed by IR — `Call` reads the kind tag,
-                        // resolves the overload via `lookup_overload`, and
-                        // emits the actual `call` against the matching FuncRef.
+                        // Push a marker for a known builtin or UDF ref. The
+                        // dummy `Value` is never consumed by IR — `Call`
+                        // reads the kind tag (Builtin → resolve overload via
+                        // `lookup_overload`; UdfRef → look up the binding in
+                        // `plan.udf_call_at` by ip) and emits the actual
+                        // `call`. The UdfRef index is unused in codegen, so
+                        // any sentinel works.
                         BytecodeOp::LoadGlobal(name) => {
-                            let canon = builtins::canonical_name(name)
-                                .ok_or("jit: LoadGlobal of non-allowlist name reached codegen")?;
                             let placeholder = b.ins().iconst(I64, 0);
-                            stack.push((placeholder, Kind::Builtin(canon)));
+                            if let Some(canon) = builtins::canonical_name(name) {
+                                stack.push((placeholder, Kind::Builtin(canon)));
+                            } else {
+                                stack.push((placeholder, Kind::UdfRef(0)));
+                            }
                         }
                         BytecodeOp::Call(n) => {
                             if stack.len() < n + 1 {
@@ -445,32 +547,94 @@ impl Backend {
                             let split = stack.len() - n;
                             let raw_args: Vec<(Value, Kind)> = stack.split_off(split);
                             let (_marker_val, marker_kind) =
-                                stack.pop().ok_or("jit: missing builtin marker")?;
-                            let name = match marker_kind {
-                                Kind::Builtin(n) => n,
-                                _ => return Err("jit: Call without a builtin marker".into()),
-                            };
-                            let arg_kinds: Vec<Kind> = raw_args.iter().map(|(_, k)| *k).collect();
-                            let shim_idx = builtins::lookup_overload(name, &arg_kinds)
-                                .ok_or("jit: no shim overload for call")?;
-                            let shim = &SHIMS[shim_idx];
-                            // Convert each arg from its operand kind to the
-                            // shim's ABI kind. `to_i64` saturates floats, `to_f64`
-                            // promotes ints — the same conversions the rest of
-                            // the JIT already uses on numeric boundaries.
-                            let mut cl_args: Vec<Value> = Vec::with_capacity(raw_args.len());
-                            for (idx, (v, k)) in raw_args.into_iter().enumerate() {
-                                let abi = shim.args_abi[idx];
-                                let conv = if abi == Kind::Float {
-                                    to_f64(&mut b, v, k)
-                                } else {
-                                    to_i64(&mut b, v, k)
-                                };
-                                cl_args.push(conv);
+                                stack.pop().ok_or("jit: missing fn-ref marker")?;
+                            match marker_kind {
+                                Kind::Builtin(name) => {
+                                    let arg_kinds: Vec<Kind> =
+                                        raw_args.iter().map(|(_, k)| *k).collect();
+                                    let shim_idx = builtins::lookup_overload(name, &arg_kinds)
+                                        .ok_or("jit: no shim overload for call")?;
+                                    let shim = &SHIMS[shim_idx];
+                                    // Convert each arg from its operand kind to the
+                                    // shim's ABI kind. `to_i64` saturates floats,
+                                    // `to_f64` promotes ints.
+                                    let mut cl_args: Vec<Value> =
+                                        Vec::with_capacity(raw_args.len());
+                                    for (idx, (v, k)) in raw_args.into_iter().enumerate() {
+                                        let abi = shim.args_abi[idx];
+                                        let conv = if abi == Kind::Float {
+                                            to_f64(&mut b, v, k)
+                                        } else {
+                                            to_i64(&mut b, v, k)
+                                        };
+                                        cl_args.push(conv);
+                                    }
+                                    let call = b.ins().call(shim_refs[shim_idx], &cl_args);
+                                    let r = b.inst_results(call)[0];
+                                    stack.push((r, shim.ret_kind));
+                                }
+                                Kind::UdfRef(_) => {
+                                    // Look up the binding the analyser
+                                    // already resolved for this call site.
+                                    let binding = plan
+                                        .udf_call_at
+                                        .get(&ip)
+                                        .copied()
+                                        .ok_or("jit: UDF call site missing binding")?;
+                                    let slot = udf_args_slot
+                                        .ok_or("jit: UDF call without stack slot")?;
+                                    // Marshal each arg into the slot. Float
+                                    // values are bit-cast to i64 (matching
+                                    // run_compiled's args buffer encoding).
+                                    for (i, (v, k)) in raw_args.iter().enumerate() {
+                                        let stored = if *k == Kind::Float {
+                                            b.ins().bitcast(
+                                                I64,
+                                                MemFlags::new(),
+                                                *v,
+                                            )
+                                        } else {
+                                            *v
+                                        };
+                                        b.ins().stack_store(stored, slot, (i * 8) as i32);
+                                    }
+                                    let args_addr = b.ins().stack_addr(ptr_ty, slot, 0);
+                                    let bp = b.use_var(bail_var);
+                                    let gid =
+                                        b.ins().iconst(I64, binding.global_id as i64);
+                                    let sig = b.ins().iconst(I64, binding.sig as i64);
+                                    let nargs_v = b.ins().iconst(I64, *n as i64);
+                                    let call = b.ins().call(
+                                        udf_dispatch_ref,
+                                        &[gid, sig, args_addr, nargs_v, bp],
+                                    );
+                                    let raw_result = b.inst_results(call)[0];
+                                    // Check the bail flag — the dispatcher
+                                    // sets it on cache miss or callee bail.
+                                    let bail_val =
+                                        b.ins().load(I64, MemFlags::new(), bp, 0);
+                                    let bail_set =
+                                        b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                                    let cont = b.create_block();
+                                    b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                                    b.switch_to_block(cont);
+                                    // Re-interpret the i64 result per the
+                                    // callee's declared return kind. (Float
+                                    // returns are an f64 bit pattern packed
+                                    // into i64 — the same convention used at
+                                    // the outer ABI boundary.)
+                                    let (result_val, result_kind) = if binding.ret_float {
+                                        (
+                                            b.ins().bitcast(F64, MemFlags::new(), raw_result),
+                                            Kind::Float,
+                                        )
+                                    } else {
+                                        (raw_result, Kind::Int)
+                                    };
+                                    stack.push((result_val, result_kind));
+                                }
+                                _ => return Err("jit: Call without a fn-ref marker".into()),
                             }
-                            let call = b.ins().call(shim_refs[shim_idx], &cl_args);
-                            let r = b.inst_results(call)[0];
-                            stack.push((r, shim.ret_kind));
                         }
 
                         other => return Err(format!("jit: unsupported op reached codegen: {other:?}")),

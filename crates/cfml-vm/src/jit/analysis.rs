@@ -66,6 +66,13 @@ pub enum Kind {
     /// so existing arithmetic / comparison / storage paths reject it just
     /// like `Bool` — only `Call` consumes it.
     Builtin(&'static str),
+    /// A reference to a JIT-eligible user-defined function pushed by
+    /// `LoadGlobal(name)`. The `usize` indexes into the per-analysis
+    /// `udf_names` table (see [`UdfResolver`]). Like `Builtin`, this kind is
+    /// non-numeric — only `Call` consumes it — and the actual binding to a
+    /// `(global_id, sig)` cache entry is resolved at the matching `Call(n)`
+    /// when concrete arg kinds are known.
+    UdfRef(usize),
 }
 
 impl Kind {
@@ -88,6 +95,35 @@ pub fn num_bin_kind(a: Kind, b: Kind) -> Option<Kind> {
     })
 }
 
+/// What the engine needs to know about a JIT-eligible UDF call resolved at
+/// analysis time. Filled in by the [`UdfResolver`] callback at each `Call(n)`
+/// against a [`Kind::UdfRef`] marker.
+#[derive(Clone, Copy, Debug)]
+pub struct UdfRefBinding {
+    /// The callee function's stable `global_id`.
+    pub global_id: u32,
+    /// The callee's cache signature (`nargs` + float bitmap — see
+    /// `signature_for` in `mod.rs`). Identifies the specific specialization
+    /// that must already be `Compiled`.
+    pub sig: u64,
+    /// `true` when that specialization returns `Float` (otherwise `Int`).
+    pub ret_float: bool,
+}
+
+impl UdfRefBinding {
+    /// Operand-stack kind the caller pushes after a successful Call.
+    pub fn ret_kind(&self) -> Kind {
+        if self.ret_float { Kind::Float } else { Kind::Int }
+    }
+}
+
+/// Resolve `(callee_name, arg_kinds)` → a binding (if the callee is currently
+/// a `Compiled` cache entry for that exact signature). Returning `None`
+/// rejects the caller's analysis. Closes over the VM's `user_functions` map
+/// and the engine's cache. A no-op resolver (`|_,_| None`) disables UDF→UDF
+/// JIT calls and gives the same behaviour as before this feature.
+pub type UdfResolver<'a> = dyn Fn(&str, &[Kind]) -> Option<UdfRefBinding> + 'a;
+
 /// Everything the translator needs to emit Cranelift IR for an accepted fn.
 pub struct Plan {
     /// Lowercased local name → slot index (slot = Cranelift `Variable` number).
@@ -107,6 +143,15 @@ pub struct Plan {
     /// every call so a runtime user-defined `abs` (or a `globals["abs"]` entry)
     /// shadows the JIT'd path and forces interpretation.
     pub referenced_builtins: Vec<&'static str>,
+    /// Per-`Call`-ip binding for UDF calls the analyser accepted. The
+    /// translator looks up the binding at each `Call` op site to emit the
+    /// libcall (`cfml_call_jit_udf`) with the correct `(global_id, sig)`.
+    pub udf_call_at: HashMap<usize, UdfRefBinding>,
+    /// Deduped list of UDF callees referenced by the body. The engine
+    /// revalidates each at every invocation: if the callee's cache entry has
+    /// been displaced, redefined, or shadowed since this body was compiled,
+    /// the caller falls back to the interpreter for that call.
+    pub referenced_udfs: Vec<UdfRefBinding>,
 }
 
 impl Plan {
@@ -141,11 +186,39 @@ fn is_reserved_scope(name: &str) -> bool {
     )
 }
 
+/// No-op UDF resolver: never binds a UDF call. Use this when calling
+/// `analyze` from contexts that don't have access to the engine cache
+/// (in-crate tests). Yields the pre-Phase-1 behaviour: any non-builtin
+/// `LoadGlobal` rejects the function.
+#[allow(dead_code)] // test-only entry point
+pub fn no_udf_resolver(_name: &str, _arg_kinds: &[Kind]) -> Option<UdfRefBinding> {
+    None
+}
+
+/// Convenience: analyse without UDF→UDF call support. Identical to
+/// `analyze(func, kinds, &no_udf_resolver)`. Used by in-crate tests and by
+/// the e2e tests in `tests/jit_numeric.rs` so they don't have to construct
+/// an engine to hand a resolver to.
+#[allow(dead_code)] // test-only entry point
+pub fn analyze_no_udfs(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
+    analyze(func, param_kinds, &no_udf_resolver)
+}
+
 /// Decide whether `func` can be compiled for a specific *call signature* (one
 /// [`Kind`] per declared parameter; `Bool` is rejected by the caller). `None`
 /// ⇒ keep on the interpreter. Different signatures produce independent
 /// specializations — each `(func, param_kinds)` pair is its own cache entry.
-pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
+///
+/// `udf_resolver` is consulted when the body calls another user-defined
+/// function; it returns a binding when the callee already has a `Compiled`
+/// cache entry for the matching arg-kind signature, and `None` otherwise (in
+/// which case the caller is also rejected — Phase 1 only admits leaf-first
+/// warmup, not mutual recursion or forward references to uncompiled UDFs).
+pub fn analyze(
+    func: &BytecodeFunction,
+    param_kinds: &[Kind],
+    udf_resolver: &UdfResolver<'_>,
+) -> Option<Plan> {
     if func.name == "__main__" {
         return None;
     }
@@ -280,6 +353,25 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
     }
     let mut block_events: Vec<Vec<Ev>> = vec![Vec::new(); plan_blocks.len()];
     let mut referenced_builtins: BTreeSet<&'static str> = BTreeSet::new();
+    // Names of UDFs referenced via `LoadGlobal` inside the reachable code.
+    // Interned at Pass 1 so the operand-stack simulator can push a Copy-able
+    // `Kind::UdfRef(idx)` marker; the resolver is queried at every
+    // simulate_block invocation (Infer fixpoint + Check) to look up the
+    // binding using the concrete arg kinds at the matching `Call`.
+    let mut udf_name_idx: HashMap<String, usize> = HashMap::new();
+    let mut udf_names: Vec<String> = Vec::new();
+    let intern_udf =
+        |name: &str, idx: &mut HashMap<String, usize>, list: &mut Vec<String>| -> usize {
+            let lower = lower(name);
+            if let Some(&i) = idx.get(&lower) {
+                i
+            } else {
+                let i = list.len();
+                list.push(lower.clone());
+                idx.insert(lower, i);
+                i
+            }
+        };
 
     for (bidx, blk) in plan_blocks.iter().enumerate() {
         let events = &mut block_events[bidx];
@@ -363,21 +455,23 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
                     intern(name, &mut locals, &mut local_slot);
                 }
 
-                // LoadGlobal(name) is allowed only for allowlisted builtin
-                // names. The Call(n) op that immediately consumes it handles
-                // overload resolution against actual arg kinds.
+                // LoadGlobal(name): allowlisted builtin names take precedence
+                // (cheaper dispatch); otherwise we intern the name as a UDF
+                // candidate. The actual cache binding is resolved by the
+                // udf_resolver at the matching Call(n) when arg kinds are
+                // known. Names that match neither reject the function.
                 BytecodeOp::LoadGlobal(name) => {
-                    let canon = builtins::canonical_name(name);
-                    match canon {
-                        Some(n) => {
-                            referenced_builtins.insert(n);
-                        }
-                        None => return None,
+                    if let Some(n) = builtins::canonical_name(name) {
+                        referenced_builtins.insert(n);
+                    } else {
+                        intern_udf(name, &mut udf_name_idx, &mut udf_names);
+                        // Optimistic admit at Pass 1 — actual rejection
+                        // happens in simulate_block / Check if no binding
+                        // exists for the call site.
                     }
                 }
-                // Call(n) is supported only as a builtin call (no UDF dispatch).
-                // simulate_block enforces that the n+1th stack slot is a
-                // `Kind::Builtin(_)` and that the arg kinds match some overload.
+                // Call(n) covers both builtin and UDF dispatch; simulate_block
+                // pops the marker and selects the right path based on Kind.
                 BytecodeOp::Call(_) => {}
 
                 // everything else (Null, Concat, heap, CallNamed, …)
@@ -397,11 +491,19 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
     loop {
         let mut changed = false;
         for blk in &plan_blocks {
+            // Infer mode: discard the per-ip UDF bindings (we only care
+            // about kind upgrades here); the resolver may be called more
+            // than once but that's fine — it's expected to be cheap and
+            // pure.
+            let mut _scratch: HashMap<usize, UdfRefBinding> = HashMap::new();
             simulate_block(
                 code,
                 blk,
                 &local_slot,
                 &mut slot_kind,
+                &udf_names,
+                udf_resolver,
+                &mut _scratch,
                 Mode::Infer { changed: &mut changed },
             )?;
         }
@@ -422,16 +524,30 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
 
     // ── 5. Consistency + kind validation pass (records the return kind) ─────
     let mut ret_kind: Option<Kind> = None;
+    let mut udf_call_at: HashMap<usize, UdfRefBinding> = HashMap::new();
     for blk in &plan_blocks {
         simulate_block(
             code,
             blk,
             &local_slot,
             &mut slot_kind,
+            &udf_names,
+            udf_resolver,
+            &mut udf_call_at,
             Mode::Check { ret_kind: &mut ret_kind },
         )?;
     }
     let ret_kind = ret_kind?; // a function with no reachable Return is rejected
+
+    // Dedupe referenced_udfs by (global_id, sig). The engine consults this
+    // list once per outer call to revalidate every callee is still cached.
+    let mut seen: BTreeSet<(u32, u64)> = BTreeSet::new();
+    let mut referenced_udfs: Vec<UdfRefBinding> = Vec::new();
+    for binding in udf_call_at.values() {
+        if seen.insert((binding.global_id, binding.sig)) {
+            referenced_udfs.push(*binding);
+        }
+    }
 
     // ── 6. Definite-assignment fixpoint over reachable blocks ───────────────
     let nblk = plan_blocks.len();
@@ -513,6 +629,8 @@ pub fn analyze(func: &BytecodeFunction, param_kinds: &[Kind]) -> Option<Plan> {
         blocks: plan_blocks,
         block_at: plan_block_at,
         referenced_builtins: referenced_builtins.into_iter().collect(),
+        udf_call_at,
+        referenced_udfs,
     })
 }
 
@@ -531,11 +649,19 @@ enum Mode<'a> {
 /// and ends empty, no underflow, supported kinds), `None` to reject the whole
 /// function. The op-subset has already been validated, so any op not handled
 /// here is treated as a rejection (defensive).
+///
+/// `udf_names` and `udf_resolver` resolve `Kind::UdfRef` markers at the
+/// matching `Call`. `udf_bindings` accumulates per-ip bindings so the
+/// translator can look them up later (populated by Check, scratched by
+/// Infer).
 fn simulate_block(
     code: &[BytecodeOp],
     blk: &Block,
     local_slot: &HashMap<String, usize>,
     slot_kind: &mut [Kind],
+    udf_names: &[String],
+    udf_resolver: &UdfResolver<'_>,
+    udf_bindings: &mut HashMap<usize, UdfRefBinding>,
     mut mode: Mode,
 ) -> Option<()> {
     let slot_index = |name: &str| -> Option<usize> { local_slot.get(&lower(name)).copied() };
@@ -549,13 +675,14 @@ fn simulate_block(
             }
         };
     }
-    // Pop one value but reject a `Builtin` ref — `Kind::Builtin(_)` is a
-    // marker that only `BytecodeOp::Call` is allowed to consume; any other op
-    // attempting to use it disqualifies the whole function.
+    // Pop one value but reject a function reference (`Kind::Builtin(_)` or
+    // `Kind::UdfRef(_)`) — those markers are only consumable by
+    // `BytecodeOp::Call`; any other op attempting to use one disqualifies
+    // the whole function.
     macro_rules! pop_value {
         () => {{
             let k = pop!();
-            if matches!(k, Kind::Builtin(_)) {
+            if matches!(k, Kind::Builtin(_) | Kind::UdfRef(_)) {
                 return None;
             }
             k
@@ -691,8 +818,8 @@ fn simulate_block(
             }
             BytecodeOp::Dup => {
                 let k = *stack.last()?;
-                if matches!(k, Kind::Builtin(_)) {
-                    return None; // a builtin ref must flow directly into Call
+                if matches!(k, Kind::Builtin(_) | Kind::UdfRef(_)) {
+                    return None; // a function ref must flow directly into Call
                 }
                 stack.push(k);
             }
@@ -712,33 +839,58 @@ fn simulate_block(
 
             BytecodeOp::DeclareLocal(_) | BytecodeOp::LineInfo(_, _) => {}
 
-            // Push the (already-validated, allowlisted) builtin reference.
-            // The actual overload — and thus the result kind — isn't picked
-            // until `Call(n)` sees the concrete arg kinds.
+            // Push a function-reference marker. Allowlisted builtins win
+            // (resolved by lookup_overload at the matching Call); otherwise
+            // we push a UdfRef marker whose binding is decided at the
+            // matching Call when arg kinds are known.
             BytecodeOp::LoadGlobal(name) => {
-                let canon = builtins::canonical_name(name)?;
-                stack.push(Kind::Builtin(canon));
+                if let Some(canon) = builtins::canonical_name(name) {
+                    stack.push(Kind::Builtin(canon));
+                } else {
+                    // The Pass-1 sweep already interned every reachable
+                    // `LoadGlobal` name as a UDF candidate, so the index
+                    // must exist; if not, the function is malformed.
+                    let idx = *udf_names
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(name))
+                        .as_ref()?;
+                    stack.push(Kind::UdfRef(idx));
+                }
             }
             BytecodeOp::Call(n) => {
-                // Stack shape (top first): arg_n, …, arg_1, Builtin(name).
+                // Stack shape (top first): arg_n, …, arg_1, fn-ref marker.
                 if stack.len() < n + 1 {
                     return None;
                 }
                 let split = stack.len() - n;
                 let arg_kinds: Vec<Kind> = stack[split..].to_vec();
                 // Every arg must be a concrete numeric kind — no nested
-                // builtin refs, no booleans (so `min(x>y, z)` is rejected).
+                // function refs, no booleans (so `min(x>y, z)` is rejected).
                 if arg_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
                     return None;
                 }
                 stack.truncate(split);
-                let builtin = stack.pop()?;
-                let name = match builtin {
-                    Kind::Builtin(n) => n,
+                let marker = stack.pop()?;
+                match marker {
+                    Kind::Builtin(name) => {
+                        let shim_idx = builtins::lookup_overload(name, &arg_kinds)?;
+                        stack.push(builtins::SHIMS[shim_idx].ret_kind);
+                    }
+                    Kind::UdfRef(idx) => {
+                        // Resolve the binding using the concrete arg kinds.
+                        // The resolver consults the engine's cache; if the
+                        // callee isn't currently Compiled with this exact
+                        // signature, the analysis rejects.
+                        let name = udf_names.get(idx)?;
+                        let binding = udf_resolver(name, &arg_kinds)?;
+                        // Record the binding so the translator can find it
+                        // by IP. Check mode persists this; Infer's scratch
+                        // map is discarded after the fixpoint.
+                        udf_bindings.insert(ip, binding);
+                        stack.push(binding.ret_kind());
+                    }
                     _ => return None,
-                };
-                let shim_idx = builtins::lookup_overload(name, &arg_kinds)?;
-                stack.push(builtins::SHIMS[shim_idx].ret_kind);
+                }
             }
 
             _ => return None,
@@ -759,7 +911,7 @@ mod tests {
     /// Test-helper: analyse with every declared param pinned to `Int`.
     fn analyze_int(f: &BytecodeFunction) -> Option<Plan> {
         let kinds: Vec<Kind> = f.params.iter().map(|_| Kind::Int).collect();
-        analyze(f, &kinds)
+        analyze_no_udfs(f, &kinds)
     }
 
     fn mkfn(params: &[&str], instrs: Vec<BytecodeOp>) -> BytecodeFunction {
@@ -939,7 +1091,7 @@ mod tests {
                 BytecodeOp::Return,
             ],
         );
-        let plan = analyze(&f, &[Kind::Float]).expect("float-seeded param accepted");
+        let plan = analyze_no_udfs(&f, &[Kind::Float]).expect("float-seeded param accepted");
         assert_eq!(plan.ret_kind, Kind::Float);
         assert_eq!(plan.slot_kind[plan.param_slots[0]], Kind::Float);
     }

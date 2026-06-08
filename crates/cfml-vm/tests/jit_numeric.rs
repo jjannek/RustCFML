@@ -355,3 +355,82 @@ fn hot_main_loop_osrs_and_matches_interpreter() {
 //  from CFML source. The guard remains as defence-in-depth: if/when CFML adds
 //  user-overridable globals for builtin names, no JIT correctness regression
 //  will follow.)
+
+// ── UDF→UDF direct call tests (Phase 1) ──────────────────────────────────────
+//
+// These cover the new path where a JIT'd function calls another user-defined
+// function. The dispatcher (`cfml_call_jit_udf`) consults the engine's cache
+// at runtime and either invokes the compiled callee or bails to the
+// interpreter. All three cases below verify result-correctness against the
+// interpreter oracle; the compile-counter check confirms at least the leaf
+// callee actually JIT'd (the caller's compile depends on the callee being
+// in cache, which only happens after warm-up).
+
+#[test]
+fn udf_to_udf_leaf_call_jits_and_matches_interpreter() {
+    // Two-level call chain: `outer(n)` calls `helper(n)` in its hot loop. On
+    // a warm-up run the leaf `helper` JITs first; subsequent calls then let
+    // `outer` JIT too via direct dispatch.
+    let src = r#"
+        function helper(x) { return x * x + 1; }
+        function outer(n) {
+            var s = 0;
+            for (var i = 1; i <= n; i++) { s = s + helper(i); }
+            return s;
+        }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & outer(20) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "UDF→UDF JIT output must match the interpreter");
+    assert!(
+        compiled >= 1,
+        "expected at least the leaf helper to be JIT-compiled, got {compiled}"
+    );
+}
+
+#[test]
+fn udf_self_recursion_jits_and_matches_interpreter() {
+    // The canonical motivating case: fib() self-recurses. The Phase-1
+    // resolver synthesises a self-call binding so the analyser admits the
+    // body; cache insertion before first run means the libcall finds it on
+    // every recursion.
+    //
+    // n is kept modest (fib(7) = 13, max recursion depth 7) so the test
+    // fits inside a 2MB debug-mode thread stack — unoptimised Cranelift
+    // emits very large per-frame allocations, and fib(10) overflows. The
+    // recursion *path* is what's being verified, not depth.
+    let src = r#"
+        function fib(n) {
+            if (n < 2) { return n; }
+            return fib(n - 1) + fib(n - 2);
+        }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & fib(7) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "self-recursive JIT output must match the interpreter");
+    assert!(compiled >= 1, "expected fib() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn udf_call_with_double_arg_jits_via_signature_match() {
+    // Caller passes a Double arg through to the callee. Both specializations
+    // must compile with the same Float-arg signature for the libcall lookup
+    // to hit.
+    let src = r#"
+        function scale(x) { return x * 2.5 + 1; }
+        function chain(x) { return scale(x) + scale(x); }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & chain(3.0) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Double-arg UDF→UDF output must match the interpreter");
+    assert!(compiled >= 1, "expected at least scale() to be JIT-compiled");
+}

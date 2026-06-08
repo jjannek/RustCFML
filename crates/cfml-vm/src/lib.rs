@@ -1799,7 +1799,25 @@ impl CfmlVirtualMachine {
                         None => false,
                     }
                 };
-                if let Some(result) = engine.try_call(func, &args, &mut is_shadowed) {
+                // UDF resolver: case-insensitive lookup against the live
+                // `user_functions` map, returning (global_id, arity). Used
+                // by the JIT analyser to bind `LoadGlobal(name)` calls to
+                // already-compiled UDFs in the cache; rejecting the
+                // caller's analysis when the callee isn't yet warm.
+                let udf_lookup = |name: &str| -> Option<jit::UdfMeta> {
+                    let lower = name.to_ascii_lowercase();
+                    let f = user_functions.get(name).or_else(|| {
+                        user_functions
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+                            .map(|(_, v)| v)
+                    })?;
+                    Some(jit::UdfMeta {
+                        global_id: f.global_id,
+                        nparams: f.params.len(),
+                    })
+                };
+                if let Some(result) = engine.try_call(func, &args, &mut is_shadowed, &udf_lookup) {
                     return result;
                 }
             }
