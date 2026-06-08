@@ -179,11 +179,26 @@ pub fn analyze_loop(
     if region_start >= region_end_excl || region_end_excl > n {
         return None;
     }
-    // The region must terminate in a ForLoopStep whose target is region_start.
-    let step_ip = region_end_excl - 1;
-    let (loop_counter_name, _step) = match &code[step_ip] {
-        BytecodeOp::ForLoopStep(name, _, _, step, target) if *target == region_start => {
-            (name.clone(), *step)
+    // The region must terminate in a back-edge whose target is `region_start`:
+    // either the fused `ForLoopStep` (counted for-loop) or an unconditional
+    // `Jump(region_start)` (while/until/repeat loop). For the ForLoopStep
+    // form we also pin the loop counter to `Int` later; the Jump form has
+    // no special counter so that check is skipped.
+    let term_ip = region_end_excl - 1;
+    let counter_name: Option<String> = match &code[term_ip] {
+        BytecodeOp::ForLoopStep(name, _, _, _, target) if *target == region_start => {
+            Some(name.clone())
+        }
+        BytecodeOp::Jump(target) if *target == region_start => {
+            // Guard against the weird case where the first op in the region
+            // is itself a ForLoopStep — that arises only with `continue`
+            // jumps inside an outer for-loop, where region_start lands on
+            // the outer ForLoopStep. Rejecting here keeps OSR focused on
+            // real while/until/repeat loop headers.
+            if matches!(code[region_start], BytecodeOp::ForLoopStep(_, _, _, _, _)) {
+                return None;
+            }
+            None
         }
         _ => return None,
     };
@@ -398,10 +413,14 @@ pub fn analyze_loop(
         }
     }
 
-    // Pin the loop counter as Int (ForLoopStep requires it).
-    let counter_slot = slot_index.get(&lower(&loop_counter_name))?;
-    if slot_kinds[*counter_slot] != Kind::Int {
-        return None;
+    // Pin the loop counter as Int — only required by the fused ForLoopStep
+    // shape (counted for-loops). A while/until/repeat loop terminating in a
+    // plain `Jump` has no special counter to constrain.
+    if let Some(name) = &counter_name {
+        let counter_slot = slot_index.get(&lower(name))?;
+        if slot_kinds[*counter_slot] != Kind::Int {
+            return None;
+        }
     }
 
     // ── 4. Simulate each block to validate kinds and operand-stack shape ───

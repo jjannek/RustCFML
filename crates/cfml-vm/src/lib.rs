@@ -2804,6 +2804,68 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
+                    // OSR (Phase 2): back-edge from a while/until/repeat loop.
+                    // `ip` was already incremented past this Jump, so `ip - 1`
+                    // is the Jump's own ip and a strictly backward `target`
+                    // means we're at the end of a loop body about to loop
+                    // back. Region = `[target, ip)`. On success the compiled
+                    // body writes back locals and we resume at `exit_ip`
+                    // (== region_end_excl == ip), so the `continue` simply
+                    // skips the `ip = *target` reassignment below. On bail
+                    // we fall through and re-execute the body once more.
+                    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+                    {
+                        if *target < ip - 1 {
+                            let user_functions = &self.user_functions;
+                            let globals = &self.globals;
+                            if let Some(engine) = self.jit.as_mut() {
+                                let is_canonical_builtin_wrapper = |v: &CfmlValue| -> bool {
+                                    if let CfmlValue::Function(f) = v {
+                                        if !f.params.is_empty() || f.captured_scope.is_some() {
+                                            return false;
+                                        }
+                                        let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
+                                        return matches!(
+                                            body,
+                                            cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
+                                        );
+                                    }
+                                    false
+                                };
+                                let mut is_shadowed = |name: &str| -> bool {
+                                    let lower = name.to_ascii_lowercase();
+                                    let ufn_hit = user_functions.contains_key(name)
+                                        || user_functions
+                                            .keys()
+                                            .any(|k| k.eq_ignore_ascii_case(&lower));
+                                    if ufn_hit {
+                                        return true;
+                                    }
+                                    let g = globals.get(name).or_else(|| {
+                                        globals
+                                            .iter()
+                                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+                                            .map(|(_, v)| v)
+                                    });
+                                    match g {
+                                        Some(v) => !is_canonical_builtin_wrapper(v),
+                                        None => false,
+                                    }
+                                };
+                                if let Some(exit_ip) = engine.try_run_loop(
+                                    func,
+                                    *target,
+                                    ip,
+                                    &mut locals,
+                                    closure_env.as_ref(),
+                                    &mut is_shadowed,
+                                ) {
+                                    ip = exit_ip;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     ip = *target;
                 }
                 BytecodeOp::JumpIfFalse(target) => {

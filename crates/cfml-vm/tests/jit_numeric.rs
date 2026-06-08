@@ -196,6 +196,29 @@ fn run_with_osr(src: &str) -> (String, usize, usize) {
 }
 
 #[test]
+fn osr_while_loop_in_main_matches_interpreter() {
+    // While-loop in __main__ — terminates in `Jump(loop_start)` rather than
+    // a fused ForLoopStep. Pre-OSR-Phase-2 this never JIT'd; post-Phase-2
+    // the Jump back-edge triggers OSR analysis + compilation just like
+    // ForLoopStep does for counted loops.
+    let src = r#"
+        sum = 0;
+        i = 1;
+        while (i <= 1000) {
+            sum = sum + i;
+            i = i + 1;
+        }
+        writeOutput(sum);
+    "#;
+    // 1+2+...+1000 = 500500
+    let oracle = run_interpreter(src);
+    let (out, _jit, osr) = run_with_osr(src);
+    assert_eq!(out, oracle, "while-loop OSR output must equal the interpreter");
+    assert_eq!(out, "500500");
+    assert!(osr >= 1, "expected the while-loop to OSR-compile, got osr={osr}");
+}
+
+#[test]
 fn osr_simple_main_loop_matches_interpreter() {
     // Simplest possible hot __main__ loop. Threshold=1 means OSR engages on
     // the 2nd back-edge — the rest of the iterations run natively.
