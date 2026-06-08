@@ -52,21 +52,37 @@ extern "C" fn cfml_pow(a: f64, b: f64) -> f64 {
 
 /// Dispatch a UDF→UDF call from inside a JIT'd body. The thread-local engine
 /// pointer (set by `JitEngine::try_call`) is consulted to look up the
-/// callee's compiled `(global_id, sig)` entry. On a cache miss, a kind
-/// mismatch, or any failure path the caller sets `*bail = 1` and returns 0 —
-/// the outer `try_call` then propagates the bail and falls back to the
-/// interpreter for the entire call chain.
+/// callee's compiled `(global_id, sig)` entry. Bail-code semantics:
+/// * `*bail = 0` — success, return value is in `i64` (re-interpreted per
+///   the caller's declared `expected_ret_float`).
+/// * `*bail = 1` — normal deopt: cache miss, callee not yet compiled, or the
+///   callee's own body bailed (e.g. div-by-zero). Outer `try_call` falls back
+///   to the interpreter but the caller's cache entry stays Compiled — the
+///   bail is local to this dynamic call chain.
+/// * `*bail = 2` — speculation mismatch: caller compiled assuming a specific
+///   callee `ret_float`, but the now-cached callee has the opposite. The
+///   outer `try_call` evicts the caller's cache entry so it re-analyses
+///   against the now-known callee `ret_float` on its next hot trip. See
+///   Phase-2 (`JIT_PHASE2_PLAN.md` v0.87.0) for the full handshake.
 #[no_mangle]
 extern "C" fn cfml_call_jit_udf(
     global_id: i64,
     sig: i64,
+    expected_ret_float: i64,
     args: *const i64,
     nargs: i64,
     bail: *mut i64,
 ) -> i64 {
     // Widened ABI: global_id arrives as i64 to dodge cross-platform
     // small-int ABI ambiguity. Truncate to u32 here.
-    crate::jit::dispatch_jit_udf(global_id as u32, sig as u64, args, nargs, bail)
+    crate::jit::dispatch_jit_udf(
+        global_id as u32,
+        sig as u64,
+        expected_ret_float != 0,
+        args,
+        nargs,
+        bail,
+    )
 }
 
 /// Owns the Cranelift module (and thus all executable memory it allocates) plus
@@ -134,15 +150,20 @@ impl Backend {
         let pow_id = make_ff_f(&mut module, "cfml_pow")?;
 
         // `cfml_call_jit_udf`:
-        //   fn(global_id: u32, sig: u64, args: *const i64, nargs: i64, bail: *mut i64) -> i64
+        //   fn(global_id: u32, sig: u64, expected_ret_float: i64,
+        //      args: *const i64, nargs: i64, bail: *mut i64) -> i64
         // u32 and u64 are both ABI'd as I64 on x86_64/aarch64 here — the
         // dispatcher truncates `global_id` itself. Keeping all integer args at
         // I64 sidesteps any cross-platform ABI ambiguity around small ints.
+        // `expected_ret_float` is `1` iff the caller compiled this site
+        // expecting a Float return; the dispatcher checks it against the
+        // cached callee and surfaces `*bail = 2` on mismatch (Phase 2).
         let udf_dispatch_id = {
             let ptr_ty = module.target_config().pointer_type();
             let mut sig = Signature::new(module.target_config().default_call_conv);
             sig.params.push(AbiParam::new(I64)); // global_id (widened to i64)
             sig.params.push(AbiParam::new(I64)); // sig
+            sig.params.push(AbiParam::new(I64)); // expected_ret_float (0 or 1)
             sig.params.push(AbiParam::new(ptr_ty)); // args
             sig.params.push(AbiParam::new(I64)); // nargs
             sig.params.push(AbiParam::new(ptr_ty)); // bail
@@ -603,10 +624,18 @@ impl Backend {
                                     let gid =
                                         b.ins().iconst(I64, binding.global_id as i64);
                                     let sig = b.ins().iconst(I64, binding.sig as i64);
+                                    // Pass the caller-speculated ret_float to
+                                    // the dispatcher so it can detect a
+                                    // speculation mismatch against the actual
+                                    // cached callee and surface `*bail = 2`.
+                                    let erf = b.ins().iconst(
+                                        I64,
+                                        if binding.ret_float { 1 } else { 0 },
+                                    );
                                     let nargs_v = b.ins().iconst(I64, *n as i64);
                                     let call = b.ins().call(
                                         udf_dispatch_ref,
-                                        &[gid, sig, args_addr, nargs_v, bp],
+                                        &[gid, sig, erf, args_addr, nargs_v, bp],
                                     );
                                     let raw_result = b.inst_results(call)[0];
                                     // Check the bail flag — the dispatcher

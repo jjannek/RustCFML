@@ -158,16 +158,29 @@ pub struct UdfMeta {
 }
 
 /// Revalidate a UDF binding captured at compile time against the current
-/// cache. The binding becomes stale when the callee is re-registered
-/// (different `global_id`), is evicted, or hasn't been recompiled for this
-/// signature. Mirrors the existing `is_shadowed` check for builtins.
+/// cache. Phase-2 (v0.87.0) relaxed this: a binding can survive when the
+/// callee is not yet compiled (the runtime dispatcher bails *this call*
+/// only, not the whole function — and the binding becomes "live" the
+/// moment the callee compiles).
+///
+/// * `Compiled { ret_float }` matching the binding's expectation → valid.
+/// * `Compiled` with the *opposite* ret_float → invalid (would silently
+///   miscompile if invoked; bail=2 in the dispatcher handles this at
+///   runtime, but we also reject here so a steady-state mismatch doesn't
+///   keep paying the dispatcher cost).
+/// * `Unjittable` → still valid: the runtime bail keeps the caller correct
+///   (bail=1 falls back to interpreter for this call only), and refusing to
+///   admit the caller would force it onto the interpreter forever just
+///   because one of its callees can't JIT.
+/// * `None` (not yet compiled) → valid for the same reason: deferred
+///   compilation of the callee is exactly the case Phase-2 unlocks.
 fn udf_binding_still_valid(
     cache: &FxHashMap<CacheKey, CacheEntry>,
     binding: UdfRefBinding,
 ) -> bool {
     match cache.get(&(binding.global_id, binding.sig)) {
         Some(CacheEntry::Compiled { ret_float, .. }) => *ret_float == binding.ret_float,
-        _ => false,
+        Some(CacheEntry::Unjittable) | None => true,
     }
 }
 
@@ -200,7 +213,7 @@ fn run_compiled_with_engine(
     func: &BytecodeFunction,
     args: &[CfmlValue],
     ret_float: bool,
-) -> Option<CfmlResult> {
+) -> (Option<CfmlResult>, i64) {
     let prev = ENGINE_PTR.with(|c| c.replace(engine as *const JitEngine));
     let result = run_compiled(f, func, args, ret_float);
     ENGINE_PTR.with(|c| c.set(prev));
@@ -208,11 +221,18 @@ fn run_compiled_with_engine(
 }
 
 /// The actual dispatcher behind `cfml_call_jit_udf` in `translate.rs`. Looks
-/// up `(global_id, sig)` in the active engine's cache and either calls the
-/// compiled body or signals a bail (cache miss / wrong sig).
+/// up `(global_id, sig)` in the active engine's cache. Bail semantics:
+/// * `*bail = 0` — success, value returned to caller.
+/// * `*bail = 1` — normal deopt: callee not yet compiled, callee is known
+///   `Unjittable`, or the callee's own body bailed. Caller's cache entry is
+///   left intact (this is a transient or per-call failure).
+/// * `*bail = 2` — speculation mismatch: caller's `expected_ret_float` does
+///   not match the cached callee's `ret_float`. The outer `try_call` evicts
+///   the caller from the cache so it re-analyses on its next hot trip.
 pub(crate) fn dispatch_jit_udf(
     global_id: u32,
     sig: u64,
+    expected_ret_float: bool,
     args: *const i64,
     nargs: i64,
     bail: *mut i64,
@@ -232,7 +252,19 @@ pub(crate) fn dispatch_jit_udf(
     // reentrancy is possible.
     let engine = unsafe { &*engine_ptr };
     match engine.cache.get(&(global_id, sig)) {
-        Some(CacheEntry::Compiled { ptr, .. }) => unsafe { (*ptr)(args, nargs, bail) },
+        Some(CacheEntry::Compiled { ptr, ret_float, .. }) => {
+            // Phase 2: caller may have speculatively bound this site with
+            // `ret_float = false` (the default for a not-yet-compiled
+            // foreign callee at analysis time). If the now-cached callee
+            // returns the other kind, invoking it would silently miscompile
+            // (i64 vs f64::to_bits reinterpreted as the wrong kind). Bail
+            // out with code 2 so the outer try_call evicts the caller.
+            if *ret_float != expected_ret_float {
+                unsafe { *bail = 2 };
+                return 0;
+            }
+            unsafe { (*ptr)(args, nargs, bail) }
+        }
         _ => {
             unsafe { *bail = 1 };
             0
@@ -379,7 +411,16 @@ impl JitEngine {
                 }
                 let ptr = *ptr;
                 let rf = *ret_float;
-                return run_compiled_with_engine(self, ptr, func, args, rf);
+                let (result, bail) = run_compiled_with_engine(self, ptr, func, args, rf);
+                if bail == 2 {
+                    // Phase-2: speculation mismatch surfaced from a UDF
+                    // callsite. Evict the caller so it re-analyses against
+                    // the now-known callee `ret_float` on its next hot trip.
+                    // `Unjittable` would pin it; instead remove the entry
+                    // so the cold path re-runs.
+                    self.cache.remove(&key);
+                }
+                return result;
             }
             None => {}
         }
@@ -428,14 +469,30 @@ impl JitEngine {
                             ret_float: false,
                         });
                     }
-                    // Foreign UDF: must already be a Compiled cache entry.
+                    // Phase-2: foreign UDF binding.
+                    // * If callee is already Compiled, bind with its real
+                    //   `ret_float` — the fast path with no runtime checks.
+                    // * If callee is `Unjittable`, refuse the optimisation
+                    //   (it would always bail at runtime; staying on the
+                    //   interpreter for this caller is cheaper).
+                    // * If callee is *not yet compiled*, speculate
+                    //   `ret_float = false` and let the runtime dispatcher
+                    //   surface `*bail = 2` if/when the callee compiles
+                    //   with the opposite kind. The outer `try_call`
+                    //   evicts the caller on bail=2 so the next hot trip
+                    //   re-specializes against the now-known callee.
                     match cache_ref.get(&(meta.global_id, callee_sig)) {
                         Some(CacheEntry::Compiled { ret_float, .. }) => Some(UdfRefBinding {
                             global_id: meta.global_id,
                             sig: callee_sig,
                             ret_float: *ret_float,
                         }),
-                        _ => None,
+                        Some(CacheEntry::Unjittable) => None,
+                        None => Some(UdfRefBinding {
+                            global_id: meta.global_id,
+                            sig: callee_sig,
+                            ret_float: false,
+                        }),
                     }
                 };
             match analysis::analyze(func, &kinds, &resolver) {
@@ -483,7 +540,11 @@ impl JitEngine {
                 }
                 let ptr = *ptr;
                 let rf = *ret_float;
-                run_compiled_with_engine(self, ptr, func, args, rf)
+                let (result, bail) = run_compiled_with_engine(self, ptr, func, args, rf);
+                if bail == 2 {
+                    self.cache.remove(&key);
+                }
+                result
             }
             _ => None,
         }
@@ -705,41 +766,45 @@ fn run_osr_compiled(
 
 /// Marshal `args` across the ABI boundary and invoke a compiled body.
 ///
-/// Returns `None` (→ interpret) unless every argument is a numeric
-/// `CfmlValue::Int` or `CfmlValue::Double`, the argument count matches the
-/// function's arity, and the callee did not set the bail flag. `Double` args
-/// cross as `f64::to_bits` so the compiled prologue can `load F64` directly.
-/// On success the `i64` result is re-wrapped as `CfmlValue::Int`, or as
-/// `CfmlValue::Double` (via `f64::from_bits`) when `ret_float` is set.
+/// Returns `(result, bail_code)`. `bail_code = 0` ⇒ success and `result` is
+/// `Some(Ok(...))`. Any non-zero bail makes `result = None` and the bail code
+/// distinguishes transient deopt (`1`: div-by-zero / callee cache miss /
+/// callee bailed) from a Phase-2 speculation mismatch (`2`: UDF→UDF
+/// `ret_float` disagreement). The outer `try_call` evicts the caller's cache
+/// entry on bail=2 so the next hot trip re-specializes against the now-known
+/// callee `ret_float`. `Double` args cross as `f64::to_bits` so the compiled
+/// prologue can `load F64` directly; on success the `i64` result is
+/// re-wrapped as `CfmlValue::Int` or `Double`.
 fn run_compiled(
     f: CompiledFn,
     func: &BytecodeFunction,
     args: &[CfmlValue],
     ret_float: bool,
-) -> Option<CfmlResult> {
+) -> (Option<CfmlResult>, i64) {
     // Tier-1 binds exactly the declared params positionally; defaults/var-args
     // are rejected at analysis time, so arity must match precisely.
     if args.len() != func.params.len() {
-        return None;
+        return (None, 0);
     }
     let mut raw: Vec<i64> = Vec::with_capacity(args.len());
     for a in args {
         match a {
             CfmlValue::Int(i) => raw.push(*i),
             CfmlValue::Double(d) => raw.push(d.to_bits() as i64),
-            _ => return None, // non-numeric argument → let the interpreter handle it
+            _ => return (None, 0), // non-numeric argument → let the interpreter handle it
         }
     }
     let mut bail: i64 = 0;
     let result = unsafe { f(raw.as_ptr(), raw.len() as i64, &mut bail as *mut i64) };
     if bail != 0 {
-        return None; // runtime deopt (e.g. divide-by-zero) → interpret
+        return (None, bail); // runtime deopt → interpret; surface code to caller
     }
-    if ret_float {
-        Some(Ok(CfmlValue::Double(f64::from_bits(result as u64))))
+    let value = if ret_float {
+        CfmlValue::Double(f64::from_bits(result as u64))
     } else {
-        Some(Ok(CfmlValue::Int(result)))
-    }
+        CfmlValue::Int(result)
+    };
+    (Some(Ok(value)), 0)
 }
 
 #[cfg(test)]
