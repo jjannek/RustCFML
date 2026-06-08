@@ -373,7 +373,13 @@ pub enum CfmlValue {
     Bool(bool),
     Int(i64),
     Double(f64),
-    String(String),
+    /// CFML string value. Wrapped in `Arc<String>` (v0.87.0) so cloning a
+    /// `CfmlValue::String` is an `Arc::clone` (refcount bump) instead of a
+    /// heap allocation + copy. Mutating string ops (rare in CFML — strings
+    /// are usually returned as new values from `uCase`/`trim`/...) should
+    /// use `Arc::make_mut` for copy-on-write. The prerequisite for Option-γ
+    /// tag-pointer polymorphic values inside the JIT (`JIT_POLY_DESIGN.md`).
+    String(Arc<String>),
     /// Reference-typed array (Lucee semantics): a shared, interior-mutable
     /// handle. Aliases see each other's mutations. See `CfmlArray`.
     Array(CfmlArray),
@@ -505,7 +511,7 @@ impl CfmlValue {
             CfmlValue::Bool(b) => b.to_string(),
             CfmlValue::Int(i) => i.to_string(),
             CfmlValue::Double(d) => d.to_string(),
-            CfmlValue::String(s) => s.clone(),
+            CfmlValue::String(s) => (**s).clone(),
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
                 if visited.contains(&ptr) {
@@ -586,6 +592,16 @@ impl CfmlValue {
             }
             _ => {}
         }
+    }
+
+    /// Construct a `CfmlValue::String` from anything `Into<String>`. Wraps
+    /// the owned `String` in an `Arc` so cloning a `CfmlValue::String` is a
+    /// refcount bump instead of a heap allocation. Use this helper at every
+    /// new construction site; pattern matches stay unchanged thanks to
+    /// `Arc`'s `Deref<Target = String>`.
+    #[inline]
+    pub fn string(s: impl Into<String>) -> Self {
+        CfmlValue::String(Arc::new(s.into()))
     }
 
     /// Construct a `CfmlValue::Array` from an owned `Vec`, wrapping in the
@@ -1164,10 +1180,10 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
         }
     }
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<CfmlValue, E> {
-        Ok(CfmlValue::String(v.to_string()))
+        Ok(CfmlValue::String(Arc::new(v.to_string())))
     }
     fn visit_string<E: serde::de::Error>(self, v: String) -> Result<CfmlValue, E> {
-        Ok(CfmlValue::String(v))
+        Ok(CfmlValue::String(Arc::new(v)))
     }
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<CfmlValue, A::Error> {
         let mut vec = Vec::new();

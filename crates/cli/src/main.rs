@@ -43,7 +43,7 @@ fn native_greet(args: Vec<CfmlValue>) -> CfmlResult {
         .get(0)
         .map(|v| v.as_string())
         .unwrap_or_else(|| "World".to_string());
-    Ok(CfmlValue::String(format!("Hello, {}!", name)))
+    Ok(CfmlValue::string(format!("Hello, {}!", name)))
 }
 
 fn coerce_num(v: &CfmlValue) -> f64 {

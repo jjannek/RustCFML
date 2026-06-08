@@ -1271,7 +1271,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 if parts.is_empty() {
                     return Ok(CfmlValue::Null);
                 }
-                return Ok(CfmlValue::String(parts.join(&sep)));
+                return Ok(CfmlValue::string(parts.join(&sep)));
             }
             return Ok(aggregate_numeric(&lname, &col));
         }
@@ -1530,7 +1530,7 @@ fn apply_binary(l: &CfmlValue, op: BinaryOp, r: &CfmlValue) -> CfmlResult {
             if matches!(l, CfmlValue::Null) || matches!(r, CfmlValue::Null) {
                 Ok(CfmlValue::Null)
             } else {
-                Ok(CfmlValue::String(l.as_string() + &r.as_string()))
+                Ok(CfmlValue::string(l.as_string() + &r.as_string()))
             }
         }
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
@@ -1571,7 +1571,7 @@ fn arith(l: &CfmlValue, op: BinaryOp, r: &CfmlValue) -> CfmlResult {
                 }
                 return Ok(integral_or_double(a + b));
             }
-            _ => return Ok(CfmlValue::String(l.as_string() + &r.as_string())),
+            _ => return Ok(CfmlValue::string(l.as_string() + &r.as_string())),
         }
     }
     // Sub / Mul / Mod — integer-preserving when both sides are integers.

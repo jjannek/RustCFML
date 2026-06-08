@@ -331,7 +331,7 @@ mod tests {
         CfmlValue::array(vals)
     }
     fn s(v: &str) -> CfmlValue {
-        CfmlValue::String(v.to_string())
+        CfmlValue::string(v.to_string())
     }
     // CfmlValue has no PartialEq; compare by stringified form for tests.
     fn params_str(p: &PgStatement) -> Vec<String> {

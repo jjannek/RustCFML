@@ -183,7 +183,7 @@ fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
                 CfmlValue::Int(0)
             }
         }
-        serde_json::Value::String(s) => CfmlValue::String(s),
+        serde_json::Value::String(s) => CfmlValue::string(s),
         serde_json::Value::Array(arr) => {
             CfmlValue::array(arr.into_iter().map(json_value_to_cfml).collect())
         }
@@ -203,29 +203,29 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
     let mut cf = IndexMap::new();
     cf.insert(
         "productname".to_string(),
-        CfmlValue::String("RustCFML".to_string()),
+        CfmlValue::string("RustCFML".to_string()),
     );
     cf.insert(
         "productversion".to_string(),
-        CfmlValue::String(env!("CARGO_PKG_VERSION").to_string()),
+        CfmlValue::string(env!("CARGO_PKG_VERSION").to_string()),
     );
     cf.insert(
         "productlevel".to_string(),
-        CfmlValue::String("Final".to_string()),
+        CfmlValue::string("Final".to_string()),
     );
     info.insert("coldfusion".to_string(), CfmlValue::strukt(cf));
 
     let mut os = IndexMap::new();
     os.insert(
         "name".to_string(),
-        CfmlValue::String(std::env::consts::OS.to_string()),
+        CfmlValue::string(std::env::consts::OS.to_string()),
     );
     os.insert(
         "arch".to_string(),
-        CfmlValue::String(std::env::consts::ARCH.to_string()),
+        CfmlValue::string(std::env::consts::ARCH.to_string()),
     );
     if let Ok(host) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
-        os.insert("hostname".to_string(), CfmlValue::String(host));
+        os.insert("hostname".to_string(), CfmlValue::string(host));
     }
     info.insert("os".to_string(), CfmlValue::strukt(os));
 
@@ -234,23 +234,23 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
     let line_sep = if cfg!(windows) { "\r\n" } else { "\n" }.to_string();
 
     let mut sep = IndexMap::new();
-    sep.insert("file".to_string(), CfmlValue::String(file_sep.clone()));
-    sep.insert("path".to_string(), CfmlValue::String(path_sep.clone()));
-    sep.insert("line".to_string(), CfmlValue::String(line_sep.clone()));
+    sep.insert("file".to_string(), CfmlValue::string(file_sep.clone()));
+    sep.insert("path".to_string(), CfmlValue::string(path_sep.clone()));
+    sep.insert("line".to_string(), CfmlValue::string(line_sep.clone()));
     info.insert("separator".to_string(), CfmlValue::strukt(sep));
 
     let mut java = IndexMap::new();
     java.insert(
         "version".to_string(),
-        CfmlValue::String(String::new()),
+        CfmlValue::string(String::new()),
     );
     java.insert(
         "vendor".to_string(),
-        CfmlValue::String("RustCFML (no JVM)".to_string()),
+        CfmlValue::string("RustCFML (no JVM)".to_string()),
     );
     java.insert(
         "archModel".to_string(),
-        CfmlValue::String(
+        CfmlValue::string(
             if cfg!(target_pointer_width = "64") { "64" } else { "32" }.to_string(),
         ),
     );
@@ -260,7 +260,7 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
 
     let mut env = IndexMap::new();
     for (k, v) in std::env::vars() {
-        env.insert(k, CfmlValue::String(v));
+        env.insert(k, CfmlValue::string(v));
     }
     system.insert("environment".to_string(), CfmlValue::strukt(env));
 
@@ -277,28 +277,28 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
     let tmp = std::env::temp_dir().to_string_lossy().to_string();
     props.insert(
         "os.name".to_string(),
-        CfmlValue::String(std::env::consts::OS.to_string()),
+        CfmlValue::string(std::env::consts::OS.to_string()),
     );
     props.insert(
         "os.arch".to_string(),
-        CfmlValue::String(std::env::consts::ARCH.to_string()),
+        CfmlValue::string(std::env::consts::ARCH.to_string()),
     );
-    props.insert("user.dir".to_string(), CfmlValue::String(cwd));
-    props.insert("user.home".to_string(), CfmlValue::String(home));
-    props.insert("user.name".to_string(), CfmlValue::String(user));
-    props.insert("java.io.tmpdir".to_string(), CfmlValue::String(tmp));
-    props.insert("file.separator".to_string(), CfmlValue::String(file_sep));
-    props.insert("path.separator".to_string(), CfmlValue::String(path_sep));
-    props.insert("line.separator".to_string(), CfmlValue::String(line_sep));
+    props.insert("user.dir".to_string(), CfmlValue::string(cwd));
+    props.insert("user.home".to_string(), CfmlValue::string(home));
+    props.insert("user.name".to_string(), CfmlValue::string(user));
+    props.insert("java.io.tmpdir".to_string(), CfmlValue::string(tmp));
+    props.insert("file.separator".to_string(), CfmlValue::string(file_sep));
+    props.insert("path.separator".to_string(), CfmlValue::string(path_sep));
+    props.insert("line.separator".to_string(), CfmlValue::string(line_sep));
     props.insert(
         "file.encoding".to_string(),
-        CfmlValue::String("UTF-8".to_string()),
+        CfmlValue::string("UTF-8".to_string()),
     );
     system.insert("properties".to_string(), CfmlValue::strukt(props));
 
     let args: Vec<CfmlValue> = std::env::args()
         .skip(1)
-        .map(CfmlValue::String)
+        .map(CfmlValue::string)
         .collect();
     system.insert("arguments".to_string(), CfmlValue::array(args));
 
@@ -1350,13 +1350,13 @@ impl CfmlVirtualMachine {
     /// `cfthread.NAME = { status, name, output, error, elapsedtime, ...vars }`.
     pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
         let mut meta = IndexMap::new();
-        meta.insert("status".to_string(), CfmlValue::String(r.status));
+        meta.insert("status".to_string(), CfmlValue::string(r.status));
         meta.insert(
             "name".to_string(),
-            CfmlValue::String(thread_name.to_string()),
+            CfmlValue::string(thread_name.to_string()),
         );
-        meta.insert("output".to_string(), CfmlValue::String(r.output));
-        meta.insert("error".to_string(), CfmlValue::String(r.error));
+        meta.insert("output".to_string(), CfmlValue::string(r.output));
+        meta.insert("error".to_string(), CfmlValue::string(r.error));
         meta.insert("elapsedtime".to_string(), CfmlValue::Int(r.elapsed));
         for (k, v) in r.thread_vars {
             meta.insert(k, v);
@@ -1540,13 +1540,13 @@ impl CfmlVirtualMachine {
                 let mut entry = IndexMap::new();
                 entry.insert(
                     "template".to_string(),
-                    CfmlValue::String(f.template.clone()),
+                    CfmlValue::string(f.template.clone()),
                 );
                 entry.insert("line".to_string(), CfmlValue::Int(f.line as i64));
-                entry.insert("id".to_string(), CfmlValue::String("CFML".to_string()));
+                entry.insert("id".to_string(), CfmlValue::string("CFML".to_string()));
                 entry.insert(
                     "raw_trace".to_string(),
-                    CfmlValue::String(format!("at {}({}:{})", f.function, f.template, f.line)),
+                    CfmlValue::string(format!("at {}({}:{})", f.function, f.template, f.line)),
                 );
                 entry.insert("column".to_string(), CfmlValue::Int(0));
                 CfmlValue::strukt(entry)
@@ -1557,12 +1557,12 @@ impl CfmlVirtualMachine {
 
     fn build_error_struct(e: &CfmlError, tag_context: CfmlValue) -> CfmlValue {
         let mut err_struct = IndexMap::new();
-        err_struct.insert("message".to_string(), CfmlValue::String(e.message.clone()));
+        err_struct.insert("message".to_string(), CfmlValue::string(e.message.clone()));
         err_struct.insert(
             "type".to_string(),
-            CfmlValue::String(format!("{}", e.error_type)),
+            CfmlValue::string(format!("{}", e.error_type)),
         );
-        err_struct.insert("detail".to_string(), CfmlValue::String(String::new()));
+        err_struct.insert("detail".to_string(), CfmlValue::string(String::new()));
         err_struct.insert("tagcontext".to_string(), tag_context);
         CfmlValue::strukt(err_struct)
     }
@@ -1575,7 +1575,7 @@ impl CfmlVirtualMachine {
         let matched = matches!(
             self.last_exception.as_ref(),
             Some(CfmlValue::Struct(s))
-                if matches!(s.get("message"), Some(CfmlValue::String(msg)) if msg == e.message)
+                if matches!(s.get("message"), Some(CfmlValue::String(msg)) if msg.as_str() == e.message)
         );
         if matched {
             // last_exception already holds the right value; clone once for the stack
@@ -1668,7 +1668,7 @@ impl CfmlVirtualMachine {
                     CfmlValue::Int(q.row_count() as i64)
                 } else if name.eq_ignore_ascii_case("columnlist") {
                     // columnList reports column names uppercased, matching Lucee/ACF.
-                    CfmlValue::String(q.column_list())
+                    CfmlValue::string(q.column_list())
                 } else if let Some(col_data) = q.column_values_ci(name) {
                     // QueryColumn proxy: acts as Array for indexing/iteration
                     // but stringifies to first row (Lucee parity).
@@ -1997,7 +1997,7 @@ impl CfmlVirtualMachine {
                 BytecodeOp::False => stack.push(CfmlValue::Bool(false)),
                 BytecodeOp::Integer(n) => stack.push(CfmlValue::Int(*n)),
                 BytecodeOp::Double(d) => stack.push(CfmlValue::Double(*d)),
-                BytecodeOp::String(s) => stack.push(CfmlValue::String(s.clone())),
+                BytecodeOp::String(s) => stack.push(CfmlValue::string(s.clone())),
 
                 BytecodeOp::LoadLocal(name) => {
                     // Handle CFML scope references
@@ -2168,14 +2168,14 @@ impl CfmlVirtualMachine {
                             let mut exception = IndexMap::new();
                             exception.insert(
                                 "message".to_string(),
-                                CfmlValue::String(format!("Variable '{}' is undefined", name)),
+                                CfmlValue::string(format!("Variable '{}' is undefined", name)),
                             );
                             exception.insert(
                                 "type".to_string(),
-                                CfmlValue::String("expression".to_string()),
+                                CfmlValue::string("expression".to_string()),
                             );
                             exception
-                                .insert("detail".to_string(), CfmlValue::String(String::new()));
+                                .insert("detail".to_string(), CfmlValue::string(String::new()));
                             stack.truncate(handler.stack_depth);
                             self.restore_capture_state(&handler);
                             let exc = CfmlValue::strukt(exception);
@@ -2679,7 +2679,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::Double(d + *i as f64)
                         }
                         (CfmlValue::String(s), CfmlValue::String(t)) => {
-                            CfmlValue::String(format!("{}{}", s, t))
+                            CfmlValue::string(format!("{}{}", s, t))
                         }
                         // CFML: try numeric coercion
                         _ => {
@@ -2688,7 +2688,7 @@ impl CfmlVirtualMachine {
                             match (a_num, b_num) {
                                 (Some(x), Some(y)) => CfmlValue::Double(x + y),
                                 _ => {
-                                    CfmlValue::String(format!("{}{}", a.as_string(), b.as_string()))
+                                    CfmlValue::string(format!("{}{}", a.as_string(), b.as_string()))
                                 }
                             }
                         }
@@ -2709,14 +2709,14 @@ impl CfmlVirtualMachine {
                             let mut exception = IndexMap::new();
                             exception.insert(
                                 "message".to_string(),
-                                CfmlValue::String("Division by zero is not allowed.".to_string()),
+                                CfmlValue::string("Division by zero is not allowed.".to_string()),
                             );
                             exception.insert(
                                 "type".to_string(),
-                                CfmlValue::String("Expression".to_string()),
+                                CfmlValue::string("Expression".to_string()),
                             );
                             exception
-                                .insert("detail".to_string(), CfmlValue::String(String::new()));
+                                .insert("detail".to_string(), CfmlValue::string(String::new()));
                             exception.insert("tagcontext".to_string(), self.build_tag_context());
                             let error_val = CfmlValue::strukt(exception);
                             self.last_exception = Some(error_val.clone());
@@ -2785,7 +2785,7 @@ impl CfmlVirtualMachine {
                 // String concatenation
                 BytecodeOp::Concat => {
                     binary_op(&mut stack, |a, b| {
-                        CfmlValue::String(format!("{}{}", a.as_string(), b.as_string()))
+                        CfmlValue::string(format!("{}{}", a.as_string(), b.as_string()))
                     });
                 }
 
@@ -3615,7 +3615,7 @@ impl CfmlVirtualMachine {
                     let mut pairs = Vec::new();
                     for _ in 0..*count {
                         let value = stack.pop().unwrap_or(CfmlValue::Null);
-                        let key = stack.pop().unwrap_or(CfmlValue::String(String::new()));
+                        let key = stack.pop().unwrap_or(CfmlValue::string(String::new()));
                         pairs.push((key.as_string(), value));
                     }
                     let mut map = IndexMap::new();
@@ -3894,7 +3894,7 @@ impl CfmlVirtualMachine {
                                     }
                                     "columnlist" => {
                                         // Uppercase column names, matching Lucee/ACF columnList.
-                                        stack.push(CfmlValue::String(q.column_list()));
+                                        stack.push(CfmlValue::string(q.column_list()));
                                     }
                                     _ => {
                                         // Column access: q.columnName returns a QueryColumn
@@ -4005,7 +4005,7 @@ impl CfmlVirtualMachine {
                         } else {
                             let class_name = match &class_ref {
                                 CfmlValue::Function(f) => f.name.clone(),
-                                CfmlValue::String(s) => s.clone(),
+                                CfmlValue::String(s) => (**s).clone(),
                                 _ => class_ref.as_string(),
                             };
                             match self.resolve_component_template(&class_name, &locals) {
@@ -4294,7 +4294,7 @@ impl CfmlVirtualMachine {
                 BytecodeOp::Throw => {
                     let error_val = stack
                         .pop()
-                        .unwrap_or(CfmlValue::String("Unknown error".to_string()));
+                        .unwrap_or(CfmlValue::string("Unknown error".to_string()));
                     self.last_exception = Some(error_val.clone());
                     if let Some(handler) = self.try_stack.pop() {
                         // Unwind stack
@@ -4322,7 +4322,7 @@ impl CfmlVirtualMachine {
                     let error_val = self
                         .last_exception
                         .clone()
-                        .unwrap_or(CfmlValue::String("No exception to rethrow".to_string()));
+                        .unwrap_or(CfmlValue::string("No exception to rethrow".to_string()));
                     if let Some(handler) = self.try_stack.pop() {
                         while stack.len() > handler.stack_depth {
                             stack.pop();
@@ -4792,14 +4792,14 @@ impl CfmlVirtualMachine {
                         match val {
                             CfmlValue::Struct(s) => {
                                 let keys: Vec<CfmlValue> =
-                                    s.keys().into_iter().map(CfmlValue::String).collect();
+                                    s.keys().into_iter().map(CfmlValue::string).collect();
                                 stack.push(CfmlValue::array(keys));
                             }
                             CfmlValue::String(s) => {
                                 // Iterating over a string: convert to array of chars
                                 let chars: Vec<CfmlValue> = s
                                     .chars()
-                                    .map(|c| CfmlValue::String(c.to_string()))
+                                    .map(|c| CfmlValue::string(c.to_string()))
                                     .collect();
                                 stack.push(CfmlValue::array(chars));
                             }
@@ -4941,15 +4941,15 @@ impl CfmlVirtualMachine {
                                     let mut err_struct = IndexMap::new();
                                     err_struct.insert(
                                         "message".to_string(),
-                                        CfmlValue::String(e.message.clone()),
+                                        CfmlValue::string(e.message.clone()),
                                     );
                                     err_struct.insert(
                                         "type".to_string(),
-                                        CfmlValue::String(format!("{}", e.error_type)),
+                                        CfmlValue::string(format!("{}", e.error_type)),
                                     );
                                     err_struct.insert(
                                         "detail".to_string(),
-                                        CfmlValue::String(String::new()),
+                                        CfmlValue::string(String::new()),
                                     );
                                     err_struct
                                         .insert("tagcontext".to_string(), self.build_tag_context());
@@ -5041,15 +5041,15 @@ impl CfmlVirtualMachine {
                                     let mut err_struct = IndexMap::new();
                                     err_struct.insert(
                                         "message".to_string(),
-                                        CfmlValue::String(e.message.clone()),
+                                        CfmlValue::string(e.message.clone()),
                                     );
                                     err_struct.insert(
                                         "type".to_string(),
-                                        CfmlValue::String(format!("{}", e.error_type)),
+                                        CfmlValue::string(format!("{}", e.error_type)),
                                     );
                                     err_struct.insert(
                                         "detail".to_string(),
-                                        CfmlValue::String(String::new()),
+                                        CfmlValue::string(String::new()),
                                     );
                                     err_struct
                                         .insert("tagcontext".to_string(), self.build_tag_context());
@@ -5849,7 +5849,7 @@ impl CfmlVirtualMachine {
                             let mut pl: Option<IndexMap<String, CfmlValue>> = None;
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::String(k.clone()));
+                                cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
                                 cb_args.push(struct_val.clone());
                                 self.closure_parent_writeback = None;
@@ -5879,7 +5879,7 @@ impl CfmlVirtualMachine {
                             let mut pl: Option<IndexMap<String, CfmlValue>> = None;
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::String(k.clone()));
+                                cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
                                 cb_args.push(struct_val.clone());
                                 self.closure_parent_writeback = None;
@@ -5911,7 +5911,7 @@ impl CfmlVirtualMachine {
                             let mut pl: Option<IndexMap<String, CfmlValue>> = None;
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::String(k.clone()));
+                                cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
                                 cb_args.push(struct_val.clone());
                                 self.closure_parent_writeback = None;
@@ -5993,7 +5993,7 @@ impl CfmlVirtualMachine {
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(4);
                                 cb_args.push(acc.clone());
-                                cb_args.push(CfmlValue::String(k.clone()));
+                                cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
                                 cb_args.push(struct_val.clone());
                                 self.closure_parent_writeback = None;
@@ -6013,7 +6013,7 @@ impl CfmlVirtualMachine {
                             let callback = callback.clone();
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::String(k.clone()));
+                                cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
                                 cb_args.push(struct_val.clone());
                                 self.closure_parent_writeback = None;
@@ -6037,7 +6037,7 @@ impl CfmlVirtualMachine {
                             let callback = callback.clone();
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
-                                cb_args.push(CfmlValue::String(k.clone()));
+                                cb_args.push(CfmlValue::string(k.clone()));
                                 cb_args.push(v.clone());
                                 cb_args.push(struct_val.clone());
                                 self.closure_parent_writeback = None;
@@ -6069,7 +6069,7 @@ impl CfmlVirtualMachine {
                             .collect();
                         for (i, item) in items.iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(item.to_string()));
+                            cb_args.push(CfmlValue::string(item.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(list_val.clone());
                             self.closure_parent_writeback = None;
@@ -6097,7 +6097,7 @@ impl CfmlVirtualMachine {
                         let mut result = Vec::with_capacity(items.len());
                         for (i, item) in items.iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(item.to_string()));
+                            cb_args.push(CfmlValue::string(item.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(list_val.clone());
                             self.closure_parent_writeback = None;
@@ -6107,9 +6107,9 @@ impl CfmlVirtualMachine {
                             }
                             result.push(mapped.as_string());
                         }
-                        return Ok(CfmlValue::String(result.join(&first_delim)));
+                        return Ok(CfmlValue::string(result.join(&first_delim)));
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "listfilter" => {
                     if let (Some(list_val), Some(callback)) = (args.get(0), args.get(1)) {
@@ -6127,7 +6127,7 @@ impl CfmlVirtualMachine {
                         let mut result = Vec::new();
                         for (i, item) in items.iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(item.to_string()));
+                            cb_args.push(CfmlValue::string(item.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(list_val.clone());
                             self.closure_parent_writeback = None;
@@ -6139,9 +6139,9 @@ impl CfmlVirtualMachine {
                                 result.push(item.to_string());
                             }
                         }
-                        return Ok(CfmlValue::String(result.join(&first_delim)));
+                        return Ok(CfmlValue::string(result.join(&first_delim)));
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "listreduce" => {
                     if let (Some(list_val), Some(callback)) = (args.get(0), args.get(1)) {
@@ -6159,7 +6159,7 @@ impl CfmlVirtualMachine {
                         for (i, item) in items.iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(4);
                             cb_args.push(acc.clone());
-                            cb_args.push(CfmlValue::String(item.to_string()));
+                            cb_args.push(CfmlValue::string(item.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(list_val.clone());
                             self.closure_parent_writeback = None;
@@ -6188,7 +6188,7 @@ impl CfmlVirtualMachine {
                         for (i, item) in items.iter().enumerate().rev() {
                             let mut cb_args = Vec::with_capacity(4);
                             cb_args.push(acc.clone());
-                            cb_args.push(CfmlValue::String(item.to_string()));
+                            cb_args.push(CfmlValue::string(item.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(list_val.clone());
                             self.closure_parent_writeback = None;
@@ -6215,7 +6215,7 @@ impl CfmlVirtualMachine {
                             .collect();
                         for (i, item) in items.iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(item.to_string()));
+                            cb_args.push(CfmlValue::string(item.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(list_val.clone());
                             self.closure_parent_writeback = None;
@@ -6244,7 +6244,7 @@ impl CfmlVirtualMachine {
                             .collect();
                         for (i, item) in items.iter().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(item.to_string()));
+                            cb_args.push(CfmlValue::string(item.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(list_val.clone());
                             self.closure_parent_writeback = None;
@@ -6266,7 +6266,7 @@ impl CfmlVirtualMachine {
                         let callback = callback.clone();
                         for (i, ch) in s.chars().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(ch.to_string()));
+                            cb_args.push(CfmlValue::string(ch.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(str_val.clone());
                             self.closure_parent_writeback = None;
@@ -6285,7 +6285,7 @@ impl CfmlVirtualMachine {
                         let mut result = String::new();
                         for (i, ch) in s.chars().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(ch.to_string()));
+                            cb_args.push(CfmlValue::string(ch.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(str_val.clone());
                             self.closure_parent_writeback = None;
@@ -6295,9 +6295,9 @@ impl CfmlVirtualMachine {
                             }
                             result.push_str(&mapped.as_string());
                         }
-                        return Ok(CfmlValue::String(result));
+                        return Ok(CfmlValue::string(result));
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "stringfilter" => {
                     if let (Some(str_val), Some(callback)) = (args.get(0), args.get(1)) {
@@ -6306,7 +6306,7 @@ impl CfmlVirtualMachine {
                         let mut result = String::new();
                         for (i, ch) in s.chars().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(ch.to_string()));
+                            cb_args.push(CfmlValue::string(ch.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(str_val.clone());
                             self.closure_parent_writeback = None;
@@ -6318,9 +6318,9 @@ impl CfmlVirtualMachine {
                                 result.push(ch);
                             }
                         }
-                        return Ok(CfmlValue::String(result));
+                        return Ok(CfmlValue::string(result));
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "stringreduce" => {
                     if let (Some(str_val), Some(callback)) = (args.get(0), args.get(1)) {
@@ -6330,7 +6330,7 @@ impl CfmlVirtualMachine {
                         for (i, ch) in s.chars().enumerate() {
                             let mut cb_args = Vec::with_capacity(4);
                             cb_args.push(acc.clone());
-                            cb_args.push(CfmlValue::String(ch.to_string()));
+                            cb_args.push(CfmlValue::string(ch.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(str_val.clone());
                             self.closure_parent_writeback = None;
@@ -6349,7 +6349,7 @@ impl CfmlVirtualMachine {
                         let callback = callback.clone();
                         for (i, ch) in s.chars().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(ch.to_string()));
+                            cb_args.push(CfmlValue::string(ch.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(str_val.clone());
                             self.closure_parent_writeback = None;
@@ -6370,7 +6370,7 @@ impl CfmlVirtualMachine {
                         let callback = callback.clone();
                         for (i, ch) in s.chars().enumerate() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(ch.to_string()));
+                            cb_args.push(CfmlValue::string(ch.to_string()));
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(str_val.clone());
                             self.closure_parent_writeback = None;
@@ -6396,8 +6396,8 @@ impl CfmlVirtualMachine {
                             for i in 0..len {
                                 for j in 0..len - 1 - i {
                                     let cb_args = vec![
-                                        CfmlValue::String(chars[j].to_string()),
-                                        CfmlValue::String(chars[j + 1].to_string()),
+                                        CfmlValue::string(chars[j].to_string()),
+                                        CfmlValue::string(chars[j + 1].to_string()),
                                     ];
                                     self.closure_parent_writeback = None;
                                     let cmp =
@@ -6418,9 +6418,9 @@ impl CfmlVirtualMachine {
                         } else {
                             chars.sort();
                         }
-                        return Ok(CfmlValue::String(chars.into_iter().collect()));
+                        return Ok(CfmlValue::string(chars.into_iter().collect::<String>()));
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 // ---- Collection Higher-Order Functions ----
                 "collectioneach" | "each" => {
@@ -6443,7 +6443,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::Struct(s) => {
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(key.clone()));
+                                    cb_args.push(CfmlValue::string(key.clone()));
                                     cb_args.push(val.clone());
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6473,7 +6473,7 @@ impl CfmlVirtualMachine {
                                     list.split(',').filter(|s| !s.is_empty()).collect();
                                 for (i, item) in items.iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(item.to_string()));
+                                    cb_args.push(CfmlValue::string(item.to_string()));
                                     cb_args.push(CfmlValue::Int((i + 1) as i64));
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6512,7 +6512,7 @@ impl CfmlVirtualMachine {
                                 let mut result = IndexMap::new();
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(key.clone()));
+                                    cb_args.push(CfmlValue::string(key.clone()));
                                     cb_args.push(val.clone());
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6533,7 +6533,7 @@ impl CfmlVirtualMachine {
                                 let mut result: Vec<String> = Vec::with_capacity(items.len());
                                 for (i, item) in items.iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(item.to_string()));
+                                    cb_args.push(CfmlValue::string(item.to_string()));
                                     cb_args.push(CfmlValue::Int((i + 1) as i64));
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6544,7 +6544,7 @@ impl CfmlVirtualMachine {
                                     }
                                     result.push(mapped.as_string());
                                 }
-                                return Ok(CfmlValue::String(result.join(",")));
+                                return Ok(CfmlValue::string(result.join(",")));
                             }
                         }
                     }
@@ -6577,7 +6577,7 @@ impl CfmlVirtualMachine {
                                 let mut result = IndexMap::new();
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(key.clone()));
+                                    cb_args.push(CfmlValue::string(key.clone()));
                                     cb_args.push(val.clone());
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6600,7 +6600,7 @@ impl CfmlVirtualMachine {
                                 let mut result = Vec::new();
                                 for (i, item) in items.iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(item.to_string()));
+                                    cb_args.push(CfmlValue::string(item.to_string()));
                                     cb_args.push(CfmlValue::Int((i + 1) as i64));
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6613,7 +6613,7 @@ impl CfmlVirtualMachine {
                                         result.push(item.to_string());
                                     }
                                 }
-                                return Ok(CfmlValue::String(result.join(",")));
+                                return Ok(CfmlValue::string(result.join(",")));
                             }
                         }
                     }
@@ -6642,7 +6642,7 @@ impl CfmlVirtualMachine {
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(4);
                                     cb_args.push(acc.clone());
-                                    cb_args.push(CfmlValue::String(key.clone()));
+                                    cb_args.push(CfmlValue::string(key.clone()));
                                     cb_args.push(val.clone());
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6659,7 +6659,7 @@ impl CfmlVirtualMachine {
                                 for (i, item) in items.iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(4);
                                     cb_args.push(acc.clone());
-                                    cb_args.push(CfmlValue::String(item.to_string()));
+                                    cb_args.push(CfmlValue::string(item.to_string()));
                                     cb_args.push(CfmlValue::Int((i + 1) as i64));
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6698,7 +6698,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::Struct(s) => {
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(key.clone()));
+                                    cb_args.push(CfmlValue::string(key.clone()));
                                     cb_args.push(val.clone());
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6718,7 +6718,7 @@ impl CfmlVirtualMachine {
                                     list.split(',').filter(|s| !s.is_empty()).collect();
                                 for (i, item) in items.iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(item.to_string()));
+                                    cb_args.push(CfmlValue::string(item.to_string()));
                                     cb_args.push(CfmlValue::Int((i + 1) as i64));
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6760,7 +6760,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::Struct(s) => {
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(key.clone()));
+                                    cb_args.push(CfmlValue::string(key.clone()));
                                     cb_args.push(val.clone());
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -6780,7 +6780,7 @@ impl CfmlVirtualMachine {
                                     list.split(',').filter(|s| !s.is_empty()).collect();
                                 for (i, item) in items.iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(3);
-                                    cb_args.push(CfmlValue::String(item.to_string()));
+                                    cb_args.push(CfmlValue::string(item.to_string()));
                                     cb_args.push(CfmlValue::Int((i + 1) as i64));
                                     cb_args.push(collection.clone());
                                     self.closure_parent_writeback = None;
@@ -7065,31 +7065,31 @@ impl CfmlVirtualMachine {
                 "getcurrenttemplatepath" => {
                     if let Some(ref source) = self.source_file {
                         if let Ok(abs) = self.vfs.canonicalize(source) {
-                            return Ok(CfmlValue::String(abs));
+                            return Ok(CfmlValue::string(abs));
                         }
-                        return Ok(CfmlValue::String(source.clone()));
+                        return Ok(CfmlValue::string(source.clone()));
                     }
                     // Fallback to CWD
                     if let Ok(cwd) = std::env::current_dir() {
-                        return Ok(CfmlValue::String(cwd.to_string_lossy().to_string()));
+                        return Ok(CfmlValue::string(cwd.to_string_lossy().to_string()));
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "getbasetemplatepath" => {
                     if let Some(ref base) = self.base_template_path {
                         if let Ok(abs) = self.vfs.canonicalize(base) {
-                            return Ok(CfmlValue::String(abs));
+                            return Ok(CfmlValue::string(abs));
                         }
-                        return Ok(CfmlValue::String(base.clone()));
+                        return Ok(CfmlValue::string(base.clone()));
                     }
                     // Fall back to source_file
                     if let Some(ref source) = self.source_file {
                         if let Ok(abs) = self.vfs.canonicalize(source) {
-                            return Ok(CfmlValue::String(abs));
+                            return Ok(CfmlValue::string(abs));
                         }
-                        return Ok(CfmlValue::String(source.clone()));
+                        return Ok(CfmlValue::string(source.clone()));
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "expandpath" => {
                     // CFML expandPath: resolve relative to current template dir,
@@ -7132,7 +7132,7 @@ impl CfmlVirtualMachine {
                     {
                         result.push('/');
                     }
-                    return Ok(CfmlValue::String(result));
+                    return Ok(CfmlValue::string(result));
                 }
                 "isdefined" => {
                     // Runtime isDefined: argument is a string variable name
@@ -7200,7 +7200,7 @@ impl CfmlVirtualMachine {
                     // Try to get IANA timezone from environment variable first
                     if let Ok(tz) = std::env::var("TZ") {
                         if !tz.is_empty() {
-                            return Ok(CfmlValue::String(tz));
+                            return Ok(CfmlValue::string(tz));
                         }
                     }
                     // macOS/Linux: read /etc/localtime symlink target
@@ -7211,12 +7211,12 @@ impl CfmlVirtualMachine {
                             // Extract timezone from path like /usr/share/zoneinfo/America/New_York
                             if let Some(pos) = link_str.find("zoneinfo/") {
                                 let tz = &link_str[pos + 9..];
-                                return Ok(CfmlValue::String(tz.to_string()));
+                                return Ok(CfmlValue::string(tz.to_string()));
                             }
                         }
                     }
                     // Fallback: return UTC
-                    return Ok(CfmlValue::String("UTC".to_string()));
+                    return Ok(CfmlValue::string("UTC".to_string()));
                 }
                 "getapplicationmetadata" => {
                     // Build application metadata from the loaded Application.cfc
@@ -7237,7 +7237,7 @@ impl CfmlVirtualMachine {
                     }
                     if !meta.keys().any(|k| k.eq_ignore_ascii_case("name")) {
                         let nm = self.current_application_name.clone().unwrap_or_default();
-                        meta.insert("name".to_string(), CfmlValue::String(nm));
+                        meta.insert("name".to_string(), CfmlValue::string(nm));
                     }
                     return Ok(CfmlValue::strukt(meta));
                 }
@@ -7251,7 +7251,7 @@ impl CfmlVirtualMachine {
                         let name_val = s
                             .get("__name")
                             .cloned()
-                            .unwrap_or(CfmlValue::String(fallback_name.to_string()));
+                            .unwrap_or(CfmlValue::string(fallback_name.to_string()));
                         meta.insert("name".to_string(), name_val.clone());
                         // fullname mirrors getMetadata(): the dotted component path.
                         meta.insert("fullname".to_string(), name_val);
@@ -7268,21 +7268,21 @@ impl CfmlVirtualMachine {
                                 if !k.starts_with("__") {
                                     let mut func_meta = IndexMap::new();
                                     func_meta
-                                        .insert("name".to_string(), CfmlValue::String(k.clone()));
+                                        .insert("name".to_string(), CfmlValue::string(k.clone()));
                                     func_meta.insert(
                                         "access".to_string(),
-                                        CfmlValue::String(format!("{:?}", f.access).to_lowercase()),
+                                        CfmlValue::string(format!("{:?}", f.access).to_lowercase()),
                                     );
                                     if let Some(ref rt) = f.return_type {
                                         func_meta.insert(
                                             "returntype".to_string(),
-                                            CfmlValue::String(rt.clone()),
+                                            CfmlValue::string(rt.clone()),
                                         );
                                     }
                                     let params: Vec<CfmlValue> = f
                                         .params
                                         .iter()
-                                        .map(|p| CfmlValue::String(p.name.clone()))
+                                        .map(|p| CfmlValue::string(p.name.clone()))
                                         .collect();
                                     func_meta
                                         .insert("parameters".to_string(), CfmlValue::array(params));
@@ -7347,7 +7347,7 @@ impl CfmlVirtualMachine {
                     // argument fell through to the trailing `Null` return.
                     let args = if args.len() == 1 {
                         vec![
-                            CfmlValue::String("component".to_string()),
+                            CfmlValue::string("component".to_string()),
                             args.into_iter().next().unwrap(),
                         ]
                     } else {
@@ -7529,7 +7529,7 @@ impl CfmlVirtualMachine {
                             .map(|(_, v)| v.as_string())
                         {
                             if let Ok(contents) = std::fs::read_to_string(&file_path) {
-                                self.response_body = Some(CfmlValue::String(contents));
+                                self.response_body = Some(CfmlValue::string(contents));
                             }
                         }
                     }
@@ -7574,9 +7574,9 @@ impl CfmlVirtualMachine {
                     }
                     let mut empty = IndexMap::new();
                     empty.insert("headers".to_string(), CfmlValue::strukt(IndexMap::new()));
-                    empty.insert("content".to_string(), CfmlValue::String(String::new()));
-                    empty.insert("method".to_string(), CfmlValue::String(String::new()));
-                    empty.insert("protocol".to_string(), CfmlValue::String(String::new()));
+                    empty.insert("content".to_string(), CfmlValue::string(String::new()));
+                    empty.insert("method".to_string(), CfmlValue::string(String::new()));
+                    empty.insert("protocol".to_string(), CfmlValue::string(String::new()));
                     return Ok(CfmlValue::strukt(empty));
                 }
                 "__cfinvoke" => {
@@ -7695,7 +7695,7 @@ impl CfmlVirtualMachine {
                 "__cfsavecontent_end" => {
                     let captured = std::mem::take(&mut self.output_buffer);
                     self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
-                    return Ok(CfmlValue::String(captured));
+                    return Ok(CfmlValue::string(captured));
                 }
                 "invoke" => {
                     // Same as __cfinvoke: invoke(component, "methodName", argStruct)
@@ -8248,11 +8248,11 @@ impl CfmlVirtualMachine {
                                         let mut result = file_info.snapshot();
                                         result.insert(
                                             "serverDirectory".to_string(),
-                                            CfmlValue::String(destination),
+                                            CfmlValue::string(destination),
                                         );
                                         result.insert(
                                             "serverFile".to_string(),
-                                            CfmlValue::String(
+                                            CfmlValue::string(
                                                 final_path
                                                     .file_name()
                                                     .unwrap_or_default()
@@ -8345,11 +8345,11 @@ impl CfmlVirtualMachine {
                                     let mut result = file_info.snapshot();
                                     result.insert(
                                         "serverDirectory".to_string(),
-                                        CfmlValue::String(destination.clone()),
+                                        CfmlValue::string(destination.clone()),
                                     );
                                     result.insert(
                                         "serverFile".to_string(),
-                                        CfmlValue::String(
+                                        CfmlValue::string(
                                             final_path
                                                 .file_name()
                                                 .unwrap_or_default()
@@ -8399,7 +8399,7 @@ impl CfmlVirtualMachine {
                             let now = now_epoch_secs();
                             meta.insert(
                                 "sessionId".to_string(),
-                                CfmlValue::String(sid.clone()),
+                                CfmlValue::string(sid.clone()),
                             );
                             meta.insert(
                                 "timeCreated".to_string(),
@@ -8419,11 +8419,11 @@ impl CfmlVirtualMachine {
                     {
                         if let Some(session) = state.sessions.get(sid) {
                             if let Some(ref user) = session.auth_user {
-                                return Ok(CfmlValue::String(user.clone()));
+                                return Ok(CfmlValue::string(user.clone()));
                             }
                         }
                     }
-                    return Ok(CfmlValue::String(String::new()));
+                    return Ok(CfmlValue::string(String::new()));
                 }
                 "isuserloggedin" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
@@ -8610,10 +8610,10 @@ impl CfmlVirtualMachine {
                     let detail = args.get(2).map(|v| v.as_string()).unwrap_or_default();
                     let errorcode = args.get(3).map(|v| v.as_string()).unwrap_or_default();
 
-                    exception.insert("message".to_string(), CfmlValue::String(message.clone()));
-                    exception.insert("type".to_string(), CfmlValue::String(error_type));
-                    exception.insert("detail".to_string(), CfmlValue::String(detail));
-                    exception.insert("errorcode".to_string(), CfmlValue::String(errorcode));
+                    exception.insert("message".to_string(), CfmlValue::string(message.clone()));
+                    exception.insert("type".to_string(), CfmlValue::string(error_type));
+                    exception.insert("detail".to_string(), CfmlValue::string(detail));
+                    exception.insert("errorcode".to_string(), CfmlValue::string(errorcode));
                     exception.insert("tagcontext".to_string(), self.build_tag_context());
 
                     let error_val = CfmlValue::strukt(exception);
@@ -8741,7 +8741,7 @@ impl CfmlVirtualMachine {
                         .cache
                         .iter()
                         .filter(|(_, (_, exp))| exp.map_or(true, |e| now <= e))
-                        .map(|(k, _)| CfmlValue::String(k.clone()))
+                        .map(|(k, _)| CfmlValue::string(k.clone()))
                         .collect();
                     return Ok(CfmlValue::array(ids));
                 }
@@ -8813,11 +8813,11 @@ impl CfmlVirtualMachine {
                                             let mut result = IndexMap::new();
                                             result.insert(
                                                 "output".to_string(),
-                                                CfmlValue::String(stdout),
+                                                CfmlValue::string(stdout),
                                             );
                                             result.insert(
                                                 "error".to_string(),
-                                                CfmlValue::String(stderr),
+                                                CfmlValue::string(stderr),
                                             );
                                             return Ok(CfmlValue::strukt(result));
                                         } else {
@@ -8873,11 +8873,11 @@ impl CfmlVirtualMachine {
                         let mut meta = IndexMap::new();
                         meta.insert(
                             "status".to_string(),
-                            CfmlValue::String("RUNNING".to_string()),
+                            CfmlValue::string("RUNNING".to_string()),
                         );
                         meta.insert(
                             "name".to_string(),
-                            CfmlValue::String(thread_name.clone()),
+                            CfmlValue::string(thread_name.clone()),
                         );
                         let cf = self.get_or_create_cfthread_scope();
                         if let Some(ts) = cf.as_cfml_struct() {
@@ -8940,7 +8940,7 @@ impl CfmlVirtualMachine {
                         .last()
                         .map(|f| f.called_name.clone())
                         .unwrap_or_default();
-                    return Ok(CfmlValue::String(name));
+                    return Ok(CfmlValue::string(name));
                 }
 
                 "callstackget" => {
@@ -8959,8 +8959,8 @@ impl CfmlVirtualMachine {
                         .take(max_frames)
                         .map(|f| {
                             let mut s = IndexMap::new();
-                            s.insert("Function".to_string(), CfmlValue::String(f.function));
-                            s.insert("Template".to_string(), CfmlValue::String(f.template));
+                            s.insert("Function".to_string(), CfmlValue::string(f.function));
+                            s.insert("Template".to_string(), CfmlValue::string(f.template));
                             s.insert("LineNumber".to_string(), CfmlValue::Int(f.line as i64));
                             CfmlValue::strukt(s)
                         })
@@ -8983,7 +8983,7 @@ impl CfmlVirtualMachine {
                 "precisionevaluate" => {
                     let expr = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     let result = precision_evaluate_expr(&expr)?;
-                    return Ok(CfmlValue::String(result));
+                    return Ok(CfmlValue::string(result));
                 }
 
                 "__cfcustomtag" => {
@@ -9000,12 +9000,12 @@ impl CfmlVirtualMachine {
                     let mut this_tag = IndexMap::new();
                     this_tag.insert(
                         "executionmode".to_string(),
-                        CfmlValue::String("start".to_string()),
+                        CfmlValue::string("start".to_string()),
                     );
                     this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(run_end_phase));
                     this_tag.insert(
                         "generatedcontent".to_string(),
-                        CfmlValue::String(String::new()),
+                        CfmlValue::string(String::new()),
                     );
 
                     let caller_snapshot = parent_locals.clone();
@@ -9033,12 +9033,12 @@ impl CfmlVirtualMachine {
                         let mut this_tag = IndexMap::new();
                         this_tag.insert(
                             "executionmode".to_string(),
-                            CfmlValue::String("end".to_string()),
+                            CfmlValue::string("end".to_string()),
                         );
                         this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(true));
                         this_tag.insert(
                             "generatedcontent".to_string(),
-                            CfmlValue::String(String::new()),
+                            CfmlValue::string(String::new()),
                         );
 
                         let mut end_locals = start_locals;
@@ -9100,12 +9100,12 @@ impl CfmlVirtualMachine {
                     let mut this_tag = IndexMap::new();
                     this_tag.insert(
                         "executionmode".to_string(),
-                        CfmlValue::String("start".to_string()),
+                        CfmlValue::string("start".to_string()),
                     );
                     this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(true));
                     this_tag.insert(
                         "generatedcontent".to_string(),
-                        CfmlValue::String(String::new()),
+                        CfmlValue::string(String::new()),
                     );
 
                     let caller_snapshot = parent_locals.clone();
@@ -9160,12 +9160,12 @@ impl CfmlVirtualMachine {
                     let mut this_tag = IndexMap::new();
                     this_tag.insert(
                         "executionmode".to_string(),
-                        CfmlValue::String("end".to_string()),
+                        CfmlValue::string("end".to_string()),
                     );
                     this_tag.insert("hasendtag".to_string(), CfmlValue::Bool(true));
                     this_tag.insert(
                         "generatedcontent".to_string(),
-                        CfmlValue::String(body_content),
+                        CfmlValue::string(body_content),
                     );
 
                     let CustomTagState {
@@ -9721,7 +9721,7 @@ impl CfmlVirtualMachine {
                     let chars: Vec<CfmlValue> = object
                         .as_string()
                         .chars()
-                        .map(|c| CfmlValue::String(c.to_string()))
+                        .map(|c| CfmlValue::string(c.to_string()))
                         .collect();
                     return Ok(CfmlValue::array(chars));
                 }
@@ -9988,7 +9988,7 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(k.clone()));
+                            cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -10006,7 +10006,7 @@ impl CfmlVirtualMachine {
                         let mut result = IndexMap::new();
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(k.clone()));
+                            cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -10027,7 +10027,7 @@ impl CfmlVirtualMachine {
                         let mut result = IndexMap::new();
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(k.clone()));
+                            cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -10047,7 +10047,7 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(k.clone()));
+                            cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -10068,7 +10068,7 @@ impl CfmlVirtualMachine {
                     if let Some(callback) = extra_args.first().cloned() {
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(3);
-                            cb_args.push(CfmlValue::String(k.clone()));
+                            cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -10096,7 +10096,7 @@ impl CfmlVirtualMachine {
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(4);
                             cb_args.push(acc.clone());
-                            cb_args.push(CfmlValue::String(k.clone()));
+                            cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
@@ -10118,7 +10118,7 @@ impl CfmlVirtualMachine {
                 }
                 "columnlist" => {
                     // Uppercase column names, matching Lucee/ACF columnList.
-                    return Ok(CfmlValue::String(q.column_list()));
+                    return Ok(CfmlValue::string(q.column_list()));
                 }
                 "addrow" => Some("queryAddRow"),
                 "getrow" => Some("queryGetRow"),
@@ -10280,7 +10280,7 @@ impl CfmlVirtualMachine {
             },
             CfmlValue::Int(_) | CfmlValue::Double(_) => match method_lower.as_str() {
                 "tostring" => {
-                    return Ok(CfmlValue::String(object.as_string()));
+                    return Ok(CfmlValue::string(object.as_string()));
                 }
                 "abs" => Some("abs"),
                 "ceiling" | "ceil" => Some("ceiling"),
@@ -10464,7 +10464,7 @@ impl CfmlVirtualMachine {
                 return self.call_function(
                     &handler,
                     vec![
-                        CfmlValue::String(method.to_string()),
+                        CfmlValue::string(method.to_string()),
                         CfmlValue::strukt(missing_args),
                     ],
                     &method_locals,
@@ -11593,19 +11593,19 @@ impl CfmlVirtualMachine {
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 s.insert(
                     "__source_file".to_string(),
-                    CfmlValue::String(cfc_path.clone()),
+                    CfmlValue::string(cfc_path.clone()),
                 );
                 // Anonymous `component { ... }` declarations get __name = "Anonymous"
                 // baked in by the parser. Override with the dotted path the caller
                 // used (e.g. "oop.Greeter") so getMetadata(cfc).name matches Lucee/ACF.
                 let needs_override = match s.get("__name") {
-                    Some(CfmlValue::String(n)) => n == "Anonymous",
+                    Some(CfmlValue::String(n)) => n.as_str() == "Anonymous",
                     _ => true,
                 };
                 if needs_override {
                     s.insert(
                         "__name".to_string(),
-                        CfmlValue::String(class_name.to_string()),
+                        CfmlValue::string(class_name.to_string()),
                     );
                 }
             }
@@ -11937,7 +11937,7 @@ impl CfmlVirtualMachine {
             if !all_ifaces.is_empty() {
                 let mut m = s.snapshot();
                 let chain: Vec<CfmlValue> =
-                    all_ifaces.into_iter().map(CfmlValue::String).collect();
+                    all_ifaces.into_iter().map(CfmlValue::string).collect();
                 m.insert("__implements_chain".to_string(), CfmlValue::array(chain));
                 return Ok(CfmlValue::strukt(m));
             }
@@ -11993,9 +11993,9 @@ impl CfmlVirtualMachine {
             };
             child_map.insert(
                 "__rust_extends".to_string(),
-                CfmlValue::String(rust_class.to_string()),
+                CfmlValue::string(rust_class.to_string()),
             );
-            let mut chain = vec![CfmlValue::String(parent_name.to_string())];
+            let mut chain = vec![CfmlValue::string(parent_name.to_string())];
             if let Some(CfmlValue::Array(existing)) = child_map.get("__extends_chain") {
                 for item in existing.iter() {
                     chain.push(item.clone());
@@ -12011,7 +12011,7 @@ impl CfmlVirtualMachine {
         let old_source_file = if let CfmlValue::Struct(ref cs) = child {
             if let Some(CfmlValue::String(src)) = cs.get("__source_file") {
                 let prev = self.source_file.clone();
-                self.source_file = Some(src.clone());
+                self.source_file = Some(src.to_string());
                 Some(prev)
             } else {
                 None
@@ -12109,7 +12109,7 @@ impl CfmlVirtualMachine {
 
         // Build __extends_chain for isInstanceOf
         let mut chain = Vec::new();
-        chain.push(CfmlValue::String(parent_name.to_string()));
+        chain.push(CfmlValue::string(parent_name.to_string()));
         if let Some(CfmlValue::Array(existing)) = parent_map.get("__extends_chain") {
             for item in existing.iter() {
                 chain.push(item.clone());
@@ -12139,7 +12139,7 @@ impl CfmlVirtualMachine {
         if !all_implements.is_empty() {
             let chain: Vec<CfmlValue> = all_implements
                 .into_iter()
-                .map(|s| CfmlValue::String(s))
+                .map(|s| CfmlValue::string(s))
                 .collect();
             parent_map.insert("__implements_chain".to_string(), CfmlValue::array(chain));
         }
@@ -12194,7 +12194,7 @@ impl CfmlVirtualMachine {
                 Some(
                     self.vfs
                         .read_to_string(&path)
-                        .map(CfmlValue::String)
+                        .map(CfmlValue::string)
                         .map_err(|e| CfmlError::runtime(format!("fileRead: {}", e))),
                 )
             }
@@ -12267,9 +12267,9 @@ impl CfmlVirtualMachine {
                             .map(|content| {
                                 let lines: Vec<&str> = content.lines().collect();
                                 if line_num < lines.len() {
-                                    CfmlValue::String(lines[line_num].to_string())
+                                    CfmlValue::string(lines[line_num].to_string())
                                 } else {
-                                    CfmlValue::String(String::new())
+                                    CfmlValue::string(String::new())
                                 }
                             })
                             .map_err(|e| CfmlError::runtime(format!("fileReadLine: {}", e))),
@@ -12308,7 +12308,7 @@ impl CfmlVirtualMachine {
                 let path = get_str(0);
                 if self.vfs.exists(&path) {
                     let mut handle = IndexMap::new();
-                    handle.insert("path".to_string(), CfmlValue::String(path));
+                    handle.insert("path".to_string(), CfmlValue::string(path));
                     handle.insert("isOpen".to_string(), CfmlValue::Bool(true));
                     handle.insert("line".to_string(), CfmlValue::Int(0));
                     Some(Ok(CfmlValue::strukt(handle)))
@@ -12320,7 +12320,7 @@ impl CfmlVirtualMachine {
                 }
             }
             "fileclose" => Some(Ok(CfmlValue::Null)),
-            "gettempdirectory" => Some(Ok(CfmlValue::String(
+            "gettempdirectory" => Some(Ok(CfmlValue::string(
                 std::env::temp_dir().to_string_lossy().to_string(),
             ))),
 
@@ -12377,7 +12377,7 @@ impl CfmlVirtualMachine {
             Ok(CfmlValue::array(
                 entries
                     .into_iter()
-                    .map(|(name, _, _)| CfmlValue::String(name))
+                    .map(|(name, _, _)| CfmlValue::string(name))
                     .collect(),
             ))
         } else if list_info == "query" {
@@ -12387,7 +12387,7 @@ impl CfmlVirtualMachine {
             Ok(CfmlValue::array(
                 entries
                     .into_iter()
-                    .map(|(_, full, _)| CfmlValue::String(full))
+                    .map(|(_, full, _)| CfmlValue::string(full))
                     .collect(),
             ))
         }
@@ -12458,16 +12458,16 @@ impl CfmlVirtualMachine {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| fallback_dir.to_string());
             let mut row = IndexMap::new();
-            row.insert("name".to_string(), CfmlValue::String(name.clone()));
+            row.insert("name".to_string(), CfmlValue::string(name.clone()));
             row.insert("size".to_string(), CfmlValue::Int(size));
             row.insert(
                 "type".to_string(),
-                CfmlValue::String(if *is_dir { "Dir" } else { "File" }.to_string()),
+                CfmlValue::string(if *is_dir { "Dir" } else { "File" }.to_string()),
             );
-            row.insert("dateLastModified".to_string(), CfmlValue::String(date));
-            row.insert("attributes".to_string(), CfmlValue::String(String::new()));
-            row.insert("mode".to_string(), CfmlValue::String(String::new()));
-            row.insert("directory".to_string(), CfmlValue::String(directory));
+            row.insert("dateLastModified".to_string(), CfmlValue::string(date));
+            row.insert("attributes".to_string(), CfmlValue::string(String::new()));
+            row.insert("mode".to_string(), CfmlValue::string(String::new()));
+            row.insert("directory".to_string(), CfmlValue::string(directory));
             query.add_row(row);
         }
         CfmlValue::Query(query)
@@ -12545,12 +12545,12 @@ impl CfmlVirtualMachine {
             0
         };
         let mut info = IndexMap::new();
-        info.insert("name".to_string(), CfmlValue::String(name));
-        info.insert("path".to_string(), CfmlValue::String(path.to_string()));
+        info.insert("name".to_string(), CfmlValue::string(name));
+        info.insert("path".to_string(), CfmlValue::string(path.to_string()));
         info.insert("size".to_string(), CfmlValue::Int(size));
         info.insert(
             "type".to_string(),
-            CfmlValue::String(if is_file { "file" } else { "dir" }.to_string()),
+            CfmlValue::string(if is_file { "file" } else { "dir" }.to_string()),
         );
         info.insert("canRead".to_string(), CfmlValue::Bool(true));
         info.insert("canWrite".to_string(), CfmlValue::Bool(false));
@@ -12576,11 +12576,11 @@ impl CfmlVirtualMachine {
             } else if in_section && trimmed.contains('=') {
                 let (key, val) = trimmed.split_once('=').unwrap();
                 if key.trim().to_lowercase() == entry_lower {
-                    return Ok(CfmlValue::String(val.trim().to_string()));
+                    return Ok(CfmlValue::string(val.trim().to_string()));
                 }
             }
         }
-        Ok(CfmlValue::String(String::new()))
+        Ok(CfmlValue::string(String::new()))
     }
 
     /// Sandbox getProfileSections: read INI sections from VFS.
@@ -12598,7 +12598,7 @@ impl CfmlVirtualMachine {
                 if !current_section.is_empty() {
                     result.insert(
                         current_section.clone(),
-                        CfmlValue::String(current_keys.join(",")),
+                        CfmlValue::string(current_keys.join(",")),
                     );
                 }
                 current_section = trimmed[1..trimmed.len() - 1].trim().to_string();
@@ -12610,7 +12610,7 @@ impl CfmlVirtualMachine {
             }
         }
         if !current_section.is_empty() {
-            result.insert(current_section, CfmlValue::String(current_keys.join(",")));
+            result.insert(current_section, CfmlValue::string(current_keys.join(",")));
         }
         Ok(CfmlValue::strukt(result))
     }
@@ -12804,7 +12804,7 @@ impl CfmlVirtualMachine {
     /// builder the cfconfig datasources use, so both config paths agree.
     fn datasource_value_to_url(val: &CfmlValue) -> Option<String> {
         match val {
-            CfmlValue::String(s) if !s.is_empty() => Some(s.clone()),
+            CfmlValue::String(s) if !s.is_empty() => Some(s.to_string()),
             CfmlValue::Struct(s) => {
                 let get = |key: &str| -> String {
                     s.iter()
@@ -12906,7 +12906,7 @@ impl CfmlVirtualMachine {
             .find(|k| k.eq_ignore_ascii_case("datasource"))
             .cloned()
             .unwrap_or_else(|| "datasource".to_string());
-        map.insert(key, CfmlValue::String(url));
+        map.insert(key, CfmlValue::string(url));
         args[2] = CfmlValue::strukt(map);
         args
     }
@@ -13097,7 +13097,7 @@ impl CfmlVirtualMachine {
             .iter()
             .find(|(k, _)| k.to_lowercase() == "name")
             .and_then(|(_, v)| match v {
-                CfmlValue::String(s) => Some(s.clone()),
+                CfmlValue::String(s) => Some(s.to_string()),
                 _ => None,
             })
             .unwrap_or_else(|| "default".to_string());
@@ -13128,12 +13128,12 @@ impl CfmlVirtualMachine {
                     }
                     // Extract path: either a String directly or a Struct with a "path" key
                     let path = match val {
-                        CfmlValue::String(p) => Some(p.clone()),
+                        CfmlValue::String(p) => Some(p.to_string()),
                         CfmlValue::Struct(inner) => inner
                             .iter()
                             .find(|(k, _)| k.to_lowercase() == "path")
                             .and_then(|(_, v)| match v {
-                                CfmlValue::String(p) => Some(p.clone()),
+                                CfmlValue::String(p) => Some(p.to_string()),
                                 _ => None,
                             }),
                         _ => None,
@@ -13223,7 +13223,7 @@ impl CfmlVirtualMachine {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("sessionstorage"))
             .and_then(|(_, v)| match v {
-                CfmlValue::String(st) if !st.is_empty() => Some(st.clone()),
+                CfmlValue::String(st) if !st.is_empty() => Some(st.to_string()),
                 _ => None,
             });
 
@@ -13241,7 +13241,7 @@ impl CfmlVirtualMachine {
                             .iter()
                             .find(|(k, _)| k.eq_ignore_ascii_case("provider"))
                             .and_then(|(_, v)| match v {
-                                CfmlValue::String(s) => Some(s.clone()),
+                                CfmlValue::String(s) => Some(s.to_string()),
                                 _ => None,
                             })
                             .unwrap_or_default();
@@ -13663,8 +13663,8 @@ impl CfmlVirtualMachine {
                         &mut template,
                         "onError",
                         vec![
-                            CfmlValue::String(e.message.clone()),
-                            CfmlValue::String("onApplicationStart".to_string()),
+                            CfmlValue::string(e.message.clone()),
+                            CfmlValue::string("onApplicationStart".to_string()),
                         ],
                     );
                     return Err(e);
@@ -13759,7 +13759,7 @@ impl CfmlVirtualMachine {
         match self.call_lifecycle_method(
             &mut template,
             "onRequestStart",
-            vec![CfmlValue::String(target_page.clone())],
+            vec![CfmlValue::string(target_page.clone())],
         ) {
             Err(e) if e.message == "__cfabort" || e.message == "__cflocation_redirect" => {
                 return Ok(CfmlValue::Null);
@@ -13780,7 +13780,7 @@ impl CfmlVirtualMachine {
             match self.call_lifecycle_method(
                 &mut template,
                 "onRequest",
-                vec![CfmlValue::String(target_page.clone())],
+                vec![CfmlValue::string(target_page.clone())],
             ) {
                 Ok(_) => Ok(CfmlValue::Null),
                 Err(e) if e.message == "__cflocation_redirect" || e.message == "__cfabort" => {
@@ -13802,7 +13802,7 @@ impl CfmlVirtualMachine {
         let _ = self.call_lifecycle_method(
             &mut template,
             "onRequestEnd",
-            vec![CfmlValue::String(target_page)],
+            vec![CfmlValue::string(target_page)],
         );
 
         // 8a. Persist the live session scope back to the store. Session

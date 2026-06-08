@@ -72,7 +72,7 @@ pub fn fn_s3_read(args: Vec<CfmlValue>) -> CfmlResult {
     let bytes = s3_get_object(&client, &bucket, &key)?;
     let text = String::from_utf8(bytes)
         .map_err(|e| err(format!("S3Read: non-UTF-8 body for {}/{}: {}", bucket, key, e)))?;
-    Ok(CfmlValue::String(text))
+    Ok(CfmlValue::string(text))
 }
 
 /// S3ReadBinary(bucket, object [, accessKeyId, secretKey, host])
@@ -146,7 +146,7 @@ pub fn fn_s3_download(args: Vec<CfmlValue>) -> CfmlResult {
     }
     let text = String::from_utf8(bytes)
         .map_err(|e| err(format!("S3Download: non-UTF-8 body for {}/{}: {}", bucket, key, e)))?;
-    Ok(CfmlValue::String(text))
+    Ok(CfmlValue::string(text))
 }
 
 /// S3ListBuckets([accessKeyId, secretKey, host])
@@ -287,7 +287,7 @@ pub fn fn_s3_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                 if o.to_lowercase().starts_with("s3://") {
                     return Err(err("S3GetMetaData: second arg looks like another URL"));
                 }
-                o.clone()
+                (**o).clone()
             } else {
                 String::new()
             };
@@ -333,7 +333,7 @@ pub fn fn_s3_generate_presigned_url(args: Vec<CfmlValue>) -> CfmlResult {
         expires_min * 60,
         &method,
     )?;
-    Ok(CfmlValue::String(url))
+    Ok(CfmlValue::string(url))
 }
 
 /// S3GenerateURI(bucket [, object, style="virtualhost", secure=true, host])
@@ -380,7 +380,7 @@ pub fn fn_s3_generate_uri(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         url
     };
-    Ok(CfmlValue::String(url))
+    Ok(CfmlValue::string(url))
 }
 
 /// StoreGetMetadata(url) — parses an `s3://` URL and returns the head metadata.

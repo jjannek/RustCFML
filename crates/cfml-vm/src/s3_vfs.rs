@@ -26,7 +26,7 @@ fn err(msg: impl Into<String>) -> CfmlError {
 
 fn is_s3_string(v: &CfmlValue) -> Option<String> {
     match v {
-        CfmlValue::String(s) if s.to_lowercase().starts_with("s3://") => Some(s.clone()),
+        CfmlValue::String(s) if s.to_lowercase().starts_with("s3://") => Some((**s).clone()),
         _ => None,
     }
 }
@@ -104,7 +104,7 @@ impl CfmlVirtualMachine {
         // mapping rewrite.
         let first_raw = nth_string(args, 0)?.to_string();
         let (path, came_from_mapping) =
-            if is_s3_string(&CfmlValue::String(first_raw.clone())).is_some() {
+            if is_s3_string(&CfmlValue::string(first_raw.clone())).is_some() {
                 (first_raw, false)
             } else if let Some(rewritten) = self.resolve_s3_mapping(&first_raw) {
                 (rewritten, true)
@@ -142,7 +142,7 @@ impl CfmlVirtualMachine {
         // mapping-or-direct logic, returning the parsed URL + a "from mapping"
         // flag so we know whether to apply the prefix.
         let resolve_dst = |raw: &str| -> Result<(S3Url, bool), CfmlError> {
-            let (resolved, from_mapping) = if is_s3_string(&CfmlValue::String(raw.to_string()))
+            let (resolved, from_mapping) = if is_s3_string(&CfmlValue::string(raw.to_string()))
                 .is_some()
             {
                 (raw.to_string(), false)
@@ -181,7 +181,7 @@ impl CfmlVirtualMachine {
                     String::from_utf8(bytes)
                         .map_err(|e| err(format!("fileRead({}): non-UTF-8 body: {}", path, e)))
                 })
-                .map(CfmlValue::String),
+                .map(CfmlValue::string),
 
             "filereadbinary" => s3_get_object(&client, &url.bucket, &src_key)
                 .map(CfmlValue::Binary),
@@ -274,7 +274,7 @@ impl CfmlVirtualMachine {
                         } else {
                             o.key.as_str()
                         };
-                        arr.push(CfmlValue::String(format!(
+                        arr.push(CfmlValue::string(format!(
                             "s3://{}/{}",
                             url.bucket, visible
                         )));

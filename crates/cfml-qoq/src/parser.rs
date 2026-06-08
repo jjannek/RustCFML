@@ -568,7 +568,7 @@ impl Parser {
             }
             Token::String(s) => {
                 self.advance();
-                Ok(Expr::Literal(CfmlValue::String(s)))
+                Ok(Expr::Literal(CfmlValue::string(s)))
             }
             Token::Null => {
                 self.advance();

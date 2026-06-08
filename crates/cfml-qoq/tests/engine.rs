@@ -9,7 +9,7 @@ fn i(n: i64) -> CfmlValue {
     CfmlValue::Int(n)
 }
 fn s(v: &str) -> CfmlValue {
-    CfmlValue::String(v.to_string())
+    CfmlValue::string(v.to_string())
 }
 
 fn query(cols: &[&str], rows: &[&[CfmlValue]]) -> CfmlQuery {
@@ -285,7 +285,7 @@ fn parallel_filter_and_order_preserves_results() {
     for n in 1..=15000i64 {
         let mut m = IndexMap::new();
         m.insert("id".to_string(), CfmlValue::Int(n));
-        m.insert("name".to_string(), CfmlValue::String(format!("n{}", n)));
+        m.insert("name".to_string(), CfmlValue::string(format!("n{}", n)));
         q.add_row(m);
     }
     // Filter to id > 5000 (10000 rows), ordered DESC.

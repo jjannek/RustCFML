@@ -188,7 +188,7 @@ impl S3Config {
             app_s3.and_then(|m| {
                 m.iter().find(|(ak, _)| ak.eq_ignore_ascii_case(k)).and_then(
                     |(_, v)| match v {
-                        CfmlValue::String(s) if !s.is_empty() => Some(s.clone()),
+                        CfmlValue::String(s) if !s.is_empty() => Some((**s).clone()),
                         _ => None,
                     },
                 )
@@ -658,7 +658,7 @@ pub fn s3_get_metadata(
 
         let mut out = IndexMap::new();
         if let Some(ct) = resp.content_type() {
-            out.insert("content_type".to_string(), CfmlValue::String(ct.to_string()));
+            out.insert("content_type".to_string(), CfmlValue::string(ct.to_string()));
         }
         out.insert(
             "content_length".to_string(),
@@ -667,24 +667,24 @@ pub fn s3_get_metadata(
         if let Some(et) = resp.e_tag() {
             out.insert(
                 "etag".to_string(),
-                CfmlValue::String(et.trim_matches('"').to_string()),
+                CfmlValue::string(et.trim_matches('"').to_string()),
             );
         }
         if let Some(lm) = resp.last_modified() {
             out.insert(
                 "last_modified".to_string(),
-                CfmlValue::String(lm.to_string()),
+                CfmlValue::string(lm.to_string()),
             );
         }
         if let Some(sc) = resp.storage_class() {
             out.insert(
                 "storage_class".to_string(),
-                CfmlValue::String(sc.as_str().to_string()),
+                CfmlValue::string(sc.as_str().to_string()),
             );
         }
         if let Some(meta) = resp.metadata() {
             for (k, v) in meta.iter() {
-                out.insert(format!("x-amz-meta-{}", k), CfmlValue::String(v.clone()));
+                out.insert(format!("x-amz-meta-{}", k), CfmlValue::string(v.clone()));
             }
         }
         Ok(out)
@@ -737,16 +737,16 @@ pub fn objects_to_query_struct(objects: Vec<S3Object>) -> CfmlValue {
     let mut arr = Vec::with_capacity(objects.len());
     for o in objects {
         let mut s = IndexMap::new();
-        s.insert("key".to_string(), CfmlValue::String(o.key));
+        s.insert("key".to_string(), CfmlValue::string(o.key));
         s.insert("size".to_string(), CfmlValue::Int(o.size));
         s.insert(
             "lastModified".to_string(),
-            CfmlValue::String(o.last_modified),
+            CfmlValue::string(o.last_modified),
         );
-        s.insert("eTag".to_string(), CfmlValue::String(o.etag));
+        s.insert("eTag".to_string(), CfmlValue::string(o.etag));
         s.insert(
             "storageClass".to_string(),
-            CfmlValue::String(o.storage_class),
+            CfmlValue::string(o.storage_class),
         );
         s.insert("isDirectory".to_string(), CfmlValue::Bool(o.is_directory));
         arr.push(CfmlValue::strukt(s));
@@ -758,10 +758,10 @@ pub fn buckets_to_array(buckets: Vec<S3BucketInfo>) -> CfmlValue {
     let mut arr = Vec::with_capacity(buckets.len());
     for b in buckets {
         let mut s = IndexMap::new();
-        s.insert("bucketName".to_string(), CfmlValue::String(b.name));
+        s.insert("bucketName".to_string(), CfmlValue::string(b.name));
         s.insert(
             "creationDate".to_string(),
-            CfmlValue::String(b.creation_date),
+            CfmlValue::string(b.creation_date),
         );
         arr.push(CfmlValue::strukt(s));
     }
@@ -860,7 +860,7 @@ pub fn client_and_config_for_url(
 
 pub fn arg_opt_string(args: &[CfmlValue], idx: usize) -> Option<String> {
     args.get(idx).and_then(|v| match v {
-        CfmlValue::String(s) if !s.is_empty() => Some(s.clone()),
+        CfmlValue::String(s) if !s.is_empty() => Some((**s).clone()),
         CfmlValue::Null => None,
         CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) => None,
         _ => None,
@@ -870,7 +870,7 @@ pub fn arg_opt_string(args: &[CfmlValue], idx: usize) -> Option<String> {
 pub fn arg_string(args: &[CfmlValue], idx: usize) -> Result<String, CfmlError> {
     args.get(idx)
         .and_then(|v| match v {
-            CfmlValue::String(s) => Some(s.clone()),
+            CfmlValue::String(s) => Some((**s).clone()),
             _ => None,
         })
         .ok_or_else(|| err(format!("expected string argument at position {}", idx + 1)))
@@ -882,7 +882,7 @@ pub fn ok_void() -> CfmlResult {
 }
 
 pub fn ok_string(s: String) -> CfmlResult {
-    Ok(CfmlValue::String(s))
+    Ok(CfmlValue::string(s))
 }
 
 pub fn ok_bool(b: bool) -> CfmlResult {

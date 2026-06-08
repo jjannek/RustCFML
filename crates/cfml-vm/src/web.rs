@@ -116,14 +116,14 @@ pub fn build_web_scopes(
     let mut globals = IndexMap::new();
 
     let mut cgi = IndexMap::new();
-    cgi.insert("request_method".to_string(), CfmlValue::String(method.to_string()));
+    cgi.insert("request_method".to_string(), CfmlValue::string(method.to_string()));
     let path_info = if path_info.is_empty() { "/" } else { path_info };
-    cgi.insert("path_info".to_string(), CfmlValue::String(path_info.to_string()));
-    cgi.insert("script_name".to_string(), CfmlValue::String(script_name.to_string()));
-    cgi.insert("query_string".to_string(), CfmlValue::String(query_string.to_string()));
-    cgi.insert("server_port".to_string(), CfmlValue::String(port.to_string()));
-    cgi.insert("remote_addr".to_string(), CfmlValue::String(remote_addr.to_string()));
-    cgi.insert("remote_host".to_string(), CfmlValue::String(remote_addr.to_string()));
+    cgi.insert("path_info".to_string(), CfmlValue::string(path_info.to_string()));
+    cgi.insert("script_name".to_string(), CfmlValue::string(script_name.to_string()));
+    cgi.insert("query_string".to_string(), CfmlValue::string(query_string.to_string()));
+    cgi.insert("server_port".to_string(), CfmlValue::string(port.to_string()));
+    cgi.insert("remote_addr".to_string(), CfmlValue::string(remote_addr.to_string()));
+    cgi.insert("remote_host".to_string(), CfmlValue::string(remote_addr.to_string()));
 
     let mut content_type = String::new();
     let mut server_name = "127.0.0.1".to_string();
@@ -131,15 +131,15 @@ pub fn build_web_scopes(
         let lower = name.to_lowercase();
         if lower == "content-type" {
             content_type = value.clone();
-            cgi.insert("content_type".to_string(), CfmlValue::String(value.clone()));
+            cgi.insert("content_type".to_string(), CfmlValue::string(value.clone()));
         }
         if lower == "host" {
             server_name = value.split(':').next().unwrap_or(value).to_string();
         }
         let cgi_key = format!("http_{}", lower.replace('-', "_"));
-        cgi.insert(cgi_key, CfmlValue::String(value.clone()));
+        cgi.insert(cgi_key, CfmlValue::string(value.clone()));
     }
-    cgi.insert("server_name".to_string(), CfmlValue::String(server_name));
+    cgi.insert("server_name".to_string(), CfmlValue::string(server_name));
 
     globals.insert("cgi".to_string(), CfmlValue::strukt(cgi));
 
@@ -169,7 +169,7 @@ pub fn build_web_scopes(
                     if let Some(eq) = cookie.find('=') {
                         let cname = cookie[..eq].trim().to_string();
                         let cvalue = cookie[eq + 1..].trim().to_string();
-                        cookies.insert(cname, CfmlValue::String(cvalue));
+                        cookies.insert(cname, CfmlValue::string(cvalue));
                     }
                 }
             }
@@ -180,14 +180,14 @@ pub fn build_web_scopes(
 
     let mut headers_struct = IndexMap::new();
     for (name, value) in headers {
-        headers_struct.insert(name.clone(), CfmlValue::String(value.clone()));
+        headers_struct.insert(name.clone(), CfmlValue::string(value.clone()));
     }
 
     let mut http_request_data = IndexMap::new();
     http_request_data.insert("headers".to_string(), CfmlValue::strukt(headers_struct));
-    http_request_data.insert("content".to_string(), CfmlValue::String(raw_body));
-    http_request_data.insert("method".to_string(), CfmlValue::String(method.to_string()));
-    http_request_data.insert("protocol".to_string(), CfmlValue::String("HTTP/1.1".to_string()));
+    http_request_data.insert("content".to_string(), CfmlValue::string(raw_body));
+    http_request_data.insert("method".to_string(), CfmlValue::string(method.to_string()));
+    http_request_data.insert("protocol".to_string(), CfmlValue::string("HTTP/1.1".to_string()));
 
     (globals, CfmlValue::strukt(http_request_data))
 }
@@ -205,7 +205,7 @@ pub fn parse_query_string(qs: &str) -> IndexMap<String, CfmlValue> {
             let key = url_decode(key);
             let value = url_decode(value);
             if !key.is_empty() {
-                map.insert(key.to_lowercase(), CfmlValue::String(value));
+                map.insert(key.to_lowercase(), CfmlValue::string(value));
             }
         }
     }
@@ -325,14 +325,14 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> IndexMap<String,
             let (server_dir, temp_path) = write_multipart_file(&fname, part_body.as_bytes());
 
             let mut file_info = IndexMap::new();
-            file_info.insert("serverFile".to_string(), CfmlValue::String(fname.clone()));
-            file_info.insert("clientFile".to_string(), CfmlValue::String(fname.clone()));
-            file_info.insert("serverDirectory".to_string(), CfmlValue::String(server_dir));
-            file_info.insert("serverFileName".to_string(), CfmlValue::String(fname.clone()));
-            file_info.insert("tempFilePath".to_string(), CfmlValue::String(temp_path));
+            file_info.insert("serverFile".to_string(), CfmlValue::string(fname.clone()));
+            file_info.insert("clientFile".to_string(), CfmlValue::string(fname.clone()));
+            file_info.insert("serverDirectory".to_string(), CfmlValue::string(server_dir));
+            file_info.insert("serverFileName".to_string(), CfmlValue::string(fname.clone()));
+            file_info.insert("tempFilePath".to_string(), CfmlValue::string(temp_path));
             file_info.insert(
                 "contentType".to_string(),
-                CfmlValue::String(
+                CfmlValue::string(
                     part_content_type
                         .unwrap_or_else(|| "application/octet-stream".to_string()),
                 ),
@@ -342,7 +342,7 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> IndexMap<String,
 
             form.insert(field_name.to_lowercase(), CfmlValue::strukt(file_info));
         } else {
-            form.insert(field_name.to_lowercase(), CfmlValue::String(part_body.to_string()));
+            form.insert(field_name.to_lowercase(), CfmlValue::string(part_body.to_string()));
         }
     }
 

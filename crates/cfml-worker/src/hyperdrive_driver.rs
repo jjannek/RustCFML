@@ -81,7 +81,7 @@ impl WireParam {
             CfmlValue::Bool(b) => WireParam::Bool(*b),
             CfmlValue::Int(i) => WireParam::Int(*i),
             CfmlValue::Double(d) => WireParam::Float(*d),
-            CfmlValue::String(s) => WireParam::Str(s.clone()),
+            CfmlValue::String(s) => WireParam::Str((**s).clone()),
             other => WireParam::Str(other.as_string()),
         }
     }
@@ -193,10 +193,10 @@ fn json_to_cfml(v: serde_json::Value) -> CfmlValue {
             } else if let Some(f) = n.as_f64() {
                 CfmlValue::Double(f)
             } else {
-                CfmlValue::String(n.to_string())
+                CfmlValue::string(n.to_string())
             }
         }
-        serde_json::Value::String(s) => CfmlValue::String(s),
+        serde_json::Value::String(s) => CfmlValue::string(s),
         serde_json::Value::Array(arr) => {
             CfmlValue::array(arr.into_iter().map(json_to_cfml).collect())
         }
@@ -242,13 +242,13 @@ fn rows_to_query(
     let mut q = IndexMap::new();
     q.insert("recordCount".into(), CfmlValue::Int(record_count as i64));
     // columnList reports column names uppercased, matching Lucee/ACF.
-    q.insert("columnList".into(), CfmlValue::String(columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
+    q.insert("columnList".into(), CfmlValue::string(columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
     q.insert(
         "columns".into(),
         CfmlValue::array(
             columns
                 .iter()
-                .map(|c| CfmlValue::String(c.clone()))
+                .map(|c| CfmlValue::string(c.clone()))
                 .collect(),
         ),
     );

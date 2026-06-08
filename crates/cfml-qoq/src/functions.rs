@@ -11,11 +11,11 @@ use crate::compare::sql_equal;
 /// built-in (so the caller can fall through to native/custom registries).
 pub fn call_scalar(name: &str, args: &[CfmlValue]) -> Option<CfmlResult> {
     let r = match name.to_lowercase().as_str() {
-        "upper" | "ucase" => Ok(CfmlValue::String(arg_str(args, 0).to_uppercase())),
-        "lower" | "lcase" => Ok(CfmlValue::String(arg_str(args, 0).to_lowercase())),
-        "trim" => Ok(CfmlValue::String(arg_str(args, 0).trim().to_string())),
-        "ltrim" => Ok(CfmlValue::String(arg_str(args, 0).trim_start().to_string())),
-        "rtrim" => Ok(CfmlValue::String(arg_str(args, 0).trim_end().to_string())),
+        "upper" | "ucase" => Ok(CfmlValue::string(arg_str(args, 0).to_uppercase())),
+        "lower" | "lcase" => Ok(CfmlValue::string(arg_str(args, 0).to_lowercase())),
+        "trim" => Ok(CfmlValue::string(arg_str(args, 0).trim().to_string())),
+        "ltrim" => Ok(CfmlValue::string(arg_str(args, 0).trim_start().to_string())),
+        "rtrim" => Ok(CfmlValue::string(arg_str(args, 0).trim_end().to_string())),
         "len" | "length" => Ok(CfmlValue::Int(arg_str(args, 0).chars().count() as i64)),
         "left" => Ok(str_left(&arg_str(args, 0), arg_i64(args, 1).unwrap_or(0))),
         "right" => Ok(str_right(&arg_str(args, 0), arg_i64(args, 1).unwrap_or(0))),
@@ -24,15 +24,15 @@ pub fn call_scalar(name: &str, args: &[CfmlValue]) -> Option<CfmlResult> {
             arg_i64(args, 1).unwrap_or(1),
             args.get(2).and_then(to_i64),
         )),
-        "replace" => Ok(CfmlValue::String(
+        "replace" => Ok(CfmlValue::string(
             arg_str(args, 0).replace(&arg_str(args, 1), &arg_str(args, 2)),
         )),
-        "replacenocase" => Ok(CfmlValue::String(replace_nocase(
+        "replacenocase" => Ok(CfmlValue::string(replace_nocase(
             &arg_str(args, 0),
             &arg_str(args, 1),
             &arg_str(args, 2),
         ))),
-        "concat" => Ok(CfmlValue::String(
+        "concat" => Ok(CfmlValue::string(
             args.iter()
                 .filter(|v| !matches!(v, CfmlValue::Null))
                 .map(|v| v.as_string())
@@ -108,7 +108,7 @@ pub fn cast_value(value: &CfmlValue, ty: &str) -> CfmlResult {
         }
         "bit" | "boolean" | "bool" => Ok(CfmlValue::Bool(value.is_true())),
         "varchar" | "char" | "nvarchar" | "nchar" | "string" | "text" | "clob" => {
-            Ok(CfmlValue::String(value.as_string()))
+            Ok(CfmlValue::string(value.as_string()))
         }
         // Dates/timestamps and unknown types pass through unchanged (RustCFML
         // has no distinct date variant).
@@ -199,13 +199,13 @@ fn modulo(a: &CfmlValue, b: &CfmlValue) -> CfmlResult {
 
 fn str_left(s: &str, n: i64) -> CfmlValue {
     let n = n.max(0) as usize;
-    CfmlValue::String(s.chars().take(n).collect())
+    CfmlValue::string(s.chars().take(n).collect::<String>())
 }
 
 fn str_right(s: &str, n: i64) -> CfmlValue {
     let chars: Vec<char> = s.chars().collect();
     let n = (n.max(0) as usize).min(chars.len());
-    CfmlValue::String(chars[chars.len() - n..].iter().collect())
+    CfmlValue::string(chars[chars.len() - n..].iter().collect::<String>())
 }
 
 fn str_mid(s: &str, start: i64, len: Option<i64>) -> CfmlValue {
@@ -213,13 +213,13 @@ fn str_mid(s: &str, start: i64, len: Option<i64>) -> CfmlValue {
     // CFML/SQL positions are 1-based.
     let start0 = if start < 1 { 0 } else { (start - 1) as usize };
     if start0 >= chars.len() {
-        return CfmlValue::String(String::new());
+        return CfmlValue::string(String::new());
     }
     let take = match len {
         Some(l) if l >= 0 => (l as usize).min(chars.len() - start0),
         _ => chars.len() - start0,
     };
-    CfmlValue::String(chars[start0..start0 + take].iter().collect())
+    CfmlValue::string(chars[start0..start0 + take].iter().collect::<String>())
 }
 
 fn replace_nocase(s: &str, from: &str, to: &str) -> String {
@@ -251,7 +251,7 @@ mod tests {
     use super::*;
 
     fn s(v: &str) -> CfmlValue {
-        CfmlValue::String(v.to_string())
+        CfmlValue::string(v.to_string())
     }
 
     fn call(name: &str, args: &[CfmlValue]) -> CfmlValue {

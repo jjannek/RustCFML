@@ -43,7 +43,7 @@ fn run_request(server_state: &ServerState, vfs: Arc<dyn Vfs>, page: &str, endlog
     }
     // Hand onApplicationEnd a path to record that it fired.
     let mut url = IndexMap::new();
-    url.insert("endlog".to_string(), CfmlValue::String(endlog.to_string()));
+    url.insert("endlog".to_string(), CfmlValue::string(endlog.to_string()));
     vm.globals.insert("url".to_string(), CfmlValue::strukt(url));
     vm.globals
         .entry("cgi".to_string())
@@ -66,7 +66,7 @@ fn seed_of(server_state: &ServerState) -> String {
         .find(|(key, _)| key.eq_ignore_ascii_case("seed"))
         .expect("started application must hold a seed");
     match value {
-        CfmlValue::String(s) => s.clone(),
+        CfmlValue::String(s) => s.to_string(),
         other => panic!("seed should be a string, got {:?}", other),
     }
 }

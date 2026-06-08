@@ -22,7 +22,7 @@ fn classify(v: &CfmlValue) -> Option<Class> {
         CfmlValue::Int(i) => Some(Class::Num(*i as f64)),
         CfmlValue::Double(d) => Some(Class::Num(*d)),
         CfmlValue::Bool(b) => Some(Class::Num(if *b { 1.0 } else { 0.0 })),
-        CfmlValue::String(s) => Some(Class::Str(s.clone())),
+        CfmlValue::String(s) => Some(Class::Str((**s).clone())),
         // Arrays/structs/etc. aren't expected as QoQ cell values; compare by
         // their string form as a last resort.
         other => Some(Class::Str(other.as_string())),
@@ -146,20 +146,20 @@ mod tests {
     fn strings_compare_lexically_case_insensitive() {
         // Two strings compare lexically even when numeric-looking.
         assert_eq!(
-            compare_sql(&CfmlValue::String("10".into()), &CfmlValue::String("9".into())),
+            compare_sql(&CfmlValue::string("10"), &CfmlValue::string("9")),
             Some(Ordering::Less)
         );
         assert_eq!(
-            sql_equal(&CfmlValue::String("ABC".into()), &CfmlValue::String("abc".into())),
+            sql_equal(&CfmlValue::string("ABC"), &CfmlValue::string("abc")),
             Some(true)
         );
     }
 
     #[test]
     fn mixed_number_string_coerces_when_numeric() {
-        assert_eq!(sql_equal(&CfmlValue::Int(10), &CfmlValue::String("10".into())), Some(true));
+        assert_eq!(sql_equal(&CfmlValue::Int(10), &CfmlValue::string("10")), Some(true));
         assert_eq!(
-            compare_sql(&CfmlValue::Int(10), &CfmlValue::String("abc".into())),
+            compare_sql(&CfmlValue::Int(10), &CfmlValue::string("abc")),
             Some(str_cmp("10", "abc"))
         );
     }
@@ -167,18 +167,18 @@ mod tests {
     #[test]
     fn null_comparison_is_unknown() {
         assert_eq!(sql_equal(&CfmlValue::Null, &CfmlValue::Int(1)), None);
-        assert_eq!(compare_sql(&CfmlValue::Null, &CfmlValue::String("x".into())), None);
+        assert_eq!(compare_sql(&CfmlValue::Null, &CfmlValue::string("x")), None);
     }
 
     #[test]
     fn group_key_distinguishes_types() {
         assert_ne!(
             group_key(&[CfmlValue::Int(1)]),
-            group_key(&[CfmlValue::String("1".into())])
+            group_key(&[CfmlValue::string("1")])
         );
         assert_eq!(
-            group_key(&[CfmlValue::String("A".into())]),
-            group_key(&[CfmlValue::String("a".into())])
+            group_key(&[CfmlValue::string("A")]),
+            group_key(&[CfmlValue::string("a")])
         );
     }
 }

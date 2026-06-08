@@ -1515,8 +1515,8 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
         if let Ok(source) = fs::read_to_string(&template_path) {
             let mut extra = IndexMap::new();
             let mut err_struct = IndexMap::new();
-            err_struct.insert("message".to_string(), CfmlValue::String(e.message.clone()));
-            err_struct.insert("output".to_string(), CfmlValue::String(e.output.clone()));
+            err_struct.insert("message".to_string(), CfmlValue::string(e.message.clone()));
+            err_struct.insert("output".to_string(), CfmlValue::string(e.output.clone()));
             let mut req = IndexMap::new();
             req.insert("_error".to_string(), CfmlValue::strukt(err_struct));
             extra.insert("request".to_string(), CfmlValue::strukt(req));
@@ -2369,12 +2369,12 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
             if let Some(eq_pos) = raw.find('=') {
                 let key = raw[..eq_pos].to_lowercase();
                 let value = raw[eq_pos + 1..].to_string();
-                cli_scope.insert(key, CfmlValue::String(value));
+                cli_scope.insert(key, CfmlValue::string(value));
                 i += 1;
             } else {
                 let key = raw.to_lowercase();
                 if i + 1 < cli_args.len() && !cli_args[i + 1].starts_with("--") {
-                    cli_scope.insert(key, CfmlValue::String(cli_args[i + 1].clone()));
+                    cli_scope.insert(key, CfmlValue::string(cli_args[i + 1].clone()));
                     i += 2;
                 } else {
                     cli_scope.insert(key, CfmlValue::Bool(true));
@@ -2386,12 +2386,12 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
             if let Some(eq_pos) = raw.find('=') {
                 let key = raw[..eq_pos].to_lowercase();
                 let value = raw[eq_pos + 1..].to_string();
-                cli_scope.insert(key, CfmlValue::String(value));
+                cli_scope.insert(key, CfmlValue::string(value));
                 i += 1;
             } else {
                 let key = raw.to_lowercase();
                 if i + 1 < cli_args.len() && !cli_args[i + 1].starts_with("-") {
-                    cli_scope.insert(key, CfmlValue::String(cli_args[i + 1].clone()));
+                    cli_scope.insert(key, CfmlValue::string(cli_args[i + 1].clone()));
                     i += 2;
                 } else {
                     cli_scope.insert(key, CfmlValue::Bool(true));
@@ -2400,7 +2400,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
             }
         } else {
             // Positional: 1-based numeric key like CFML arguments scope
-            cli_scope.insert(positional_idx.to_string(), CfmlValue::String(arg.clone()));
+            cli_scope.insert(positional_idx.to_string(), CfmlValue::string(arg.clone()));
             positional_idx += 1;
             i += 1;
         }

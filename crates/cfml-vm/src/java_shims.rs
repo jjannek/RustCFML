@@ -18,11 +18,11 @@ pub fn handle_java_messagedigest(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.security.messagedigest".to_string()),
+                CfmlValue::string("java.security.messagedigest".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__algorithm".to_string(), CfmlValue::String(algorithm));
-            shim.insert("__data".to_string(), CfmlValue::String(String::new()));
+            shim.insert("__algorithm".to_string(), CfmlValue::string(algorithm));
+            shim.insert("__data".to_string(), CfmlValue::string(String::new()));
             Ok(CfmlValue::strukt(shim))
         }
         "update" => {
@@ -42,7 +42,7 @@ pub fn handle_java_messagedigest(
                 let mut new_shim = shim.snapshot();
                 new_shim.insert(
                     "__data".to_string(),
-                    CfmlValue::String(format!("{}{}", current, input)),
+                    CfmlValue::string(format!("{}{}", current, input)),
                 );
                 Ok(CfmlValue::strukt(new_shim))
             } else {
@@ -70,7 +70,7 @@ pub fn handle_java_messagedigest(
         "reset" => {
             if let CfmlValue::Struct(ref shim) = object {
                 let mut new_shim = shim.snapshot();
-                new_shim.insert("__data".to_string(), CfmlValue::String(String::new()));
+                new_shim.insert("__data".to_string(), CfmlValue::string(String::new()));
                 Ok(CfmlValue::strukt(new_shim))
             } else {
                 Ok(CfmlValue::Null)
@@ -87,10 +87,10 @@ pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue)
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.uuid".to_string()),
+                CfmlValue::string("java.util.uuid".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__uuid".to_string(), CfmlValue::String(uuid));
+            shim.insert("__uuid".to_string(), CfmlValue::string(uuid));
             Ok(CfmlValue::strukt(shim))
         }
         "tostring" => {
@@ -105,7 +105,7 @@ pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue)
                             &uuid[16..20],
                             &uuid[20..32]
                         );
-                        return Ok(CfmlValue::String(formatted));
+                        return Ok(CfmlValue::string(formatted));
                     }
                 }
             }
@@ -130,7 +130,7 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
             return match method {
                 "getname" => Ok(shim
                     .get("__name")
-                    .unwrap_or(CfmlValue::String("main".to_string()))),
+                    .unwrap_or(CfmlValue::string("main".to_string()))),
                 _ => Ok(CfmlValue::Null),
             };
         }
@@ -140,29 +140,29 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.lang.thread".to_string()),
+                CfmlValue::string("java.lang.thread".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__name".to_string(), CfmlValue::String("main".to_string()));
+            shim.insert("__name".to_string(), CfmlValue::string("main".to_string()));
             Ok(CfmlValue::strukt(shim))
         }
         "getname" => {
             if let CfmlValue::Struct(ref shim) = object {
                 Ok(shim
                     .get("__name")
-                    .unwrap_or(CfmlValue::String("main".to_string())))
+                    .unwrap_or(CfmlValue::string("main".to_string())))
             } else {
-                Ok(CfmlValue::String("main".to_string()))
+                Ok(CfmlValue::string("main".to_string()))
             }
         }
         "getthreadgroup" => {
             let mut tg = IndexMap::new();
             tg.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.lang.threadgroup".to_string()),
+                CfmlValue::string("java.lang.threadgroup".to_string()),
             );
             tg.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            tg.insert("__name".to_string(), CfmlValue::String("main".to_string()));
+            tg.insert("__name".to_string(), CfmlValue::string("main".to_string()));
             Ok(CfmlValue::strukt(tg))
         }
         "getpriority" => Ok(CfmlValue::Int(5)),
@@ -185,16 +185,16 @@ pub fn handle_java_inetaddress(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.net.inetaddress".to_string()),
+                CfmlValue::string("java.net.inetaddress".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert(
                 "__hostname".to_string(),
-                CfmlValue::String(hostname.clone()),
+                CfmlValue::string(hostname.clone()),
             );
             shim.insert(
                 "__address".to_string(),
-                CfmlValue::String("127.0.0.1".to_string()),
+                CfmlValue::string("127.0.0.1".to_string()),
             );
             Ok(CfmlValue::strukt(shim))
         }
@@ -206,16 +206,16 @@ pub fn handle_java_inetaddress(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.net.inetaddress".to_string()),
+                CfmlValue::string("java.net.inetaddress".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert(
                 "__hostname".to_string(),
-                CfmlValue::String(hostname.clone()),
+                CfmlValue::string(hostname.clone()),
             );
             shim.insert(
                 "__address".to_string(),
-                CfmlValue::String("127.0.0.1".to_string()),
+                CfmlValue::string("127.0.0.1".to_string()),
             );
             Ok(CfmlValue::strukt(shim))
         }
@@ -228,9 +228,9 @@ pub fn handle_java_inetaddress(
                 };
                 Ok(shim
                     .get(key)
-                    .unwrap_or(CfmlValue::String("localhost".to_string())))
+                    .unwrap_or(CfmlValue::string("localhost".to_string())))
             } else {
-                Ok(CfmlValue::String("localhost".to_string()))
+                Ok(CfmlValue::string("localhost".to_string()))
             }
         }
         _ => Ok(CfmlValue::Null),
@@ -244,10 +244,10 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.io.file".to_string()),
+                CfmlValue::string("java.io.file".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__path".to_string(), CfmlValue::String(path));
+            shim.insert("__path".to_string(), CfmlValue::string(path));
             Ok(CfmlValue::strukt(shim))
         }
         "tostring" => {
@@ -255,30 +255,30 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             if let CfmlValue::Struct(ref shim) = object {
                 return Ok(shim
                     .get("__path")
-                    .unwrap_or(CfmlValue::String(String::new())));
+                    .unwrap_or(CfmlValue::string(String::new())));
             }
-            Ok(CfmlValue::String(String::new()))
+            Ok(CfmlValue::string(String::new()))
         }
         "getabsolute_path" | "getabsolutepath" | "getcanonicalpath" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    let p = std::path::Path::new(&path);
+                    let p = std::path::Path::new(path.as_str());
                     if p.is_absolute() {
-                        return Ok(CfmlValue::String(path.clone()));
+                        return Ok(CfmlValue::string(path.to_string()));
                     }
                     if let Ok(cwd) = std::env::current_dir() {
-                        return Ok(CfmlValue::String(
-                            cwd.join(path).to_string_lossy().to_string(),
+                        return Ok(CfmlValue::string(
+                            cwd.join(path.as_str()).to_string_lossy().to_string(),
                         ));
                     }
                 }
             }
-            Ok(CfmlValue::String(String::new()))
+            Ok(CfmlValue::string(String::new()))
         }
         "isabsolute" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    return Ok(CfmlValue::Bool(std::path::Path::new(&path).is_absolute()));
+                    return Ok(CfmlValue::Bool(std::path::Path::new(path.as_str()).is_absolute()));
                 }
             }
             Ok(CfmlValue::Bool(false))
@@ -286,7 +286,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "exists" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    return Ok(CfmlValue::Bool(std::path::Path::new(&path).exists()));
+                    return Ok(CfmlValue::Bool(std::path::Path::new(path.as_str()).exists()));
                 }
             }
             Ok(CfmlValue::Bool(false))
@@ -294,7 +294,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "isfile" | "is_directory" | "isdirectory" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    let p = std::path::Path::new(&path);
+                    let p = std::path::Path::new(path.as_str());
                     return Ok(CfmlValue::Bool(if method == "isfile" {
                         p.is_file()
                     } else {
@@ -307,10 +307,10 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
         "getname" | "lastmodified" | "length" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    if let Ok(meta) = std::fs::metadata(&path) {
+                    if let Ok(meta) = std::fs::metadata(path.as_str()) {
                         if method == "getname" {
-                            if let Some(n) = std::path::Path::new(&path).file_name() {
-                                return Ok(CfmlValue::String(n.to_string_lossy().to_string()));
+                            if let Some(n) = std::path::Path::new(path.as_str()).file_name() {
+                                return Ok(CfmlValue::string(n.to_string_lossy().to_string()));
                             }
                         } else if method == "lastmodified" {
                             if let Ok(t) = meta.modified() {
@@ -334,7 +334,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
                     let mut ps = IndexMap::new();
                     ps.insert(
                         "__java_class".to_string(),
-                        CfmlValue::String("java.nio.file.paths".to_string()),
+                        CfmlValue::string("java.nio.file.paths".to_string()),
                     );
                     ps.insert("__java_shim".to_string(), CfmlValue::Bool(true));
                     ps.insert("__path".to_string(), path.clone());
@@ -355,14 +355,14 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.lang.system".to_string()),
+                CfmlValue::string("java.lang.system".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             // Expose `out` as a nested shim so `system.out.println(...)` works.
             let mut out = IndexMap::new();
             out.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.lang.system.out".to_string()),
+                CfmlValue::string("java.lang.system.out".to_string()),
             );
             out.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("out".to_string(), CfmlValue::strukt(out));
@@ -403,7 +403,7 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                 "java.version" => "rustcfml".to_string(),
                 _ => String::new(),
             };
-            Ok(CfmlValue::String(val))
+            Ok(CfmlValue::string(val))
         }
         "getenv" => {
             // No-arg form returns a struct of all env vars (real Java returns a Map).
@@ -413,11 +413,11 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                 _ => None,
             });
             match key {
-                Some(k) => Ok(CfmlValue::String(std::env::var(&k).unwrap_or_default())),
+                Some(k) => Ok(CfmlValue::string(std::env::var(k.as_str()).unwrap_or_default())),
                 None => {
                     let mut env = IndexMap::new();
                     for (k, v) in std::env::vars() {
-                        env.insert(k, CfmlValue::String(v));
+                        env.insert(k, CfmlValue::string(v));
                     }
                     Ok(CfmlValue::strukt(env))
                 }
@@ -438,10 +438,10 @@ pub fn handle_java_stringbuilder(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.lang.stringbuilder".to_string()),
+                CfmlValue::string("java.lang.stringbuilder".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__buffer".to_string(), CfmlValue::String(init));
+            shim.insert("__buffer".to_string(), CfmlValue::string(init));
             Ok(CfmlValue::strukt(shim))
         }
         "append" => {
@@ -454,7 +454,7 @@ pub fn handle_java_stringbuilder(
                 let mut ns = shim.snapshot();
                 ns.insert(
                     "__buffer".to_string(),
-                    CfmlValue::String(format!("{}{}", cur, app)),
+                    CfmlValue::string(format!("{}{}", cur, app)),
                 );
                 Ok(CfmlValue::strukt(ns))
             } else {
@@ -465,9 +465,9 @@ pub fn handle_java_stringbuilder(
             if let CfmlValue::Struct(ref shim) = object {
                 Ok(shim
                     .get("__buffer")
-                    .unwrap_or(CfmlValue::String(String::new())))
+                    .unwrap_or(CfmlValue::string(String::new())))
             } else {
-                Ok(CfmlValue::String(String::new()))
+                Ok(CfmlValue::string(String::new()))
             }
         }
         "length" => {
@@ -484,7 +484,7 @@ pub fn handle_java_stringbuilder(
         "clear" => {
             if let CfmlValue::Struct(ref shim) = object {
                 let mut ns = shim.snapshot();
-                ns.insert("__buffer".to_string(), CfmlValue::String(String::new()));
+                ns.insert("__buffer".to_string(), CfmlValue::string(String::new()));
                 Ok(CfmlValue::strukt(ns))
             } else {
                 Ok(CfmlValue::Null)
@@ -501,7 +501,7 @@ pub fn handle_java_treemap(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.treemap".to_string()),
+                CfmlValue::string("java.util.treemap".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             if let Some(CfmlValue::Struct(init)) = args.first() {
@@ -533,7 +533,7 @@ pub fn handle_java_treemap(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
                     .collect();
                 ks.sort(); // TreeMap = sorted key order
                 Ok(CfmlValue::array(
-                    ks.into_iter().map(CfmlValue::String).collect(),
+                    ks.into_iter().map(CfmlValue::string).collect(),
                 ))
             } else {
                 Ok(CfmlValue::array(Vec::new()))
@@ -589,7 +589,7 @@ pub fn handle_java_linkedhashmap(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.linkedhashmap".to_string()),
+                CfmlValue::string("java.util.linkedhashmap".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             Ok(CfmlValue::strukt(shim))
@@ -599,7 +599,7 @@ pub fn handle_java_linkedhashmap(
                 let ks: Vec<CfmlValue> = shim
                     .iter()
                     .filter(|(k, _)| !k.starts_with("__"))
-                    .map(|(k, _)| CfmlValue::String(k.clone()))
+                    .map(|(k, _)| CfmlValue::string(k.clone()))
                     .collect();
                 Ok(CfmlValue::array(ks))
             } else {
@@ -673,7 +673,7 @@ pub fn handle_java_concurrentlinkedqueue(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.concurrent.concurrentlinkedqueue".to_string()),
+                CfmlValue::string("java.util.concurrent.concurrentlinkedqueue".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert("__queue".to_string(), CfmlValue::array(Vec::new()));
@@ -764,7 +764,7 @@ pub fn handle_java_concurrenthashmap(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.concurrent.concurrenthashmap".to_string()),
+                CfmlValue::string("java.util.concurrent.concurrenthashmap".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             Ok(CfmlValue::strukt(shim))
@@ -831,7 +831,7 @@ pub fn handle_java_concurrenthashmap(
                         if values {
                             v.clone()
                         } else {
-                            CfmlValue::String(k.clone())
+                            CfmlValue::string(k.clone())
                         }
                     })
                     .collect();
@@ -874,7 +874,7 @@ pub fn handle_java_collections(
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.collections".to_string()),
+                CfmlValue::string("java.util.collections".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             Ok(CfmlValue::strukt(shim))
@@ -928,7 +928,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.nio.file.paths".to_string()),
+                CfmlValue::string("java.nio.file.paths".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             Ok(CfmlValue::strukt(shim))
@@ -938,25 +938,25 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.nio.file.paths".to_string()),
+                CfmlValue::string("java.nio.file.paths".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__path".to_string(), CfmlValue::String(path));
+            shim.insert("__path".to_string(), CfmlValue::string(path));
             Ok(CfmlValue::strukt(shim))
         }
         "getparent" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    if let Some(p) = std::path::Path::new(&path).parent() {
+                    if let Some(p) = std::path::Path::new(path.as_str()).parent() {
                         let mut ps = IndexMap::new();
                         ps.insert(
                             "__java_class".to_string(),
-                            CfmlValue::String("java.nio.file.paths".to_string()),
+                            CfmlValue::string("java.nio.file.paths".to_string()),
                         );
                         ps.insert("__java_shim".to_string(), CfmlValue::Bool(true));
                         ps.insert(
                             "__path".to_string(),
-                            CfmlValue::String(p.to_string_lossy().to_string()),
+                            CfmlValue::string(p.to_string_lossy().to_string()),
                         );
                         return Ok(CfmlValue::strukt(ps));
                     }
@@ -969,7 +969,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
         "isabsolute" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    return Ok(CfmlValue::Bool(std::path::Path::new(&path).is_absolute()));
+                    return Ok(CfmlValue::Bool(std::path::Path::new(path.as_str()).is_absolute()));
                 }
                 Ok(CfmlValue::Bool(false))
             } else {
@@ -980,24 +980,24 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
             if let CfmlValue::Struct(ref shim) = object {
                 Ok(shim
                     .get("__path")
-                    .unwrap_or(CfmlValue::String(String::new())))
+                    .unwrap_or(CfmlValue::string(String::new())))
             } else {
-                Ok(CfmlValue::String(String::new()))
+                Ok(CfmlValue::string(String::new()))
             }
         }
         "toabsolute" | "toabsolutepath" => {
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
-                    let p = std::path::Path::new(&path);
+                    let p = std::path::Path::new(path.as_str());
                     if p.is_absolute() {
                         return Ok(shim.get("__path").unwrap_or(CfmlValue::Null));
                     }
                     if let Ok(cwd) = std::env::current_dir() {
-                        let full = cwd.join(path);
+                        let full = cwd.join(path.as_str());
                         let mut ns = shim.snapshot();
                         ns.insert(
                             "__path".to_string(),
-                            CfmlValue::String(full.to_string_lossy().to_string()),
+                            CfmlValue::string(full.to_string_lossy().to_string()),
                         );
                         return Ok(CfmlValue::strukt(ns));
                     }
@@ -1056,7 +1056,7 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.regex.pattern".to_string()),
+                CfmlValue::string("java.util.regex.pattern".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             Ok(CfmlValue::strukt(shim))
@@ -1068,13 +1068,13 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.regex.pattern".to_string()),
+                CfmlValue::string("java.util.regex.pattern".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__regex".to_string(), CfmlValue::String(regex_str));
+            shim.insert("__regex".to_string(), CfmlValue::string(regex_str));
             Ok(CfmlValue::strukt(shim))
         }
-        "pattern" | "tostring" => Ok(CfmlValue::String(object_regex())),
+        "pattern" | "tostring" => Ok(CfmlValue::string(object_regex())),
         // Pattern.matcher(input) — create a Matcher positioned before the first
         // match. find()/matches()/lookingAt() (handled inline in the VM so they
         // can write the advanced state back) populate the capture groups.
@@ -1086,11 +1086,11 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             let mut shim = IndexMap::new();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::String("java.util.regex.matcher".to_string()),
+                CfmlValue::string("java.util.regex.matcher".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
-            shim.insert("__regex".to_string(), CfmlValue::String(regex_str));
-            shim.insert("__input".to_string(), CfmlValue::String(input));
+            shim.insert("__regex".to_string(), CfmlValue::string(regex_str));
+            shim.insert("__input".to_string(), CfmlValue::string(input));
             shim.insert("__groupcount".to_string(), CfmlValue::Int(group_count));
             shim.insert("__matched".to_string(), CfmlValue::Bool(false));
             shim.insert("__findindex".to_string(), CfmlValue::Int(0));
@@ -1172,7 +1172,7 @@ pub fn java_matcher_step(
         Some(caps) => (0..re.captures_len())
             .map(|i| {
                 caps.get(i)
-                    .map(|m| CfmlValue::String(m.as_str().to_string()))
+                    .map(|m| CfmlValue::string(m.as_str().to_string()))
                     .unwrap_or(CfmlValue::Null)
             })
             .collect(),
