@@ -171,6 +171,32 @@ extern "C" fn cfml_atan_f64(x: f64) -> f64 {
     x.atan()
 }
 
+// ── Bit-twiddling shims ───────────────────────────────────────────────────
+// Mirror `fn_bit_and/or/xor/not/shln/shrn` in cfml-stdlib. Operands are
+// always Int at the ABI; `bitNot` truncates to Java's 32-bit `int` semantics
+// (Lucee/Adobe parity) before complementing.
+
+extern "C" fn cfml_bit_and_i64(a: i64, b: i64) -> i64 {
+    a & b
+}
+extern "C" fn cfml_bit_or_i64(a: i64, b: i64) -> i64 {
+    a | b
+}
+extern "C" fn cfml_bit_xor_i64(a: i64, b: i64) -> i64 {
+    a ^ b
+}
+/// `fn_bit_not` truncates to 32 bits before complementing to match the
+/// interpreter's Java-int semantics: `(!(x as i32)) as i64`.
+extern "C" fn cfml_bit_not_i64(x: i64) -> i64 {
+    (!(x as i32)) as i64
+}
+extern "C" fn cfml_bit_shln_i64(a: i64, b: i64) -> i64 {
+    a << b
+}
+extern "C" fn cfml_bit_shrn_i64(a: i64, b: i64) -> i64 {
+    a >> b
+}
+
 /// The complete shim table. Order matters for `lookup_overload`: more specific
 /// signatures (e.g. `abs(Int)`) must precede broader ones (`abs(Numeric)`).
 pub static SHIMS: &[Shim] = &[
@@ -327,6 +353,55 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_atan_f64",
         addr: cfml_atan_f64 as *const u8,
+    },
+    // ── Bit-twiddling: 1 / 2-arg Int → Int ───────────────────────────────
+    Shim {
+        name: "bitand",
+        args_req: &[KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_and_i64",
+        addr: cfml_bit_and_i64 as *const u8,
+    },
+    Shim {
+        name: "bitor",
+        args_req: &[KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_or_i64",
+        addr: cfml_bit_or_i64 as *const u8,
+    },
+    Shim {
+        name: "bitxor",
+        args_req: &[KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_xor_i64",
+        addr: cfml_bit_xor_i64 as *const u8,
+    },
+    Shim {
+        name: "bitnot",
+        args_req: &[KindReq::Int],
+        args_abi: &[Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_not_i64",
+        addr: cfml_bit_not_i64 as *const u8,
+    },
+    Shim {
+        name: "bitshln",
+        args_req: &[KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_shln_i64",
+        addr: cfml_bit_shln_i64 as *const u8,
+    },
+    Shim {
+        name: "bitshrn",
+        args_req: &[KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_shrn_i64",
+        addr: cfml_bit_shrn_i64 as *const u8,
     },
 ];
 

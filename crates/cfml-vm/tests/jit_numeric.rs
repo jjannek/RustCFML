@@ -196,6 +196,31 @@ fn run_with_osr(src: &str) -> (String, usize, usize) {
 }
 
 #[test]
+fn jit_bit_twiddling_builtins_match_interpreter() {
+    // Exercises bitAnd / bitOr / bitXor / bitNot / bitShln / bitShrn inside a
+    // hot loop. Tests bit-level parity vs the interpreter — important
+    // because the interpreter does the 32-bit truncation dance on bitNot
+    // (Java parity) that Rust's `!` on i64 does NOT do natively.
+    let src = r#"
+        function kernel(n) {
+            var t = 0;
+            for (var i = 1; i <= n; i++) {
+                t = t + bitAnd(i, 7) + bitOr(i, 16) + bitXor(i, 42)
+                      + bitShln(1, i % 5) + bitShrn(i * 100, 2)
+                      + bitNot(i);
+            }
+            return t;
+        }
+        for (k = 1; k <= 120; k++) { x = kernel(100); }
+        writeOutput(x);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, jit, _osr) = run_with_osr(src);
+    assert_eq!(out, oracle, "bit builtins JIT output must match interpreter");
+    assert!(jit >= 1, "kernel() should have been whole-fn-JIT-compiled");
+}
+
+#[test]
 fn jit_extended_pure_math_builtins_match_interpreter() {
     // Exercises the v0.79.0 widened builtin allowlist: floor / ceiling /
     // round / sgn / fix (Numeric→Int) and sqr / exp / log / log10 / sin /
