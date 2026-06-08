@@ -171,6 +171,15 @@ struct Args {
     /// actually engaged the JIT. No effect when the JIT feature is off.
     #[arg(long)]
     jit_stats: bool,
+
+    /// Before executing, walk the compiled bytecode and print an
+    /// Option-γ coverage report to stderr: per-op classification
+    /// (supported / boxed-promising / hopeless) and the fraction of
+    /// functions that would become admissible once polymorphic
+    /// tag-pointer values land (see `JIT_POLY_DESIGN.md`). Forward-
+    /// looking diagnostic only — does not change execution behaviour.
+    #[arg(long)]
+    jit_coverage: bool,
 }
 
 /// Process-global flag set by the `--jit-stats` CLI option. Polled after
@@ -180,6 +189,11 @@ struct Args {
 /// execute) just for a debug knob; the JIT itself is also a process-global
 /// per-VM init, so the scope matches.
 static JIT_STATS_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Process-global flag set by `--jit-coverage`. Triggers the Option-γ
+/// coverage scan + render after compile, before run.
+static JIT_COVERAGE_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Encapsulates the full response from CFML execution, including HTTP metadata.
@@ -250,6 +264,15 @@ fn real_main() {
     }
     if args.jit_stats {
         JIT_STATS_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if args.jit_coverage {
+        JIT_COVERAGE_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Also propagate via env var so the in-cfml-vm compile path (which
+        // doesn't see the CLI args struct directly) can dump too. Set
+        // BEFORE the first VM init for the same reason as RUSTCFML_JIT.
+        unsafe {
+            std::env::set_var("RUSTCFML_JIT_COVERAGE", "1");
+        }
     }
 
     // Handle --build <app-dir>
@@ -599,6 +622,15 @@ fn compile_and_run(
         // Compile to bytecode
         let compiler = CfmlCompiler::new();
         let program = compiler.compile(ast);
+
+        // --jit-coverage: dump the Option-γ forecast before running. Cheap,
+        // pure read of the bytecode; doesn't change execution. Stderr so
+        // it doesn't interleave with the program's stdout.
+        #[cfg(feature = "jit")]
+        if JIT_COVERAGE_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let report = cfml_vm::jit::coverage::scan_program(&program);
+            eprintln!("{}", report.render());
+        }
 
         if debug {
             println!("=== BYTECODE ===");

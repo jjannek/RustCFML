@@ -15,7 +15,7 @@ mod java_shims;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
 /// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
 #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-mod jit;
+pub mod jit;
 #[cfg(feature = "s3")]
 mod s3_vfs;
 pub mod session_store;
@@ -418,6 +418,18 @@ pub fn compile_file_cached(
     let compiler =
         cfml_codegen::compiler::CfmlCompiler::new().with_source_file(Some(path.to_string()));
     let program = compiler.compile(ast);
+
+    // --jit-coverage / RUSTCFML_JIT_COVERAGE=1: dump the Option-γ forecast
+    // for this compilation unit before it gets cached. Cheap, side-effect-
+    // free walk of the bytecode (see `JIT_POLY_DESIGN.md` and v0.88.0).
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    if matches!(
+        std::env::var("RUSTCFML_JIT_COVERAGE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    ) {
+        let report = jit::coverage::scan_program(&program);
+        eprintln!("=== {} ===\n{}", path, report.render());
+    }
 
     // Cache the result
     if let Some(c) = cache {

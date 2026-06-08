@@ -73,6 +73,14 @@ pub enum Kind {
     /// `(global_id, sig)` cache entry is resolved at the matching `Call(n)`
     /// when concrete arg kinds are known.
     UdfRef(usize),
+    /// **Forward-declared (v0.88.0) for Option-γ tag-pointer polymorphic
+    /// values.** No analyser path yet produces or consumes this kind — the
+    /// real codegen lands in v0.90.0 / v0.91.0 (see `JIT_POLY_DESIGN.md`).
+    /// Reserved here so coverage instrumentation, tests, and downstream
+    /// pattern-matches can refer to it without a follow-up enum-extension
+    /// churn when v0.90.0 ships.
+    #[allow(dead_code)]
+    Boxed,
 }
 
 impl Kind {

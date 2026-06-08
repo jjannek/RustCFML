@@ -35,6 +35,7 @@ use std::sync::{Arc, RwLock};
 
 mod analysis;
 mod builtins;
+pub mod coverage;
 mod osr;
 mod translate;
 
