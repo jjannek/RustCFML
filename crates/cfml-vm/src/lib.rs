@@ -1014,6 +1014,14 @@ impl CfmlVirtualMachine {
         self.jit.as_ref().map_or(0, |j| j.compiled_count())
     }
 
+    /// Number of loop bodies the OSR engine has compiled. `0` when the `jit`
+    /// feature is off or the engine is disabled. Exposed for tests asserting
+    /// OSR fired (distinct from whole-function JIT).
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    pub fn osr_compiled_count(&self) -> usize {
+        self.jit.as_ref().map_or(0, |j| j.osr_compiled_count())
+    }
+
     /// Register every function in `prog` into `fn_registry` by its `global_id`
     /// (idempotent — a cached program registers the same Arc into the same slot).
     /// Grows the registry as needed; ids are dense across a process so the Vec
@@ -2906,6 +2914,74 @@ impl CfmlVirtualMachine {
                         _ => false,
                     };
                     if matched {
+                        // OSR (on-stack replacement) hook. When a hot back-edge
+                        // crosses the JIT threshold we compile the loop's body
+                        // region `[*target, ip)` to native code; subsequent
+                        // back-edges marshal locals across, run the compiled
+                        // body to completion (or until a runtime bail), and
+                        // resume the interpreter at `ip` (the natural
+                        // fall-through after this ForLoopStep). On bail we
+                        // simply fall through to the existing `ip = *target`
+                        // path and let the interpreter re-execute the body
+                        // once more — the compiled body has written back
+                        // the in-flight slot values so the next iteration
+                        // resumes from exactly the trapping point. With the
+                        // `jit` feature off the whole block compiles away.
+                        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+                        {
+                            // Snapshot the lookup tables first to keep the
+                            // borrow of `self.jit` clean — same pattern as
+                            // the whole-function JIT hook at the top of
+                            // `execute_function_with_args`.
+                            let user_functions = &self.user_functions;
+                            let globals = &self.globals;
+                            if let Some(engine) = self.jit.as_mut() {
+                                let is_canonical_builtin_wrapper = |v: &CfmlValue| -> bool {
+                                    if let CfmlValue::Function(f) = v {
+                                        if !f.params.is_empty() || f.captured_scope.is_some() {
+                                            return false;
+                                        }
+                                        let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
+                                        return matches!(
+                                            body,
+                                            cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
+                                        );
+                                    }
+                                    false
+                                };
+                                let mut is_shadowed = |name: &str| -> bool {
+                                    let lower = name.to_ascii_lowercase();
+                                    let ufn_hit = user_functions.contains_key(name)
+                                        || user_functions
+                                            .keys()
+                                            .any(|k| k.eq_ignore_ascii_case(&lower));
+                                    if ufn_hit {
+                                        return true;
+                                    }
+                                    let g = globals.get(name).or_else(|| {
+                                        globals
+                                            .iter()
+                                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+                                            .map(|(_, v)| v)
+                                    });
+                                    match g {
+                                        Some(v) => !is_canonical_builtin_wrapper(v),
+                                        None => false,
+                                    }
+                                };
+                                if let Some(exit_ip) = engine.try_run_loop(
+                                    func,
+                                    *target,
+                                    ip,
+                                    &mut locals,
+                                    closure_env.as_ref(),
+                                    &mut is_shadowed,
+                                ) {
+                                    ip = exit_ip;
+                                    continue;
+                                }
+                            }
+                        }
                         ip = *target;
                     }
                 }

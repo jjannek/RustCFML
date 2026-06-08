@@ -175,6 +175,80 @@ fn builtin_calls_jit_and_match_interpreter() {
     assert!(compiled >= 1, "expected score() to be JIT-compiled");
 }
 
+/// Same setup as `run` but also returns the count of OSR-compiled loop bodies
+/// — used to confirm OSR specifically fired (not just whole-fn JIT).
+fn run_with_osr(src: &str) -> (String, usize, usize) {
+    std::env::set_var("RUSTCFML_JIT_THRESHOLD", "1");
+    std::env::remove_var("RUSTCFML_JIT");
+    let mut vm = CfmlVirtualMachine::new(compile(src));
+    for (name, value) in get_builtins() {
+        vm.globals.insert(name, value);
+    }
+    for (name, func) in get_builtin_functions() {
+        vm.builtins.insert(name, func);
+    }
+    vm.execute().expect("execute");
+    (
+        vm.get_output().trim().to_string(),
+        vm.jit_compiled_count(),
+        vm.osr_compiled_count(),
+    )
+}
+
+#[test]
+fn osr_simple_main_loop_matches_interpreter() {
+    // Simplest possible hot __main__ loop. Threshold=1 means OSR engages on
+    // the 2nd back-edge — the rest of the iterations run natively.
+    let src = "sum = 0; for (i = 1; i <= 10; i++) { sum = sum + i; } writeOutput(sum);";
+    let oracle = run_interpreter(src);
+    let (out, _jit, osr) = run_with_osr(src);
+    assert_eq!(out, oracle);
+    assert!(osr >= 1, "expected at least one loop to OSR-compile, got {osr}");
+}
+
+#[test]
+fn osr_nested_inner_loop_exits_to_outer_body_not_writeback() {
+    // Regression: in an early draft of compile_loop the INNER ForLoopStep's
+    // matched-false branch jumped to the OUTER writeback block, exiting the
+    // entire OSR'd region after one inner iteration. Correct behaviour is to
+    // fall through to the next basic block (the outer-body code after the
+    // inner loop), so only the OUTERMOST ForLoopStep exits via writeback.
+    let src = r#"
+        acc = 0;
+        for (k = 1; k <= 4; k++) {
+            t = 0;
+            for (i = 1; i <= 3; i++) { t = t + i; }
+            acc = acc + t;
+        }
+        writeOutput(acc);
+    "#;
+    // inner = 1+2+3 = 6; acc = 4 * 6 = 24
+    let oracle = run_interpreter(src);
+    let (out, _jit, _osr) = run_with_osr(src);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn hot_main_loop_osrs_and_matches_interpreter() {
+    // The hot loop lives at __main__ scope, which the whole-fn JIT rejects
+    // outright. Without OSR none of this runs natively; with OSR the body of
+    // the outer loop compiles and the interpreter only runs each iteration's
+    // first step before handing over.
+    let src = r#"
+        acc = 0;
+        for (k = 1; k <= 200; k++) {
+            t = 0;
+            for (i = 1; i <= 50; i++) { t = t + abs(i - 25); }
+            acc = acc + t;
+        }
+        writeOutput(acc);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _jit, osr) = run_with_osr(src);
+    assert_eq!(out, oracle, "OSR'd loop output must equal the interpreter");
+    assert!(osr >= 1, "expected at least one loop to be OSR-compiled, got {osr}");
+}
+
 // (engine-level shadow guard is covered by the `shadow_check_short_circuits_jit`
 //  unit test in `crates/cfml-vm/src/jit/mod.rs`. A full e2e shadowing test
 //  isn't included here because RustCFML's `LoadGlobal` lookup order resolves

@@ -23,13 +23,17 @@
 //! i64 ops, bit-exact with the interpreter's `CfmlValue::Int(i + j)` in release
 //! builds. See `JIT_DESIGN.md` for the full rationale and gotchas.
 
-use cfml_codegen::BytecodeFunction;
+use cfml_codegen::{BytecodeFunction, BytecodeOp};
 use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::CfmlResult;
+use indexmap::IndexMap;
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 mod analysis;
 mod builtins;
+mod osr;
 mod translate;
 
 /// ABI of every Tier-1 compiled function.
@@ -110,13 +114,50 @@ fn signature_for(args: &[CfmlValue]) -> Option<u64> {
     Some(((mask as u64) << 32) | (args.len() as u64))
 }
 
+/// Composite key for the per-loop OSR cache: `(global_id, region_start_ip)`.
+/// One entry per (function, hot-loop site); a subsequent call that observes a
+/// different kind layout for the same loop simply bails (no re-specialization).
+type OsrKey = (u32, usize);
+
+/// Successfully compiled OSR loop body — see [`osr::CompiledLoop`].
+struct OsrCompiled {
+    ptr: osr::CompiledLoop,
+    slots: Vec<osr::OsrSlot>,
+    exit_ip: usize,
+    referenced_builtins: Vec<&'static str>,
+}
+
+enum OsrCacheEntry {
+    Unjittable,
+    Compiled(OsrCompiled),
+}
+
 /// The JIT engine, owned by the VM (one per VM instance; child cfthread VMs get
 /// their own). Holds the Cranelift module that owns all executable memory, the
 /// reusable compilation context, the per-function cache, and the profiler.
+///
+/// OSR (On-Stack Replacement) state lives alongside the whole-function cache:
+/// hot loops in `__main__` (or any non-eligible enclosing function) compile
+/// their body region to native code on a separate `osr_cache`, sharing the
+/// single [`translate::Backend`] (and therefore the single JIT module, shim
+/// symbols, and executable memory). See `JIT_OSR_DESIGN.md`.
 pub struct JitEngine {
     cache: FxHashMap<CacheKey, CacheEntry>,
     hot: HotnessTracker,
     backend: translate::Backend,
+    /// Per-(function, loop-start) cache. Once a loop is compiled or marked
+    /// `Unjittable` it stays that way for the life of this engine.
+    osr_cache: FxHashMap<OsrKey, OsrCacheEntry>,
+    /// Hotness counter for OSR loop sites. A loop becomes a compilation
+    /// candidate when its back-edge has been observed `threshold` times. Uses
+    /// the same threshold as whole-function JIT; loop back-edges trip the
+    /// counter faster than function calls, so OSR engages almost immediately
+    /// on any loop that runs more than a handful of iterations.
+    osr_hot: FxHashMap<OsrKey, u32>,
+    /// Test/introspection counter — incremented exactly when a loop body is
+    /// successfully compiled to native code. Distinct from the whole-fn
+    /// counter so e2e tests can assert OSR specifically fired.
+    osr_compiled: usize,
 }
 
 impl JitEngine {
@@ -141,7 +182,16 @@ impl JitEngine {
             cache: FxHashMap::default(),
             hot: HotnessTracker::new(threshold),
             backend,
+            osr_cache: FxHashMap::default(),
+            osr_hot: FxHashMap::default(),
+            osr_compiled: 0,
         })
+    }
+
+    /// Count of OSR-compiled loop bodies currently in cache. Used by tests to
+    /// confirm OSR (not just whole-fn JIT) actually fired.
+    pub fn osr_compiled_count(&self) -> usize {
+        self.osr_compiled
     }
 
     /// Number of functions currently holding a compiled native body. Used by
@@ -237,6 +287,219 @@ impl JitEngine {
         };
         self.cache.insert(key, entry);
         run
+    }
+
+    /// Try to run a hot loop natively via OSR. Returns:
+    /// * `Some(exit_ip)` — the compiled body ran to completion. `locals`
+    ///   and `closure_env` have been updated with the post-loop slot values;
+    ///   the caller must advance the interpreter `ip` to this value.
+    /// * `None` — either not hot yet, not eligible, kind mismatch, runtime
+    ///   bail (divide-by-zero), or a shadowed builtin. In every case the
+    ///   interpreter must continue in-place: `locals`/`closure_env` may have
+    ///   been *partially* updated (bail path writes back current slot
+    ///   values), so the natural fall-through — `ip = ForLoopStep.target`
+    ///   to re-execute the body once more — is the safe resume point.
+    ///
+    /// `is_shadowed` is consulted both on the cache-hit fast path *and* on
+    /// the first call after compilation — same model as `try_call`. A
+    /// user-defined `function abs(x){}` wins over the JIT'd native call.
+    ///
+    /// Region semantics (see `JIT_OSR_DESIGN.md`):
+    /// * `region_start` = `ForLoopStep.target` (loop body start).
+    /// * `region_end_excl` = `ForLoopStep_ip + 1` (the dispatch loop's `ip`
+    ///   value AFTER it incremented past the ForLoopStep op).
+    /// * The interpreter must have already executed its own step (counter +=
+    ///   1) and computed `matched == true` before calling this — the OSR
+    ///   body enters at `region_start` and assumes the counter is at the
+    ///   value it should run the body with.
+    pub fn try_run_loop(
+        &mut self,
+        func: &BytecodeFunction,
+        region_start: usize,
+        region_end_excl: usize,
+        locals: &mut IndexMap<String, CfmlValue>,
+        closure_env: Option<&Arc<RwLock<IndexMap<String, CfmlValue>>>>,
+        is_shadowed: &mut dyn FnMut(&str) -> bool,
+    ) -> Option<usize> {
+        let key: OsrKey = (func.global_id, region_start);
+
+        // Fast path: known outcome.
+        match self.osr_cache.get(&key) {
+            Some(OsrCacheEntry::Unjittable) => return None,
+            Some(OsrCacheEntry::Compiled(c)) => {
+                for n in &c.referenced_builtins {
+                    if is_shadowed(n) {
+                        return None;
+                    }
+                }
+                return run_osr_compiled(c, locals, closure_env);
+            }
+            None => {}
+        }
+
+        // Hotness: a back-edge fires this many times before we look.
+        let threshold = self.hot.threshold;
+        let count = self.osr_hot.entry(key).or_insert(0);
+        if *count > threshold {
+            // Already counted past threshold but cache miss — shouldn't happen
+            // outside races; defensive return.
+            return None;
+        }
+        *count += 1;
+        if *count <= threshold {
+            return None;
+        }
+
+        // Crossed threshold — analyse + (maybe) compile, exactly once.
+        let caller_kinds = build_caller_kinds(func, region_start, region_end_excl, locals);
+        let entry = match osr::analyze_loop(func, region_start, region_end_excl, &caller_kinds) {
+            Some(plan) => match osr::compile_loop(&mut self.backend, func, &plan) {
+                Ok(ptr) => {
+                    self.osr_compiled += 1;
+                    OsrCacheEntry::Compiled(OsrCompiled {
+                        ptr,
+                        slots: plan.slots,
+                        exit_ip: plan.region_end_excl,
+                        referenced_builtins: plan.referenced_builtins,
+                    })
+                }
+                Err(_) => OsrCacheEntry::Unjittable,
+            },
+            None => OsrCacheEntry::Unjittable,
+        };
+        let run = match &entry {
+            OsrCacheEntry::Compiled(c) => {
+                if c.referenced_builtins.iter().any(|n| is_shadowed(n)) {
+                    None
+                } else {
+                    run_osr_compiled(c, locals, closure_env)
+                }
+            }
+            OsrCacheEntry::Unjittable => None,
+        };
+        self.osr_cache.insert(key, entry);
+        run
+    }
+}
+
+/// Build the caller_kinds map for an OSR analysis attempt: scan the region for
+/// local-name references and resolve each against the current value in
+/// `locals`. Names whose live value isn't a numeric `Int`/`Double` are
+/// silently dropped — the analyser then rejects any region that reads them.
+fn build_caller_kinds(
+    func: &BytecodeFunction,
+    region_start: usize,
+    region_end_excl: usize,
+    locals: &IndexMap<String, CfmlValue>,
+) -> HashMap<String, analysis::Kind> {
+    let mut kinds: HashMap<String, analysis::Kind> = HashMap::new();
+    for ip in region_start..region_end_excl {
+        let name = match &func.instructions[ip] {
+            BytecodeOp::LoadLocal(n)
+            | BytecodeOp::StoreLocal(n)
+            | BytecodeOp::Increment(n)
+            | BytecodeOp::Decrement(n)
+            | BytecodeOp::AddLocalConst(n, _)
+            | BytecodeOp::MulLocalConst(n, _)
+            | BytecodeOp::JumpIfLocalCmpConstFalse(n, _, _, _)
+            | BytecodeOp::ForLoopStep(n, _, _, _, _)
+            | BytecodeOp::DeclareLocal(n) => n,
+            _ => continue,
+        };
+        let lower = name.to_ascii_lowercase();
+        if kinds.contains_key(&lower) {
+            continue;
+        }
+        // Case-insensitive lookup against the live locals map.
+        let v = locals
+            .get(name)
+            .or_else(|| locals.iter().find(|(k, _)| k.eq_ignore_ascii_case(&lower)).map(|(_, v)| v));
+        let k = match v {
+            Some(CfmlValue::Int(_)) => analysis::Kind::Int,
+            Some(CfmlValue::Double(_)) => analysis::Kind::Float,
+            _ => continue,
+        };
+        kinds.insert(lower, k);
+    }
+    kinds
+}
+
+/// Marshal each slot of `c` from `locals` into a packed `i64` buffer, invoke
+/// the compiled body, then write every slot back to `locals` (and `closure_env`
+/// when the env shares the name). Returns `Some(exit_ip)` on the success path
+/// and `None` on the bail path — on bail the locals reflect the trapping
+/// iteration's pre-failure state, exactly what the interpreter needs to
+/// re-execute the body once more.
+fn run_osr_compiled(
+    c: &OsrCompiled,
+    locals: &mut IndexMap<String, CfmlValue>,
+    closure_env: Option<&Arc<RwLock<IndexMap<String, CfmlValue>>>>,
+) -> Option<usize> {
+    // ── Marshal in. A kind mismatch (slot was Int at compile, now Double,
+    // or missing entirely) forces a bail to the interpreter.
+    let mut buf: Vec<i64> = Vec::with_capacity(c.slots.len());
+    for slot in &c.slots {
+        // Case-insensitive lookup, matching the interpreter's behaviour.
+        let v = locals.get(&slot.name).or_else(|| {
+            locals
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&slot.name))
+                .map(|(_, v)| v)
+        });
+        match (slot.kind, v) {
+            (analysis::Kind::Int, Some(CfmlValue::Int(i))) => buf.push(*i),
+            (analysis::Kind::Float, Some(CfmlValue::Double(d))) => buf.push(d.to_bits() as i64),
+            _ => return None,
+        }
+    }
+
+    // ── Run.
+    let mut bail: i64 = 0;
+    // SAFETY: `c.ptr` is a Cranelift-emitted function with matching ABI
+    // (`*mut i64`, `*mut i64`) -> `()`; the slot buffer + bail pointer are
+    // both valid for the duration of the call.
+    unsafe {
+        (c.ptr)(buf.as_mut_ptr(), &mut bail as *mut i64);
+    }
+
+    // ── Write back every slot — success and bail alike. The compiled body
+    // populates buf in both paths so the interpreter sees consistent state.
+    for (i, slot) in c.slots.iter().enumerate() {
+        let val = match slot.kind {
+            analysis::Kind::Int => CfmlValue::Int(buf[i]),
+            analysis::Kind::Float => CfmlValue::Double(f64::from_bits(buf[i] as u64)),
+            _ => unreachable!("OSR slots are always Int or Float"),
+        };
+        // The original locals map may have a different-case key (`I` vs `i`);
+        // preserve the existing casing rather than introducing a duplicate
+        // entry with a different case.
+        if let Some(existing_key) = locals
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(&slot.name))
+            .cloned()
+        {
+            locals.insert(existing_key, val.clone());
+        } else {
+            locals.insert(slot.name.clone(), val.clone());
+        }
+        if let Some(env) = closure_env {
+            let mut m = env.write().unwrap();
+            // Closure env: write back only if the env already tracks this
+            // name (it's a captured local); never widen the env.
+            if let Some(existing_key) = m
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(&slot.name))
+                .cloned()
+            {
+                m.insert(existing_key, val);
+            }
+        }
+    }
+
+    if bail != 0 {
+        None
+    } else {
+        Some(c.exit_ip)
     }
 }
 
@@ -591,6 +854,9 @@ mod tests {
             cache: rustc_hash::FxHashMap::default(),
             hot: HotnessTracker::new(0), // any non-cached call compiles on the first hit
             backend: translate::Backend::new().expect("backend"),
+            osr_cache: rustc_hash::FxHashMap::default(),
+            osr_hot: rustc_hash::FxHashMap::default(),
+            osr_compiled: 0,
         };
         let args = vec![CfmlValue::Int(-7)];
         // First call: not hot yet (record_and_is_hot returns true at threshold+1

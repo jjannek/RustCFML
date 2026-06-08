@@ -49,19 +49,21 @@ extern "C" fn cfml_pow(a: f64, b: f64) -> f64 {
 }
 
 /// Owns the Cranelift module (and thus all executable memory it allocates) plus
-/// a reusable `FunctionBuilderContext`.
+/// a reusable `FunctionBuilderContext`. Fields are `pub(super)` so the `osr`
+/// sibling module can declare additional functions in the same `JITModule`
+/// (and therefore share registered shim symbols and executable memory).
 pub struct Backend {
-    module: JITModule,
-    fbc: FunctionBuilderContext,
+    pub(super) module: JITModule,
+    pub(super) fbc: FunctionBuilderContext,
     /// Monotonic counter for unique per-function symbol names.
-    func_counter: u32,
+    pub(super) func_counter: u32,
     /// Pre-declared `fn(f64, f64) -> f64` shims (`cfml_fmod`, `cfml_pow`).
-    fmod_id: FuncId,
-    pow_id: FuncId,
+    pub(super) fmod_id: FuncId,
+    pub(super) pow_id: FuncId,
     /// Per-entry `FuncId` for every shim in [`SHIMS`] (parallel slice). Each
     /// `compile()` turns these into per-function `FuncRef`s via
     /// `declare_func_in_func`.
-    shim_ids: Vec<FuncId>,
+    pub(super) shim_ids: Vec<FuncId>,
 }
 
 impl Backend {
@@ -505,7 +507,7 @@ impl Backend {
 }
 
 /// CFML `CmpOp` → Cranelift signed integer condition (fused loop ops only).
-fn int_cc(op: CmpOp) -> IntCC {
+pub(super) fn int_cc(op: CmpOp) -> IntCC {
     match op {
         CmpOp::Lt => IntCC::SignedLessThan,
         CmpOp::Lte => IntCC::SignedLessThanOrEqual,
@@ -517,7 +519,7 @@ fn int_cc(op: CmpOp) -> IntCC {
 }
 
 /// Promote a value to `f64` (int/bool → `fcvt_from_sint`; float passes through).
-fn to_f64(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
+pub(super) fn to_f64(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
     if k == Kind::Float {
         v
     } else {
@@ -527,7 +529,7 @@ fn to_f64(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
 
 /// Truncate a value to `i64` (float → saturating `fcvt_to_sint_sat`, matching
 /// Rust's `as i64`; int/bool pass through).
-fn to_i64(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
+pub(super) fn to_i64(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
     if k == Kind::Float {
         b.ins().fcvt_to_sint_sat(I64, v)
     } else {
@@ -537,7 +539,7 @@ fn to_i64(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
 
 /// Emit the integer divide/modulo guard: branch to `bail` when the divisor is
 /// `0` or the `INT_MIN / -1` overflow case, returning the continuation block.
-fn guard_int_div(
+pub(super) fn guard_int_div(
     b: &mut FunctionBuilder,
     bail: cranelift_codegen::ir::Block,
     dividend: Value,
@@ -554,14 +556,14 @@ fn guard_int_div(
 }
 
 /// Materialise a Cranelift boolean (`I8`) into an `i64` `0`/`1`.
-fn bool_to_i64(b: &mut FunctionBuilder, cond: Value) -> Value {
+pub(super) fn bool_to_i64(b: &mut FunctionBuilder, cond: Value) -> Value {
     let one = b.ins().iconst(I64, 1);
     let zero = b.ins().iconst(I64, 0);
     b.ins().select(cond, one, zero)
 }
 
 /// Boolean: `v == 0` (`fcmp`/`icmp` per kind). Used by `Not` and `JumpIfFalse`.
-fn is_zero_test(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
+pub(super) fn is_zero_test(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
     if k == Kind::Float {
         let z = b.ins().f64const(0.0);
         b.ins().fcmp(FloatCC::Equal, v, z)
@@ -571,7 +573,7 @@ fn is_zero_test(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
 }
 
 /// Boolean: `v != 0` (`fcmp`/`icmp` per kind). Truthiness for logical ops.
-fn is_truthy(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
+pub(super) fn is_truthy(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
     if k == Kind::Float {
         let z = b.ins().f64const(0.0);
         b.ins().fcmp(FloatCC::NotEqual, v, z)
@@ -580,7 +582,7 @@ fn is_truthy(b: &mut FunctionBuilder, v: Value, k: Kind) -> Value {
     }
 }
 
-enum NumOp {
+pub(super) enum NumOp {
     Add,
     Sub,
     Mul,
@@ -589,7 +591,7 @@ enum NumOp {
 /// `+ - *`: pop b, pop a. Two ints use wrapping integer ops (bit-exact with the
 /// interpreter's `Int(i op j)`); any float operand promotes both and uses the
 /// float op (matching the interpreter's int→double promotion on mixed operands).
-fn num_bin(b: &mut FunctionBuilder, stack: &mut Vec<(Value, Kind)>, op: NumOp) -> Result<(), String> {
+pub(super) fn num_bin(b: &mut FunctionBuilder, stack: &mut Vec<(Value, Kind)>, op: NumOp) -> Result<(), String> {
     let (rhs, rk) = stack.pop().ok_or("jit: stack underflow")?;
     let (lhs, lk) = stack.pop().ok_or("jit: stack underflow")?;
     if lk == Kind::Float || rk == Kind::Float {
@@ -615,7 +617,7 @@ fn num_bin(b: &mut FunctionBuilder, stack: &mut Vec<(Value, Kind)>, op: NumOp) -
 /// Comparison: pop b, pop a, push `(a CMP b)` as i64 `0`/`1`. Two ints compare
 /// with `icmp`; a float operand promotes both and uses `fcmp` (matching the
 /// interpreter, which compares mixed int/double in f64).
-fn cmp(
+pub(super) fn cmp(
     b: &mut FunctionBuilder,
     stack: &mut Vec<(Value, Kind)>,
     icc: IntCC,
@@ -635,14 +637,14 @@ fn cmp(
     Ok(())
 }
 
-enum LogicOp {
+pub(super) enum LogicOp {
     And,
     Or,
     Xor,
 }
 
 /// Logical op on truthiness: pop b, pop a, push `(a≠0 OP b≠0)` as i64 `0`/`1`.
-fn logic2(b: &mut FunctionBuilder, stack: &mut Vec<(Value, Kind)>, op: LogicOp) -> Result<(), String> {
+pub(super) fn logic2(b: &mut FunctionBuilder, stack: &mut Vec<(Value, Kind)>, op: LogicOp) -> Result<(), String> {
     let (rhs, rk) = stack.pop().ok_or("jit: stack underflow")?;
     let (lhs, lk) = stack.pop().ok_or("jit: stack underflow")?;
     let at = is_truthy(b, lhs, lk);
