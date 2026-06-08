@@ -196,6 +196,25 @@ fn run_with_osr(src: &str) -> (String, usize, usize) {
 }
 
 #[test]
+fn osr_do_while_loop_matches_interpreter() {
+    // do { body } while (cond) — terminates in `JumpIfTrue(loop_start)`.
+    let src = r#"
+        sum = 0;
+        i = 1;
+        do {
+            sum = sum + i;
+            i = i + 1;
+        } while (i <= 1000);
+        writeOutput(sum);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _jit, osr) = run_with_osr(src);
+    assert_eq!(out, oracle);
+    assert_eq!(out, "500500");
+    assert!(osr >= 1, "expected do-while to OSR-compile, got osr={osr}");
+}
+
+#[test]
 fn osr_while_loop_in_main_matches_interpreter() {
     // While-loop in __main__ — terminates in `Jump(loop_start)` rather than
     // a fused ForLoopStep. Pre-OSR-Phase-2 this never JIT'd; post-Phase-2

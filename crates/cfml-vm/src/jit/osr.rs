@@ -180,16 +180,26 @@ pub fn analyze_loop(
         return None;
     }
     // The region must terminate in a back-edge whose target is `region_start`:
-    // either the fused `ForLoopStep` (counted for-loop) or an unconditional
-    // `Jump(region_start)` (while/until/repeat loop). For the ForLoopStep
-    // form we also pin the loop counter to `Int` later; the Jump form has
-    // no special counter so that check is skipped.
+    //
+    // * `ForLoopStep(_, _, _, _, region_start)` — fused counted for-loop
+    //   (the increment, test, and back-jump rolled into one super-op).
+    // * `Jump(region_start)` — unconditional back-edge from a while/until
+    //   loop or the inner repeat shape.
+    // * `JumpIfTrue(region_start)` — back-edge from `do { body } while(cond)`.
+    // * `JumpIfFalse(region_start)` — back-edge from `do { body } until(cond)`.
+    //
+    // For the ForLoopStep form we also pin the loop counter to `Int` later;
+    // the other forms have no special counter so that check is skipped.
     let term_ip = region_end_excl - 1;
     let counter_name: Option<String> = match &code[term_ip] {
         BytecodeOp::ForLoopStep(name, _, _, _, target) if *target == region_start => {
             Some(name.clone())
         }
-        BytecodeOp::Jump(target) if *target == region_start => {
+        BytecodeOp::Jump(target)
+        | BytecodeOp::JumpIfTrue(target)
+        | BytecodeOp::JumpIfFalse(target)
+            if *target == region_start =>
+        {
             // Guard against the weird case where the first op in the region
             // is itself a ForLoopStep — that arises only with `continue`
             // jumps inside an outer for-loop, where region_start lands on

@@ -1021,6 +1021,60 @@ impl CfmlVirtualMachine {
     pub fn osr_compiled_count(&self) -> usize {
         self.jit.as_ref().map_or(0, |j| j.osr_compiled_count())
     }
+}
+
+/// Shared OSR/JIT shadow-guard predicate: `true` when calling the canonical
+/// builtin named `name` would be wrong because the live VM has been told to
+/// resolve it differently (user-defined function with the same name, or a
+/// non-canonical entry in `globals`). Hot-path: every cached compiled body
+/// re-runs this for each builtin it references. Pulled out of the inline
+/// closures in `execute_function_with_args` so the whole-fn JIT hook and
+/// the OSR hooks (ForLoopStep / Jump / JumpIfTrue / JumpIfFalse) all share
+/// one implementation.
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+fn jit_is_shadowed(
+    user_functions: &HashMap<String, Arc<BytecodeFunction>>,
+    globals: &IndexMap<String, CfmlValue>,
+    name: &str,
+) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let ufn_hit = user_functions.contains_key(name)
+        || user_functions.keys().any(|k| k.eq_ignore_ascii_case(&lower));
+    if ufn_hit {
+        return true;
+    }
+    let g = globals.get(name).or_else(|| {
+        globals
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+            .map(|(_, v)| v)
+    });
+    match g {
+        Some(v) => {
+            // Canonical builtin wrapper = `Function{ body: Expression(Null),
+            // params: [], captured_scope: None }` produced by
+            // `cfml_stdlib::create_builtin_func`. Anything else for an
+            // allowlist name is real shadowing.
+            if let CfmlValue::Function(f) = v {
+                if !f.params.is_empty() || f.captured_scope.is_some() {
+                    return true;
+                }
+                let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
+                !matches!(
+                    body,
+                    cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
+                )
+            } else {
+                true
+            }
+        }
+        None => false,
+    }
+}
+
+impl CfmlVirtualMachine {
+    // continuation of the previous impl block (split only to insert the
+    // free `jit_is_shadowed` helper above with the matching cfg gates).
 
     /// Register every function in `prog` into `fn_registry` by its `global_id`
     /// (idempotent — a cached program registers the same Arc into the same slot).
@@ -2819,39 +2873,8 @@ impl CfmlVirtualMachine {
                             let user_functions = &self.user_functions;
                             let globals = &self.globals;
                             if let Some(engine) = self.jit.as_mut() {
-                                let is_canonical_builtin_wrapper = |v: &CfmlValue| -> bool {
-                                    if let CfmlValue::Function(f) = v {
-                                        if !f.params.is_empty() || f.captured_scope.is_some() {
-                                            return false;
-                                        }
-                                        let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
-                                        return matches!(
-                                            body,
-                                            cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
-                                        );
-                                    }
-                                    false
-                                };
-                                let mut is_shadowed = |name: &str| -> bool {
-                                    let lower = name.to_ascii_lowercase();
-                                    let ufn_hit = user_functions.contains_key(name)
-                                        || user_functions
-                                            .keys()
-                                            .any(|k| k.eq_ignore_ascii_case(&lower));
-                                    if ufn_hit {
-                                        return true;
-                                    }
-                                    let g = globals.get(name).or_else(|| {
-                                        globals
-                                            .iter()
-                                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-                                            .map(|(_, v)| v)
-                                    });
-                                    match g {
-                                        Some(v) => !is_canonical_builtin_wrapper(v),
-                                        None => false,
-                                    }
-                                };
+                                let mut is_shadowed =
+                                    |name: &str| jit_is_shadowed(user_functions, globals, name);
                                 if let Some(exit_ip) = engine.try_run_loop(
                                     func,
                                     *target,
@@ -2871,6 +2894,34 @@ impl CfmlVirtualMachine {
                 BytecodeOp::JumpIfFalse(target) => {
                     if let Some(cond) = stack.pop() {
                         if !cond.is_true() {
+                            // OSR Phase 2: a JumpIfFalse whose target is
+                            // strictly behind this op is the back-edge of a
+                            // `do { body } until (cond)` shape (i.e. loop
+                            // back when cond is false). Same region/hook
+                            // mechanics as the unconditional Jump case.
+                            #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+                            {
+                                if *target < ip - 1 {
+                                    let user_functions = &self.user_functions;
+                                    let globals = &self.globals;
+                                    if let Some(engine) = self.jit.as_mut() {
+                                        let mut is_shadowed = |name: &str| {
+                                            jit_is_shadowed(user_functions, globals, name)
+                                        };
+                                        if let Some(exit_ip) = engine.try_run_loop(
+                                            func,
+                                            *target,
+                                            ip,
+                                            &mut locals,
+                                            closure_env.as_ref(),
+                                            &mut is_shadowed,
+                                        ) {
+                                            ip = exit_ip;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             ip = *target;
                         }
                     }
@@ -2991,46 +3042,11 @@ impl CfmlVirtualMachine {
                         // `jit` feature off the whole block compiles away.
                         #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
                         {
-                            // Snapshot the lookup tables first to keep the
-                            // borrow of `self.jit` clean — same pattern as
-                            // the whole-function JIT hook at the top of
-                            // `execute_function_with_args`.
                             let user_functions = &self.user_functions;
                             let globals = &self.globals;
                             if let Some(engine) = self.jit.as_mut() {
-                                let is_canonical_builtin_wrapper = |v: &CfmlValue| -> bool {
-                                    if let CfmlValue::Function(f) = v {
-                                        if !f.params.is_empty() || f.captured_scope.is_some() {
-                                            return false;
-                                        }
-                                        let body: &cfml_common::dynamic::CfmlClosureBody = &f.body;
-                                        return matches!(
-                                            body,
-                                            cfml_common::dynamic::CfmlClosureBody::Expression(b) if matches!(b.as_ref(), CfmlValue::Null)
-                                        );
-                                    }
-                                    false
-                                };
-                                let mut is_shadowed = |name: &str| -> bool {
-                                    let lower = name.to_ascii_lowercase();
-                                    let ufn_hit = user_functions.contains_key(name)
-                                        || user_functions
-                                            .keys()
-                                            .any(|k| k.eq_ignore_ascii_case(&lower));
-                                    if ufn_hit {
-                                        return true;
-                                    }
-                                    let g = globals.get(name).or_else(|| {
-                                        globals
-                                            .iter()
-                                            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
-                                            .map(|(_, v)| v)
-                                    });
-                                    match g {
-                                        Some(v) => !is_canonical_builtin_wrapper(v),
-                                        None => false,
-                                    }
-                                };
+                                let mut is_shadowed =
+                                    |name: &str| jit_is_shadowed(user_functions, globals, name);
                                 if let Some(exit_ip) = engine.try_run_loop(
                                     func,
                                     *target,
@@ -3050,6 +3066,34 @@ impl CfmlVirtualMachine {
                 BytecodeOp::JumpIfTrue(target) => {
                     if let Some(cond) = stack.pop() {
                         if cond.is_true() {
+                            // OSR Phase 2: a JumpIfTrue whose target is
+                            // strictly behind this op is the back-edge of a
+                            // `do { body } while (cond)` shape (loop back
+                            // when cond is true). Same region/hook mechanics
+                            // as the unconditional Jump case.
+                            #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+                            {
+                                if *target < ip - 1 {
+                                    let user_functions = &self.user_functions;
+                                    let globals = &self.globals;
+                                    if let Some(engine) = self.jit.as_mut() {
+                                        let mut is_shadowed = |name: &str| {
+                                            jit_is_shadowed(user_functions, globals, name)
+                                        };
+                                        if let Some(exit_ip) = engine.try_run_loop(
+                                            func,
+                                            *target,
+                                            ip,
+                                            &mut locals,
+                                            closure_env.as_ref(),
+                                            &mut is_shadowed,
+                                        ) {
+                                            ip = exit_ip;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             ip = *target;
                         }
                     }
