@@ -197,6 +197,40 @@ extern "C" fn cfml_bit_shrn_i64(a: i64, b: i64) -> i64 {
     a >> b
 }
 
+// ── incrementValue / decrementValue — typed overloads ───────────────────
+// `fn_increment_value` / `fn_decrement_value` in cfml-stdlib pattern-match
+// on `Int` and `Double` and add/subtract 1; the JIT only ever sees those
+// two kinds, so two overloads each cover the JIT-eligible paths exactly.
+// Non-numeric coercion stays in the interpreter (we'd bail in analysis).
+
+extern "C" fn cfml_increment_value_i64(x: i64) -> i64 {
+    x.wrapping_add(1)
+}
+extern "C" fn cfml_increment_value_f64(x: f64) -> f64 {
+    x + 1.0
+}
+extern "C" fn cfml_decrement_value_i64(x: i64) -> i64 {
+    x.wrapping_sub(1)
+}
+extern "C" fn cfml_decrement_value_f64(x: f64) -> f64 {
+    x - 1.0
+}
+
+// ── bitMaskRead / bitMaskSet / bitMaskClear — 3 / 4-arg Int → Int ────────
+// Mirror `fn_bit_mask_read` / `fn_bit_mask_set` / `fn_bit_mask_clear` in
+// cfml-stdlib bit-for-bit.
+
+extern "C" fn cfml_bit_mask_read_i64(number: i64, start: i64, length: i64) -> i64 {
+    (number >> start) & ((1i64 << length) - 1)
+}
+extern "C" fn cfml_bit_mask_set_i64(number: i64, mask: i64, start: i64, length: i64) -> i64 {
+    let clear_mask = ((1i64 << length) - 1) << start;
+    (number & !clear_mask) | ((mask & ((1i64 << length) - 1)) << start)
+}
+extern "C" fn cfml_bit_mask_clear_i64(number: i64, start: i64, length: i64) -> i64 {
+    number & !(((1i64 << length) - 1) << start)
+}
+
 /// `fn_pow(base, exp)` — `base.powf(exp)`. The `^` infix operator already
 /// calls `translate::cfml_pow` (a private extern in the translate module);
 /// this adds the function-call form too so `pow(2, 10)` JITs identically
@@ -410,6 +444,64 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_shrn_i64",
         addr: cfml_bit_shrn_i64 as *const u8,
+    },
+    // ── incrementValue / decrementValue — typed overloads ────────────────
+    Shim {
+        name: "incrementvalue",
+        args_req: &[KindReq::Int],
+        args_abi: &[Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_increment_value_i64",
+        addr: cfml_increment_value_i64 as *const u8,
+    },
+    Shim {
+        name: "incrementvalue",
+        args_req: &[KindReq::Float],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_increment_value_f64",
+        addr: cfml_increment_value_f64 as *const u8,
+    },
+    Shim {
+        name: "decrementvalue",
+        args_req: &[KindReq::Int],
+        args_abi: &[Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_decrement_value_i64",
+        addr: cfml_decrement_value_i64 as *const u8,
+    },
+    Shim {
+        name: "decrementvalue",
+        args_req: &[KindReq::Float],
+        args_abi: &[Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_decrement_value_f64",
+        addr: cfml_decrement_value_f64 as *const u8,
+    },
+    // ── bitMaskRead / bitMaskSet / bitMaskClear — Int → Int ──────────────
+    Shim {
+        name: "bitmaskread",
+        args_req: &[KindReq::Int, KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_mask_read_i64",
+        addr: cfml_bit_mask_read_i64 as *const u8,
+    },
+    Shim {
+        name: "bitmaskset",
+        args_req: &[KindReq::Int, KindReq::Int, KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int, Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_mask_set_i64",
+        addr: cfml_bit_mask_set_i64 as *const u8,
+    },
+    Shim {
+        name: "bitmaskclear",
+        args_req: &[KindReq::Int, KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Int, Kind::Int, Kind::Int],
+        ret_kind: Kind::Int,
+        sym: "cfml_bit_mask_clear_i64",
+        addr: cfml_bit_mask_clear_i64 as *const u8,
     },
     // ── 2-arg pow() builtin (function-call form of the `^` infix) ────────
     Shim {

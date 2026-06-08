@@ -251,6 +251,41 @@ fn jit_extended_pure_math_builtins_match_interpreter() {
 }
 
 #[test]
+fn jit_increment_decrement_and_bitmask_builtins_match_interpreter() {
+    // Exercises the v0.85.0 additions: incrementValue / decrementValue
+    // (both Int and Float overloads) and the 3/4-arg bitMaskRead/Set/Clear
+    // shims, all from a hot kernel that the JIT compiles whole-function.
+    let src = r#"
+        function intKernel(n) {
+            var t = 0;
+            for (var i = 1; i <= n; i++) {
+                t = t + incrementValue(i) - decrementValue(i)
+                      + bitMaskRead(i, 1, 3)
+                      + bitMaskSet(i, 5, 2, 3)
+                      + bitMaskClear(i, 0, 2);
+            }
+            return t;
+        }
+        function floatKernel(n) {
+            var f = 0.0;
+            for (var i = 1; i <= n; i++) {
+                f = f + incrementValue(i / 10.0) - decrementValue(i / 10.0);
+            }
+            return f;
+        }
+        for (k = 1; k <= 120; k++) {
+            x = intKernel(80);
+            y = floatKernel(80);
+        }
+        writeOutput(x & ":" & y);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, jit, _osr) = run_with_osr(src);
+    assert_eq!(out, oracle, "new builtins JIT output must match interpreter");
+    assert!(jit >= 1, "kernel() should have been whole-fn-JIT-compiled");
+}
+
+#[test]
 fn osr_do_while_loop_matches_interpreter() {
     // do { body } while (cond) — terminates in `JumpIfTrue(loop_start)`.
     let src = r#"
