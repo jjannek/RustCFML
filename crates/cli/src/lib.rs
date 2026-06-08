@@ -164,7 +164,23 @@ struct Args {
     /// `RUSTCFML_JIT_THRESHOLD=N`. Defaults to 50.
     #[arg(long, value_name = "N")]
     jit_threshold: Option<u32>,
+
+    /// After execution, print JIT statistics to stderr: number of whole
+    /// functions compiled and number of OSR loop bodies compiled. Useful
+    /// for diagnostics, threshold tuning, and confirming a hot path
+    /// actually engaged the JIT. No effect when the JIT feature is off.
+    #[arg(long)]
+    jit_stats: bool,
 }
+
+/// Process-global flag set by the `--jit-stats` CLI option. Polled after
+/// each VM run (`execute_with_session_handling`) to print a one-line
+/// diagnostic to stderr. Static-atomic so we don't have to thread an extra
+/// param through every nested call site (compile_and_run → … → the per-VM
+/// execute) just for a debug knob; the JIT itself is also a process-global
+/// per-VM init, so the scope matches.
+static JIT_STATS_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Encapsulates the full response from CFML execution, including HTTP metadata.
 struct CfmlResponse {
@@ -231,6 +247,9 @@ fn real_main() {
         unsafe {
             std::env::set_var("RUSTCFML_JIT_THRESHOLD", n.to_string());
         }
+    }
+    if args.jit_stats {
+        JIT_STATS_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Handle --build <app-dir>
@@ -639,6 +658,23 @@ fn compile_and_run(
     vm.session_id = session_id;
 
     let result = vm.execute_with_lifecycle();
+
+    // Diagnostic: dump JIT compile counts to stderr if --jit-stats was set.
+    // No-op when JIT was off at compile-time (counts return 0 by definition).
+    if JIT_STATS_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+        {
+            eprintln!(
+                "jit-stats: fn_compiled={} osr_compiled={}",
+                vm.jit_compiled_count(),
+                vm.osr_compiled_count()
+            );
+        }
+        #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
+        {
+            eprintln!("jit-stats: JIT feature not built in (rebuild with --features jit)");
+        }
+    }
 
     // Catch redirect errors as success
     let result = match result {
