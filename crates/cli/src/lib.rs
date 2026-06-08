@@ -151,6 +151,19 @@ struct Args {
     /// Entry point for CLI mode (default: main.cfm)
     #[arg(long, default_value = "main.cfm")]
     entry: String,
+
+    /// Disable the optional Cranelift JIT at runtime. Equivalent to setting
+    /// `RUSTCFML_JIT=0` in the environment — the interpreter handles every
+    /// op and the JIT engine isn't initialised. Has no effect on builds
+    /// produced without `--features jit`.
+    #[arg(long)]
+    no_jit: bool,
+
+    /// Override the JIT hotness threshold (number of invocations before a
+    /// candidate function or loop is compiled). Equivalent to setting
+    /// `RUSTCFML_JIT_THRESHOLD=N`. Defaults to 50.
+    #[arg(long, value_name = "N")]
+    jit_threshold: Option<u32>,
 }
 
 /// Encapsulates the full response from CFML execution, including HTTP metadata.
@@ -202,6 +215,22 @@ fn real_main() {
 
     if args.verbose {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    }
+
+    // JIT control flags (mirror the existing RUSTCFML_JIT / RUSTCFML_JIT_THRESHOLD
+    // env vars). Must be set BEFORE the first `CfmlVirtualMachine::new` since
+    // `JitEngine::maybe_new` reads these at construction time.
+    if args.no_jit {
+        // SAFETY: single-threaded startup; no races with other env readers.
+        unsafe {
+            std::env::set_var("RUSTCFML_JIT", "0");
+        }
+    }
+    if let Some(n) = args.jit_threshold {
+        // SAFETY: same — pre-VM-init.
+        unsafe {
+            std::env::set_var("RUSTCFML_JIT_THRESHOLD", n.to_string());
+        }
     }
 
     // Handle --build <app-dir>
