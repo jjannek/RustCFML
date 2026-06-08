@@ -50,7 +50,10 @@ socket2 = { version = "0.5", optional = true, features = ["all"] }
 default = ["memcached", "cluster"]
 memcached = ["dep:memcache"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
-# Passthrough to the VM's optional Cranelift JIT (native only). Off by default.
+# Passthrough to the VM's Cranelift JIT (native only). **On by default** via
+# `cfml-vm`'s default feature set; this feature exists so that a downstream
+# build that opts out of cfml-vm defaults can still flip the JIT back on
+# explicitly from the CLI side. Runtime kill-switch: `RUSTCFML_JIT=0`.
 jit = ["cfml-vm/jit"]
 
 [target.'cfg(unix)'.dependencies]
