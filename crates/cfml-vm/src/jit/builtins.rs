@@ -197,6 +197,14 @@ extern "C" fn cfml_bit_shrn_i64(a: i64, b: i64) -> i64 {
     a >> b
 }
 
+/// `fn_pow(base, exp)` — `base.powf(exp)`. The `^` infix operator already
+/// calls `translate::cfml_pow` (a private extern in the translate module);
+/// this adds the function-call form too so `pow(2, 10)` JITs identically
+/// to `2 ^ 10`.
+extern "C" fn cfml_pow_fn_f64(base: f64, exp: f64) -> f64 {
+    base.powf(exp)
+}
+
 /// The complete shim table. Order matters for `lookup_overload`: more specific
 /// signatures (e.g. `abs(Int)`) must precede broader ones (`abs(Numeric)`).
 pub static SHIMS: &[Shim] = &[
@@ -402,6 +410,15 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_shrn_i64",
         addr: cfml_bit_shrn_i64 as *const u8,
+    },
+    // ── 2-arg pow() builtin (function-call form of the `^` infix) ────────
+    Shim {
+        name: "pow",
+        args_req: &[KindReq::Numeric, KindReq::Numeric],
+        args_abi: &[Kind::Float, Kind::Float],
+        ret_kind: Kind::Float,
+        sym: "cfml_pow_fn_f64",
+        addr: cfml_pow_fn_f64 as *const u8,
     },
 ];
 

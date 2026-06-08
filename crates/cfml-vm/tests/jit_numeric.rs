@@ -234,7 +234,8 @@ fn jit_extended_pure_math_builtins_match_interpreter() {
                 t = t + sqr(i) + log(i + 1) + sin(i / 10.0) + cos(i / 10.0)
                       + floor(i / 3.0) + ceiling(i / 7.0) + round(i / 4.0)
                       + sgn(i - 50) + fix(i / 11.0)
-                      + exp(i / 100.0) + log10(i + 1) + tan(i / 100.0);
+                      + exp(i / 100.0) + log10(i + 1) + tan(i / 100.0)
+                      + pow(1.001, i % 10);
             }
             return t;
         }
