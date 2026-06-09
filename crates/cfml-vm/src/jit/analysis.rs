@@ -73,13 +73,16 @@ pub enum Kind {
     /// `(global_id, sig)` cache entry is resolved at the matching `Call(n)`
     /// when concrete arg kinds are known.
     UdfRef(usize),
-    /// **Forward-declared (v0.88.0) for Option-γ tag-pointer polymorphic
-    /// values.** No analyser path yet produces or consumes this kind — the
-    /// real codegen lands in v0.90.0 / v0.91.0 (see `JIT_POLY_DESIGN.md`).
-    /// Reserved here so coverage instrumentation, tests, and downstream
-    /// pattern-matches can refer to it without a follow-up enum-extension
-    /// churn when v0.90.0 ships.
-    #[allow(dead_code)]
+    /// **Option-γ tag-pointer polymorphic value** (v0.89.0+). A Boxed slot
+    /// holds a tagged `usize` — in v0.89.0 always a heap-allocated
+    /// `Box<CfmlValue>` (tag `0b000`). The analyser only admits Boxed at
+    /// the outer ABI boundary: a param can be Boxed, a slot can carry Boxed
+    /// via store-flow from a Boxed param, and a return can yield Boxed.
+    /// **No other operation** consumes Boxed in v0.89.0 — arithmetic,
+    /// comparison, branching, and call-args all reject it, forcing the
+    /// interpreter for any body that mixes polymorphic and operating ops.
+    /// v0.90.0 lifts that restriction by emitting tag/untag IR for `+`,
+    /// concat, member access, etc.
     Boxed,
 }
 
@@ -237,8 +240,11 @@ pub fn analyze(
     if param_kinds.len() != func.params.len() {
         return None;
     }
-    // Only numeric kinds are admissible for ABI params.
-    if param_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
+    // Admissible ABI param kinds: Int, Float, Boxed.
+    if param_kinds
+        .iter()
+        .any(|k| !matches!(k, Kind::Int | Kind::Float | Kind::Boxed))
+    {
         return None;
     }
 
@@ -521,9 +527,10 @@ pub fn analyze(
     }
 
     // A param slot's final kind must equal its seeded ABI kind. The fixpoint
-    // only upgrades Int → Float, so this only fires when an `Int` param is
-    // reassigned to a `Float` result (a path-dependent type the monomorphic
-    // JIT can't model). A `Float` param stays `Float` by construction.
+    // only upgrades from Int → Float / Boxed, so this only fires when an
+    // `Int` param is reassigned to a non-Int result (a path-dependent type
+    // the monomorphic JIT can't model). `Float` / `Boxed` params stay their
+    // kind by construction.
     for (i, &p) in param_slots.iter().enumerate() {
         if slot_kind[p] != param_kinds[i] {
             return None;
@@ -686,8 +693,22 @@ fn simulate_block(
     // Pop one value but reject a function reference (`Kind::Builtin(_)` or
     // `Kind::UdfRef(_)`) — those markers are only consumable by
     // `BytecodeOp::Call`; any other op attempting to use one disqualifies
-    // the whole function.
+    // the whole function. Also rejects `Kind::Boxed` — v0.89.0 only admits
+    // Boxed at three sites (LoadLocal of a Boxed slot, StoreLocal into a
+    // Boxed slot, Return) which call [`pop_assignable!`] instead.
     macro_rules! pop_value {
+        () => {{
+            let k = pop!();
+            if matches!(k, Kind::Builtin(_) | Kind::UdfRef(_) | Kind::Boxed) {
+                return None;
+            }
+            k
+        }};
+    }
+    // Pop one value for assignment/return — like `pop_value!` but admits
+    // `Kind::Boxed` (handled by the caller against the target slot's kind
+    // or the return-kind tracker).
+    macro_rules! pop_assignable {
         () => {{
             let k = pop!();
             if matches!(k, Kind::Builtin(_) | Kind::UdfRef(_)) {
@@ -708,14 +729,17 @@ fn simulate_block(
             }
             BytecodeOp::StoreLocal(name) => {
                 let s = slot_index(name)?;
-                let v = pop_value!();
+                let v = pop_assignable!();
                 if v == Kind::Bool {
                     return None; // a boolean must never enter a local
                 }
                 match &mut mode {
                     Mode::Infer { changed } => {
-                        if v == Kind::Float && slot_kind[s] == Kind::Int {
-                            slot_kind[s] = Kind::Float;
+                        // Monotonic upgrades from the default `Int`: a non-Int
+                        // store on an Int slot promotes the slot's kind. Any
+                        // other mismatch is left for the Check pass to reject.
+                        if slot_kind[s] == Kind::Int && v != Kind::Int {
+                            slot_kind[s] = v;
                             **changed = true;
                         }
                     }
@@ -826,14 +850,14 @@ fn simulate_block(
             }
             BytecodeOp::Dup => {
                 let k = *stack.last()?;
-                if matches!(k, Kind::Builtin(_) | Kind::UdfRef(_)) {
-                    return None; // a function ref must flow directly into Call
+                if matches!(k, Kind::Builtin(_) | Kind::UdfRef(_) | Kind::Boxed) {
+                    return None; // fn-ref / Boxed must flow directly into their dedicated consumer
                 }
                 stack.push(k);
             }
 
             BytecodeOp::Return => {
-                let v = pop_value!();
+                let v = pop_assignable!();
                 if v == Kind::Bool {
                     return None;
                 }

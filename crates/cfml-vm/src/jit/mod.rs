@@ -34,6 +34,7 @@ use std::ptr;
 use std::sync::{Arc, RwLock};
 
 mod analysis;
+mod boxed;
 mod builtins;
 pub mod coverage;
 mod osr;
@@ -43,14 +44,45 @@ pub use analysis::UdfRefBinding;
 
 /// ABI of every Tier-1 compiled function.
 ///
-/// * `args`  — pointer to `nargs` little-endian `i64`s (the unwrapped
-///   `CfmlValue::Int` arguments, in declaration order).
+/// * `args`  — pointer to `nargs` little-endian `i64`s. Each slot's bit
+///   pattern depends on the param's kind for this specialization:
+///   * `Int`   — the unwrapped `i64`.
+///   * `Float` — the `f64`'s `to_bits()` reinterpretation.
+///   * `Boxed` — an Option-γ tagged `usize` (v0.89.0: always `TAG_PTR`, i.e.
+///     a raw `*mut CfmlValue` produced by [`boxed::box_value`]).
 /// * `nargs` — number of valid entries behind `args`.
 /// * `bail`  — out-param; the callee stores `1` here to signal *deopt* (fall
 ///   back to the interpreter) and `0` (or leaves it untouched) on success.
 ///
-/// Returns the `i64` result, valid only when `*bail == 0`.
+/// Returns an `i64`, valid only when `*bail == 0`. The return's interpretation
+/// is governed by the per-cache-entry [`RetKind`]: `Int`/`Float` as above, and
+/// `Boxed` as a tagged `usize` reinterpreted as an `i64` (engine reclaims via
+/// [`boxed::reclaim_tagged`]).
 pub type CompiledFn = unsafe extern "C" fn(args: *const i64, nargs: i64, bail: *mut i64) -> i64;
+
+/// Tri-state return kind for a compiled body, used at the outer ABI boundary
+/// to re-interpret the `i64` result the compiled function hands back. The
+/// UDF→UDF dispatcher only ever handles `Int`/`Float` callees (see
+/// [`udf_binding_still_valid`]); a `Boxed` return is reachable only via the
+/// outermost `try_call` entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RetKind {
+    Int,
+    Float,
+    Boxed,
+}
+
+impl RetKind {
+    fn from_analysis(k: analysis::Kind) -> Self {
+        match k {
+            analysis::Kind::Int => RetKind::Int,
+            analysis::Kind::Float => RetKind::Float,
+            analysis::Kind::Boxed => RetKind::Boxed,
+            _ => unreachable!("ret_kind validated to Int/Float/Boxed by analyser"),
+        }
+    }
+    fn is_float(self) -> bool { matches!(self, RetKind::Float) }
+}
 
 /// Per-function compilation outcome. A `global_id` absent from the cache simply
 /// hasn't crossed the hotness threshold yet.
@@ -71,7 +103,7 @@ enum CacheEntry {
     ///   interpreter for the whole call.
     Compiled {
         ptr: CompiledFn,
-        ret_float: bool,
+        ret_kind: RetKind,
         builtins: Vec<&'static str>,
         udfs: Vec<UdfRefBinding>,
     },
@@ -104,48 +136,76 @@ impl HotnessTracker {
 }
 
 /// Composite cache key: `(global_id, signature)` where `signature` packs
-/// `(nargs, float_bitmap)` so each `(func, param-kind-tuple)` specialization
-/// caches independently. A Float bit is set when the corresponding argument
-/// arrived as `CfmlValue::Double`. Limited to 32 params (anything larger is
-/// not a JIT candidate today; we bail to the interpreter).
+/// `(nargs, kind-bitmap)` so each `(func, param-kind-tuple)` specialization
+/// caches independently. v0.89.0 widens the encoding from a 1-bit float
+/// bitmap (32 max params) to a 2-bit kind tuple (16 max params) admitting a
+/// third kind, `Boxed`. Code:
+/// * `0b00` → `Int`
+/// * `0b01` → `Float`
+/// * `0b10` → `Boxed` (any non-numeric `CfmlValue`, crossed as a tagged
+///   `usize` per [`boxed`])
+/// * `0b11` → reserved
 type CacheKey = (u32, u64);
 
-const MAX_JIT_PARAMS: usize = 32;
+const MAX_JIT_PARAMS: usize = 16;
 
-/// Build the cache signature for a call. The low 32 bits hold `nargs`, the
-/// high 32 bits a bitmap where bit `i` = 1 means `args[i]` is `Double`.
-fn signature_for(args: &[CfmlValue]) -> Option<u64> {
-    if args.len() > MAX_JIT_PARAMS {
+const KIND_INT: u64 = 0b00;
+const KIND_FLOAT: u64 = 0b01;
+const KIND_BOXED: u64 = 0b10;
+
+fn pack_sig<I: ExactSizeIterator<Item = u64>>(kinds: I) -> Option<u64> {
+    let nargs = kinds.len();
+    if nargs > MAX_JIT_PARAMS {
         return None;
     }
-    let mut mask: u64 = 0;
-    for (i, a) in args.iter().enumerate() {
-        match a {
-            CfmlValue::Int(_) => {}
-            CfmlValue::Double(_) => mask |= 1u64 << i,
-            _ => return None,
-        }
+    let mut packed: u64 = 0;
+    for (i, k) in kinds.enumerate() {
+        packed |= (k & 0b11) << (i * 2);
     }
-    Some(((mask as u64) << 32) | (args.len() as u64))
+    Some((packed << 32) | (nargs as u64))
+}
+
+/// Extract the param kind code at index `idx` from a packed signature.
+fn arg_kind_code(sig: u64, idx: usize) -> u64 {
+    (sig >> (32 + idx * 2)) & 0b11
+}
+
+fn sig_nargs(sig: u64) -> usize {
+    (sig as u32) as usize
+}
+
+/// Build the cache signature for a call.
+fn signature_for(args: &[CfmlValue]) -> Option<u64> {
+    let kinds = args.iter().map(|a| match a {
+        CfmlValue::Int(_) => KIND_INT,
+        CfmlValue::Double(_) => KIND_FLOAT,
+        _ => KIND_BOXED,
+    });
+    pack_sig(kinds.collect::<Vec<_>>().into_iter())
 }
 
 /// Build the same cache signature directly from an analysis [`analysis::Kind`]
-/// vector. Mirrors [`signature_for`] but works at JIT-analysis time when
-/// concrete `CfmlValue`s aren't on hand. Returns `None` if any kind isn't a
-/// concrete numeric (only `Int`/`Float` map to ABI params).
+/// vector. Returns `None` if any kind isn't an ABI-admissible concrete kind
+/// (`Int`/`Float`/`Boxed`).
 fn sig_from_kinds(kinds: &[analysis::Kind]) -> Option<u64> {
-    if kinds.len() > MAX_JIT_PARAMS {
-        return None;
-    }
-    let mut mask: u64 = 0;
-    for (i, k) in kinds.iter().enumerate() {
-        match k {
-            analysis::Kind::Int => {}
-            analysis::Kind::Float => mask |= 1u64 << i,
-            _ => return None,
-        }
-    }
-    Some((mask << 32) | (kinds.len() as u64))
+    let codes: Option<Vec<u64>> = kinds
+        .iter()
+        .map(|k| match k {
+            analysis::Kind::Int => Some(KIND_INT),
+            analysis::Kind::Float => Some(KIND_FLOAT),
+            analysis::Kind::Boxed => Some(KIND_BOXED),
+            _ => None,
+        })
+        .collect();
+    pack_sig(codes?.into_iter())
+}
+
+/// True iff any param in `sig` is `Boxed`. Used by the UDF resolver to refuse
+/// binding a callee whose specialization the caller cannot pass arguments to
+/// (v0.89.0 admits Boxed only at the outermost ABI, not at UDF→UDF callsites).
+fn sig_has_boxed(sig: u64) -> bool {
+    let n = sig_nargs(sig);
+    (0..n).any(|i| arg_kind_code(sig, i) == KIND_BOXED)
 }
 
 /// Static metadata about a user-defined function. Returned by the
@@ -180,7 +240,14 @@ fn udf_binding_still_valid(
     binding: UdfRefBinding,
 ) -> bool {
     match cache.get(&(binding.global_id, binding.sig)) {
-        Some(CacheEntry::Compiled { ret_float, .. }) => *ret_float == binding.ret_float,
+        Some(CacheEntry::Compiled { ret_kind, .. }) => match ret_kind {
+            RetKind::Int => !binding.ret_float,
+            RetKind::Float => binding.ret_float,
+            // v0.89.0: a JIT'd caller cannot consume a Boxed return from a
+            // UDF callsite (no IR-level box ops yet). If the callee compiled
+            // as Boxed-returning, the binding is invalid forever.
+            RetKind::Boxed => false,
+        },
         Some(CacheEntry::Unjittable) | None => true,
     }
 }
@@ -213,10 +280,10 @@ fn run_compiled_with_engine(
     f: CompiledFn,
     func: &BytecodeFunction,
     args: &[CfmlValue],
-    ret_float: bool,
+    ret_kind: RetKind,
 ) -> (Option<CfmlResult>, i64) {
     let prev = ENGINE_PTR.with(|c| c.replace(engine as *const JitEngine));
-    let result = run_compiled(f, func, args, ret_float);
+    let result = run_compiled(f, func, args, ret_kind);
     ENGINE_PTR.with(|c| c.set(prev));
     result
 }
@@ -253,14 +320,24 @@ pub(crate) fn dispatch_jit_udf(
     // reentrancy is possible.
     let engine = unsafe { &*engine_ptr };
     match engine.cache.get(&(global_id, sig)) {
-        Some(CacheEntry::Compiled { ptr, ret_float, .. }) => {
+        Some(CacheEntry::Compiled { ptr, ret_kind, .. }) => {
             // Phase 2: caller may have speculatively bound this site with
             // `ret_float = false` (the default for a not-yet-compiled
             // foreign callee at analysis time). If the now-cached callee
             // returns the other kind, invoking it would silently miscompile
             // (i64 vs f64::to_bits reinterpreted as the wrong kind). Bail
             // out with code 2 so the outer try_call evicts the caller.
-            if *ret_float != expected_ret_float {
+            // v0.89.0: a Boxed-returning callee is *never* a valid binding
+            // target — same path, no caller can consume it.
+            let cached_is_float = match ret_kind {
+                RetKind::Float => true,
+                RetKind::Int => false,
+                RetKind::Boxed => {
+                    unsafe { *bail = 2 };
+                    return 0;
+                }
+            };
+            if cached_is_float != expected_ret_float {
                 unsafe { *bail = 2 };
                 return 0;
             }
@@ -393,7 +470,7 @@ impl JitEngine {
         // Fast path: already-known outcome for this exact signature.
         match self.cache.get(&key) {
             Some(CacheEntry::Unjittable) => return None,
-            Some(CacheEntry::Compiled { ptr, ret_float, builtins, udfs }) => {
+            Some(CacheEntry::Compiled { ptr, ret_kind, builtins, udfs }) => {
                 // Shadowing guard — a user-defined `abs` (etc.) defined after
                 // the JIT cached this body must still take precedence.
                 for n in builtins {
@@ -411,8 +488,8 @@ impl JitEngine {
                     }
                 }
                 let ptr = *ptr;
-                let rf = *ret_float;
-                let (result, bail) = run_compiled_with_engine(self, ptr, func, args, rf);
+                let rk = *ret_kind;
+                let (result, bail) = run_compiled_with_engine(self, ptr, func, args, rk);
                 if bail == 2 {
                     // Phase-2: speculation mismatch surfaced from a UDF
                     // callsite. Evict the caller so it re-analyses against
@@ -437,7 +514,7 @@ impl JitEngine {
             kinds.push(match a {
                 CfmlValue::Int(_) => analysis::Kind::Int,
                 CfmlValue::Double(_) => analysis::Kind::Float,
-                _ => return None, // unreachable given signature_for, but defensive
+                _ => analysis::Kind::Boxed,
             });
         }
 
@@ -482,12 +559,24 @@ impl JitEngine {
                     //   with the opposite kind. The outer `try_call`
                     //   evicts the caller on bail=2 so the next hot trip
                     //   re-specializes against the now-known callee.
+                    // v0.89.0: refuse to bind a callee whose specialization
+                    // has any Boxed param — the caller's analyser only ever
+                    // observes Int/Float arg kinds at a call site, so this
+                    // is normally unreachable, but defensive in case the
+                    // resolver is invoked speculatively from a future
+                    // codepath. Also refuse Boxed-returning callees.
+                    if sig_has_boxed(callee_sig) {
+                        return None;
+                    }
                     match cache_ref.get(&(meta.global_id, callee_sig)) {
-                        Some(CacheEntry::Compiled { ret_float, .. }) => Some(UdfRefBinding {
-                            global_id: meta.global_id,
-                            sig: callee_sig,
-                            ret_float: *ret_float,
-                        }),
+                        Some(CacheEntry::Compiled { ret_kind, .. }) => match ret_kind {
+                            RetKind::Boxed => None,
+                            other => Some(UdfRefBinding {
+                                global_id: meta.global_id,
+                                sig: callee_sig,
+                                ret_float: matches!(other, RetKind::Float),
+                            }),
+                        },
                         Some(CacheEntry::Unjittable) => None,
                         None => Some(UdfRefBinding {
                             global_id: meta.global_id,
@@ -498,11 +587,15 @@ impl JitEngine {
                 };
             match analysis::analyze(func, &kinds, &resolver) {
                 Some(plan) => {
-                    let ret_float = matches!(plan.ret_kind, analysis::Kind::Float);
+                    let ret_kind = RetKind::from_analysis(plan.ret_kind);
                     // Self-recursion kind check: if the body's actual return
                     // kind is Float but a self-call was typed Int, the
                     // resolver's optimistic answer was wrong. Reject.
-                    let self_call_mistyped = ret_float
+                    // (Boxed ret_kind would imply a Boxed self-call, but the
+                    // resolver above already rejects Boxed-returning bindings,
+                    // so a Boxed-returning self-recursive function is never
+                    // admitted regardless.)
+                    let self_call_mistyped = ret_kind.is_float()
                         && plan
                             .referenced_udfs
                             .iter()
@@ -513,7 +606,7 @@ impl JitEngine {
                         let builtins = plan.referenced_builtins.clone();
                         let udfs = plan.referenced_udfs.clone();
                         match self.backend.compile(func, &plan) {
-                            Ok(ptr) => CacheEntry::Compiled { ptr, ret_float, builtins, udfs },
+                            Ok(ptr) => CacheEntry::Compiled { ptr, ret_kind, builtins, udfs },
                             Err(_) => CacheEntry::Unjittable,
                         }
                     }
@@ -530,7 +623,7 @@ impl JitEngine {
         // as the fast path. (Cache lookup is cheap; this keeps the
         // post-insert run path single-source-of-truth.)
         match self.cache.get(&key) {
-            Some(CacheEntry::Compiled { ptr, ret_float, builtins, udfs }) => {
+            Some(CacheEntry::Compiled { ptr, ret_kind, builtins, udfs }) => {
                 if builtins.iter().any(|n| is_shadowed(n)) {
                     return None;
                 }
@@ -540,8 +633,8 @@ impl JitEngine {
                     }
                 }
                 let ptr = *ptr;
-                let rf = *ret_float;
-                let (result, bail) = run_compiled_with_engine(self, ptr, func, args, rf);
+                let rk = *ret_kind;
+                let (result, bail) = run_compiled_with_engine(self, ptr, func, args, rk);
                 if bail == 2 {
                     self.cache.remove(&key);
                 }
@@ -780,30 +873,59 @@ fn run_compiled(
     f: CompiledFn,
     func: &BytecodeFunction,
     args: &[CfmlValue],
-    ret_float: bool,
+    ret_kind: RetKind,
 ) -> (Option<CfmlResult>, i64) {
     // Tier-1 binds exactly the declared params positionally; defaults/var-args
     // are rejected at analysis time, so arity must match precisely.
     if args.len() != func.params.len() {
         return (None, 0);
     }
+    // Any Boxed argument is leaked across the ABI; reclaim every box after
+    // the body returns (success or bail). Boxed args must always come back
+    // — the compiled body in v0.89.0 only loads/stores/returns them, never
+    // dropping or replacing.
     let mut raw: Vec<i64> = Vec::with_capacity(args.len());
+    let mut boxed_args: Vec<usize> = Vec::new();
     for a in args {
         match a {
             CfmlValue::Int(i) => raw.push(*i),
             CfmlValue::Double(d) => raw.push(d.to_bits() as i64),
-            _ => return (None, 0), // non-numeric argument → let the interpreter handle it
+            other => {
+                // Everything else (String, Array, Struct, Component, Null,
+                // Bool, ...) crosses as a tagged box.
+                let tagged = boxed::box_value(other.clone());
+                boxed_args.push(tagged);
+                raw.push(tagged as i64);
+            }
         }
     }
     let mut bail: i64 = 0;
     let result = unsafe { f(raw.as_ptr(), raw.len() as i64, &mut bail as *mut i64) };
+
+    // On a Boxed return the body always yields one of the input tagged
+    // pointers (v0.89.0 has no IR-level box producer). That single input box
+    // becomes the return value's owned `CfmlValue`; every *other* input box
+    // is reclaimed and dropped here.
+    let return_input_match: Option<usize> =
+        if bail == 0 && matches!(ret_kind, RetKind::Boxed) {
+            boxed_args.iter().position(|&t| t == result as usize)
+        } else {
+            None
+        };
+    for (i, &t) in boxed_args.iter().enumerate() {
+        if Some(i) == return_input_match {
+            continue; // ownership transfers to the return value below
+        }
+        drop(unsafe { boxed::reclaim_tagged(t) });
+    }
+
     if bail != 0 {
         return (None, bail); // runtime deopt → interpret; surface code to caller
     }
-    let value = if ret_float {
-        CfmlValue::Double(f64::from_bits(result as u64))
-    } else {
-        CfmlValue::Int(result)
+    let value = match ret_kind {
+        RetKind::Int => CfmlValue::Int(result),
+        RetKind::Float => CfmlValue::Double(f64::from_bits(result as u64)),
+        RetKind::Boxed => unsafe { boxed::reclaim_tagged(result as usize) },
     };
     (Some(Ok(value)), 0)
 }

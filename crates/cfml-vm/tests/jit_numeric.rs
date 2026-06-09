@@ -452,6 +452,68 @@ fn udf_self_recursion_jits_and_matches_interpreter() {
     assert!(compiled >= 1, "expected fib() to be JIT-compiled, got {compiled}");
 }
 
+// ── v0.89.0 — Boxed scalar in/out at the ABI ─────────────────────────────────
+//
+// Pure pass-through functions admit a Boxed param + Boxed return: the body
+// loads/stores the tagged value through slots without ever operating on it.
+// The interpreter oracle must accept the same call shape (a CfmlValue::String
+// passed straight through) and yield byte-identical output.
+
+#[test]
+fn boxed_pass_through_string_arg_jits_and_matches_interpreter() {
+    // `identity(s)` is loaded with a String, hot-warmed past threshold so the
+    // JIT engages with a Boxed-param specialization, then must echo the
+    // string back through the tagged-pointer ABI.
+    let src = r#"
+        function identity(s) { return s; }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & identity("hello-#k#") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Boxed-pass-through output must match the interpreter");
+    assert!(
+        compiled >= 1,
+        "expected identity() to be JIT-compiled with a Boxed signature, got {compiled}"
+    );
+}
+
+#[test]
+fn boxed_pass_through_via_intermediate_local_jits_and_matches() {
+    // `relay(s)` has the value flow Param → Local → Return. The slot-kind
+    // fixpoint must upgrade the non-param local to Boxed via store-flow
+    // from the Boxed param.
+    let src = r#"
+        function relay(s) { var t = s; return t; }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & relay("relay-#k#") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle);
+    assert!(compiled >= 1, "expected relay() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn boxed_pass_through_mixed_int_and_boxed_args() {
+    // `pick(_, s)` has a Boxed param alongside an Int param. The Int param
+    // is read by a discardable comparison (admitted via pop_value), and the
+    // Boxed `s` is passed through unchanged. Confirms the 2-bit-per-arg sig
+    // encoding distinguishes (Int, Boxed) from (Int, Int) / (Int, Float).
+    let src = r#"
+        function pick(n, s) { var t = s; return t; }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & pick(k, "mixed-#k#") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle);
+    assert!(compiled >= 1, "expected pick() to be JIT-compiled, got {compiled}");
+}
+
 #[test]
 fn udf_call_with_double_arg_jits_via_signature_match() {
     // Caller passes a Double arg through to the callee. Both specializations
