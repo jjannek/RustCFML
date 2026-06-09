@@ -688,6 +688,11 @@ fn osr_calls_jitted_udf_from_outer_loop_in_main() {
     // JIT-compiled UDF (`buildLine`) that takes Boxed + Int args and returns
     // Boxed. The outer loop region is now OSR-eligible because OSR admits
     // UDF callsites (Phase-2 dispatcher) and Boxed slots.
+    //
+    // The body intentionally does meaningful work *between* the UDF calls
+    // (two Concats) so it clears the v0.91.1 OSR-UDF admission heuristic —
+    // a thin "loop-of-UDF-call-wrappers" body would (correctly) reject as
+    // a libcall-overhead net pessimization.
     let src = r#"
         function buildLine(prefix, n) {
             var s = prefix;
@@ -695,7 +700,9 @@ fn osr_calls_jitted_udf_from_outer_loop_in_main() {
             return s;
         }
         total = "";
-        for (k = 1; k <= 200; k++) { total = buildLine("row" & k, 3); }
+        for (k = 1; k <= 200; k++) {
+            total = total & buildLine("row" & k, 3) & ";";
+        }
         writeOutput(total);
     "#;
     let oracle = run_interpreter(src);
@@ -705,5 +712,28 @@ fn osr_calls_jitted_udf_from_outer_loop_in_main() {
     assert!(
         osr_compiled >= 1,
         "expected outer loop in __main__ to OSR-compile (UDF dispatch + Boxed slot), got osr_compiled={osr_compiled}"
+    );
+}
+
+#[test]
+fn osr_rejects_thin_udf_wrapper_loop() {
+    // v0.91.1 regression guard. A `for-loop { x = udf(arg) }` body — i.e.
+    // a UDF-call wrapper with no real work between calls — must NOT be
+    // OSR-compiled, because the UDF dispatcher libcall adds ~100ns/call
+    // overhead vs the interpreter's already-cached Call→try_call path.
+    // Surfaced empirically as a 6.2pp slowdown on udf_call_graph.cfm
+    // between v0.90.1 and v0.91.0; v0.91.1's analyser heuristic removes it.
+    let src = r#"
+        function id(n) { return n; }
+        total = 0;
+        for (k = 1; k <= 200; k++) { total = id(k); }
+        writeOutput(total);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    assert_eq!(out, oracle, "interpreter parity for thin UDF-wrapper loop");
+    assert_eq!(
+        osr_compiled, 0,
+        "thin UDF-wrapper outer loop must be rejected by the admission heuristic (got osr_compiled={osr_compiled})"
     );
 }

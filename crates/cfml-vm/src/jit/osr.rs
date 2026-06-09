@@ -358,6 +358,14 @@ pub fn analyze_loop(
     };
 
     let mut referenced_builtins: BTreeSet<&'static str> = BTreeSet::new();
+    // v0.91.1 — "useful work" op count for the admission heuristic below.
+    // Counts arithmetic / comparison / logic / String / Concat ops in the
+    // reachable region; ignores literal pushes, control flow, locals, Pop,
+    // Dup, LineInfo, DeclareLocal, LoadGlobal, and Call (Call sites are
+    // resolved into builtin vs UDF after simulate_block). Native builtin
+    // Calls are added to this count post-simulate.
+    let mut useful_ops: usize = 0;
+    let mut total_calls: usize = 0;
     // v0.91.0 — UDF names referenced by `LoadGlobal` inside the region.
     // The resolver is consulted at simulate_block to bind each `Call` site.
     let mut udf_name_idx: HashMap<String, usize> = HashMap::new();
@@ -384,7 +392,18 @@ pub fn analyze_loop(
                 | BytecodeOp::Double(_)
                 | BytecodeOp::True
                 | BytecodeOp::False
-                | BytecodeOp::Add
+                | BytecodeOp::Jump(_)
+                | BytecodeOp::JumpIfFalse(_)
+                | BytecodeOp::JumpIfTrue(_)
+                | BytecodeOp::Pop
+                | BytecodeOp::Dup
+                | BytecodeOp::LineInfo(_, _) => {}
+
+                // v0.91.1 — count these as "useful work" for the OSR-UDF
+                // admission heuristic. Native execution of these ops is what
+                // makes OSR worthwhile vs the interpreter's already-fast
+                // dispatch-into-JIT-cache path for Call ops.
+                BytecodeOp::Add
                 | BytecodeOp::Sub
                 | BytecodeOp::Mul
                 | BytecodeOp::Div
@@ -402,17 +421,13 @@ pub fn analyze_loop(
                 | BytecodeOp::Or
                 | BytecodeOp::Xor
                 | BytecodeOp::Not
-                | BytecodeOp::Jump(_)
-                | BytecodeOp::JumpIfFalse(_)
-                | BytecodeOp::JumpIfTrue(_)
-                | BytecodeOp::Pop
-                | BytecodeOp::Dup
-                | BytecodeOp::LineInfo(_, _)
                 // v0.91.0 — String literals and Concat are admitted; the
                 // simulate_block pass below validates operand kinds. Codegen
                 // mirrors translate.rs's whole-fn path (intern + box + shim).
                 | BytecodeOp::String(_)
-                | BytecodeOp::Concat => {}
+                | BytecodeOp::Concat => {
+                    useful_ops += 1;
+                }
 
                 BytecodeOp::LoadLocal(name)
                 | BytecodeOp::StoreLocal(name)
@@ -460,7 +475,9 @@ pub fn analyze_loop(
                         intern_udf(name, &mut udf_name_idx, &mut udf_names);
                     }
                 }
-                BytecodeOp::Call(_) => {} // overload validated below in simulate
+                BytecodeOp::Call(_) => {
+                    total_calls += 1; // builtin Calls add to useful_ops post-simulate
+                }
 
                 _ => return None,
             }
@@ -491,6 +508,30 @@ pub fn analyze_loop(
             udf_resolver,
             &mut udf_call_at,
         )?;
+    }
+
+    // v0.91.1 — OSR-UDF admission heuristic. The UDF dispatcher libcall
+    // (cfml_call_jit_udf) adds ~100ns of overhead per call vs the
+    // interpreter's already-fast Call→try_call→cached compiled body path.
+    // For a hot outer loop whose body is essentially "load + UDF call +
+    // store + step" — i.e. a UDF-call wrapper with no real work between
+    // calls — OSR is a net pessimization (this surfaced as a 6.2pp drop
+    // on udf_call_graph.cfm: 82× → 75×). When the body has meaningful
+    // native work between UDF calls, OSR's per-op acceleration outweighs
+    // the libcall overhead and the loop benefits.
+    //
+    // Heuristic: with any UDF call in the region, require at least
+    // MIN_USEFUL_FOR_UDF total useful ops (arithmetic / comparison /
+    // logic / String / Concat / native builtin Call). Sized so the bench
+    // udf_call_graph (1 Add) rejects, but realistic mixed-work loops
+    // (≥2 ops between UDF calls) admit.
+    if !udf_call_at.is_empty() {
+        const MIN_USEFUL_FOR_UDF: usize = 2;
+        let builtin_calls = total_calls.saturating_sub(udf_call_at.len());
+        let total_useful = useful_ops + builtin_calls;
+        if total_useful < MIN_USEFUL_FOR_UDF {
+            return None;
+        }
     }
 
     let referenced_builtins: Vec<&'static str> = referenced_builtins.into_iter().collect();
