@@ -531,3 +531,57 @@ fn udf_call_with_double_arg_jits_via_signature_match() {
     assert_eq!(out, oracle, "Double-arg UDF→UDF output must match the interpreter");
     assert!(compiled >= 1, "expected at least scale() to be JIT-compiled");
 }
+
+// ── v0.90.0 — Boxed mid-body operations ───────────────────────────────────
+
+#[test]
+fn string_literal_pass_through_jits() {
+    // `function f() { return "x"; }` admits with Kind::Boxed return now.
+    let src = r#"
+        function f() { return "x"; }
+        for (k = 1; k <= 60; k++) { v = f(); }
+        writeOutput(v);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle);
+    assert!(compiled >= 1, "expected f() to JIT, got {compiled}");
+}
+
+#[test]
+fn boxed_concat_in_jitted_udf_matches_interpreter() {
+    // The signature for `build` is (Boxed, Int) — admissible since v0.89.0.
+    // The body uses String literal + Concat (mixed Boxed + Int + Boxed)
+    // and a Boxed loop accumulator, which are the v0.90.0 additions.
+    let src = r#"
+        function build(prefix, n) {
+            var s = prefix;
+            for (var i = 1; i <= n; i++) { s = s & "-" & i; }
+            return s;
+        }
+        out = "";
+        for (k = 1; k <= 60; k++) { out = out & build("row" & k, 5) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Boxed-concat UDF must produce identical output");
+    assert!(compiled >= 1, "expected build() to JIT, got {compiled}");
+}
+
+#[test]
+fn boxed_concat_with_float_operand_matches_interpreter() {
+    // Concat of String + Float — the box_float shim should fire on the
+    // Float side and the concat result must stringify identically to
+    // the interpreter (`d` formatted by `CfmlValue::as_string`).
+    let src = r#"
+        function fmt(label, d) { return label & "=" & d; }
+        out = "";
+        for (k = 1; k <= 60; k++) { out = out & fmt("x", 2.5) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Boxed-concat with Float operand must match");
+    assert!(compiled >= 1, "expected fmt() to JIT, got {compiled}");
+}

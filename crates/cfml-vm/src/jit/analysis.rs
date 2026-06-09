@@ -420,7 +420,14 @@ pub fn analyze(
                 | BytecodeOp::Pop
                 | BytecodeOp::Dup
                 | BytecodeOp::Return
-                | BytecodeOp::LineInfo(_, _) => {}
+                | BytecodeOp::LineInfo(_, _)
+                // v0.90.0: `String(literal)` produces a Boxed value;
+                // `Concat` consumes two arbitrary values and produces a
+                // Boxed string. Pass 1 doesn't track stack kinds, so we
+                // simply admit them here and let simulate_block enforce
+                // the operand-kind rules.
+                | BytecodeOp::String(_)
+                | BytecodeOp::Concat => {}
 
                 BytecodeOp::LoadLocal(name) => {
                     if is_reserved_scope(name) {
@@ -724,6 +731,28 @@ fn simulate_block(
             BytecodeOp::Double(_) => stack.push(Kind::Float),
             BytecodeOp::True | BytecodeOp::False => stack.push(Kind::Bool),
 
+            // v0.90.0: a string literal becomes a freshly-boxed
+            // `CfmlValue::String` allocated into the active per-call arena
+            // by the `cfml_jit_string_literal` shim. The kind is Boxed.
+            BytecodeOp::String(_) => stack.push(Kind::Boxed),
+
+            // v0.90.0: `&` concat. Always yields a Boxed String (per
+            // `BytecodeOp::Concat` semantics in lib.rs). Either operand
+            // may be Int / Float / Boxed; Bool / Builtin / UdfRef are
+            // rejected by `pop_value!` (a fn-reference can never reach
+            // a concat). Int / Float operands are auto-boxed in codegen
+            // before the `cfml_jit_concat_boxed` call.
+            BytecodeOp::Concat => {
+                let b = pop!();
+                let a = pop!();
+                if !matches!(a, Kind::Int | Kind::Float | Kind::Boxed)
+                    || !matches!(b, Kind::Int | Kind::Float | Kind::Boxed)
+                {
+                    return None;
+                }
+                stack.push(Kind::Boxed);
+            }
+
             BytecodeOp::LoadLocal(name) => {
                 stack.push(slot_kind[slot_index(name)?]);
             }
@@ -988,9 +1017,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_op() {
+    fn admits_string_literal_return_as_boxed() {
+        // v0.90.0: a String literal now admits with `Kind::Boxed`. The
+        // function `function f() { return "x"; }` is a valid Tier-1 body.
         let f = mkfn(&[], vec![BytecodeOp::String("x".into()), BytecodeOp::Return]);
-        assert!(analyze_int(&f).is_none());
+        let plan = analyze_int(&f).expect("string-literal return now admissible");
+        assert_eq!(plan.ret_kind, Kind::Boxed);
     }
 
     #[test]

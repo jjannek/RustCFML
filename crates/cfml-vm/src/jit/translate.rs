@@ -22,6 +22,8 @@
 //!   **bails** (→ interpreter, which *throws*) on a zero divisor. `%`/`\` keep
 //!   the existing integer bail on a zero/`INT_MIN`-overflow divisor.
 
+use std::collections::HashMap;
+
 use cfml_codegen::{BytecodeOp, BytecodeFunction, CmpOp};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
@@ -34,6 +36,9 @@ use cranelift_module::{FuncId, Linkage, Module};
 
 use super::analysis::{Kind, Plan};
 use super::builtins::{self, SHIMS};
+use super::shims::{
+    cfml_jit_add_boxed, cfml_jit_box_float, cfml_jit_box_int, cfml_jit_concat_boxed,
+};
 use super::CompiledFn;
 
 const I64: types::Type = types::I64;
@@ -48,6 +53,25 @@ extern "C" fn cfml_fmod(a: f64, b: f64) -> f64 {
 }
 extern "C" fn cfml_pow(a: f64, b: f64) -> f64 {
     a.powf(b)
+}
+
+/// v0.90.0 — materialise a string literal from a stable `(ptr, len)` view
+/// of UTF-8 bytes owned by the [`Backend`]. The shim allocates a fresh
+/// `CfmlValue::String(Arc<String>)` into the active per-call arena and
+/// returns its tagged pointer.
+///
+/// Safety: `ptr`/`len` describe a live `Box<str>` stored in
+/// `Backend::string_literals`, which lives as long as the JIT module.
+#[no_mangle]
+extern "C" fn cfml_jit_str_literal(ptr: *const u8, len: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    // SAFETY: see the doc comment above; backed by a stable `Box<str>` for
+    // the lifetime of the JIT engine.
+    let s = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    // The slice is guaranteed UTF-8 because we built it from a Rust
+    // `Box<str>` / `String`.
+    let s = unsafe { std::str::from_utf8_unchecked(s) };
+    super::arena::box_into_active(CfmlValue::string(s.to_owned())) as i64
 }
 
 /// Dispatch a UDF→UDF call from inside a JIT'd body. The thread-local engine
@@ -104,6 +128,20 @@ pub struct Backend {
     /// `compile()` turns these into per-function `FuncRef`s via
     /// `declare_func_in_func`.
     pub(super) shim_ids: Vec<FuncId>,
+    /// v0.90.0 — pre-declared FuncIds for the Boxed-value shims:
+    /// `cfml_jit_box_int`, `cfml_jit_box_float`, `cfml_jit_concat_boxed`,
+    /// `cfml_jit_add_boxed`, `cfml_jit_str_literal`. Imported into each
+    /// compiled function's IR namespace via `declare_func_in_func`.
+    pub(super) box_int_id: FuncId,
+    pub(super) box_float_id: FuncId,
+    pub(super) concat_boxed_id: FuncId,
+    pub(super) add_boxed_id: FuncId,
+    pub(super) str_literal_id: FuncId,
+    /// String-literal storage. Each unique `BytecodeOp::String(s)` interned
+    /// during a compile is appended here (deduped). The `Box<str>` keeps
+    /// each literal at a stable address for the life of the JIT module, so
+    /// the IR can hold a raw pointer to it.
+    pub(super) string_literals: Vec<Box<str>>,
 }
 
 impl Backend {
@@ -127,6 +165,12 @@ impl Backend {
         builder.symbol("cfml_fmod", cfml_fmod as *const u8);
         builder.symbol("cfml_pow", cfml_pow as *const u8);
         builder.symbol("cfml_call_jit_udf", cfml_call_jit_udf as *const u8);
+        // v0.90.0 boxed-value shims.
+        builder.symbol("cfml_jit_box_int", cfml_jit_box_int as *const u8);
+        builder.symbol("cfml_jit_box_float", cfml_jit_box_float as *const u8);
+        builder.symbol("cfml_jit_concat_boxed", cfml_jit_concat_boxed as *const u8);
+        builder.symbol("cfml_jit_add_boxed", cfml_jit_add_boxed as *const u8);
+        builder.symbol("cfml_jit_str_literal", cfml_jit_str_literal as *const u8);
         // Register every allowlisted builtin shim (Option A — Tier-1 native
         // calls). Each is a pure `extern "C"` Rust fn whose semantics mirror
         // the interpreter's `cfml-stdlib::builtins::fn_*` entry.
@@ -192,6 +236,54 @@ impl Backend {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        // v0.90.0 boxed-value shim declarations. All signatures use I64
+        // for tagged-pointer args/returns (Option-γ encoding).
+        let ptr_ty = module.target_config().pointer_type();
+        let box_int_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(I64));
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_jit_box_int", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
+        let box_float_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(F64));
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_jit_box_float", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
+        let concat_boxed_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(I64));
+            sig.params.push(AbiParam::new(I64));
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_jit_concat_boxed", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
+        let add_boxed_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(I64));
+            sig.params.push(AbiParam::new(I64));
+            sig.params.push(AbiParam::new(ptr_ty)); // bail
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_jit_add_boxed", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
+        let str_literal_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(ptr_ty)); // *const u8
+            sig.params.push(AbiParam::new(I64)); // len
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_jit_str_literal", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
+
         Ok(Self {
             module,
             fbc: FunctionBuilderContext::new(),
@@ -200,7 +292,30 @@ impl Backend {
             pow_id,
             udf_dispatch_id,
             shim_ids,
+            box_int_id,
+            box_float_id,
+            concat_boxed_id,
+            add_boxed_id,
+            str_literal_id,
+            string_literals: Vec::new(),
         })
+    }
+
+    /// Intern a string literal at a stable heap location and return the
+    /// `(ptr, len)` view the JIT can embed as a constant in IR.
+    pub(super) fn intern_literal(&mut self, s: &str) -> (*const u8, i64) {
+        // Linear scan — dedupe is nice-to-have but literals are bounded by
+        // the compile rate, and dedup keys typically scale O(small).
+        for boxed in &self.string_literals {
+            if boxed.as_ref() == s {
+                return (boxed.as_ptr(), boxed.len() as i64);
+            }
+        }
+        let boxed: Box<str> = s.into();
+        let ptr = boxed.as_ptr();
+        let len = boxed.len() as i64;
+        self.string_literals.push(boxed);
+        (ptr, len)
     }
 
     /// Compile `func` per `plan` to native code, returning a callable pointer.
@@ -242,6 +357,35 @@ impl Backend {
         let udf_dispatch_ref = self
             .module
             .declare_func_in_func(self.udf_dispatch_id, &mut ctx.func);
+        // v0.90.0 boxed shims.
+        let box_int_ref = self
+            .module
+            .declare_func_in_func(self.box_int_id, &mut ctx.func);
+        let box_float_ref = self
+            .module
+            .declare_func_in_func(self.box_float_id, &mut ctx.func);
+        let concat_boxed_ref = self
+            .module
+            .declare_func_in_func(self.concat_boxed_id, &mut ctx.func);
+        let _add_boxed_ref = self
+            .module
+            .declare_func_in_func(self.add_boxed_id, &mut ctx.func);
+        let str_literal_ref = self
+            .module
+            .declare_func_in_func(self.str_literal_id, &mut ctx.func);
+
+        // v0.90.0 — intern every String literal in the reachable code
+        // before the FunctionBuilder borrows take effect. The resulting
+        // (ptr, len) pairs are keyed by IP and pulled into the codegen
+        // loop below as constants.
+        let mut str_literal_at: HashMap<usize, (*const u8, i64)> = HashMap::new();
+        for blk in &plan.blocks {
+            for ip in blk.start..blk.end {
+                if let BytecodeOp::String(s) = &func.instructions[ip] {
+                    str_literal_at.insert(ip, self.intern_literal(s));
+                }
+            }
+        }
         // Parallel to SHIMS — only the entries the function actually calls
         // get used, but importing all of them is cheap and keeps indexing
         // straight-through.
@@ -352,6 +496,33 @@ impl Backend {
                         BytecodeOp::Double(d) => stack.push((b.ins().f64const(*d), Kind::Float)),
                         BytecodeOp::True => stack.push((b.ins().iconst(I64, 1), Kind::Bool)),
                         BytecodeOp::False => stack.push((b.ins().iconst(I64, 0), Kind::Bool)),
+
+                        // v0.90.0 — emit a call to `cfml_jit_str_literal`
+                        // with the interned (ptr, len) view. Returns a
+                        // tagged Boxed pointer.
+                        BytecodeOp::String(_) => {
+                            let (ptr, len) = *str_literal_at
+                                .get(&ip)
+                                .ok_or("jit: missing interned string literal")?;
+                            let ptr_v = b.ins().iconst(ptr_ty, ptr as i64);
+                            let len_v = b.ins().iconst(I64, len);
+                            let call = b.ins().call(str_literal_ref, &[ptr_v, len_v]);
+                            let r = b.inst_results(call)[0];
+                            stack.push((r, Kind::Boxed));
+                        }
+
+                        // v0.90.0 — `&` concat. Pop b, pop a; box each
+                        // non-Boxed operand via the matching shim; call
+                        // `cfml_jit_concat_boxed(a, b)`; push Boxed.
+                        BytecodeOp::Concat => {
+                            let (rhs, rk) = stack.pop().ok_or("jit: stack underflow")?;
+                            let (lhs, lk) = stack.pop().ok_or("jit: stack underflow")?;
+                            let a_tag = ensure_boxed(&mut b, box_int_ref, box_float_ref, lhs, lk);
+                            let b_tag = ensure_boxed(&mut b, box_int_ref, box_float_ref, rhs, rk);
+                            let call = b.ins().call(concat_boxed_ref, &[a_tag, b_tag]);
+                            let r = b.inst_results(call)[0];
+                            stack.push((r, Kind::Boxed));
+                        }
 
                         BytecodeOp::LoadLocal(name) => {
                             let slot = plan.slot_of(name).ok_or("jit: unknown local")?;
@@ -696,6 +867,38 @@ impl Backend {
         // SAFETY: `code` points at freshly-emitted native code for our exact
         // signature; it lives as long as the `JITModule` (owned by the engine).
         Ok(unsafe { std::mem::transmute::<*const u8, CompiledFn>(code) })
+    }
+}
+
+/// v0.90.0 — promote a stack value to its tagged-Boxed form. A Boxed
+/// operand passes through; an `Int` or `Float` operand is shipped to the
+/// matching `cfml_jit_box_int` / `cfml_jit_box_float` shim. `Bool` /
+/// fn-ref markers should never reach this helper (the analyser rejects).
+pub(super) fn ensure_boxed(
+    b: &mut FunctionBuilder,
+    box_int: cranelift_codegen::ir::FuncRef,
+    box_float: cranelift_codegen::ir::FuncRef,
+    v: Value,
+    k: Kind,
+) -> Value {
+    match k {
+        Kind::Boxed => v,
+        Kind::Float => {
+            let call = b.ins().call(box_float, &[v]);
+            b.inst_results(call)[0]
+        }
+        Kind::Int => {
+            let call = b.ins().call(box_int, &[v]);
+            b.inst_results(call)[0]
+        }
+        _ => {
+            // The analyser only ever pushes Int/Float/Boxed onto sites
+            // that flow into ensure_boxed (Concat operands). Defensive:
+            // emit an iconst-zero so the IR still verifies, but the
+            // result will be wrong; this should be unreachable.
+            debug_assert!(false, "ensure_boxed: unexpected operand kind");
+            b.ins().iconst(I64, 0)
+        }
     }
 }
 

@@ -34,10 +34,12 @@ use std::ptr;
 use std::sync::{Arc, RwLock};
 
 mod analysis;
+pub(super) mod arena;
 mod boxed;
 mod builtins;
 pub mod coverage;
 mod osr;
+mod shims;
 mod translate;
 
 pub use analysis::UdfRefBinding;
@@ -880,21 +882,22 @@ fn run_compiled(
     if args.len() != func.params.len() {
         return (None, 0);
     }
-    // Any Boxed argument is leaked across the ABI; reclaim every box after
-    // the body returns (success or bail). Boxed args must always come back
-    // — the compiled body in v0.89.0 only loads/stores/returns them, never
-    // dropping or replacing.
+    // v0.90.0: install a per-call arena for mid-body shim allocations.
+    // Boxed inputs are tracked in the same arena (uniform drain semantics).
+    // Nested `run_compiled` (interpreter re-entry from inside a JIT'd
+    // callee) pushes/pops its own arena via `ArenaGuard`.
+    let mut arena = arena::Arena::new();
+    let _guard = arena::ArenaGuard::install(&mut arena);
+
     let mut raw: Vec<i64> = Vec::with_capacity(args.len());
-    let mut boxed_args: Vec<usize> = Vec::new();
     for a in args {
         match a {
             CfmlValue::Int(i) => raw.push(*i),
             CfmlValue::Double(d) => raw.push(d.to_bits() as i64),
             other => {
-                // Everything else (String, Array, Struct, Component, Null,
-                // Bool, ...) crosses as a tagged box.
-                let tagged = boxed::box_value(other.clone());
-                boxed_args.push(tagged);
+                // Boxed arg: track in the arena so the post-call drain
+                // reclaims it uniformly with shim-allocated boxes.
+                let tagged = arena::box_into_active(other.clone());
                 raw.push(tagged as i64);
             }
         }
@@ -902,22 +905,19 @@ fn run_compiled(
     let mut bail: i64 = 0;
     let result = unsafe { f(raw.as_ptr(), raw.len() as i64, &mut bail as *mut i64) };
 
-    // On a Boxed return the body always yields one of the input tagged
-    // pointers (v0.89.0 has no IR-level box producer). That single input box
-    // becomes the return value's owned `CfmlValue`; every *other* input box
-    // is reclaimed and dropped here.
-    let return_input_match: Option<usize> =
+    // Drop the active-arena binding before we touch `arena` directly.
+    drop(_guard);
+
+    // On a Boxed return the body's `result` is a tagged pointer that
+    // currently lives in this call's arena. The arena drains every box
+    // EXCEPT that one; the engine then reclaims it to wrap as CfmlValue.
+    let keep_for_return: Option<usize> =
         if bail == 0 && matches!(ret_kind, RetKind::Boxed) {
-            boxed_args.iter().position(|&t| t == result as usize)
+            Some(result as usize)
         } else {
             None
         };
-    for (i, &t) in boxed_args.iter().enumerate() {
-        if Some(i) == return_input_match {
-            continue; // ownership transfers to the return value below
-        }
-        drop(unsafe { boxed::reclaim_tagged(t) });
-    }
+    arena.drain_except(keep_for_return);
 
     if bail != 0 {
         return (None, bail); // runtime deopt → interpret; surface code to caller
