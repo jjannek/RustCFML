@@ -13,7 +13,14 @@
 //! The checks (all over the **reachable** CFG only, so dead trailing
 //! `Null; Return` epilogues never disqualify a function):
 //!
-//! 1. **No defaulted params / not `__main__`** — args are bound positionally.
+//! 1. **No defaulted params.** Args are bound positionally. `__main__` is now
+//!    admissible on its merits: it is called with zero args, has no defaults,
+//!    and the op-by-op pass below rejects every side-effecting top-level
+//!    construct (writeOutput, includes, cfquery, struct/array, …) anyway.
+//!    Whole-function admission of `__main__` (v0.91.0) lets a hot per-request
+//!    `__main__` whose body is a pure numeric / Boxed-concat loop compile
+//!    natively; pure-CLI runs never cross the hotness threshold so this is
+//!    only a serve-mode unlock in practice.
 //! 2. **Op-subset** — only the numeric/arithmetic/counted-loop ops below.
 //! 3. **No reserved scope names** in local ops (`variables`, `arguments`, …).
 //! 4. **Slot kinds** — every local slot is *uniformly* `Int` or `Float`. A
@@ -256,9 +263,7 @@ pub fn analyze(
     param_kinds: &[Kind],
     udf_resolver: &UdfResolver<'_>,
 ) -> Option<Plan> {
-    if func.name == "__main__" {
-        return None;
-    }
+    // `__main__` is admissible on its merits — see the module-level doc.
     // Args are bound positionally; defaulted params need the runtime preamble.
     if func.has_default.iter().any(|d| *d) {
         return None;

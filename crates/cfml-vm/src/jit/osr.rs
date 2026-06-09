@@ -9,13 +9,17 @@
 //!
 //! # Why a separate analyser
 //!
-//! The whole-function analyser in `super::analysis` rejects `__main__` and
-//! validates the full reachable CFG from entry to every `Return`. A hot
-//! top-level loop in `__main__` therefore never qualifies — even though the
-//! loop body itself may use the same op subset. OSR lifts that restriction by
-//! analysing the *region* `[loop_header, step_ip + 1)` only, with caller-
-//! provided slot kinds as the seed (no params; the locals already exist in
-//! the live VM scope and we marshal them across an in/out ABI).
+//! The whole-function analyser in `super::analysis` validates the full
+//! reachable CFG from entry to every `Return`. A hot loop inside a function
+//! that contains *any* non-admitted op (a side-effecting `writeOutput`, a
+//! struct/array build, a non-allowlist `Call`, …) anywhere else in its body
+//! therefore never qualifies via the whole-function path — even though the
+//! loop region itself uses the supported op subset. OSR lifts that
+//! restriction by analysing the *region* `[loop_header, step_ip + 1)` only,
+//! with caller-provided slot kinds as the seed (no params; the locals
+//! already exist in the live VM scope and we marshal them across an in/out
+//! ABI). `__main__` is admissible by both paths (whole-fn since v0.91.0, OSR
+//! all along).
 //!
 //! # ABI
 //!
