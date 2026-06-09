@@ -42,7 +42,7 @@ mod osr;
 mod shims;
 mod translate;
 
-pub use analysis::UdfRefBinding;
+pub use analysis::{BindingRet, UdfRefBinding};
 
 /// ABI of every Tier-1 compiled function.
 ///
@@ -83,7 +83,23 @@ impl RetKind {
             _ => unreachable!("ret_kind validated to Int/Float/Boxed by analyser"),
         }
     }
-    fn is_float(self) -> bool { matches!(self, RetKind::Float) }
+    /// 0/1/2 encoding matching the `expected_ret_kind` argument the JIT'd
+    /// caller passes to `cfml_call_jit_udf`.
+    fn as_code(self) -> i64 {
+        match self {
+            RetKind::Int => 0,
+            RetKind::Float => 1,
+            RetKind::Boxed => 2,
+        }
+    }
+
+    fn to_binding(self) -> BindingRet {
+        match self {
+            RetKind::Int => BindingRet::Int,
+            RetKind::Float => BindingRet::Float,
+            RetKind::Boxed => BindingRet::Boxed,
+        }
+    }
 }
 
 /// Per-function compilation outcome. A `global_id` absent from the cache simply
@@ -167,15 +183,6 @@ fn pack_sig<I: ExactSizeIterator<Item = u64>>(kinds: I) -> Option<u64> {
     Some((packed << 32) | (nargs as u64))
 }
 
-/// Extract the param kind code at index `idx` from a packed signature.
-fn arg_kind_code(sig: u64, idx: usize) -> u64 {
-    (sig >> (32 + idx * 2)) & 0b11
-}
-
-fn sig_nargs(sig: u64) -> usize {
-    (sig as u32) as usize
-}
-
 /// Build the cache signature for a call.
 fn signature_for(args: &[CfmlValue]) -> Option<u64> {
     let kinds = args.iter().map(|a| match a {
@@ -202,14 +209,6 @@ fn sig_from_kinds(kinds: &[analysis::Kind]) -> Option<u64> {
     pack_sig(codes?.into_iter())
 }
 
-/// True iff any param in `sig` is `Boxed`. Used by the UDF resolver to refuse
-/// binding a callee whose specialization the caller cannot pass arguments to
-/// (v0.89.0 admits Boxed only at the outermost ABI, not at UDF→UDF callsites).
-fn sig_has_boxed(sig: u64) -> bool {
-    let n = sig_nargs(sig);
-    (0..n).any(|i| arg_kind_code(sig, i) == KIND_BOXED)
-}
-
 /// Static metadata about a user-defined function. Returned by the
 /// `udf_lookup` callback passed into [`JitEngine::try_call`]. Lets the JIT
 /// resolve a `LoadGlobal(name)` to a stable `(global_id, arity)` pair
@@ -226,8 +225,8 @@ pub struct UdfMeta {
 /// only, not the whole function — and the binding becomes "live" the
 /// moment the callee compiles).
 ///
-/// * `Compiled { ret_float }` matching the binding's expectation → valid.
-/// * `Compiled` with the *opposite* ret_float → invalid (would silently
+/// * `Compiled` whose `ret_kind` matches the binding's expectation → valid.
+/// * `Compiled` with a *different* `ret_kind` → invalid (would silently
 ///   miscompile if invoked; bail=2 in the dispatcher handles this at
 ///   runtime, but we also reject here so a steady-state mismatch doesn't
 ///   keep paying the dispatcher cost).
@@ -242,14 +241,9 @@ fn udf_binding_still_valid(
     binding: UdfRefBinding,
 ) -> bool {
     match cache.get(&(binding.global_id, binding.sig)) {
-        Some(CacheEntry::Compiled { ret_kind, .. }) => match ret_kind {
-            RetKind::Int => !binding.ret_float,
-            RetKind::Float => binding.ret_float,
-            // v0.89.0: a JIT'd caller cannot consume a Boxed return from a
-            // UDF callsite (no IR-level box ops yet). If the callee compiled
-            // as Boxed-returning, the binding is invalid forever.
-            RetKind::Boxed => false,
-        },
+        Some(CacheEntry::Compiled { ret_kind, .. }) => {
+            ret_kind.to_binding() == binding.ret_kind
+        }
         Some(CacheEntry::Unjittable) | None => true,
     }
 }
@@ -296,13 +290,17 @@ fn run_compiled_with_engine(
 /// * `*bail = 1` — normal deopt: callee not yet compiled, callee is known
 ///   `Unjittable`, or the callee's own body bailed. Caller's cache entry is
 ///   left intact (this is a transient or per-call failure).
-/// * `*bail = 2` — speculation mismatch: caller's `expected_ret_float` does
-///   not match the cached callee's `ret_float`. The outer `try_call` evicts
+/// * `*bail = 2` — speculation mismatch: caller's `expected_ret_kind` does
+///   not match the cached callee's `ret_kind`. The outer `try_call` evicts
 ///   the caller from the cache so it re-analyses on its next hot trip.
+///
+/// `expected_ret_kind` is the 0/1/2 encoding from [`RetKind::as_code`]:
+/// `0=Int / 1=Float / 2=Boxed`. v0.90.1 widens this from the previous
+/// boolean `expected_ret_float`.
 pub(crate) fn dispatch_jit_udf(
     global_id: u32,
     sig: u64,
-    expected_ret_float: bool,
+    expected_ret_kind: i64,
     args: *const i64,
     nargs: i64,
     bail: *mut i64,
@@ -324,22 +322,12 @@ pub(crate) fn dispatch_jit_udf(
     match engine.cache.get(&(global_id, sig)) {
         Some(CacheEntry::Compiled { ptr, ret_kind, .. }) => {
             // Phase 2: caller may have speculatively bound this site with
-            // `ret_float = false` (the default for a not-yet-compiled
-            // foreign callee at analysis time). If the now-cached callee
-            // returns the other kind, invoking it would silently miscompile
-            // (i64 vs f64::to_bits reinterpreted as the wrong kind). Bail
-            // out with code 2 so the outer try_call evicts the caller.
-            // v0.89.0: a Boxed-returning callee is *never* a valid binding
-            // target — same path, no caller can consume it.
-            let cached_is_float = match ret_kind {
-                RetKind::Float => true,
-                RetKind::Int => false,
-                RetKind::Boxed => {
-                    unsafe { *bail = 2 };
-                    return 0;
-                }
-            };
-            if cached_is_float != expected_ret_float {
+            // `ret_kind = Int` (the default for a not-yet-compiled foreign
+            // callee at analysis time). If the now-cached callee returns
+            // a different kind, invoking it would silently miscompile
+            // (the i64 result would be reinterpreted as the wrong kind).
+            // Bail out with code 2 so the outer try_call evicts the caller.
+            if ret_kind.as_code() != expected_ret_kind {
                 unsafe { *bail = 2 };
                 return 0;
             }
@@ -541,63 +529,54 @@ impl JitEngine {
                     let callee_sig = sig_from_kinds(arg_kinds)?;
                     // Self-call: same fn + same sig as the specialization
                     // we're compiling. Optimistically assume Int return; the
-                    // post-check below catches the Float-returning case.
+                    // post-check below catches Float/Boxed-returning cases.
                     if meta.global_id == caller_gid && callee_sig == caller_sig {
                         return Some(UdfRefBinding {
                             global_id: caller_gid,
                             sig: caller_sig,
-                            ret_float: false,
+                            ret_kind: BindingRet::Int,
                         });
                     }
                     // Phase-2: foreign UDF binding.
                     // * If callee is already Compiled, bind with its real
-                    //   `ret_float` — the fast path with no runtime checks.
+                    //   `ret_kind` — the fast path with no runtime checks.
                     // * If callee is `Unjittable`, refuse the optimisation
                     //   (it would always bail at runtime; staying on the
                     //   interpreter for this caller is cheaper).
                     // * If callee is *not yet compiled*, speculate
-                    //   `ret_float = false` and let the runtime dispatcher
+                    //   `ret_kind = Int` and let the runtime dispatcher
                     //   surface `*bail = 2` if/when the callee compiles
-                    //   with the opposite kind. The outer `try_call`
+                    //   with a different kind. The outer `try_call`
                     //   evicts the caller on bail=2 so the next hot trip
                     //   re-specializes against the now-known callee.
-                    // v0.89.0: refuse to bind a callee whose specialization
-                    // has any Boxed param — the caller's analyser only ever
-                    // observes Int/Float arg kinds at a call site, so this
-                    // is normally unreachable, but defensive in case the
-                    // resolver is invoked speculatively from a future
-                    // codepath. Also refuse Boxed-returning callees.
-                    if sig_has_boxed(callee_sig) {
-                        return None;
-                    }
+                    //
+                    // v0.90.1: Boxed-arg and Boxed-ret callees are now
+                    // admitted (sig_has_boxed rejection lifted, RetKind::
+                    // Boxed binding allowed). The IR-level Boxed pipeline
+                    // (v0.90.0) consumes tagged-pointer returns the same
+                    // way it consumes a `Concat` result.
                     match cache_ref.get(&(meta.global_id, callee_sig)) {
-                        Some(CacheEntry::Compiled { ret_kind, .. }) => match ret_kind {
-                            RetKind::Boxed => None,
-                            other => Some(UdfRefBinding {
-                                global_id: meta.global_id,
-                                sig: callee_sig,
-                                ret_float: matches!(other, RetKind::Float),
-                            }),
-                        },
+                        Some(CacheEntry::Compiled { ret_kind, .. }) => Some(UdfRefBinding {
+                            global_id: meta.global_id,
+                            sig: callee_sig,
+                            ret_kind: ret_kind.to_binding(),
+                        }),
                         Some(CacheEntry::Unjittable) => None,
                         None => Some(UdfRefBinding {
                             global_id: meta.global_id,
                             sig: callee_sig,
-                            ret_float: false,
+                            ret_kind: BindingRet::Int,
                         }),
                     }
                 };
             match analysis::analyze(func, &kinds, &resolver) {
                 Some(plan) => {
                     let ret_kind = RetKind::from_analysis(plan.ret_kind);
-                    // Self-recursion kind check: if the body's actual return
-                    // kind is Float but a self-call was typed Int, the
-                    // resolver's optimistic answer was wrong. Reject.
-                    // (Boxed ret_kind would imply a Boxed self-call, but the
-                    // resolver above already rejects Boxed-returning bindings,
-                    // so a Boxed-returning self-recursive function is never
-                    // admitted regardless.)
-                    let self_call_mistyped = ret_kind.is_float()
+                    // Self-recursion kind check: the resolver optimistically
+                    // typed a self-call as `BindingRet::Int`. If the body's
+                    // actual return kind is Float or Boxed, that speculation
+                    // was wrong. Reject so we don't silently miscompile.
+                    let self_call_mistyped = !matches!(ret_kind, RetKind::Int)
                         && plan
                             .referenced_udfs
                             .iter()

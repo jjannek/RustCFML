@@ -384,7 +384,7 @@ fn hot_main_loop_osrs_and_matches_interpreter() {
 // (engine-level shadow guard is covered by the `shadow_check_short_circuits_jit`
 //  unit test in `crates/cfml-vm/src/jit/mod.rs`. A full e2e shadowing test
 //  isn't included here because RustCFML's `LoadGlobal` lookup order resolves
-//  bare-name calls to the canonical builtin wrapper in `vm.globals` before any
+//  bare-name calls to the canonical builtin passThroughper in `vm.globals` before any
 //  user `function abs(){…}` or `abs = ...` reassignment — so the language
 //  doesn't currently expose a path to actually shadow an Option-A builtin name
 //  from CFML source. The guard remains as defence-in-depth: if/when CFML adds
@@ -567,6 +567,78 @@ fn boxed_concat_in_jitted_udf_matches_interpreter() {
     let (out, compiled) = run(src);
     assert_eq!(out, oracle, "Boxed-concat UDF must produce identical output");
     assert!(compiled >= 1, "expected build() to JIT, got {compiled}");
+}
+
+// ── v0.90.1 — UDF→UDF dispatch carrying Boxed args / Boxed returns ──────────
+//
+// Before v0.90.1 the UDF resolver refused any callee whose specialization
+// took Boxed args or returned Boxed — the binding was unrepresentable in
+// the dispatcher (ret_float: bool) and there was no IR-level Boxed pipeline
+// to feed the result into. v0.90.0 lit the IR pipeline (String/Concat +
+// arena). v0.90.1 lifts the resolver gate and grows expected_ret_float into
+// a tri-state expected_ret_kind (0=Int / 1=Float / 2=Boxed), letting a
+// JIT'd caller invoke a JIT'd Boxed-returning UDF.
+
+#[test]
+fn jit_caller_invokes_boxed_returning_udf_and_matches_interpreter() {
+    // `buildLine(prefix, n) → Boxed` is called from a JIT-eligible non-main
+    // passThroughper `joinMany(label, count) → Boxed`. The passThroughper's Call site
+    // receives a Boxed prefix arg (`"row" & i`) and consumes buildLine's
+    // Boxed return via another Concat — both newly admitted in v0.90.1.
+    let src = r#"
+        function buildLine(prefix, n) {
+            var s = prefix;
+            for (var i = 1; i <= n; i++) { s = s & "-" & i; }
+            return s;
+        }
+        function joinMany(label, count) {
+            var out = label;
+            for (var i = 1; i <= count; i++) {
+                out = out & buildLine("row" & i, 3) & ";";
+            }
+            return out;
+        }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & joinMany("L", 4) & "|"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Boxed UDF→UDF dispatch output must match the interpreter");
+    assert!(
+        compiled >= 2,
+        "expected both buildLine and joinMany to JIT (Boxed-arg + Boxed-ret dispatch), got {compiled}"
+    );
+}
+
+#[test]
+fn jit_caller_threads_boxed_arg_through_to_jitted_callee() {
+    // A Boxed value crosses TWO UDF call boundaries:
+    //   passThrough(s) → echo(s) → s
+    // Both functions specialise on Boxed args + Boxed returns. The runtime
+    // tagged-pointer threads from caller's slot → dispatcher's i64 arg →
+    // callee's slot → return → caller's stack as Boxed. No IR-level box
+    // operations beyond the dispatch itself.
+    let src = r#"
+        function echo(s) { return s; }
+        function passThrough(s) {
+            var t = echo(s);
+            return t;
+        }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & passThrough("v-#k#") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(
+        out, oracle,
+        "Boxed arg threaded across two JIT'd UDFs must match the interpreter"
+    );
+    assert!(
+        compiled >= 2,
+        "expected both echo and passThrough to JIT, got {compiled}"
+    );
 }
 
 #[test]

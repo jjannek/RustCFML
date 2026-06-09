@@ -106,6 +106,32 @@ pub fn num_bin_kind(a: Kind, b: Kind) -> Option<Kind> {
     })
 }
 
+/// Tri-state return-kind tag for a [`UdfRefBinding`]. Parallel to
+/// `crate::jit::RetKind`; lives in `analysis` so the binding type is
+/// self-contained (no cycle from `analysis` back up to `mod.rs`).
+///
+/// v0.90.1 widens this from a `ret_float: bool` to admit `Boxed`. A
+/// JIT'd caller may now invoke another JIT'd UDF whose specialization
+/// returns a tagged-pointer `CfmlValue`; the result enters the caller's
+/// operand stack as [`Kind::Boxed`] and flows through mid-body Boxed ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BindingRet {
+    Int,
+    Float,
+    Boxed,
+}
+
+impl BindingRet {
+    /// Operand-stack kind the caller pushes after a successful Call.
+    pub fn to_kind(self) -> Kind {
+        match self {
+            BindingRet::Int => Kind::Int,
+            BindingRet::Float => Kind::Float,
+            BindingRet::Boxed => Kind::Boxed,
+        }
+    }
+}
+
 /// What the engine needs to know about a JIT-eligible UDF call resolved at
 /// analysis time. Filled in by the [`UdfResolver`] callback at each `Call(n)`
 /// against a [`Kind::UdfRef`] marker.
@@ -113,18 +139,18 @@ pub fn num_bin_kind(a: Kind, b: Kind) -> Option<Kind> {
 pub struct UdfRefBinding {
     /// The callee function's stable `global_id`.
     pub global_id: u32,
-    /// The callee's cache signature (`nargs` + float bitmap — see
+    /// The callee's cache signature (`nargs` + 2-bit kind tuple — see
     /// `signature_for` in `mod.rs`). Identifies the specific specialization
-    /// that must already be `Compiled`.
+    /// that must already be `Compiled` (or speculatively bound).
     pub sig: u64,
-    /// `true` when that specialization returns `Float` (otherwise `Int`).
-    pub ret_float: bool,
+    /// Tri-state return kind of that specialization (v0.90.1).
+    pub ret_kind: BindingRet,
 }
 
 impl UdfRefBinding {
     /// Operand-stack kind the caller pushes after a successful Call.
     pub fn ret_kind(&self) -> Kind {
-        if self.ret_float { Kind::Float } else { Kind::Int }
+        self.ret_kind.to_kind()
     }
 }
 
@@ -925,19 +951,37 @@ fn simulate_block(
                 }
                 let split = stack.len() - n;
                 let arg_kinds: Vec<Kind> = stack[split..].to_vec();
-                // Every arg must be a concrete numeric kind — no nested
-                // function refs, no booleans (so `min(x>y, z)` is rejected).
-                if arg_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
+                // No nested function refs, no booleans at any arg position.
+                // (Per-marker arms below tighten this further: builtins
+                // accept only Int/Float; UDF callsites also admit Boxed.)
+                if arg_kinds
+                    .iter()
+                    .any(|k| matches!(k, Kind::Builtin(_) | Kind::UdfRef(_) | Kind::Bool))
+                {
                     return None;
                 }
                 stack.truncate(split);
                 let marker = stack.pop()?;
                 match marker {
                     Kind::Builtin(name) => {
+                        // Builtin shims have static ABIs that only admit
+                        // Int/Float operands today (Option-A surface).
+                        if arg_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
+                            return None;
+                        }
                         let shim_idx = builtins::lookup_overload(name, &arg_kinds)?;
                         stack.push(builtins::SHIMS[shim_idx].ret_kind);
                     }
                     Kind::UdfRef(idx) => {
+                        // UDF callsites cross args as i64 (Int / Float bits
+                        // / tagged Boxed ptr). The resolver decides whether
+                        // the callee specialization for `arg_kinds` exists.
+                        if arg_kinds
+                            .iter()
+                            .any(|k| !matches!(k, Kind::Int | Kind::Float | Kind::Boxed))
+                        {
+                            return None;
+                        }
                         // Resolve the binding using the concrete arg kinds.
                         // The resolver consults the engine's cache; if the
                         // callee isn't currently Compiled with this exact
