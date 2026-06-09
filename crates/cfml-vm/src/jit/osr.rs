@@ -55,12 +55,14 @@
 
 use cfml_codegen::{BytecodeFunction, BytecodeOp};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{
+    types, AbiParam, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Value,
+};
 use cranelift_frontend::{FunctionBuilder, Variable};
 use cranelift_module::{Linkage, Module};
 use std::collections::{BTreeSet, HashMap};
 
-use super::analysis::Kind;
+use super::analysis::{Kind, UdfRefBinding, UdfResolver};
 use super::builtins::{self, SHIMS};
 use super::translate::{self, Backend};
 
@@ -113,6 +115,14 @@ pub struct LoopPlan {
     /// The engine re-checks each against the live VM on every call so a
     /// user-defined `function abs(x){}` still shadows the JIT.
     pub referenced_builtins: Vec<&'static str>,
+    /// Per-`Call`-ip binding for UDF calls the analyser accepted. Codegen
+    /// looks up the binding at each `Call` op site to emit the libcall
+    /// (`cfml_call_jit_udf`) with the correct `(global_id, sig)`.
+    pub udf_call_at: HashMap<usize, UdfRefBinding>,
+    /// Deduped list of UDF callees referenced by the region. The engine
+    /// revalidates each at every outer call so a redefined / evicted /
+    /// shadowed callee forces interpretation.
+    pub referenced_udfs: Vec<UdfRefBinding>,
 }
 
 /// A reachable basic block: half-open `[start, end)` over function bytecode
@@ -177,6 +187,7 @@ pub fn analyze_loop(
     region_start: usize,
     region_end_excl: usize,
     caller_kinds: &HashMap<String, Kind>,
+    udf_resolver: &UdfResolver<'_>,
 ) -> Option<LoopPlan> {
     let code = &func.instructions;
     let n = code.len();
@@ -333,7 +344,7 @@ pub fn analyze_loop(
         // The local must have an observed kind from the caller. If not, the
         // loop is reading an undefined local on a path — bail.
         let k = *caller_kinds.get(&key)?;
-        if !matches!(k, Kind::Int | Kind::Float) {
+        if !matches!(k, Kind::Int | Kind::Float | Kind::Boxed) {
             return None;
         }
         let s = slot_names.len();
@@ -347,6 +358,24 @@ pub fn analyze_loop(
     };
 
     let mut referenced_builtins: BTreeSet<&'static str> = BTreeSet::new();
+    // v0.91.0 — UDF names referenced by `LoadGlobal` inside the region.
+    // The resolver is consulted at simulate_block to bind each `Call` site.
+    let mut udf_name_idx: HashMap<String, usize> = HashMap::new();
+    let mut udf_names: Vec<String> = Vec::new();
+    let intern_udf = |name: &str,
+                      idx: &mut HashMap<String, usize>,
+                      list: &mut Vec<String>|
+     -> usize {
+        let lower = lower(name);
+        if let Some(&i) = idx.get(&lower) {
+            i
+        } else {
+            let i = list.len();
+            list.push(lower.clone());
+            idx.insert(lower, i);
+            i
+        }
+    };
 
     for blk in &reach_blocks {
         for ip in blk.start..blk.end {
@@ -378,7 +407,12 @@ pub fn analyze_loop(
                 | BytecodeOp::JumpIfTrue(_)
                 | BytecodeOp::Pop
                 | BytecodeOp::Dup
-                | BytecodeOp::LineInfo(_, _) => {}
+                | BytecodeOp::LineInfo(_, _)
+                // v0.91.0 — String literals and Concat are admitted; the
+                // simulate_block pass below validates operand kinds. Codegen
+                // mirrors translate.rs's whole-fn path (intern + box + shim).
+                | BytecodeOp::String(_)
+                | BytecodeOp::Concat => {}
 
                 BytecodeOp::LoadLocal(name)
                 | BytecodeOp::StoreLocal(name)
@@ -417,8 +451,14 @@ pub fn analyze_loop(
                 }
 
                 BytecodeOp::LoadGlobal(name) => {
-                    let canon = builtins::canonical_name(name)?;
-                    referenced_builtins.insert(canon);
+                    if let Some(canon) = builtins::canonical_name(name) {
+                        referenced_builtins.insert(canon);
+                    } else {
+                        // v0.91.0 — non-builtin LoadGlobal might bind to a
+                        // JIT-eligible UDF; defer the resolver query to
+                        // simulate_block where the arg kinds are known.
+                        intern_udf(name, &mut udf_name_idx, &mut udf_names);
+                    }
                 }
                 BytecodeOp::Call(_) => {} // overload validated below in simulate
 
@@ -440,11 +480,29 @@ pub fn analyze_loop(
     // ── 4. Simulate each block to validate kinds and operand-stack shape ───
     // (Operand stack starts and ends empty at each block boundary; booleans
     // never enter a slot or escape via a non-branch consumer.)
+    let mut udf_call_at: HashMap<usize, UdfRefBinding> = HashMap::new();
     for blk in &reach_blocks {
-        simulate_block(code, blk, &slot_index, &slot_kinds)?;
+        simulate_block(
+            code,
+            blk,
+            &slot_index,
+            &slot_kinds,
+            &udf_names,
+            udf_resolver,
+            &mut udf_call_at,
+        )?;
     }
 
     let referenced_builtins: Vec<&'static str> = referenced_builtins.into_iter().collect();
+
+    // Dedupe referenced UDFs by (global_id, sig).
+    let mut seen: BTreeSet<(u32, u64)> = BTreeSet::new();
+    let mut referenced_udfs: Vec<UdfRefBinding> = Vec::new();
+    for binding in udf_call_at.values() {
+        if seen.insert((binding.global_id, binding.sig)) {
+            referenced_udfs.push(*binding);
+        }
+    }
 
     let slots: Vec<OsrSlot> = slot_names
         .iter()
@@ -464,6 +522,8 @@ pub fn analyze_loop(
         region_start,
         region_end_excl,
         referenced_builtins,
+        udf_call_at,
+        referenced_udfs,
     })
 }
 
@@ -476,6 +536,9 @@ fn simulate_block(
     blk: &Block,
     slot_index: &HashMap<String, usize>,
     slot_kinds: &[Kind],
+    udf_names: &[String],
+    udf_resolver: &UdfResolver<'_>,
+    udf_call_at: &mut HashMap<usize, UdfRefBinding>,
 ) -> Option<()> {
     let mut stack: Vec<Kind> = Vec::new();
     macro_rules! pop {
@@ -489,7 +552,7 @@ fn simulate_block(
     macro_rules! pop_value {
         () => {{
             let k = pop!();
-            if matches!(k, Kind::Builtin(_)) {
+            if matches!(k, Kind::Builtin(_) | Kind::UdfRef(_)) {
                 return None;
             }
             k
@@ -598,9 +661,26 @@ fn simulate_block(
 
             BytecodeOp::DeclareLocal(_) | BytecodeOp::LineInfo(_, _) => {}
 
+            // v0.91.0 — `String` literal pushes Boxed; `Concat` consumes any
+            // two non-fn-ref operands (Int/Float/Bool/Boxed all OK; mirrors
+            // translate.rs's whole-fn semantics) and pushes Boxed.
+            BytecodeOp::String(_) => stack.push(Kind::Boxed),
+            BytecodeOp::Concat => {
+                let _b = pop_value!();
+                let _a = pop_value!();
+                stack.push(Kind::Boxed);
+            }
+
             BytecodeOp::LoadGlobal(name) => {
-                let canon = builtins::canonical_name(name)?;
-                stack.push(Kind::Builtin(canon));
+                if let Some(canon) = builtins::canonical_name(name) {
+                    stack.push(Kind::Builtin(canon));
+                } else {
+                    // v0.91.0 — resolve to a UdfRef marker; the resolver is
+                    // queried at the matching Call when arg kinds are known.
+                    let lower = lower(name);
+                    let idx = udf_names.iter().position(|n| n == &lower)?;
+                    stack.push(Kind::UdfRef(idx));
+                }
             }
             BytecodeOp::Call(n) => {
                 if stack.len() < n + 1 {
@@ -608,17 +688,33 @@ fn simulate_block(
                 }
                 let split = stack.len() - n;
                 let arg_kinds: Vec<Kind> = stack[split..].to_vec();
-                if arg_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
-                    return None;
-                }
                 stack.truncate(split);
-                let builtin = stack.pop()?;
-                let name = match builtin {
-                    Kind::Builtin(n) => n,
+                let marker = stack.pop()?;
+                match marker {
+                    Kind::Builtin(name) => {
+                        if arg_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
+                            return None;
+                        }
+                        let shim_idx = builtins::lookup_overload(name, &arg_kinds)?;
+                        stack.push(SHIMS[shim_idx].ret_kind);
+                    }
+                    Kind::UdfRef(idx) => {
+                        // v0.91.0 — UDF call. Arg kinds must be Int/Float/Boxed
+                        // (the dispatcher marshals them into the args buffer
+                        // exactly as the whole-fn path does).
+                        if arg_kinds
+                            .iter()
+                            .any(|k| !matches!(k, Kind::Int | Kind::Float | Kind::Boxed))
+                        {
+                            return None;
+                        }
+                        let name = udf_names.get(idx)?;
+                        let binding = udf_resolver(name.as_str(), &arg_kinds)?;
+                        udf_call_at.insert(ip, binding);
+                        stack.push(binding.ret_kind());
+                    }
                     _ => return None,
-                };
-                let shim_idx = builtins::lookup_overload(name, &arg_kinds)?;
-                stack.push(SHIMS[shim_idx].ret_kind);
+                }
             }
 
             _ => return None,
@@ -661,11 +757,41 @@ pub fn compile_loop(
     let pow_ref = backend
         .module
         .declare_func_in_func(backend.pow_id, &mut ctx.func);
+    // v0.91.0 — Boxed-value shim refs (parallel to translate.rs's whole-fn
+    // path). Imported eagerly; importing an unused shim is free.
+    let box_int_ref = backend
+        .module
+        .declare_func_in_func(backend.box_int_id, &mut ctx.func);
+    let box_float_ref = backend
+        .module
+        .declare_func_in_func(backend.box_float_id, &mut ctx.func);
+    let concat_boxed_ref = backend
+        .module
+        .declare_func_in_func(backend.concat_boxed_id, &mut ctx.func);
+    let str_literal_ref = backend
+        .module
+        .declare_func_in_func(backend.str_literal_id, &mut ctx.func);
+    // v0.91.0 — UDF dispatcher (mirrors translate.rs).
+    let udf_dispatch_ref = backend
+        .module
+        .declare_func_in_func(backend.udf_dispatch_id, &mut ctx.func);
     let shim_ids = backend.shim_ids.clone();
     let shim_refs: Vec<_> = shim_ids
         .iter()
         .map(|id| backend.module.declare_func_in_func(*id, &mut ctx.func))
         .collect();
+
+    // v0.91.0 — intern every String literal in the reachable region BEFORE
+    // the FunctionBuilder grabs neighbouring borrows. See translate.rs gotcha
+    // #15 for the same trick.
+    let mut str_literal_at: HashMap<usize, (*const u8, i64)> = HashMap::new();
+    for blk in &plan.blocks {
+        for ip in blk.start..blk.end {
+            if let BytecodeOp::String(s) = &func.instructions[ip] {
+                str_literal_at.insert(ip, backend.intern_literal(s));
+            }
+        }
+    }
 
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut backend.fbc);
@@ -683,6 +809,33 @@ pub fn compile_loop(
             .collect();
         let io_var = b.declare_var(ptr_ty);
         let bail_var = b.declare_var(ptr_ty);
+
+        // v0.91.0 — stack slot for marshalling UDF→UDF call args (mirrors
+        // translate.rs). Only allocated when the region actually calls
+        // another UDF. Sized for the widest call this region makes.
+        let udf_args_slot = if !plan.udf_call_at.is_empty() {
+            let max_call_args = plan
+                .udf_call_at
+                .keys()
+                .map(|&ip| match &func.instructions[ip] {
+                    BytecodeOp::Call(n) => *n,
+                    _ => 0,
+                })
+                .max()
+                .unwrap_or(0);
+            if max_call_args == 0 {
+                None
+            } else {
+                let bytes = (max_call_args * 8) as u32;
+                Some(b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    bytes,
+                    3, // log2(8) — i64-aligned
+                )))
+            }
+        } else {
+            None
+        };
 
         // ── Prologue: load every slot from io_locals[i*8] ──────────────────
         b.append_block_params_for_function_params(entry);
@@ -762,6 +915,31 @@ pub fn compile_loop(
                     BytecodeOp::Double(d) => stack.push((b.ins().f64const(*d), Kind::Float)),
                     BytecodeOp::True => stack.push((b.ins().iconst(I64, 1), Kind::Bool)),
                     BytecodeOp::False => stack.push((b.ins().iconst(I64, 0), Kind::Bool)),
+
+                    // v0.91.0 — String literal → call cfml_jit_str_literal
+                    // with the interned (ptr, len) view; returns tagged Boxed.
+                    BytecodeOp::String(_) => {
+                        let (ptr, len) = *str_literal_at
+                            .get(&ip)
+                            .ok_or("osr: missing interned string literal")?;
+                        let ptr_v = b.ins().iconst(ptr_ty, ptr as i64);
+                        let len_v = b.ins().iconst(I64, len);
+                        let call = b.ins().call(str_literal_ref, &[ptr_v, len_v]);
+                        let r = b.inst_results(call)[0];
+                        stack.push((r, Kind::Boxed));
+                    }
+
+                    // v0.91.0 — `&` concat. Box non-Boxed operands via the
+                    // matching shim then call cfml_jit_concat_boxed(a, b).
+                    BytecodeOp::Concat => {
+                        let (rhs, rk) = stack.pop().ok_or("osr: stack underflow")?;
+                        let (lhs, lk) = stack.pop().ok_or("osr: stack underflow")?;
+                        let a_tag = translate::ensure_boxed(&mut b, box_int_ref, box_float_ref, lhs, lk);
+                        let b_tag = translate::ensure_boxed(&mut b, box_int_ref, box_float_ref, rhs, rk);
+                        let call = b.ins().call(concat_boxed_ref, &[a_tag, b_tag]);
+                        let r = b.inst_results(call)[0];
+                        stack.push((r, Kind::Boxed));
+                    }
 
                     BytecodeOp::LoadLocal(name) => {
                         let slot = plan.slot_of(name).ok_or("osr: unknown local")?;
@@ -933,10 +1111,14 @@ pub fn compile_loop(
                     BytecodeOp::DeclareLocal(_) | BytecodeOp::LineInfo(_, _) => {}
 
                     BytecodeOp::LoadGlobal(name) => {
-                        let canon = builtins::canonical_name(name)
-                            .ok_or("osr: LoadGlobal of non-allowlist name reached codegen")?;
                         let placeholder = b.ins().iconst(I64, 0);
-                        stack.push((placeholder, Kind::Builtin(canon)));
+                        if let Some(canon) = builtins::canonical_name(name) {
+                            stack.push((placeholder, Kind::Builtin(canon)));
+                        } else {
+                            // v0.91.0 — UDF marker; the matching Call site
+                            // looks up the binding in plan.udf_call_at by ip.
+                            stack.push((placeholder, Kind::UdfRef(0)));
+                        }
                     }
                     BytecodeOp::Call(n) => {
                         if stack.len() < n + 1 {
@@ -945,28 +1127,81 @@ pub fn compile_loop(
                         let split = stack.len() - n;
                         let raw_args: Vec<(Value, Kind)> = stack.split_off(split);
                         let (_marker_val, marker_kind) =
-                            stack.pop().ok_or("osr: missing builtin marker")?;
-                        let name = match marker_kind {
-                            Kind::Builtin(n) => n,
-                            _ => return Err("osr: Call without a builtin marker".into()),
-                        };
-                        let arg_kinds: Vec<Kind> = raw_args.iter().map(|(_, k)| *k).collect();
-                        let shim_idx = builtins::lookup_overload(name, &arg_kinds)
-                            .ok_or("osr: no shim overload for call")?;
-                        let shim = &SHIMS[shim_idx];
-                        let mut cl_args: Vec<Value> = Vec::with_capacity(raw_args.len());
-                        for (idx, (v, k)) in raw_args.into_iter().enumerate() {
-                            let abi = shim.args_abi[idx];
-                            let conv = if abi == Kind::Float {
-                                translate::to_f64(&mut b, v, k)
-                            } else {
-                                translate::to_i64(&mut b, v, k)
-                            };
-                            cl_args.push(conv);
+                            stack.pop().ok_or("osr: missing fn-ref marker")?;
+                        match marker_kind {
+                            Kind::Builtin(name) => {
+                                let arg_kinds: Vec<Kind> =
+                                    raw_args.iter().map(|(_, k)| *k).collect();
+                                let shim_idx = builtins::lookup_overload(name, &arg_kinds)
+                                    .ok_or("osr: no shim overload for call")?;
+                                let shim = &SHIMS[shim_idx];
+                                let mut cl_args: Vec<Value> =
+                                    Vec::with_capacity(raw_args.len());
+                                for (idx, (v, k)) in raw_args.into_iter().enumerate() {
+                                    let abi = shim.args_abi[idx];
+                                    let conv = if abi == Kind::Float {
+                                        translate::to_f64(&mut b, v, k)
+                                    } else {
+                                        translate::to_i64(&mut b, v, k)
+                                    };
+                                    cl_args.push(conv);
+                                }
+                                let call = b.ins().call(shim_refs[shim_idx], &cl_args);
+                                let r = b.inst_results(call)[0];
+                                stack.push((r, shim.ret_kind));
+                            }
+                            Kind::UdfRef(_) => {
+                                // v0.91.0 — UDF dispatch. Mirrors translate.rs.
+                                let binding = plan
+                                    .udf_call_at
+                                    .get(&ip)
+                                    .copied()
+                                    .ok_or("osr: UDF call site missing binding")?;
+                                let slot = udf_args_slot
+                                    .ok_or("osr: UDF call without stack slot")?;
+                                for (i, (v, k)) in raw_args.iter().enumerate() {
+                                    let stored = if *k == Kind::Float {
+                                        b.ins().bitcast(I64, MemFlags::new(), *v)
+                                    } else {
+                                        *v
+                                    };
+                                    b.ins().stack_store(stored, slot, (i * 8) as i32);
+                                }
+                                let args_addr = b.ins().stack_addr(ptr_ty, slot, 0);
+                                let bp = b.use_var(bail_var);
+                                let gid = b.ins().iconst(I64, binding.global_id as i64);
+                                let sig = b.ins().iconst(I64, binding.sig as i64);
+                                let erk_code: i64 = match binding.ret_kind {
+                                    crate::jit::BindingRet::Int => 0,
+                                    crate::jit::BindingRet::Float => 1,
+                                    crate::jit::BindingRet::Boxed => 2,
+                                };
+                                let erk = b.ins().iconst(I64, erk_code);
+                                let nargs_v = b.ins().iconst(I64, *n as i64);
+                                let call = b.ins().call(
+                                    udf_dispatch_ref,
+                                    &[gid, sig, erk, args_addr, nargs_v, bp],
+                                );
+                                let raw_result = b.inst_results(call)[0];
+                                let bail_val =
+                                    b.ins().load(I64, MemFlags::new(), bp, 0);
+                                let bail_set =
+                                    b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                                let cont = b.create_block();
+                                b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                                b.switch_to_block(cont);
+                                let (result_val, result_kind) = match binding.ret_kind {
+                                    crate::jit::BindingRet::Float => (
+                                        b.ins().bitcast(F64, MemFlags::new(), raw_result),
+                                        Kind::Float,
+                                    ),
+                                    crate::jit::BindingRet::Boxed => (raw_result, Kind::Boxed),
+                                    crate::jit::BindingRet::Int => (raw_result, Kind::Int),
+                                };
+                                stack.push((result_val, result_kind));
+                            }
+                            _ => return Err("osr: Call without a fn-ref marker".into()),
                         }
-                        let call = b.ins().call(shim_refs[shim_idx], &cl_args);
-                        let r = b.inst_results(call)[0];
-                        stack.push((r, shim.ret_kind));
                     }
 
                     BytecodeOp::Return => {
@@ -1066,7 +1301,7 @@ mod tests {
         let f = compile_main("sum = 0; for (i = 1; i <= 10; i++) { sum = sum + i; }");
         let (s, e) = first_loop_region(&f);
         let kinds = int_kinds(&["sum", "i"]);
-        let plan = analyze_loop(&f, s, e, &kinds).expect("region should be JIT-eligible");
+        let plan = analyze_loop(&f, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).expect("region should be JIT-eligible");
         // Both sum and i must appear as slots, both Int.
         let names: BTreeSet<String> = plan.slots.iter().map(|s| s.name.clone()).collect();
         assert!(names.contains("sum"));
@@ -1085,7 +1320,7 @@ mod tests {
         // The caller_kinds has no useful entry for `s` (it's a String), so
         // even if we lie and call it Int the body's Concat op should reject.
         let kinds = int_kinds(&["s", "i"]);
-        assert!(analyze_loop(&f, s, e, &kinds).is_none());
+        assert!(analyze_loop(&f, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).is_none());
     }
 
     #[test]
@@ -1099,7 +1334,7 @@ mod tests {
         );
         let (s, e) = first_loop_region(&f);
         let kinds = int_kinds(&["sum", "i"]);
-        assert!(analyze_loop(&f, s, e, &kinds).is_some());
+        assert!(analyze_loop(&f, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).is_some());
     }
 
     #[test]
@@ -1110,7 +1345,7 @@ mod tests {
         let mut kinds = HashMap::new();
         kinds.insert("s".into(), Kind::Float);
         kinds.insert("i".into(), Kind::Int);
-        let plan = analyze_loop(&f, s_ip, e_ip, &kinds).expect("should accept float accumulator");
+        let plan = analyze_loop(&f, s_ip, e_ip, &kinds, &crate::jit::analysis::no_udf_resolver).expect("should accept float accumulator");
         let s_slot = plan.slot_of("s").unwrap();
         assert_eq!(plan.slots[s_slot].kind, Kind::Float);
         let i_slot = plan.slot_of("i").unwrap();
@@ -1135,7 +1370,7 @@ mod tests {
             .clone();
         let (s, e) = first_loop_region(&score);
         let kinds = int_kinds(&["t", "i"]);
-        assert!(analyze_loop(&score, s, e, &kinds).is_none());
+        assert!(analyze_loop(&score, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).is_none());
     }
 
     #[test]
@@ -1144,7 +1379,7 @@ mod tests {
         let f = compile_main("t = 0; for (i = 1; i <= 5; i++) { t = t + abs(i - 3); }");
         let (s, e) = first_loop_region(&f);
         let kinds = int_kinds(&["t", "i"]);
-        let plan = analyze_loop(&f, s, e, &kinds).expect("abs() loop should be eligible");
+        let plan = analyze_loop(&f, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).expect("abs() loop should be eligible");
         assert!(plan.referenced_builtins.contains(&"abs"));
     }
 
@@ -1160,7 +1395,7 @@ mod tests {
         let f = compile_main("sum = 0; for (i = 1; i <= 10; i++) { sum = sum + i; }");
         let (s, e) = first_loop_region(&f);
         let kinds = int_kinds(&["sum", "i"]);
-        assert!(analyze_loop(&f, s, e, &kinds).is_some());
+        assert!(analyze_loop(&f, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).is_some());
         assert!(MAX_OSR_SLOTS >= 2);
     }
 
@@ -1175,7 +1410,7 @@ mod tests {
         init: &HashMap<String, i64>, // raw 8-byte values per slot
     ) -> (HashMap<String, i64>, bool) {
         let (s, e) = first_loop_region(func);
-        let plan = analyze_loop(func, s, e, caller_kinds).expect("eligible");
+        let plan = analyze_loop(func, s, e, caller_kinds, &crate::jit::analysis::no_udf_resolver).expect("eligible");
         let mut backend = Backend::new().expect("backend init");
         let ptr = compile_loop(&mut backend, func, &plan).expect("compile");
         let mut buf: Vec<i64> = plan

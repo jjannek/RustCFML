@@ -1084,6 +1084,28 @@ fn jit_is_shadowed(
     }
 }
 
+/// v0.91.0 — case-insensitive lookup against `user_functions` returning the
+/// `(global_id, arity)` pair OSR / whole-fn JIT need to bind a `LoadGlobal`
+/// of a non-builtin name to a UDF. Pulled out of the inline closures so the
+/// OSR hooks (4 sites) and the whole-fn try_call site share one impl.
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+fn jit_udf_lookup(
+    user_functions: &HashMap<String, Arc<BytecodeFunction>>,
+    name: &str,
+) -> Option<jit::UdfMeta> {
+    let lower = name.to_ascii_lowercase();
+    let f = user_functions.get(name).or_else(|| {
+        user_functions
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+            .map(|(_, v)| v)
+    })?;
+    Some(jit::UdfMeta {
+        global_id: f.global_id,
+        nparams: f.params.len(),
+    })
+}
+
 impl CfmlVirtualMachine {
     // continuation of the previous impl block (split only to insert the
     // free `jit_is_shadowed` helper above with the matching cfg gates).
@@ -2912,6 +2934,7 @@ impl CfmlVirtualMachine {
                                     &mut locals,
                                     closure_env.as_ref(),
                                     &mut is_shadowed,
+                                    &|name: &str| jit_udf_lookup(user_functions, name),
                                 ) {
                                     ip = exit_ip;
                                     continue;
@@ -2945,6 +2968,7 @@ impl CfmlVirtualMachine {
                                             &mut locals,
                                             closure_env.as_ref(),
                                             &mut is_shadowed,
+                                            &|name: &str| jit_udf_lookup(user_functions, name),
                                         ) {
                                             ip = exit_ip;
                                             continue;
@@ -3084,6 +3108,7 @@ impl CfmlVirtualMachine {
                                     &mut locals,
                                     closure_env.as_ref(),
                                     &mut is_shadowed,
+                                    &|name: &str| jit_udf_lookup(user_functions, name),
                                 ) {
                                     ip = exit_ip;
                                     continue;
@@ -3117,6 +3142,7 @@ impl CfmlVirtualMachine {
                                             &mut locals,
                                             closure_env.as_ref(),
                                             &mut is_shadowed,
+                                            &|name: &str| jit_udf_lookup(user_functions, name),
                                         ) {
                                             ip = exit_ip;
                                             continue;

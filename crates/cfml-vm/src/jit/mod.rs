@@ -351,6 +351,11 @@ struct OsrCompiled {
     slots: Vec<osr::OsrSlot>,
     exit_ip: usize,
     referenced_builtins: Vec<&'static str>,
+    /// v0.91.0 — UDF callees referenced inside the compiled region. Each
+    /// must still resolve to a Compiled cache entry with a matching
+    /// `(global_id, sig, ret_kind)` at every outer invocation; drift evicts
+    /// the OSR entry so it re-specialises.
+    referenced_udfs: Vec<UdfRefBinding>,
 }
 
 enum OsrCacheEntry {
@@ -656,6 +661,7 @@ impl JitEngine {
         locals: &mut IndexMap<String, CfmlValue>,
         closure_env: Option<&Arc<RwLock<IndexMap<String, CfmlValue>>>>,
         is_shadowed: &mut dyn FnMut(&str) -> bool,
+        udf_lookup: &dyn Fn(&str) -> Option<UdfMeta>,
     ) -> Option<usize> {
         let key: OsrKey = (func.global_id, region_start);
 
@@ -668,7 +674,22 @@ impl JitEngine {
                         return None;
                     }
                 }
-                return run_osr_compiled(c, locals, closure_env);
+                // v0.91.0 — every referenced UDF must still bind the same
+                // specialization. Drift forces interpretation for this call.
+                for u in &c.referenced_udfs {
+                    if !udf_binding_still_valid(&self.cache, *u) {
+                        return None;
+                    }
+                }
+                let result = run_osr_compiled(c, locals, closure_env);
+                // Bail=2 (speculation mismatch) is surfaced inside
+                // `run_osr_compiled` via the same bail flag as bail=1 today —
+                // both turn into `None`. Eviction-on-mismatch happens at the
+                // *whole-function* layer (try_call). For OSR the simplest
+                // safe response is: stay Compiled, but bail this trip. A
+                // subsequent referenced_udfs check above will catch any
+                // permanent drift.
+                return result;
             }
             None => {}
         }
@@ -677,8 +698,6 @@ impl JitEngine {
         let threshold = self.hot.threshold;
         let count = self.osr_hot.entry(key).or_insert(0);
         if *count > threshold {
-            // Already counted past threshold but cache miss — shouldn't happen
-            // outside races; defensive return.
             return None;
         }
         *count += 1;
@@ -688,7 +707,37 @@ impl JitEngine {
 
         // Crossed threshold — analyse + (maybe) compile, exactly once.
         let caller_kinds = build_caller_kinds(func, region_start, region_end_excl, locals);
-        let entry = match osr::analyze_loop(func, region_start, region_end_excl, &caller_kinds) {
+        // UDF resolver: mirror the whole-fn try_call resolver. Consult the
+        // engine's cache + caller-provided `udf_lookup` to bind any
+        // `LoadGlobal(name)` of a non-builtin to its (global_id, sig)
+        // specialization. Phase-2 speculation: not-yet-compiled callees
+        // bind with `BindingRet::Int` and the dispatcher surfaces bail=2
+        // at runtime on mismatch (handled defensively above).
+        let cache_ref = &self.cache;
+        let udf_resolver_closure = |name: &str, arg_kinds: &[analysis::Kind]| -> Option<UdfRefBinding> {
+            let meta = udf_lookup(name)?;
+            if meta.nparams != arg_kinds.len() {
+                return None;
+            }
+            let sig = sig_from_kinds(arg_kinds)?;
+            let ret = match cache_ref.get(&(meta.global_id, sig)) {
+                Some(CacheEntry::Compiled { ret_kind, .. }) => ret_kind.to_binding(),
+                Some(CacheEntry::Unjittable) => return None,
+                None => BindingRet::Int, // speculate; dispatcher surfaces bail=2 on mismatch
+            };
+            Some(UdfRefBinding {
+                global_id: meta.global_id,
+                sig,
+                ret_kind: ret,
+            })
+        };
+        let entry = match osr::analyze_loop(
+            func,
+            region_start,
+            region_end_excl,
+            &caller_kinds,
+            &udf_resolver_closure,
+        ) {
             Some(plan) => match osr::compile_loop(&mut self.backend, func, &plan) {
                 Ok(ptr) => {
                     self.osr_compiled += 1;
@@ -697,6 +746,7 @@ impl JitEngine {
                         slots: plan.slots,
                         exit_ip: plan.region_end_excl,
                         referenced_builtins: plan.referenced_builtins,
+                        referenced_udfs: plan.referenced_udfs,
                     })
                 }
                 Err(_) => OsrCacheEntry::Unjittable,
@@ -706,6 +756,12 @@ impl JitEngine {
         let run = match &entry {
             OsrCacheEntry::Compiled(c) => {
                 if c.referenced_builtins.iter().any(|n| is_shadowed(n)) {
+                    None
+                } else if c
+                    .referenced_udfs
+                    .iter()
+                    .any(|u| !udf_binding_still_valid(&self.cache, *u))
+                {
                     None
                 } else {
                     run_osr_compiled(c, locals, closure_env)
@@ -753,7 +809,12 @@ fn build_caller_kinds(
         let k = match v {
             Some(CfmlValue::Int(_)) => analysis::Kind::Int,
             Some(CfmlValue::Double(_)) => analysis::Kind::Float,
-            _ => continue,
+            // v0.91.0: any other live value crosses as a Boxed slot. The
+            // analyser still rejects ops that can't consume Boxed (arithmetic,
+            // comparison, …) so a non-string non-numeric local that's actually
+            // read by a non-Boxed-admissible op will still reject.
+            Some(_) => analysis::Kind::Boxed,
+            None => continue,
         };
         kinds.insert(lower, k);
     }
@@ -771,71 +832,111 @@ fn run_osr_compiled(
     locals: &mut IndexMap<String, CfmlValue>,
     closure_env: Option<&Arc<RwLock<IndexMap<String, CfmlValue>>>>,
 ) -> Option<usize> {
+    // v0.91.0 — install a per-call arena. Mid-body Boxed allocations
+    // (`cfml_jit_concat_boxed`, `cfml_jit_box_int`, …) land here, and the
+    // entry-side boxes we allocate below are also tracked (via
+    // `arena::box_into_active`) so a single `drain_except(None)` reclaims
+    // every leaked `Box<CfmlValue>` regardless of whether the slot held its
+    // original value or a body-overwritten tag at exit.
+    let mut arena = arena::Arena::new();
+
     // ── Marshal in. A kind mismatch (slot was Int at compile, now Double,
-    // or missing entirely) forces a bail to the interpreter.
+    // or missing entirely) forces a bail to the interpreter. Boxed slots
+    // accept any non-Int/Float CfmlValue; we clone-then-box so the live
+    // `locals` entry is untouched until writeback.
     let mut buf: Vec<i64> = Vec::with_capacity(c.slots.len());
-    for slot in &c.slots {
-        // Case-insensitive lookup, matching the interpreter's behaviour.
-        let v = locals.get(&slot.name).or_else(|| {
-            locals
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&slot.name))
-                .map(|(_, v)| v)
-        });
-        match (slot.kind, v) {
-            (analysis::Kind::Int, Some(CfmlValue::Int(i))) => buf.push(*i),
-            (analysis::Kind::Float, Some(CfmlValue::Double(d))) => buf.push(d.to_bits() as i64),
-            _ => return None,
+    {
+        // Scope the ArenaGuard so it drops before we touch `arena` again
+        // (drain). See gotcha #16 in JIT_NEXT_SESSION.md.
+        let _g = arena::ArenaGuard::install(&mut arena);
+        for slot in &c.slots {
+            // Case-insensitive lookup, matching the interpreter's behaviour.
+            let v = locals.get(&slot.name).or_else(|| {
+                locals
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&slot.name))
+                    .map(|(_, v)| v)
+            });
+            match (slot.kind, v) {
+                (analysis::Kind::Int, Some(CfmlValue::Int(i))) => buf.push(*i),
+                (analysis::Kind::Float, Some(CfmlValue::Double(d))) => {
+                    buf.push(d.to_bits() as i64)
+                }
+                (analysis::Kind::Boxed, Some(val)) => {
+                    let tag = arena::box_into_active(val.clone());
+                    buf.push(tag as i64);
+                }
+                _ => {
+                    drop(_g);
+                    arena.drain_except(None);
+                    return None;
+                }
+            }
         }
-    }
 
-    // ── Run.
-    let mut bail: i64 = 0;
-    // SAFETY: `c.ptr` is a Cranelift-emitted function with matching ABI
-    // (`*mut i64`, `*mut i64`) -> `()`; the slot buffer + bail pointer are
-    // both valid for the duration of the call.
-    unsafe {
-        (c.ptr)(buf.as_mut_ptr(), &mut bail as *mut i64);
-    }
-
-    // ── Write back every slot — success and bail alike. The compiled body
-    // populates buf in both paths so the interpreter sees consistent state.
-    for (i, slot) in c.slots.iter().enumerate() {
-        let val = match slot.kind {
-            analysis::Kind::Int => CfmlValue::Int(buf[i]),
-            analysis::Kind::Float => CfmlValue::Double(f64::from_bits(buf[i] as u64)),
-            _ => unreachable!("OSR slots are always Int or Float"),
-        };
-        // The original locals map may have a different-case key (`I` vs `i`);
-        // preserve the existing casing rather than introducing a duplicate
-        // entry with a different case.
-        if let Some(existing_key) = locals
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(&slot.name))
-            .cloned()
-        {
-            locals.insert(existing_key, val.clone());
-        } else {
-            locals.insert(slot.name.clone(), val.clone());
+        // ── Run.
+        let mut bail: i64 = 0;
+        // SAFETY: `c.ptr` is a Cranelift-emitted function with matching ABI
+        // (`*mut i64`, `*mut i64`) -> `()`; the slot buffer + bail pointer are
+        // both valid for the duration of the call.
+        unsafe {
+            (c.ptr)(buf.as_mut_ptr(), &mut bail as *mut i64);
         }
-        if let Some(env) = closure_env {
-            let mut m = env.write().unwrap();
-            // Closure env: write back only if the env already tracks this
-            // name (it's a captured local); never widen the env.
-            if let Some(existing_key) = m
+
+        // ── Read back live values BEFORE draining the arena. For Boxed slots
+        // we borrow the tag and clone the inner CfmlValue so the underlying
+        // boxes can be safely reclaimed below.
+        let mut writes: Vec<CfmlValue> = Vec::with_capacity(c.slots.len());
+        for (i, slot) in c.slots.iter().enumerate() {
+            let val = match slot.kind {
+                analysis::Kind::Int => CfmlValue::Int(buf[i]),
+                analysis::Kind::Float => CfmlValue::Double(f64::from_bits(buf[i] as u64)),
+                analysis::Kind::Boxed => {
+                    // SAFETY: the tag at this slot either came from our entry
+                    // `box_into_active` or from a shim allocation during the
+                    // body; both kinds are tracked by the active arena and
+                    // still live until drain below.
+                    unsafe { boxed::borrow_tagged(buf[i] as usize).clone() }
+                }
+                _ => unreachable!("OSR slots are always Int / Float / Boxed"),
+            };
+            writes.push(val);
+        }
+
+        // Drop the guard before draining (the active-pointer in the
+        // thread-local must be cleared before we mutate `arena` directly).
+        drop(_g);
+        arena.drain_except(None);
+
+        // Write back every slot — success and bail alike. The compiled body
+        // populates buf in both paths so the interpreter sees consistent state.
+        for (slot, val) in c.slots.iter().zip(writes.into_iter()) {
+            if let Some(existing_key) = locals
                 .keys()
                 .find(|k| k.eq_ignore_ascii_case(&slot.name))
                 .cloned()
             {
-                m.insert(existing_key, val);
+                locals.insert(existing_key, val.clone());
+            } else {
+                locals.insert(slot.name.clone(), val.clone());
+            }
+            if let Some(env) = closure_env {
+                let mut m = env.write().unwrap();
+                if let Some(existing_key) = m
+                    .keys()
+                    .find(|k| k.eq_ignore_ascii_case(&slot.name))
+                    .cloned()
+                {
+                    m.insert(existing_key, val);
+                }
             }
         }
-    }
 
-    if bail != 0 {
-        None
-    } else {
-        Some(c.exit_ip)
+        if bail != 0 {
+            None
+        } else {
+            Some(c.exit_ip)
+        }
     }
 }
 

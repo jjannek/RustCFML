@@ -657,3 +657,53 @@ fn boxed_concat_with_float_operand_matches_interpreter() {
     assert_eq!(out, oracle, "Boxed-concat with Float operand must match");
     assert!(compiled >= 1, "expected fmt() to JIT, got {compiled}");
 }
+
+// ── v0.91.0 — OSR Boxed slots + UDF dispatch ────────────────────────────────
+//
+// The whole-function JIT can already compile a UDF with Boxed slots + UDF
+// calls (since v0.90.1). v0.91.0 adds the same capabilities to OSR so a hot
+// outer loop in __main__ (or in any function whose whole body is otherwise
+// non-admissible) can be compiled to native code.
+
+#[test]
+fn osr_boxed_concat_loop_in_main_matches_interpreter() {
+    // `__main__` body contains a non-allowlist top-level call (writeOutput)
+    // which the whole-fn analyser rejects. The for-loop region by itself,
+    // however, contains only String/Concat/StoreLocal ops on a Boxed slot —
+    // exactly the v0.91.0 OSR admission surface.
+    let src = r#"
+        out = "";
+        for (k = 1; k <= 200; k++) { out = out & "row" & k & ";"; }
+        writeOutput(len(out));
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    assert_eq!(out, oracle, "OSR Boxed-concat loop must match interpreter");
+    assert!(osr_compiled >= 1, "expected OSR to fire on the Boxed concat loop, got {osr_compiled}");
+}
+
+#[test]
+fn osr_calls_jitted_udf_from_outer_loop_in_main() {
+    // The headline v0.91.0 unlock: `__main__`'s outer loop invokes a
+    // JIT-compiled UDF (`buildLine`) that takes Boxed + Int args and returns
+    // Boxed. The outer loop region is now OSR-eligible because OSR admits
+    // UDF callsites (Phase-2 dispatcher) and Boxed slots.
+    let src = r#"
+        function buildLine(prefix, n) {
+            var s = prefix;
+            for (var i = 1; i <= n; i++) { s = s & "-" & i; }
+            return s;
+        }
+        total = "";
+        for (k = 1; k <= 200; k++) { total = buildLine("row" & k, 3); }
+        writeOutput(total);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, fn_compiled, osr_compiled) = run_with_osr(src);
+    assert_eq!(out, oracle, "OSR-with-UDF-dispatch output must match interpreter");
+    assert!(fn_compiled >= 1, "expected buildLine to JIT, got fn_compiled={fn_compiled}");
+    assert!(
+        osr_compiled >= 1,
+        "expected outer loop in __main__ to OSR-compile (UDF dispatch + Boxed slot), got osr_compiled={osr_compiled}"
+    );
+}
