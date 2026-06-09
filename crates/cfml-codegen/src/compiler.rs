@@ -874,6 +874,13 @@ impl CfmlCompiler {
                                     ident.name.clone(),
                                     member.clone(),
                                 ));
+                            } else if ident.name.eq_ignore_ascii_case("local") {
+                                // `local.X = v` is identical to `var X = v` in CFML —
+                                // function-frame scope, must NOT propagate to caller at
+                                // return. Compile to DeclareLocal + StoreLocal so the
+                                // classic-localmode writeback loop skips it (same as `var`).
+                                instructions.push(BytecodeOp::DeclareLocal(member.clone()));
+                                instructions.push(BytecodeOp::StoreLocal(member.clone()));
                             } else {
                                 self.compile_expression(obj, instructions);
                                 instructions.push(BytecodeOp::Swap);
@@ -2462,6 +2469,15 @@ impl CfmlCompiler {
                                         ident.name.clone(),
                                         access.member.clone(),
                                     ));
+                                    return;
+                                }
+                                if ident.name.eq_ignore_ascii_case("local") {
+                                    // `local.X = v` is identical to `var X = v` —
+                                    // function-frame scope, must NOT propagate to
+                                    // caller at return. Same fix as the
+                                    // Statement::Assignment path above.
+                                    instructions.push(BytecodeOp::DeclareLocal(access.member.clone()));
+                                    instructions.push(BytecodeOp::StoreLocal(access.member.clone()));
                                     return;
                                 }
                             }
