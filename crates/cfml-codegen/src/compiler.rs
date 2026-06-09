@@ -3092,6 +3092,14 @@ impl CfmlCompiler {
             Expression::StringInterpolation(interp) => {
                 if interp.parts.is_empty() {
                     instructions.push(BytecodeOp::String(String::new()));
+                } else if interp.parts.len() == 1 {
+                    // Single-part interpolation: a quoted string whose ENTIRE
+                    // content is one `#expr#` (or one literal). Lucee/ACF/BoxLang
+                    // preserve the expression's native value/type here — e.g.
+                    // `"#someStruct#"` IS the struct, not a stringified copy.
+                    // Skip the empty-string Concat coercion. Multi-part
+                    // interpolation below keeps the string-concat semantics.
+                    self.compile_expression(&interp.parts[0], instructions);
                 } else {
                     // Compile first part
                     self.compile_expression(&interp.parts[0], instructions);
