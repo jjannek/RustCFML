@@ -5650,7 +5650,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
 
     // Parse arguments: either a URL string or an options struct
     let (mut url, method, headers, body, timeout_secs, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port) = match &arg {
-        CfmlValue::String(url) => ((**url).clone(), "GET".to_string(), HashMap::<String, String>::new(), None::<String>, 30u64, false, true, true, None::<u16>, None::<String>, None::<u16>),
+        CfmlValue::String(url) => ((**url).clone(), "GET".to_string(), HashMap::<String, String>::new(), None::<Vec<u8>>, 30u64, false, true, true, None::<u16>, None::<String>, None::<u16>),
         CfmlValue::Struct(opts) => {
             let mut url = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("url"))
@@ -5688,43 +5688,138 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                     }
                 }
             }
-            let body = opts.iter()
+            // Explicit body attr (string) — wins over param-built body.
+            let explicit_body: Option<Vec<u8>> = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("body"))
-                .and_then(|(_, v)| if matches!(v, CfmlValue::Null) { None } else { Some(v.as_string()) });
-            // Build body from formfield/body/xml params if no explicit body
-            let body = if body.is_none() {
+                .and_then(|(_, v)| if matches!(v, CfmlValue::Null) { None } else { Some(v.as_string().into_bytes()) });
+
+            // Multipart attr: true/yes/"true"/"yes" → opt-in. A type="file"
+            // cfhttpparam also forces multipart (Lucee parity — you can't send
+            // file uploads as urlencoded).
+            let multipart_attr = opts.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("multipart"))
+                .map(|(_, v)| match v {
+                    CfmlValue::Bool(b) => b,
+                    CfmlValue::String(s) => s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes"),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            let has_file_param = if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
+                params.iter().any(|p| {
+                    if let CfmlValue::Struct(s) = p {
+                        s.iter().any(|(k, v)| k.eq_ignore_ascii_case("type") && v.as_string().eq_ignore_ascii_case("file"))
+                    } else { false }
+                })
+            } else { false };
+            let use_multipart = multipart_attr || has_file_param;
+
+            // Build body from cfhttpparam params if no explicit body attr.
+            let body: Option<Vec<u8>> = if explicit_body.is_none() {
                 if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
-                    let mut form_parts = Vec::new();
-                    let mut xml_body = None;
-                    for param in params.iter() {
-                        if let CfmlValue::Struct(p) = param {
+                    if use_multipart {
+                        // Generate a boundary unlikely to collide with body bytes.
+                        // Combines a fixed prefix, the request URL hash, and a
+                        // per-process atomic counter — sufficient for uniqueness
+                        // without pulling in `rand`.
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static MULTIPART_SEQ: AtomicU64 = AtomicU64::new(0);
+                        let seq = MULTIPART_SEQ.fetch_add(1, Ordering::Relaxed);
+                        let boundary = format!("----RustCFMLBoundary{:016x}{:016x}", seq, url.len() as u64);
+
+                        let mut buf: Vec<u8> = Vec::new();
+                        let dashes = b"--";
+                        let crlf = b"\r\n";
+                        for param in params.iter() {
+                            let p = match param { CfmlValue::Struct(s) => s, _ => continue };
                             let ptype = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("type"))
                                 .map(|(_, v)| v.as_string().to_lowercase()).unwrap_or_default();
                             let pname = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("name"))
                                 .map(|(_, v)| v.as_string()).unwrap_or_default();
-                            let pvalue = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("value"))
-                                .map(|(_, v)| v.as_string()).unwrap_or_default();
                             match ptype.as_str() {
-                                "formfield" => form_parts.push(format!("{}={}", pname, pvalue)),
-                                "body" => xml_body = Some(pvalue),
-                                "xml" => xml_body = Some(pvalue),
+                                "formfield" => {
+                                    let pvalue = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("value"))
+                                        .map(|(_, v)| v.as_string()).unwrap_or_default();
+                                    buf.extend_from_slice(dashes);
+                                    buf.extend_from_slice(boundary.as_bytes());
+                                    buf.extend_from_slice(crlf);
+                                    buf.extend_from_slice(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", pname).as_bytes());
+                                    buf.extend_from_slice(pvalue.as_bytes());
+                                    buf.extend_from_slice(crlf);
+                                }
+                                "file" => {
+                                    let file_path = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("file"))
+                                        .map(|(_, v)| v.as_string()).unwrap_or_default();
+                                    let mime = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("mimetype"))
+                                        .map(|(_, v)| v.as_string())
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                                    let file_bytes = match std::fs::read(&file_path) {
+                                        Ok(b) => b,
+                                        Err(e) => return Err(CfmlError::runtime(format!(
+                                            "cfhttp: failed to read file '{}' for multipart upload: {}", file_path, e
+                                        ))),
+                                    };
+                                    let filename = std::path::Path::new(&file_path)
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| pname.clone());
+                                    buf.extend_from_slice(dashes);
+                                    buf.extend_from_slice(boundary.as_bytes());
+                                    buf.extend_from_slice(crlf);
+                                    buf.extend_from_slice(format!(
+                                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
+                                        pname, filename, mime
+                                    ).as_bytes());
+                                    buf.extend_from_slice(&file_bytes);
+                                    buf.extend_from_slice(crlf);
+                                }
                                 _ => {}
                             }
                         }
-                    }
-                    if let Some(xml) = xml_body {
-                        Some(xml)
-                    } else if !form_parts.is_empty() {
-                        hdrs.entry("Content-Type".to_string()).or_insert("application/x-www-form-urlencoded".to_string());
-                        Some(form_parts.join("&"))
+                        if !buf.is_empty() {
+                            buf.extend_from_slice(dashes);
+                            buf.extend_from_slice(boundary.as_bytes());
+                            buf.extend_from_slice(dashes);
+                            buf.extend_from_slice(crlf);
+                            hdrs.entry("Content-Type".to_string())
+                                .or_insert(format!("multipart/form-data; boundary={}", boundary));
+                            Some(buf)
+                        } else {
+                            None
+                        }
                     } else {
-                        None
+                        let mut form_parts = Vec::new();
+                        let mut xml_body = None;
+                        for param in params.iter() {
+                            if let CfmlValue::Struct(p) = param {
+                                let ptype = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("type"))
+                                    .map(|(_, v)| v.as_string().to_lowercase()).unwrap_or_default();
+                                let pname = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("name"))
+                                    .map(|(_, v)| v.as_string()).unwrap_or_default();
+                                let pvalue = p.iter().find(|(k, _)| k.eq_ignore_ascii_case("value"))
+                                    .map(|(_, v)| v.as_string()).unwrap_or_default();
+                                match ptype.as_str() {
+                                    "formfield" => form_parts.push(format!("{}={}", pname, pvalue)),
+                                    "body" => xml_body = Some(pvalue),
+                                    "xml" => xml_body = Some(pvalue),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Some(xml) = xml_body {
+                            Some(xml.into_bytes())
+                        } else if !form_parts.is_empty() {
+                            hdrs.entry("Content-Type".to_string()).or_insert("application/x-www-form-urlencoded".to_string());
+                            Some(form_parts.join("&").into_bytes())
+                        } else {
+                            None
+                        }
                     }
                 } else {
                     None
                 }
             } else {
-                body
+                explicit_body
             };
             let timeout = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("timeout"))
@@ -5891,8 +5986,8 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
         request = request.set(k, v);
     }
 
-    let response = if let Some(body_str) = &body {
-        request.send_string(body_str)
+    let response = if let Some(body_bytes) = &body {
+        request.send_bytes(body_bytes)
     } else {
         request.call()
     };

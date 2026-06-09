@@ -710,6 +710,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             let password = attrs.get("password").cloned();
             let useragent = attrs.get("useragent").cloned();
             let proxyserver = attrs.get("proxyserver").cloned();
+            let multipart = attrs.get("multipart").cloned();
 
             let mut opts = Vec::new();
             // String attributes may carry #expr# interpolation inside an
@@ -725,6 +726,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             if let Some(p) = password { opts.push(format!("password: {}", format_attr_value(&p, quoted.contains("password")))); }
             if let Some(u) = useragent { opts.push(format!("useragent: {}", format_attr_value(&u, quoted.contains("useragent")))); }
             if let Some(p) = proxyserver { opts.push(format!("proxyserver: {}", format_attr_value(&p, quoted.contains("proxyserver")))); }
+            if let Some(m) = multipart { opts.push(format!("multipart: {}", format_attr_value(&m, quoted.contains("multipart")))); }
 
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
