@@ -310,6 +310,70 @@ extern "C" fn cfml_rtrim_boxed(tagged: i64) -> i64 {
     super::arena::box_into_active(CfmlValue::string(v.as_string().trim_end().to_string())) as i64
 }
 
+/// Mirrors `fn_reverse`: `chars().rev().collect()` of the stringified value.
+/// Lucee/RustCFML `reverse()` is string-only (arrays go through `arrayReverse`).
+extern "C" fn cfml_reverse_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s: String = v.as_string().chars().rev().collect();
+    super::arena::box_into_active(CfmlValue::string(s)) as i64
+}
+
+/// Mirrors `fn_asc`: first char of stringified arg as its `i64` code point,
+/// or `0` for empty. CFML returns `Int`.
+extern "C" fn cfml_asc_boxed_i64(tagged: i64) -> i64 {
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    v.as_string().chars().next().map_or(0, |c| c as i64)
+}
+
+/// Mirrors `fn_strip_cr`: drops every `\r` from the stringified arg.
+extern "C" fn cfml_strip_cr_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::string(v.as_string().replace('\r', ""))) as i64
+}
+
+/// Mirrors `fn_html_edit_format`: `& < > "` → entity refs.
+extern "C" fn cfml_html_edit_format_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v
+        .as_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    super::arena::box_into_active(CfmlValue::string(s)) as i64
+}
+
+/// Mirrors `fn_html_code_format`: htmlEditFormat then `<pre>…</pre>` wrap.
+extern "C" fn cfml_html_code_format_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let inner = v
+        .as_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    super::arena::box_into_active(CfmlValue::string(format!("<pre>{inner}</pre>"))) as i64
+}
+
+/// Mirrors `fn_encode_for_html`: same as htmlEditFormat plus `'` and `/` escapes.
+extern "C" fn cfml_encode_for_html_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v
+        .as_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+        .replace('/', "&#x2f;");
+    super::arena::box_into_active(CfmlValue::string(s)) as i64
+}
+
 /// The complete shim table. Order matters for `lookup_overload`: more specific
 /// signatures (e.g. `abs(Int)`) must precede broader ones (`abs(Numeric)`).
 pub static SHIMS: &[Shim] = &[
@@ -632,6 +696,54 @@ pub static SHIMS: &[Shim] = &[
         sym: "cfml_rtrim_boxed",
         addr: cfml_rtrim_boxed as *const u8,
     },
+    Shim {
+        name: "reverse",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_reverse_boxed",
+        addr: cfml_reverse_boxed as *const u8,
+    },
+    Shim {
+        name: "asc",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Int,
+        sym: "cfml_asc_boxed_i64",
+        addr: cfml_asc_boxed_i64 as *const u8,
+    },
+    Shim {
+        name: "stripcr",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_strip_cr_boxed",
+        addr: cfml_strip_cr_boxed as *const u8,
+    },
+    Shim {
+        name: "htmleditformat",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_html_edit_format_boxed",
+        addr: cfml_html_edit_format_boxed as *const u8,
+    },
+    Shim {
+        name: "htmlcodeformat",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_html_code_format_boxed",
+        addr: cfml_html_code_format_boxed as *const u8,
+    },
+    Shim {
+        name: "encodeforhtml",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_encode_for_html_boxed",
+        addr: cfml_encode_for_html_boxed as *const u8,
+    },
 ];
 
 /// Lowercased lookup: `true` iff some shim has this exact name. Currently only
@@ -720,9 +832,23 @@ mod tests {
     #[test]
     fn boxed_overloads_match_only_boxed_args() {
         use super::super::analysis::Kind;
-        // len / uCase / lCase / trim / ltrim / rtrim each accept exactly
-        // one Boxed argument. Int and Float must miss.
-        for name in ["len", "ucase", "lcase", "trim", "ltrim", "rtrim"] {
+        // len / uCase / lCase / trim / ltrim / rtrim / reverse / asc /
+        // stripCr / htmlEditFormat / htmlCodeFormat / encodeForHtml each
+        // accept exactly one Boxed argument. Int and Float must miss.
+        for name in [
+            "len",
+            "ucase",
+            "lcase",
+            "trim",
+            "ltrim",
+            "rtrim",
+            "reverse",
+            "asc",
+            "stripcr",
+            "htmleditformat",
+            "htmlcodeformat",
+            "encodeforhtml",
+        ] {
             assert!(
                 lookup_overload(name, &[Kind::Boxed]).is_some(),
                 "{name}(Boxed) must match"
@@ -736,10 +862,23 @@ mod tests {
                 "{name}(Float) must not match"
             );
         }
-        // len returns Int; the case/trim family return Boxed.
-        let idx = lookup_overload("len", &[Kind::Boxed]).unwrap();
-        assert_eq!(SHIMS[idx].ret_kind, Kind::Int);
-        for name in ["ucase", "lcase", "trim", "ltrim", "rtrim"] {
+        // len + asc return Int; the case/trim/format family return Boxed.
+        for name in ["len", "asc"] {
+            let idx = lookup_overload(name, &[Kind::Boxed]).unwrap();
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Int, "{name} ret must be Int");
+        }
+        for name in [
+            "ucase",
+            "lcase",
+            "trim",
+            "ltrim",
+            "rtrim",
+            "reverse",
+            "stripcr",
+            "htmleditformat",
+            "htmlcodeformat",
+            "encodeforhtml",
+        ] {
             let idx = lookup_overload(name, &[Kind::Boxed]).unwrap();
             assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed, "{name} ret must be Boxed");
         }
@@ -791,12 +930,55 @@ mod tests {
         let v = unsafe { boxed::borrow_tagged(rt as usize) };
         assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "  AbCd"));
 
+        // reverse — chars().rev() on the stringified value.
+        let rev_in = boxed::box_value(CfmlValue::string("abcdé")) as i64;
+        let rev = cfml_reverse_boxed(rev_in);
+        let v = unsafe { boxed::borrow_tagged(rev as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "édcba"));
+
+        // asc — first char as i64; empty string → 0.
+        assert_eq!(cfml_asc_boxed_i64(rev_in), 'a' as i64);
+        let empty = boxed::box_value(CfmlValue::string("")) as i64;
+        assert_eq!(cfml_asc_boxed_i64(empty), 0);
+
+        // stripCr — \r dropped, \n retained.
+        let cr_in = boxed::box_value(CfmlValue::string("a\r\nb\rc")) as i64;
+        let stripped = cfml_strip_cr_boxed(cr_in);
+        let v = unsafe { boxed::borrow_tagged(stripped as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "a\nbc"));
+
+        // htmlEditFormat — & < > " escaped, ' and / left alone.
+        let html_in = boxed::box_value(CfmlValue::string("a<b>&c\"d'/e")) as i64;
+        let edited = cfml_html_edit_format_boxed(html_in);
+        let v = unsafe { boxed::borrow_tagged(edited as usize) };
+        assert!(
+            matches!(v, CfmlValue::String(s) if s.as_str() == "a&lt;b&gt;&amp;c&quot;d'/e")
+        );
+
+        // htmlCodeFormat — wraps htmlEditFormat in <pre>…</pre>.
+        let coded = cfml_html_code_format_boxed(html_in);
+        let v = unsafe { boxed::borrow_tagged(coded as usize) };
+        assert!(
+            matches!(v, CfmlValue::String(s) if s.as_str() == "<pre>a&lt;b&gt;&amp;c&quot;d'/e</pre>")
+        );
+
+        // encodeForHtml — adds ' and / escapes on top of htmlEditFormat.
+        let encoded = cfml_encode_for_html_boxed(html_in);
+        let v = unsafe { boxed::borrow_tagged(encoded as usize) };
+        assert!(
+            matches!(v, CfmlValue::String(s) if s.as_str() == "a&lt;b&gt;&amp;c&quot;d&#x27;&#x2f;e")
+        );
+
         drop(_g);
         // Reclaim the manually-boxed inputs; arena drains the shim outputs.
         drop(unsafe { boxed::reclaim_tagged(s as usize) });
         drop(unsafe { boxed::reclaim_tagged(i as usize) });
         drop(unsafe { boxed::reclaim_tagged(a as usize) });
         drop(unsafe { boxed::reclaim_tagged(mixed as usize) });
+        drop(unsafe { boxed::reclaim_tagged(rev_in as usize) });
+        drop(unsafe { boxed::reclaim_tagged(empty as usize) });
+        drop(unsafe { boxed::reclaim_tagged(cr_in as usize) });
+        drop(unsafe { boxed::reclaim_tagged(html_in as usize) });
         arena.drain_except(None);
     }
 

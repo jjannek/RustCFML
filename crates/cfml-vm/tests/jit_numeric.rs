@@ -790,3 +790,60 @@ fn trim_family_in_jitted_udf_matches_interpreter() {
     assert_eq!(out, oracle, "trim-family Boxed shim output must match the interpreter");
     assert!(compiled >= 1, "expected clean() to be JIT-compiled, got {compiled}");
 }
+
+#[test]
+fn reverse_in_jitted_udf_matches_interpreter() {
+    // reverse(string) — Boxed → Boxed. Confirms chars().rev() round-trips
+    // through the arena identically to the interpreter.
+    let src = r#"
+        function rev(s) { return reverse(s); }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & rev("abc-#k#") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "reverse Boxed shim output must match the interpreter");
+    assert!(compiled >= 1, "expected rev() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn asc_returns_int_from_boxed_arg_in_jit() {
+    // asc(s) is the second Boxed→Int shim after len(). Result feeds back
+    // into arithmetic to prove the Int return kind plumbs correctly.
+    let src = r##"
+        function code(s) { return asc(s) + 1; }
+        out = "";
+        for (k = 1; k <= 80; k++) {
+            ch = chr(64 + (k % 26));
+            out = out & code(ch & "x") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "asc Boxed shim output must match the interpreter");
+    assert!(compiled >= 1, "expected code() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn html_format_shims_in_jitted_udf_match_interpreter() {
+    // htmlEditFormat / htmlCodeFormat / encodeForHtml / stripCr — chained
+    // through a Concat. Confirms the entity-escape semantics match interp
+    // byte-for-byte.
+    let src = r#"
+        function fmt(s) {
+            return htmlEditFormat(s) & "|" & htmlCodeFormat(s) & "|"
+                & encodeForHtml(s) & "|" & stripCr(s);
+        }
+        out = "";
+        for (k = 1; k <= 60; k++) {
+            out = out & fmt("a<b>&""c'/d#chr(13)#e-#k#") & ";";
+        }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "html-format Boxed shims must match the interpreter");
+    assert!(compiled >= 1, "expected fmt() to be JIT-compiled, got {compiled}");
+}
