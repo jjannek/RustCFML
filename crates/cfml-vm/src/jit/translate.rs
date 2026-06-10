@@ -38,6 +38,7 @@ use super::analysis::{Kind, Plan};
 use super::builtins::{self, SHIMS};
 use super::shims::{
     cfml_jit_add_boxed, cfml_jit_box_float, cfml_jit_box_int, cfml_jit_concat_boxed,
+    cfml_jit_mul_boxed, cfml_jit_sub_boxed,
 };
 use super::CompiledFn;
 
@@ -140,6 +141,9 @@ pub struct Backend {
     pub(super) box_float_id: FuncId,
     pub(super) concat_boxed_id: FuncId,
     pub(super) add_boxed_id: FuncId,
+    /// v0.99.7 — Sub/Mul Boxed slow shims (mirror `add_boxed_id`).
+    pub(super) sub_boxed_id: FuncId,
+    pub(super) mul_boxed_id: FuncId,
     pub(super) str_literal_id: FuncId,
     /// String-literal storage. Each unique `BytecodeOp::String(s)` interned
     /// during a compile is appended here (deduped). The `Box<str>` keeps
@@ -191,6 +195,8 @@ impl Backend {
         builder.symbol("cfml_jit_box_float", cfml_jit_box_float as *const u8);
         builder.symbol("cfml_jit_concat_boxed", cfml_jit_concat_boxed as *const u8);
         builder.symbol("cfml_jit_add_boxed", cfml_jit_add_boxed as *const u8);
+        builder.symbol("cfml_jit_sub_boxed", cfml_jit_sub_boxed as *const u8);
+        builder.symbol("cfml_jit_mul_boxed", cfml_jit_mul_boxed as *const u8);
         builder.symbol("cfml_jit_str_literal", cfml_jit_str_literal as *const u8);
         // v0.99.5 member-access IC shim.
         builder.symbol(
@@ -295,16 +301,20 @@ impl Backend {
                 .declare_function("cfml_jit_concat_boxed", Linkage::Import, &sig)
                 .map_err(|e| e.to_string())?
         };
-        let add_boxed_id = {
-            let mut sig = Signature::new(module.target_config().default_call_conv);
-            sig.params.push(AbiParam::new(I64));
-            sig.params.push(AbiParam::new(I64));
-            sig.params.push(AbiParam::new(ptr_ty)); // bail
-            sig.returns.push(AbiParam::new(I64));
-            module
-                .declare_function("cfml_jit_add_boxed", Linkage::Import, &sig)
-                .map_err(|e| e.to_string())?
-        };
+        let declare_arith_boxed =
+            |module: &mut JITModule, sym: &str| -> Result<FuncId, String> {
+                let mut sig = Signature::new(module.target_config().default_call_conv);
+                sig.params.push(AbiParam::new(I64));
+                sig.params.push(AbiParam::new(I64));
+                sig.params.push(AbiParam::new(ptr_ty)); // bail
+                sig.returns.push(AbiParam::new(I64));
+                module
+                    .declare_function(sym, Linkage::Import, &sig)
+                    .map_err(|e| e.to_string())
+            };
+        let add_boxed_id = declare_arith_boxed(&mut module, "cfml_jit_add_boxed")?;
+        let sub_boxed_id = declare_arith_boxed(&mut module, "cfml_jit_sub_boxed")?;
+        let mul_boxed_id = declare_arith_boxed(&mut module, "cfml_jit_mul_boxed")?;
         let str_literal_id = {
             let mut sig = Signature::new(module.target_config().default_call_conv);
             sig.params.push(AbiParam::new(ptr_ty)); // *const u8
@@ -342,6 +352,8 @@ impl Backend {
             box_float_id,
             concat_boxed_id,
             add_boxed_id,
+            sub_boxed_id,
+            mul_boxed_id,
             str_literal_id,
             string_literals: Vec::new(),
             member_get_id,
@@ -450,6 +462,12 @@ impl Backend {
         let add_boxed_ref = self
             .module
             .declare_func_in_func(self.add_boxed_id, &mut ctx.func);
+        let sub_boxed_ref = self
+            .module
+            .declare_func_in_func(self.sub_boxed_id, &mut ctx.func);
+        let mul_boxed_ref = self
+            .module
+            .declare_func_in_func(self.mul_boxed_id, &mut ctx.func);
         let str_literal_ref = self
             .module
             .declare_func_in_func(self.str_literal_id, &mut ctx.func);
@@ -688,29 +706,37 @@ impl Backend {
                             b.def_var(vars[slot], v);
                         }
 
-                        // v0.99.6 — `Add` admits Boxed operands; if either
-                        // side is Boxed, route through the SMI tag-check
-                        // fast path with `cfml_jit_add_boxed` as the slow
-                        // shim.
-                        BytecodeOp::Add => {
+                        // v0.99.6/v0.99.7 — Add/Sub/Mul admit Boxed operands;
+                        // if either side is Boxed, route through the SMI
+                        // tag-check fast path with the matching slow shim.
+                        op_variant @ (BytecodeOp::Add | BytecodeOp::Sub | BytecodeOp::Mul) => {
+                            let op = match op_variant {
+                                BytecodeOp::Add => NumOp::Add,
+                                BytecodeOp::Sub => NumOp::Sub,
+                                _ => NumOp::Mul,
+                            };
                             let either_boxed = matches!(stack.last(), Some((_, Kind::Boxed)))
                                 || matches!(stack.iter().rev().nth(1), Some((_, Kind::Boxed)));
                             if either_boxed {
-                                add_boxed_smi(
+                                let slow = match op {
+                                    NumOp::Add => add_boxed_ref,
+                                    NumOp::Sub => sub_boxed_ref,
+                                    NumOp::Mul => mul_boxed_ref,
+                                };
+                                arith_boxed_smi(
                                     &mut b,
                                     &mut stack,
+                                    op,
                                     box_int_ref,
                                     box_float_ref,
-                                    add_boxed_ref,
+                                    slow,
                                     bail_var,
                                     ptr_ty,
                                 )?;
                             } else {
-                                num_bin(&mut b, &mut stack, NumOp::Add)?;
+                                num_bin(&mut b, &mut stack, op)?;
                             }
                         }
-                        BytecodeOp::Sub => num_bin(&mut b, &mut stack, NumOp::Sub)?,
-                        BytecodeOp::Mul => num_bin(&mut b, &mut stack, NumOp::Mul)?,
 
                         // `/` — always f64; bail (→ interpreter throws) on zero.
                         BytecodeOp::Div => {
@@ -1255,12 +1281,13 @@ pub(super) fn num_bin(b: &mut FunctionBuilder, stack: &mut Vec<(Value, Kind)>, o
 ///         ; push (result, Kind::Boxed)
 /// ```
 #[allow(clippy::too_many_arguments)]
-pub(super) fn add_boxed_smi(
+pub(super) fn arith_boxed_smi(
     b: &mut FunctionBuilder,
     stack: &mut Vec<(Value, Kind)>,
+    op: NumOp,
     box_int: cranelift_codegen::ir::FuncRef,
     box_float: cranelift_codegen::ir::FuncRef,
-    add_boxed: cranelift_codegen::ir::FuncRef,
+    slow_shim: cranelift_codegen::ir::FuncRef,
     bail_var: Variable,
     ptr_ty: types::Type,
 ) -> Result<(), String> {
@@ -1286,11 +1313,15 @@ pub(super) fn add_boxed_smi(
 
     b.ins().brif(both_smi, smi_block, &[], slow_block, &[]);
 
-    // SMI block.
+    // SMI block: untag, apply op, retag with SMI-fit check.
     b.switch_to_block(smi_block);
     let ua = b.ins().sshr_imm(a, 3);
     let ub = b.ins().sshr_imm(bv, 3);
-    let raw = b.ins().iadd(ua, ub);
+    let raw = match op {
+        NumOp::Add => b.ins().iadd(ua, ub),
+        NumOp::Sub => b.ins().isub(ua, ub),
+        NumOp::Mul => b.ins().imul(ua, ub),
+    };
     let shifted = b.ins().ishl_imm(raw, 3);
     let recovered = b.ins().sshr_imm(shifted, 3);
     let fits = b.ins().icmp(IntCC::Equal, recovered, raw);
@@ -1314,7 +1345,7 @@ pub(super) fn add_boxed_smi(
     // Slow block.
     b.switch_to_block(slow_block);
     let bp = b.use_var(bail_var);
-    let call = b.ins().call(add_boxed, &[a, bv, bp]);
+    let call = b.ins().call(slow_shim, &[a, bv, bp]);
     let slow_r = b.inst_results(call)[0];
     let slow_arg: cranelift_codegen::ir::BlockArg = slow_r.into();
     b.ins().jump(common, &[slow_arg]);

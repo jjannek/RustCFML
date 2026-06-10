@@ -252,6 +252,61 @@ pub extern "C" fn cfml_jit_add_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
     encode_into_arena(result)
 }
 
+/// v0.99.7 — `a - b` where one or both operands cross as Boxed. Mirrors the
+/// interpreter's `BytecodeOp::Sub` (`numeric_op(.. |x,y| x-y)`): coerce both
+/// sides via `to_number` (falling back to 0.0 on non-coercible) and produce
+/// a `Double`. Int×Int stays in i64 via wrapping_sub (matches the
+/// interpreter's Int×Int branch when the result still fits i64; CFML int
+/// overflow wraps per gotcha #4).
+///
+/// `bail` is currently unused (Sub never throws — non-numeric coerces).
+#[no_mangle]
+pub extern "C" fn cfml_jit_sub_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
+    if boxed::is_smi_int(a) && boxed::is_smi_int(b) {
+        let r = boxed::untag_smi_int(a).wrapping_sub(boxed::untag_smi_int(b));
+        if let Some(smi) = boxed::try_tag_smi_int(r) {
+            return smi;
+        }
+        return arena::box_into_active(CfmlValue::Int(r)) as i64;
+    }
+    let (va, vb) = unsafe { (materialize(a), materialize(b)) };
+    let result: CfmlValue = match (&va, &vb) {
+        (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i.wrapping_sub(*j)),
+        _ => {
+            let x = to_number(&va).unwrap_or(0.0);
+            let y = to_number(&vb).unwrap_or(0.0);
+            CfmlValue::Double(x - y)
+        }
+    };
+    encode_into_arena(result)
+}
+
+/// v0.99.7 — `a * b` where one or both operands cross as Boxed. Mirrors the
+/// interpreter's `BytecodeOp::Mul`. Int×Int wraps via `wrapping_mul`; mixed
+/// or non-numeric coerces to `Double` via `to_number().unwrap_or(0.0)`.
+///
+/// `bail` is currently unused (Mul never throws).
+#[no_mangle]
+pub extern "C" fn cfml_jit_mul_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
+    if boxed::is_smi_int(a) && boxed::is_smi_int(b) {
+        let r = boxed::untag_smi_int(a).wrapping_mul(boxed::untag_smi_int(b));
+        if let Some(smi) = boxed::try_tag_smi_int(r) {
+            return smi;
+        }
+        return arena::box_into_active(CfmlValue::Int(r)) as i64;
+    }
+    let (va, vb) = unsafe { (materialize(a), materialize(b)) };
+    let result: CfmlValue = match (&va, &vb) {
+        (CfmlValue::Int(i), CfmlValue::Int(j)) => CfmlValue::Int(i.wrapping_mul(*j)),
+        _ => {
+            let x = to_number(&va).unwrap_or(0.0);
+            let y = to_number(&vb).unwrap_or(0.0);
+            CfmlValue::Double(x * y)
+        }
+    };
+    encode_into_arena(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +387,86 @@ mod tests {
         let r = cfml_jit_add_boxed(a, b, &mut bail);
         let v = unsafe { materialize(r) };
         assert!(matches!(v, CfmlValue::String(t) if t.as_str() == "34"));
+        drop(_g);
+        drop(unsafe { boxed::reclaim_tagged(a as usize) });
+        drop(unsafe { boxed::reclaim_tagged(b as usize) });
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn sub_smi_int_int() {
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let a = boxed::try_tag_smi_int(10).unwrap();
+        let b = boxed::try_tag_smi_int(3).unwrap();
+        let mut bail = 0i64;
+        let r = cfml_jit_sub_boxed(a, b, &mut bail);
+        assert!(boxed::is_smi_int(r));
+        let v = unsafe { materialize(r) };
+        assert!(matches!(v, CfmlValue::Int(7)));
+        drop(_g);
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn mul_smi_int_int() {
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let a = boxed::try_tag_smi_int(6).unwrap();
+        let b = boxed::try_tag_smi_int(7).unwrap();
+        let mut bail = 0i64;
+        let r = cfml_jit_mul_boxed(a, b, &mut bail);
+        assert!(boxed::is_smi_int(r));
+        let v = unsafe { materialize(r) };
+        assert!(matches!(v, CfmlValue::Int(42)));
+        drop(_g);
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn sub_string_string_coerces_to_double() {
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let a = boxed::box_value(CfmlValue::string("10")) as i64;
+        let b = boxed::box_value(CfmlValue::string("3")) as i64;
+        let mut bail = 0i64;
+        let r = cfml_jit_sub_boxed(a, b, &mut bail);
+        let v = unsafe { materialize(r) };
+        assert!(matches!(v, CfmlValue::Double(d) if (d - 7.0).abs() < 1e-9));
+        drop(_g);
+        drop(unsafe { boxed::reclaim_tagged(a as usize) });
+        drop(unsafe { boxed::reclaim_tagged(b as usize) });
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn mul_int_plus_boxed_string_number_is_double() {
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let a = boxed::box_value(CfmlValue::Int(3)) as i64;
+        let b = boxed::box_value(CfmlValue::string("4")) as i64;
+        let mut bail = 0i64;
+        let r = cfml_jit_mul_boxed(a, b, &mut bail);
+        let v = unsafe { materialize(r) };
+        assert!(matches!(v, CfmlValue::Double(d) if (d - 12.0).abs() < 1e-9));
+        drop(_g);
+        drop(unsafe { boxed::reclaim_tagged(a as usize) });
+        drop(unsafe { boxed::reclaim_tagged(b as usize) });
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn sub_non_numeric_coerces_to_zero() {
+        // Sub on two non-numeric strings: to_number returns None, falls back
+        // to 0.0 - 0.0 = 0.0 (Double). Matches interpreter `numeric_op`.
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let a = boxed::box_value(CfmlValue::string("hello")) as i64;
+        let b = boxed::box_value(CfmlValue::string("world")) as i64;
+        let mut bail = 0i64;
+        let r = cfml_jit_sub_boxed(a, b, &mut bail);
+        let v = unsafe { materialize(r) };
+        assert!(matches!(v, CfmlValue::Double(d) if d.abs() < 1e-9));
         drop(_g);
         drop(unsafe { boxed::reclaim_tagged(a as usize) });
         drop(unsafe { boxed::reclaim_tagged(b as usize) });

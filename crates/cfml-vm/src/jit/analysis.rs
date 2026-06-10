@@ -868,22 +868,11 @@ fn simulate_block(
                 }
             }
 
-            // v0.99.6 — `+` admits Boxed operands (SMI fast path + add_boxed
-            // slow shim). Sub/Mul stay Int/Float-only until matching slow
-            // shims land (a Sub/Mul on a struct member would error in the
-            // interpreter anyway for non-numeric types).
-            BytecodeOp::Add => {
+            // v0.99.6/v0.99.7 — Add/Sub/Mul admit Boxed operands (SMI fast
+            // path + matching add/sub/mul_boxed slow shim).
+            BytecodeOp::Add | BytecodeOp::Sub | BytecodeOp::Mul => {
                 let b = pop!();
                 let a = pop!();
-                stack.push(num_bin_kind(a, b)?);
-            }
-            // `- *`: Int,Int → Int; any Float → Float; Bool operand rejects.
-            BytecodeOp::Sub | BytecodeOp::Mul => {
-                let b = pop!();
-                let a = pop!();
-                if !a.is_num() || !b.is_num() {
-                    return None;
-                }
                 stack.push(num_bin_kind(a, b)?);
             }
             // `%`: Int,Int → Int (`srem`); any float operand → Float (via the

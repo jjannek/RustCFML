@@ -1133,6 +1133,73 @@ fn add_boxed_smi_slow_path_string_member_concats_per_interpreter() {
 }
 
 #[test]
+fn sub_boxed_smi_struct_member_matches_interpreter() {
+    // v0.99.7 — `p.a - p.b` where both members are Ints. SMI fast path
+    // (untag, isub, retag) must match the interpreter's `BytecodeOp::Sub`.
+    let src = r##"
+        function diff(p) { return p.a - p.b; }
+        rec = {a: 100, b: 7};
+        out = "";
+        for (k = 1; k <= 40; k++) { out = out & diff(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Sub on Boxed-Int operands must match interpreter");
+    assert!(compiled >= 1, "expected diff() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn mul_boxed_smi_struct_member_matches_interpreter() {
+    // v0.99.7 — `p.a * p.b` SMI fast path.
+    let src = r##"
+        function prod(p) { return p.a * p.b; }
+        rec = {a: 6, b: 7};
+        out = "";
+        for (k = 1; k <= 40; k++) { out = out & prod(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Mul on Boxed-Int operands must match interpreter");
+    assert!(compiled >= 1, "expected prod() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn sub_mul_chain_on_struct_member_kernel_matches_interpreter() {
+    // v0.99.7 — full struct_member_kernel shape: a + b * 2 + c - d. Exercises
+    // Add, Sub, and Mul all in one body, all on Boxed (member-read) operands.
+    let src = r##"
+        function calc(p) { return p.a + p.b * 2 + p.c - p.d; }
+        rec = {a: 10, b: 3, c: 5, d: 1};
+        out = "";
+        for (k = 1; k <= 40; k++) { out = out & calc(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Sub+Mul+Add chain on Boxed must match interpreter");
+    assert!(compiled >= 1, "expected calc() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn sub_boxed_slow_path_string_coerces_to_zero_per_interpreter() {
+    // Non-numeric Sub: interpreter's numeric_op falls back to 0.0 - 0.0 = 0
+    // (Double); the JIT slow shim must mirror that.
+    let src = r##"
+        function diff(p) { return p.s - p.t; }
+        rec = {s: "hello", t: "world"};
+        out = "";
+        for (k = 1; k <= 40; k++) { out = out & diff(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Sub non-numeric slow path must match interpreter");
+    assert!(compiled >= 1, "expected diff() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
 fn add_boxed_smi_handles_large_int_via_box_int_overflow() {
     // v0.99.6 — `p.big + p.big` where p.big is just under i61 max. The
     // SMI Add overflows out of i61; the JIT must take the smi_overflow
