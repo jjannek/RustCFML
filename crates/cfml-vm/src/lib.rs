@@ -1936,6 +1936,13 @@ impl CfmlVirtualMachine {
         // with no default must stay ABSENT from both `locals` and `arguments`,
         // so `structKeyExists(arguments, "p")` is false — matching Lucee/ACF.
         let mut arguments_map: IndexMap<String, CfmlValue> = IndexMap::new();
+        // Lucee/ACF/BoxLang: a value bound to a declared parameter appears in
+        // the `arguments` scope under its parameter NAME — never under its
+        // 1-based positional index. Positional access (`arguments[1]`) still
+        // works via the `__arguments_scope` marker handled in GetIndex below.
+        // Overflow positional args (paramless fn called positionally, or
+        // extras beyond declared params with no matching name) DO get numeric
+        // keys — that's the only handle they have.
         for (i, param_name) in func.params.iter().enumerate() {
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
             // A Null arg value counts as "not supplied": CFML has no way to pass
@@ -1948,9 +1955,7 @@ impl CfmlVirtualMachine {
             match supplied {
                 Some(value) => {
                     locals.insert(param_name.clone(), value.clone());
-                    arguments_map.insert(param_name.clone(), value.clone());
-                    // Also make args accessible by position (1-based)
-                    arguments_map.insert((i + 1).to_string(), value);
+                    arguments_map.insert(param_name.clone(), value);
                 }
                 None => {
                     // Omitted. Pre-seed Null only so the default preamble's
@@ -1988,6 +1993,21 @@ impl CfmlVirtualMachine {
                 ))));
             }
         }
+        // Tag this struct as the arguments scope. `__arguments_scope` is the
+        // sentinel; `__arguments_params` carries the declared param names so
+        // `arguments[N]` (1-based) can fall through to params[N-1] at the
+        // GetIndex site without having to thread the param list separately.
+        // Both markers are filtered from user-visible struct introspection.
+        arguments_map.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
+        let params_array: Vec<CfmlValue> = func
+            .params
+            .iter()
+            .map(|p| CfmlValue::string(p.clone()))
+            .collect();
+        arguments_map.insert(
+            "__arguments_params".to_string(),
+            CfmlValue::array(params_array),
+        );
         locals.insert("arguments".to_string(), CfmlValue::strukt(arguments_map));
 
         // The name this call was dispatched under (a member-call alias, if any).
@@ -3685,7 +3705,7 @@ impl CfmlVirtualMachine {
                         }
                         CfmlValue::Struct(s) => {
                             let key = index.as_string();
-                            let val = s
+                            let direct = s
                                 .get(&key)
                                 .or_else(|| s.get(&key.to_uppercase()))
                                 .or_else(|| s.get(&key.to_lowercase()))
@@ -3694,9 +3714,39 @@ impl CfmlVirtualMachine {
                                     s.iter()
                                         .find(|(k, _)| k.to_lowercase() == key_lower)
                                         .map(|(_, v)| v)
-                                })
-                                
-                                .unwrap_or(CfmlValue::Null);
+                                });
+                            // Arguments-scope positional fallback: when the
+                            // index is numeric N (1-based) and there's no
+                            // direct key match, resolve via the declared
+                            // param name at position N-1. A value bound to
+                            // a declared param lives under its name, not
+                            // under the numeric alias.
+                            let val = if direct.is_none()
+                                && s.contains_key("__arguments_scope")
+                            {
+                                if let Ok(n) = key.parse::<i64>() {
+                                    if n >= 1 {
+                                        if let Some(CfmlValue::Array(params)) =
+                                            s.get("__arguments_params")
+                                        {
+                                            let idx = (n - 1) as usize;
+                                            params
+                                                .get(idx)
+                                                .map(|p| p.as_string())
+                                                .and_then(|name| s.get(&name))
+                                                .unwrap_or(CfmlValue::Null)
+                                        } else {
+                                            CfmlValue::Null
+                                        }
+                                    } else {
+                                        CfmlValue::Null
+                                    }
+                                } else {
+                                    CfmlValue::Null
+                                }
+                            } else {
+                                direct.unwrap_or(CfmlValue::Null)
+                            };
                             stack.push(val);
                         }
                         _ => stack.push(CfmlValue::Null),
@@ -4834,8 +4884,21 @@ impl CfmlVirtualMachine {
                     if let Some(val) = stack.pop() {
                         match val {
                             CfmlValue::Struct(s) => {
-                                let keys: Vec<CfmlValue> =
-                                    s.keys().into_iter().map(CfmlValue::string).collect();
+                                // Hide the private arguments-scope markers
+                                // from for-in iteration. Real numeric keys
+                                // (overflow positional args) still surface,
+                                // matching Lucee.
+                                let is_args = s.contains_key("__arguments_scope");
+                                let keys: Vec<CfmlValue> = s
+                                    .keys()
+                                    .into_iter()
+                                    .filter(|k| {
+                                        !is_args
+                                            || (k != "__arguments_scope"
+                                                && k != "__arguments_params")
+                                    })
+                                    .map(CfmlValue::string)
+                                    .collect();
                                 stack.push(CfmlValue::array(keys));
                             }
                             CfmlValue::String(s) => {

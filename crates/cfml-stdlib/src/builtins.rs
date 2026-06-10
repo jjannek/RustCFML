@@ -2213,9 +2213,26 @@ fn fn_struct_new(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::strukt(IndexMap::new()))
 }
 
+/// The `arguments` scope carries two private markers (`__arguments_scope` +
+/// `__arguments_params`) used for positional-index fallback in `arguments[i]`.
+/// Neither must appear in user-visible struct introspection (`structKeyList`,
+/// `structCount`, `structKeyExists`, key arrays, for-in). Real numeric keys —
+/// produced when overflow positional args have no matching declared param
+/// name (e.g. paramless fn called positionally) — DO remain visible: that's
+/// how Lucee surfaces them.
+fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
+    let keys: Vec<String> = s.keys();
+    if !keys.iter().any(|k| k == "__arguments_scope") {
+        return keys;
+    }
+    keys.into_iter()
+        .filter(|k| k != "__arguments_scope" && k != "__arguments_params")
+        .collect()
+}
+
 fn fn_struct_count(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
-        Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Int(s.len() as i64)),
+        Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Int(visible_struct_keys(s).len() as i64)),
         _ => Ok(CfmlValue::Int(0)),
     }
 }
@@ -2224,7 +2241,15 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Struct(s) = &args[0] {
             let key = args[1].as_string();
-            return Ok(CfmlValue::Bool(struct_find_key_ci(s, &key).is_some()));
+            let found = struct_find_key_ci(s, &key).is_some();
+            // Hide the private arguments-scope markers from introspection.
+            if found
+                && s.contains_key("__arguments_scope")
+                && (key == "__arguments_scope" || key == "__arguments_params")
+            {
+                return Ok(CfmlValue::Bool(false));
+            }
+            return Ok(CfmlValue::Bool(found));
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -2233,8 +2258,7 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_key_list(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let delimiter = get_delimiter(&args, 1);
-        let keys: Vec<String> = s.keys();
-        Ok(CfmlValue::string(keys.join(&delimiter)))
+        Ok(CfmlValue::string(visible_struct_keys(s).join(&delimiter)))
     } else {
         Ok(CfmlValue::string(String::new()))
     }
@@ -2242,7 +2266,10 @@ fn fn_struct_key_list(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_key_array(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Struct(s)) = args.first() {
-        let keys: Vec<CfmlValue> = s.keys().into_iter().map(CfmlValue::string).collect();
+        let keys: Vec<CfmlValue> = visible_struct_keys(s)
+            .into_iter()
+            .map(CfmlValue::string)
+            .collect();
         Ok(CfmlValue::array(keys))
     } else {
         Ok(CfmlValue::array(Vec::new()))
