@@ -161,13 +161,38 @@ impl FromIterator<CfmlValue> for CfmlArray {
 /// guard is held, and never lock the same struct twice on one thread. Anything
 /// iterate-then-call (higher-order struct fns, equality, dump, CFC method
 /// dispatch) must `snapshot()` / `iter()` first to release the lock.
+/// v0.99.4 — inner struct payload. `shape_id` is bumped on every
+/// **structural** change (new key inserted, key removed, clear when
+/// non-empty, or any `with_write` access). Value-only updates do NOT
+/// bump shape — the same `(name → index)` mapping holds, and JIT inline
+/// caches over `GetProperty(name)` stay valid. `with_write` exposes the
+/// inner `IndexMap` directly, so it must bump unconditionally (the
+/// closure could do anything). Shape IDs are allocated from a process-
+/// wide atomic counter; `0` is reserved (never used) so an
+/// uninitialised IC slot is always a miss.
+pub struct StructInner {
+    pub map: IndexMap<String, CfmlValue>,
+    pub shape_id: u64,
+}
+
+static STRUCT_SHAPE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn next_shape_id() -> u64 {
+    STRUCT_SHAPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Clone)]
-pub struct CfmlStruct(Arc<PlRwLock<IndexMap<String, CfmlValue>>>);
+pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
 impl CfmlStruct {
     #[inline]
     pub fn new(m: IndexMap<String, CfmlValue>) -> Self {
-        CfmlStruct(Arc::new(PlRwLock::new(m)))
+        CfmlStruct(Arc::new(PlRwLock::new(StructInner {
+            map: m,
+            shape_id: next_shape_id(),
+        })))
     }
 
     #[inline]
@@ -188,77 +213,112 @@ impl CfmlStruct {
         Arc::as_ptr(&self.0) as *const () as usize
     }
 
+    /// v0.99.4 — current shape generation. Bumped on every structural
+    /// change. JIT IC fast path: load this, compare with cached
+    /// `shape_id`; on match the cached `(name → index)` is still valid
+    /// so the IC can index directly into `map.get_index(cached_idx)`.
+    /// On miss the slow path re-resolves the key and updates the IC.
+    #[inline]
+    pub fn shape_id(&self) -> u64 {
+        self.0.read().shape_id
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.read().len()
+        self.0.read().map.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.read().is_empty()
+        self.0.read().map.is_empty()
     }
 
     /// Clone the value for `key` (case-sensitive), or `None`.
     #[inline]
     pub fn get(&self, key: &str) -> Option<CfmlValue> {
-        self.0.read().get(key).cloned()
+        self.0.read().map.get(key).cloned()
     }
 
     /// Clone the value for `key`, matching keys case-insensitively (CFML keys
     /// are case-insensitive). Returns the first matching entry's value.
     pub fn get_ci(&self, key: &str) -> Option<CfmlValue> {
         let g = self.0.read();
-        if let Some(v) = g.get(key) {
+        if let Some(v) = g.map.get(key) {
             return Some(v.clone());
         }
-        g.iter()
+        g.map
+            .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v.clone())
     }
 
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.0.read().contains_key(key)
+        self.0.read().map.contains_key(key)
     }
 
     /// Case-insensitive key presence check.
     pub fn contains_key_ci(&self, key: &str) -> bool {
         let g = self.0.read();
-        g.contains_key(key) || g.keys().any(|k| k.eq_ignore_ascii_case(key))
+        g.map.contains_key(key) || g.map.keys().any(|k| k.eq_ignore_ascii_case(key))
     }
 
     /// Insert (interior mutability — visible to all aliases). Returns the
-    /// previous value if the key already existed.
+    /// previous value if the key already existed. v0.99.4 — shape_id is
+    /// bumped iff the key is genuinely new (no prior value); value-only
+    /// updates leave shape alone so JIT ICs stay warm.
     #[inline]
     pub fn insert(&self, key: String, value: CfmlValue) -> Option<CfmlValue> {
-        self.0.write().insert(key, value)
+        let mut g = self.0.write();
+        let prev = g.map.insert(key, value);
+        if prev.is_none() {
+            g.shape_id = next_shape_id();
+        }
+        prev
     }
 
     /// Remove a key (case-sensitive), returning its value if present. Uses
     /// `shift_remove` to preserve insertion order of the remaining entries.
+    /// v0.99.4 — shape_id bumps iff a key was actually removed.
     #[inline]
     pub fn remove(&self, key: &str) -> Option<CfmlValue> {
-        self.0.write().shift_remove(key)
+        let mut g = self.0.write();
+        let prev = g.map.shift_remove(key);
+        if prev.is_some() {
+            g.shape_id = next_shape_id();
+        }
+        prev
     }
 
     /// Remove a key case-insensitively, returning its value if present.
+    /// v0.99.4 — shape_id bumps iff a key was actually removed.
     pub fn remove_ci(&self, key: &str) -> Option<CfmlValue> {
         let mut g = self.0.write();
-        if g.contains_key(key) {
-            return g.shift_remove(key);
+        let prev = if g.map.contains_key(key) {
+            g.map.shift_remove(key)
+        } else {
+            let found = g.map.keys().find(|k| k.eq_ignore_ascii_case(key)).cloned();
+            found.and_then(|k| g.map.shift_remove(&k))
+        };
+        if prev.is_some() {
+            g.shape_id = next_shape_id();
         }
-        let found = g.keys().find(|k| k.eq_ignore_ascii_case(key)).cloned();
-        found.and_then(|k| g.shift_remove(&k))
+        prev
     }
 
+    /// v0.99.4 — shape_id bumps iff the map was non-empty before clear.
     #[inline]
     pub fn clear(&self) {
-        self.0.write().clear();
+        let mut g = self.0.write();
+        if !g.map.is_empty() {
+            g.map.clear();
+            g.shape_id = next_shape_id();
+        }
     }
 
     #[inline]
     pub fn keys(&self) -> Vec<String> {
-        self.0.read().keys().cloned().collect()
+        self.0.read().map.keys().cloned().collect()
     }
 
     /// A point-in-time copy of the contents. Use this before iterating when the
@@ -266,7 +326,7 @@ impl CfmlStruct {
     /// releases the lock so re-entrancy can't deadlock.
     #[inline]
     pub fn snapshot(&self) -> IndexMap<String, CfmlValue> {
-        self.0.read().clone()
+        self.0.read().map.clone()
     }
 
     /// Iterate a point-in-time **snapshot** of the entries (yields owned
@@ -288,15 +348,21 @@ impl CfmlStruct {
 
     /// Run a closure with exclusive (write) access to the backing map. The
     /// closure MUST NOT touch this same struct again (would deadlock).
+    /// v0.99.4 — bumps shape_id unconditionally on entry because the
+    /// closure can do anything (insert / remove / restructure); we can't
+    /// see whether the operation was structural. Conservative: every
+    /// `with_write` invalidates all ICs on this struct.
     #[inline]
     pub fn with_write<R>(&self, f: impl FnOnce(&mut IndexMap<String, CfmlValue>) -> R) -> R {
-        f(&mut self.0.write())
+        let mut g = self.0.write();
+        g.shape_id = next_shape_id();
+        f(&mut g.map)
     }
 
     /// Run a closure with shared (read) access. Same re-entrancy caveat.
     #[inline]
     pub fn with_read<R>(&self, f: impl FnOnce(&IndexMap<String, CfmlValue>) -> R) -> R {
-        f(&self.0.read())
+        f(&self.0.read().map)
     }
 
     /// Get the value at `key` as a shared struct handle, inserting a fresh
@@ -305,18 +371,29 @@ impl CfmlStruct {
     /// write guard only for the get-or-insert — never calls user code — so it
     /// can't deadlock. The replacement template for the old
     /// `entry(..).or_insert_with(..)` + `as_struct_mut()` idiom.
+    /// v0.99.4 — shape_id bumps iff the key was absent OR held a non-struct
+    /// (in either case the entry is overwritten / created).
     pub fn get_or_insert_struct(&self, key: &str) -> CfmlStruct {
         let mut g = self.0.write();
+        let pre_existing = g.map.get(key).map(|v| matches!(v, CfmlValue::Struct(_)));
         let entry = g
+            .map
             .entry(key.to_string())
             .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
-        if let CfmlValue::Struct(s) = entry {
+        let result = if let CfmlValue::Struct(s) = entry {
             s.clone()
         } else {
             let s = CfmlStruct::empty();
             *entry = CfmlValue::Struct(s.clone());
             s
+        };
+        // pre_existing = Some(true) means key was already a struct → no
+        // structural change; Some(false) = overwrote non-struct; None =
+        // brand-new key. Both of the latter mutate the shape.
+        if pre_existing != Some(true) {
+            g.shape_id = next_shape_id();
         }
+        result
     }
 }
 

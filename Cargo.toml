@@ -22,7 +22,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.99.3"
+version = "0.99.4"
 authors = ["RustCFML Team"]
 edition = "2021"
 rust-version = "1.75.0"
