@@ -6388,6 +6388,48 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
 // Structured query parameter normalization
 // -----------------------------------------------
 
+/// Unwrap a cfqueryparam-style struct (`{value, cfsqltype, null, ...}`) to the
+/// effective bind value: `CfmlValue::Null` when `null=true`, otherwise the
+/// inner `value`. Non-struct inputs pass through unchanged.
+///
+/// Lucee/ACF/BoxLang accept this struct wherever a queryExecute parameter is
+/// expected — positional **and** named — and bind the inner value (or NULL).
+/// Binding the stringified struct itself is never correct. The positional
+/// (array) path already strips the struct in `normalize_query_params`; this
+/// helper covers the named (struct-of-params) path the per-driver builders
+/// hit later.
+///
+/// Intentionally NOT feature-gated: `pg_sql::prepare_pg_statements` is
+/// always-compiled (no DB feature gate), so the helper has to be too.
+pub(crate) fn cfqueryparam_unwrap(v: &CfmlValue) -> CfmlValue {
+    if let CfmlValue::Struct(s) = v {
+        let has_value = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
+        if !has_value {
+            return v.clone();
+        }
+        let is_null = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("null"))
+            .map(|(_, nv)| match nv {
+                CfmlValue::Bool(b) => b,
+                CfmlValue::String(s) => {
+                    s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        if is_null {
+            return CfmlValue::Null;
+        }
+        return s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("value"))
+            .map(|(_, val)| val.clone())
+            .unwrap_or(CfmlValue::Null);
+    }
+    v.clone()
+}
+
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn normalize_query_params(params_arg: &CfmlValue) -> (Vec<CfmlValue>, Vec<String>) {
     // If params is an array of structs with "value" key, extract typed values
@@ -6817,10 +6859,16 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<Vec<rusqlite
                     }
                     if end > start {
                         let param_name: String = String::from_utf8_lossy(&bytes[start..end]).to_string();
-                        let val = map.iter()
+                        let raw = map.iter()
                             .find(|(k, _)| k.eq_ignore_ascii_case(&param_name))
                             .map(|(_, v)| v)
                             .unwrap_or(CfmlValue::Null);
+                        // Named params may carry a cfqueryparam-style struct
+                        // ({value, cfsqltype, null, ...}). Unwrap to the bind
+                        // value (or NULL when null=true) before driver binding,
+                        // matching Lucee. Positional arrays are already
+                        // normalized by normalize_query_params() upstream.
+                        let val = cfqueryparam_unwrap(&raw);
                         result.push(cfml_to_sqlite(&val));
                         i = end;
                         continue;
@@ -6887,7 +6935,9 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
         CfmlValue::Struct(map) => {
             let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
             for (k, v) in map.iter() {
-                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&v));
+                // Unwrap cfqueryparam-style param structs before binding.
+                let val = cfqueryparam_unwrap(&v);
+                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&val));
             }
             Params::Named(named)
         }
@@ -7874,7 +7924,9 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
         CfmlValue::Struct(map) => {
             let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
             for (k, v) in map.iter() {
-                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&v));
+                // Unwrap cfqueryparam-style param structs before binding.
+                let val = cfqueryparam_unwrap(&v);
+                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&val));
             }
             Params::Named(named)
         }

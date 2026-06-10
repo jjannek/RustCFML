@@ -115,10 +115,16 @@ pub fn prepare_pg_statements(
                 let params = names
                     .iter()
                     .map(|name| {
-                        map.iter()
+                        let raw = map
+                            .iter()
                             .find(|(k, _)| k.eq_ignore_ascii_case(name))
                             .map(|(_, v)| v.query_column_scalar().clone())
-                            .unwrap_or(CfmlValue::Null)
+                            .unwrap_or(CfmlValue::Null);
+                        // Named param may be a cfqueryparam-style struct
+                        // ({value, cfsqltype, null, ...}); unwrap to the
+                        // bind value (or NULL when null=true) before
+                        // driver binding — matches Lucee semantics.
+                        crate::builtins::cfqueryparam_unwrap(&raw)
                     })
                     .collect();
                 out.push(PgStatement {

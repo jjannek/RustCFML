@@ -3703,6 +3703,37 @@ impl CfmlVirtualMachine {
                             let idx = one_based_to_zero(&index);
                             stack.push(arr.get(idx).cloned().unwrap_or(CfmlValue::Null));
                         }
+                        // Lucee/ACF/BoxLang parity: q["colName"] returns the column
+                        // proxy (same as q.colName via GetProperty); q[N] returns
+                        // row N as a struct. Frameworks need the bracket form for
+                        // dynamic column names (e.g. Wheels' ORM column processing).
+                        CfmlValue::Query(q) => {
+                            let row_at_oneless = |n: i64| -> CfmlValue {
+                                if n >= 1 {
+                                    q.get_row((n - 1) as usize)
+                                        .map(|m| CfmlValue::Struct(cfml_common::dynamic::CfmlStruct::new(m)))
+                                        .unwrap_or(CfmlValue::Null)
+                                } else {
+                                    CfmlValue::Null
+                                }
+                            };
+                            match &index {
+                                CfmlValue::String(name) => {
+                                    if let Some(col_data) = q.column_values_ci(name.as_str()) {
+                                        stack.push(CfmlValue::QueryColumn(
+                                            std::sync::Arc::new(col_data),
+                                        ));
+                                    } else if let Ok(n) = name.trim().parse::<i64>() {
+                                        stack.push(row_at_oneless(n));
+                                    } else {
+                                        stack.push(CfmlValue::Null);
+                                    }
+                                }
+                                CfmlValue::Int(n) => stack.push(row_at_oneless(*n)),
+                                CfmlValue::Double(d) => stack.push(row_at_oneless(*d as i64)),
+                                _ => stack.push(CfmlValue::Null),
+                            }
+                        }
                         CfmlValue::Struct(s) => {
                             let key = index.as_string();
                             let direct = s

@@ -4411,15 +4411,47 @@ impl Parser {
                     // Use a sentinel key to mark this as a spread entry
                     pairs.push((Expression::Spread(Box::new(expr.clone())), expr));
                 } else {
-                    // In struct literals, `=` is a key-value separator (like `:`),
-                    // NOT an assignment operator. parse_expression() is greedy and
-                    // would consume `"key" = value` as an assignment expression
-                    // (yielding the value, not the key), so always parse the key
-                    // at ternary precedence — that covers identifiers, soft
-                    // keywords (`{ component = x }`), string literals
-                    // (`{ "default" = x }`), and bracketed/parenthesized
-                    // expressions, but stops at `=`/`:`.
-                    let key = self.parse_ternary()?;
+                    // Soften `null`/`true`/`false` when they appear as a struct-
+                    // literal key (followed by `:` or `=`) — Lucee/ACF/BoxLang
+                    // accept them as identifier-style keys here, and the
+                    // cfqueryparam compiler emits exactly this shape
+                    // (`{value: ..., cfsqltype: ..., null: true}`). Without this
+                    // softening, `null:` parses as a Null literal-key, and the
+                    // struct ends up missing the "null" entry — so
+                    // queryExecute's struct-unwrap can't see null=true.
+                    let key = match self.peek(0) {
+                        Token::Null if matches!(self.peek(1), Token::Colon | Token::Equal) => {
+                            self.advance();
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String("null".to_string()),
+                                location: self.current_location(),
+                            })
+                        }
+                        Token::True if matches!(self.peek(1), Token::Colon | Token::Equal) => {
+                            self.advance();
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String("true".to_string()),
+                                location: self.current_location(),
+                            })
+                        }
+                        Token::False if matches!(self.peek(1), Token::Colon | Token::Equal) => {
+                            self.advance();
+                            Expression::Literal(Literal {
+                                value: LiteralValue::String("false".to_string()),
+                                location: self.current_location(),
+                            })
+                        }
+                        // In struct literals, `=` is a key-value separator (like
+                        // `:`), NOT an assignment operator. parse_expression()
+                        // is greedy and would consume `"key" = value` as an
+                        // assignment expression (yielding the value, not the
+                        // key), so always parse the key at ternary precedence —
+                        // that covers identifiers, soft keywords
+                        // (`{ component = x }`), string literals
+                        // (`{ "default" = x }`), and bracketed/parenthesized
+                        // expressions, but stops at `=`/`:`.
+                        _ => self.parse_ternary()?,
+                    };
 
                     // Support both : and = for struct initialization
                     if self.match_token(&Token::Colon) || self.match_token(&Token::Equal) {

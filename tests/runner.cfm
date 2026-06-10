@@ -48,12 +48,14 @@ try { include "types/test_array.cfm"; } catch (any e) { writeOutput("ERROR | typ
 try { include "types/test_array_append_grow.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array_append_grow.cfm | " & e.message & chr(10)); }
 try { include "types/test_array_reference_semantics.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array_reference_semantics.cfm | " & e.message & chr(10)); }
 try { include "types/test_struct.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct.cfm | " & e.message & chr(10)); }
+try { include "types/test_struct_literal_null_key.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct_literal_null_key.cfm | " & e.message & chr(10)); }
 try { include "types/test_struct_reference_semantics.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct_reference_semantics.cfm | " & e.message & chr(10)); }
 try { include "types/test_ordered_struct_literals.cfm"; } catch (any e) { writeOutput("ERROR | types/test_ordered_struct_literals.cfm | " & e.message & chr(10)); }
 try { include "types/test_nested_writeback.cfm"; } catch (any e) { writeOutput("ERROR | types/test_nested_writeback.cfm | " & e.message & chr(10)); }
 try { include "types/test_query.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_column.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_column.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_reference.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_reference.cfm | " & e.message & chr(10)); }
+try { include "types/test_query_bracket_column_access.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_bracket_column_access.cfm | " & e.message & chr(10)); }
 try { include "types/test_binary.cfm"; } catch (any e) { writeOutput("ERROR | types/test_binary.cfm | " & e.message & chr(10)); }
 try { include "types/test_hash_in_strings.cfm"; } catch (any e) { writeOutput("ERROR | types/test_hash_in_strings.cfm | " & e.message & chr(10)); }
 try { include "comments/test_hash_in_comments.cfm"; } catch (any e) { writeOutput("ERROR | comments/test_hash_in_comments.cfm | " & e.message & chr(10)); }
@@ -158,6 +160,7 @@ try { include "tags/test_tags_cfmail.cfm"; } catch (any e) { writeOutput("ERROR 
 try { include "tags/test_tags_cfcache.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfcache.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfstoredproc.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfstoredproc.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfqueryparam_attribute_collection.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfqueryparam_attribute_collection.cfm | " & e.message & chr(10)); }
+try { include "tags/test_queryexecute_param_structs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_queryexecute_param_structs.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfqueryparam_interpolated_value.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfqueryparam_interpolated_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfquery_quoted_identifier.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_quoted_identifier.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfquery_control_tags.cfm | " & e.message & chr(10)); }
