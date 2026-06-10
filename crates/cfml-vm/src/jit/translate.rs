@@ -225,6 +225,8 @@ impl Backend {
         // Declare the allowlisted builtin shims, each with a signature derived
         // from its `args_abi` / `ret_kind`. The order matches `SHIMS` so the
         // analysis' shim index can be reused as a slice index here.
+        // v0.99.3 — bailable shims get a trailing `*mut i64` bail param.
+        let ptr_ty = module.target_config().pointer_type();
         let shim_ids: Vec<FuncId> = SHIMS
             .iter()
             .map(|shim| {
@@ -232,6 +234,9 @@ impl Backend {
                 for k in shim.args_abi {
                     sig.params
                         .push(AbiParam::new(if *k == Kind::Float { F64 } else { I64 }));
+                }
+                if shim.bailable {
+                    sig.params.push(AbiParam::new(ptr_ty)); // bail
                 }
                 sig.returns
                     .push(AbiParam::new(if shim.ret_kind == Kind::Float { F64 } else { I64 }));
@@ -243,7 +248,6 @@ impl Backend {
 
         // v0.90.0 boxed-value shim declarations. All signatures use I64
         // for tagged-pointer args/returns (Option-γ encoding).
-        let ptr_ty = module.target_config().pointer_type();
         let box_int_id = {
             let mut sig = Signature::new(module.target_config().default_call_conv);
             sig.params.push(AbiParam::new(I64));
@@ -756,7 +760,7 @@ impl Backend {
                                     // shim's ABI kind. `to_i64` saturates floats,
                                     // `to_f64` promotes ints.
                                     let mut cl_args: Vec<Value> =
-                                        Vec::with_capacity(raw_args.len());
+                                        Vec::with_capacity(raw_args.len() + 1);
                                     for (idx, (v, k)) in raw_args.into_iter().enumerate() {
                                         let abi = shim.args_abi[idx];
                                         let conv = if abi == Kind::Float {
@@ -766,8 +770,28 @@ impl Backend {
                                         };
                                         cl_args.push(conv);
                                     }
+                                    // v0.99.3 — bailable shims take a trailing
+                                    // *mut i64 bail pointer; after the call we
+                                    // load *bail and branch to bail_block if
+                                    // it's non-zero (mirrors UDF dispatcher).
+                                    if shim.bailable {
+                                        cl_args.push(b.use_var(bail_var));
+                                    }
                                     let call = b.ins().call(shim_refs[shim_idx], &cl_args);
                                     let r = b.inst_results(call)[0];
+                                    if shim.bailable {
+                                        let bp = b.use_var(bail_var);
+                                        let bail_val =
+                                            b.ins().load(I64, MemFlags::new(), bp, 0);
+                                        let bail_set = b.ins().icmp_imm(
+                                            IntCC::NotEqual,
+                                            bail_val,
+                                            0,
+                                        );
+                                        let cont = b.create_block();
+                                        b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                                        b.switch_to_block(cont);
+                                    }
                                     stack.push((r, shim.ret_kind));
                                 }
                                 Kind::UdfRef(_) => {

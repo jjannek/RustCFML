@@ -60,6 +60,13 @@ pub struct Shim {
     pub sym: &'static str,
     /// Raw fn pointer for `JITBuilder::symbol` to hand off to the linker.
     pub addr: *const u8,
+    /// v0.99.3 — when true, the shim takes a trailing `*mut i64` bail
+    /// parameter and may set `*bail = 1` to signal a runtime error. The
+    /// translator appends the bail pointer to the call arglist and emits
+    /// a post-call `brif bail, bail_block, cont` (mirrors the UDF Call
+    /// dispatcher's bail pattern). When false the shim is infallible:
+    /// signature is `(args...) -> ret`, no trailing arg, no post-check.
+    pub bailable: bool,
 }
 
 // `Shim`'s `addr` is a function pointer; we share the table across threads.
@@ -562,6 +569,66 @@ extern "C" fn cfml_replace_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -> i64 {
     super::arena::box_into_active(CfmlValue::string(out)) as i64
 }
 
+// ── v0.99.3 — fallible shim (uses the new bail plumbing) ────────────────────
+// `arrayLen(QueryColumn)` errors in the interpreter (Lucee@7 parity); the JIT
+// can't constant-fold this away because the underlying kind of a Boxed arg is
+// only known at runtime. Pattern: shim takes a trailing `*mut i64`; on error
+// it writes `*bail = 1` and returns 0. The translator emits a post-call
+// `brif bail, bail_block, cont` so execution falls through to the interpreter
+// re-run path on bail.
+//
+// Mirrors `fn_array_len`: Array → len, Struct (arguments-scope shape) →
+// count-of-numeric-keys, anything else → 0, **QueryColumn → bail to
+// interpreter so it throws the same `Can't cast` runtime error.**
+extern "C" fn cfml_array_len_boxed_i64(tagged: i64, bail: *mut i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    match v {
+        CfmlValue::Array(a) => a.len() as i64,
+        CfmlValue::QueryColumn(_) => {
+            // Surface as a bail; interpreter throws on re-run.
+            unsafe {
+                *bail = 1;
+            }
+            0
+        }
+        CfmlValue::Struct(s) => {
+            // Arguments-scope shape: count entries with numeric keys (1-based
+            // positional args). Plain struct with no numeric keys returns 0
+            // (same as interpreter).
+            s.keys()
+                .into_iter()
+                .filter(|k| k.parse::<usize>().is_ok())
+                .count() as i64
+        }
+        _ => 0,
+    }
+}
+
+// ── v0.99.3 infallible struct shims (no bail) ──────────────────────────────
+
+/// Mirrors `fn_struct_key_list(struct)` with default delimiter `,`. Returns
+/// `""` for non-struct inputs (infallible — same as interpreter).
+extern "C" fn cfml_struct_key_list_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let out = if let CfmlValue::Struct(s) = v {
+        // Inline `visible_struct_keys`: hide the arguments-scope markers.
+        let keys: Vec<String> = s.keys();
+        let visible: Vec<String> = if keys.iter().any(|k| k == "__arguments_scope") {
+            keys.into_iter()
+                .filter(|k| k != "__arguments_scope" && k != "__arguments_params")
+                .collect()
+        } else {
+            keys
+        };
+        visible.join(",")
+    } else {
+        String::new()
+    };
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
 /// Mirrors `fn_replace_no_case(string, find, replaceWith)` with default scope="one".
 extern "C" fn cfml_replace_no_case_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
@@ -595,6 +662,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_abs_i64",
         addr: cfml_abs_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "abs",
@@ -603,6 +671,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_abs_f64",
         addr: cfml_abs_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "min",
@@ -611,6 +680,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_min_f64",
         addr: cfml_min_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "max",
@@ -619,6 +689,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_max_f64",
         addr: cfml_max_f64 as *const u8,
+        bailable: false,
     },
     // ── Single-arg numeric → Int (rounding / sign / truncation) ──────────
     Shim {
@@ -628,6 +699,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_floor_i64",
         addr: cfml_floor_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "ceiling",
@@ -636,6 +708,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_ceiling_i64",
         addr: cfml_ceiling_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "round",
@@ -644,6 +717,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_round_i64",
         addr: cfml_round_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "sgn",
@@ -652,6 +726,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_sgn_i64",
         addr: cfml_sgn_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "fix",
@@ -660,6 +735,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_fix_i64",
         addr: cfml_fix_i64 as *const u8,
+        bailable: false,
     },
     // ── Single-arg numeric → Float (transcendentals) ─────────────────────
     Shim {
@@ -669,6 +745,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_sqr_f64",
         addr: cfml_sqr_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "exp",
@@ -677,6 +754,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_exp_f64",
         addr: cfml_exp_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "log",
@@ -685,6 +763,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_log_f64",
         addr: cfml_log_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "log10",
@@ -693,6 +772,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_log10_f64",
         addr: cfml_log10_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "sin",
@@ -701,6 +781,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_sin_f64",
         addr: cfml_sin_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "cos",
@@ -709,6 +790,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_cos_f64",
         addr: cfml_cos_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "tan",
@@ -717,6 +799,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_tan_f64",
         addr: cfml_tan_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "asin",
@@ -725,6 +808,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_asin_f64",
         addr: cfml_asin_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "acos",
@@ -733,6 +817,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_acos_f64",
         addr: cfml_acos_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "atan",
@@ -741,6 +826,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_atan_f64",
         addr: cfml_atan_f64 as *const u8,
+        bailable: false,
     },
     // ── Bit-twiddling: 1 / 2-arg Int → Int ───────────────────────────────
     Shim {
@@ -750,6 +836,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_and_i64",
         addr: cfml_bit_and_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "bitor",
@@ -758,6 +845,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_or_i64",
         addr: cfml_bit_or_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "bitxor",
@@ -766,6 +854,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_xor_i64",
         addr: cfml_bit_xor_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "bitnot",
@@ -774,6 +863,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_not_i64",
         addr: cfml_bit_not_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "bitshln",
@@ -782,6 +872,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_shln_i64",
         addr: cfml_bit_shln_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "bitshrn",
@@ -790,6 +881,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_shrn_i64",
         addr: cfml_bit_shrn_i64 as *const u8,
+        bailable: false,
     },
     // ── incrementValue / decrementValue — typed overloads ────────────────
     Shim {
@@ -799,6 +891,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_increment_value_i64",
         addr: cfml_increment_value_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "incrementvalue",
@@ -807,6 +900,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_increment_value_f64",
         addr: cfml_increment_value_f64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "decrementvalue",
@@ -815,6 +909,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_decrement_value_i64",
         addr: cfml_decrement_value_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "decrementvalue",
@@ -823,6 +918,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_decrement_value_f64",
         addr: cfml_decrement_value_f64 as *const u8,
+        bailable: false,
     },
     // ── bitMaskRead / bitMaskSet / bitMaskClear — Int → Int ──────────────
     Shim {
@@ -832,6 +928,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_mask_read_i64",
         addr: cfml_bit_mask_read_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "bitmaskset",
@@ -840,6 +937,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_mask_set_i64",
         addr: cfml_bit_mask_set_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "bitmaskclear",
@@ -848,6 +946,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_bit_mask_clear_i64",
         addr: cfml_bit_mask_clear_i64 as *const u8,
+        bailable: false,
     },
     // ── 2-arg pow() builtin (function-call form of the `^` infix) ────────
     Shim {
@@ -857,6 +956,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Float,
         sym: "cfml_pow_fn_f64",
         addr: cfml_pow_fn_f64 as *const u8,
+        bailable: false,
     },
     // ── v0.92.0 — Boxed-argument string/array shims ──────────────────────
     Shim {
@@ -866,6 +966,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_len_boxed_i64",
         addr: cfml_len_boxed_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "ucase",
@@ -874,6 +975,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_ucase_boxed",
         addr: cfml_ucase_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "lcase",
@@ -882,6 +984,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_lcase_boxed",
         addr: cfml_lcase_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "trim",
@@ -890,6 +993,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_trim_boxed",
         addr: cfml_trim_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "ltrim",
@@ -898,6 +1002,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_ltrim_boxed",
         addr: cfml_ltrim_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "rtrim",
@@ -906,6 +1011,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_rtrim_boxed",
         addr: cfml_rtrim_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "reverse",
@@ -914,6 +1020,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_reverse_boxed",
         addr: cfml_reverse_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "asc",
@@ -922,6 +1029,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_asc_boxed_i64",
         addr: cfml_asc_boxed_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "stripcr",
@@ -930,6 +1038,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_strip_cr_boxed",
         addr: cfml_strip_cr_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "htmleditformat",
@@ -938,6 +1047,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_html_edit_format_boxed",
         addr: cfml_html_edit_format_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "htmlcodeformat",
@@ -946,6 +1056,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_html_code_format_boxed",
         addr: cfml_html_code_format_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "encodeforhtml",
@@ -954,6 +1065,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_encode_for_html_boxed",
         addr: cfml_encode_for_html_boxed as *const u8,
+        bailable: false,
     },
     // ── v0.99.2 — more single-arg Boxed→Boxed string shims ───────────────
     Shim {
@@ -963,6 +1075,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_url_encoded_format_boxed",
         addr: cfml_url_encoded_format_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "urldecode",
@@ -971,6 +1084,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_url_decode_boxed",
         addr: cfml_url_decode_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "jsstringformat",
@@ -979,6 +1093,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_js_string_format_boxed",
         addr: cfml_js_string_format_boxed as *const u8,
+        bailable: false,
     },
     // ── v0.99.2 — multi-arg Boxed shims ──────────────────────────────────
     Shim {
@@ -988,6 +1103,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_left_boxed_int",
         addr: cfml_left_boxed_int as *const u8,
+        bailable: false,
     },
     Shim {
         name: "right",
@@ -996,6 +1112,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_right_boxed_int",
         addr: cfml_right_boxed_int as *const u8,
+        bailable: false,
     },
     Shim {
         name: "mid",
@@ -1004,6 +1121,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_mid_boxed_int_int",
         addr: cfml_mid_boxed_int_int as *const u8,
+        bailable: false,
     },
     Shim {
         name: "repeatstring",
@@ -1012,6 +1130,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_repeat_string_boxed_int",
         addr: cfml_repeat_string_boxed_int as *const u8,
+        bailable: false,
     },
     Shim {
         name: "find",
@@ -1020,6 +1139,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_find_boxed_boxed_i64",
         addr: cfml_find_boxed_boxed_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "findnocase",
@@ -1028,6 +1148,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Int,
         sym: "cfml_find_no_case_boxed_boxed_i64",
         addr: cfml_find_no_case_boxed_boxed_i64 as *const u8,
+        bailable: false,
     },
     Shim {
         name: "replace",
@@ -1036,6 +1157,7 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_replace_3_boxed",
         addr: cfml_replace_3_boxed as *const u8,
+        bailable: false,
     },
     Shim {
         name: "replacenocase",
@@ -1044,6 +1166,27 @@ pub static SHIMS: &[Shim] = &[
         ret_kind: Kind::Boxed,
         sym: "cfml_replace_no_case_3_boxed",
         addr: cfml_replace_no_case_3_boxed as *const u8,
+        bailable: false,
+    },
+    // ── v0.99.3 — fallible builtin shim (uses new bail plumbing) ─────────
+    Shim {
+        name: "arraylen",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Int,
+        sym: "cfml_array_len_boxed_i64",
+        addr: cfml_array_len_boxed_i64 as *const u8,
+        bailable: true,
+    },
+    // ── v0.99.3 — infallible struct introspection shim ───────────────────
+    Shim {
+        name: "structkeylist",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_struct_key_list_boxed",
+        addr: cfml_struct_key_list_boxed as *const u8,
+        bailable: false,
     },
 ];
 

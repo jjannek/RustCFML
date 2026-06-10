@@ -827,6 +827,77 @@ fn asc_returns_int_from_boxed_arg_in_jit() {
 }
 
 #[test]
+fn array_len_shim_matches_interpreter() {
+    // v0.99.3 bail plumbing — arrayLen(Boxed) → Int. Pure-array path is
+    // the happy case (no bail); struct/numeric fall-throughs covered by
+    // the interpreter oracle.
+    let src = r#"
+        function sz(a) { return arrayLen(a) * 2 + 1; }
+        out = "";
+        for (k = 1; k <= 80; k++) {
+            arr = [1, 2, 3, k, k+1, k+2];
+            out = out & sz(arr) & ";";
+        }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "arrayLen Boxed shim must match interpreter");
+    assert!(compiled >= 1, "expected sz() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn array_len_bails_on_query_column_and_matches_interpreter() {
+    // v0.99.3 — arrayLen on a QueryColumn THROWS in Lucee/RustCFML. The
+    // JIT'd shim sets *bail = 1; the engine then re-interprets the call,
+    // and the interpreter throws the same `Can't cast` runtime error,
+    // which the cftry/cfcatch grabs. The error message must match exactly.
+    let src = r#"
+        function probe(a) { return arrayLen(a); }
+        q = queryNew("name", "varchar");
+        queryAddRow(q, {name: "alice"});
+        out = "";
+        for (k = 1; k <= 80; k++) {
+            try {
+                v = probe(q.name);  // QueryColumn — must throw
+                out = out & "ok:" & v & ";";
+            } catch (any e) {
+                out = out & "err:" & e.message & ";";
+            }
+        }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _compiled) = run(src);
+    assert_eq!(
+        out, oracle,
+        "arrayLen(QueryColumn) bail must re-interpret to same error as interpreter"
+    );
+    // We deliberately don't assert compiled>=1 — under JIT the shim sets
+    // *bail every call, so the function may be evicted from cache. The
+    // critical guarantee is output parity with the interpreter.
+}
+
+#[test]
+fn struct_key_list_shim_matches_interpreter() {
+    // v0.99.3 — structKeyList(Boxed) → Boxed. Infallible: non-struct
+    // inputs return empty string. Default delimiter "," (1-arg form).
+    let src = r##"
+        function keys(s) { return "[" & structKeyList(s) & "]"; }
+        out = "";
+        for (k = 1; k <= 60; k++) {
+            st = {a: k, b: k+1, c: k+2};
+            out = out & keys(st) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "structKeyList Boxed shim must match interpreter");
+    assert!(compiled >= 1, "expected keys() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
 fn url_and_js_string_format_shims_match_interpreter() {
     // v0.99.2 single-arg Boxed→Boxed shims: urlEncodedFormat / urlDecode /
     // jsStringFormat. Chain through Concat to exercise all three.

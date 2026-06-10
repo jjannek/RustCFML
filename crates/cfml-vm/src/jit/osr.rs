@@ -1177,7 +1177,7 @@ pub fn compile_loop(
                                     .ok_or("osr: no shim overload for call")?;
                                 let shim = &SHIMS[shim_idx];
                                 let mut cl_args: Vec<Value> =
-                                    Vec::with_capacity(raw_args.len());
+                                    Vec::with_capacity(raw_args.len() + 1);
                                 for (idx, (v, k)) in raw_args.into_iter().enumerate() {
                                     let abi = shim.args_abi[idx];
                                     let conv = if abi == Kind::Float {
@@ -1187,8 +1187,26 @@ pub fn compile_loop(
                                     };
                                     cl_args.push(conv);
                                 }
+                                // v0.99.3 — bailable shims take trailing
+                                // *mut i64 bail pointer; post-call brif on it.
+                                if shim.bailable {
+                                    cl_args.push(b.use_var(bail_var));
+                                }
                                 let call = b.ins().call(shim_refs[shim_idx], &cl_args);
                                 let r = b.inst_results(call)[0];
+                                if shim.bailable {
+                                    let bp = b.use_var(bail_var);
+                                    let bail_val =
+                                        b.ins().load(I64, MemFlags::new(), bp, 0);
+                                    let bail_set = b.ins().icmp_imm(
+                                        IntCC::NotEqual,
+                                        bail_val,
+                                        0,
+                                    );
+                                    let cont = b.create_block();
+                                    b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                                    b.switch_to_block(cont);
+                                }
                                 stack.push((r, shim.ret_kind));
                             }
                             Kind::UdfRef(_) => {
