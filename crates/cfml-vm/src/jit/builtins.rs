@@ -871,6 +871,207 @@ extern "C" fn cfml_array_contains_no_case_boxed_boxed(tag_a: i64, tag_v: i64) ->
     super::arena::box_into_active(CfmlValue::Bool(b)) as i64
 }
 
+// ── v0.103.0 — Boxed-aware array + list shims ────────────────────────────────
+// arrayFirst/arrayLast THROW on non-array (see cfml-stdlib::fn_array_first /
+// fn_array_last → `Err(...)`); the JIT bails so the interpreter re-runs the
+// function and surfaces the same runtime error. arraySum/arrayAvg are
+// infallible (Int(0) sentinel for non-array / empty, Double otherwise). The
+// list-family shims are all infallible string-in/string-out with default
+// delimiter `,`.
+
+/// Mirrors `fn_array_first`: Array → first element (or Null if empty); else
+/// BAIL to interpreter for the `argument must be an array` throw.
+extern "C" fn cfml_array_first_boxed(tagged: i64, bail: *mut i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    if let CfmlValue::Array(arr) = &v {
+        let first = arr.first().unwrap_or(CfmlValue::Null);
+        super::arena::box_into_active(first) as i64
+    } else {
+        unsafe {
+            *bail = 1;
+        }
+        0
+    }
+}
+
+/// Mirrors `fn_array_last`: Array → last element (or Null if empty); else
+/// BAIL to interpreter.
+extern "C" fn cfml_array_last_boxed(tagged: i64, bail: *mut i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    if let CfmlValue::Array(arr) = &v {
+        let last = arr.last().unwrap_or(CfmlValue::Null);
+        super::arena::box_into_active(last) as i64
+    } else {
+        unsafe {
+            *bail = 1;
+        }
+        0
+    }
+}
+
+/// Mirrors `fn_array_sum`: Array → sum-of-as_string-as-f64 (Double); else 0.
+extern "C" fn cfml_array_sum_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let out = if let CfmlValue::Array(arr) = &v {
+        // get_float coerces via query_column_scalar then parses; for plain
+        // Int/Double/String entries this matches `as_string().parse::<f64>()`
+        // with 0.0 fallback. Stay bit-exact with the interp helper by going
+        // through `as_string()` (covers QueryColumn proxies via their
+        // stringify).
+        let sum: f64 = arr
+            .iter()
+            .map(|x| match &x {
+                CfmlValue::Int(i) => *i as f64,
+                CfmlValue::Double(d) => *d,
+                _ => x.as_string().parse::<f64>().unwrap_or(0.0),
+            })
+            .sum();
+        CfmlValue::Double(sum)
+    } else {
+        CfmlValue::Int(0)
+    };
+    super::arena::box_into_active(out) as i64
+}
+
+/// Mirrors `fn_array_avg`: Array && non-empty → sum/len (Double); else 0.
+extern "C" fn cfml_array_avg_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let out = if let CfmlValue::Array(arr) = &v {
+        if arr.is_empty() {
+            CfmlValue::Int(0)
+        } else {
+            let n = arr.len() as f64;
+            let sum: f64 = arr
+                .iter()
+                .map(|x| match &x {
+                    CfmlValue::Int(i) => *i as f64,
+                    CfmlValue::Double(d) => *d,
+                    _ => x.as_string().parse::<f64>().unwrap_or(0.0),
+                })
+                .sum();
+            CfmlValue::Double(sum / n)
+        }
+    } else {
+        CfmlValue::Int(0)
+    };
+    super::arena::box_into_active(out) as i64
+}
+
+// Inline copy of `cfml-stdlib::cfml_list_split` to avoid a cross-crate `pub`
+// leak: each delimiter character is its own delimiter; empty items dropped.
+fn list_split<'a>(list: &'a str, delimiters: &str) -> Vec<&'a str> {
+    if list.is_empty() {
+        return Vec::new();
+    }
+    list.split(|c: char| delimiters.contains(c))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Mirrors `fn_list_first` with default delimiter `,`.
+extern "C" fn cfml_list_first_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let list = v.as_string();
+    let items = list_split(&list, ",");
+    let first = items.first().copied().unwrap_or("").to_string();
+    super::arena::box_into_active(CfmlValue::string(first)) as i64
+}
+
+/// Mirrors `fn_list_last` with default delimiter `,`.
+extern "C" fn cfml_list_last_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let list = v.as_string();
+    let items = list_split(&list, ",");
+    let last = items.last().copied().unwrap_or("").to_string();
+    super::arena::box_into_active(CfmlValue::string(last)) as i64
+}
+
+/// Mirrors `fn_list_rest` (default delimiter `,`): literal substring from
+/// the start of element 2 to end, preserving interior/trailing empties +
+/// original delimiter chars. Empty-collapsing only over the leading run +
+/// the run that ends element 1.
+extern "C" fn cfml_list_rest_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let list = v.as_string();
+    let is_delim = |c: char| c == ',';
+    let mut iter = list.char_indices().peekable();
+    while let Some(&(_, c)) = iter.peek() {
+        if is_delim(c) {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    while let Some(&(_, c)) = iter.peek() {
+        if is_delim(c) {
+            break;
+        }
+        iter.next();
+    }
+    while let Some(&(_, c)) = iter.peek() {
+        if is_delim(c) {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    let rest = match iter.peek() {
+        Some(&(i, _)) => &list[i..],
+        None => "",
+    };
+    super::arena::box_into_active(CfmlValue::string(rest.to_string())) as i64
+}
+
+/// Mirrors `fn_list_get_at(list, index)` with default delimiter `,`. Index is
+/// 1-based; saturating_sub(1) clamps 0 → 0. Out-of-range → empty string.
+extern "C" fn cfml_list_get_at_boxed_i64(tagged: i64, index: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let list = v.as_string();
+    let idx = (index as usize).saturating_sub(1);
+    let items = list_split(&list, ",");
+    let out = items.get(idx).copied().unwrap_or("").to_string();
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
+/// Mirrors `fn_list_append(list, value)` with default delimiter `,`. Empty
+/// list short-circuits to bare value (no leading delim).
+extern "C" fn cfml_list_append_boxed_boxed(tag_l: i64, tag_v: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let vl = unsafe { super::boxed::materialize_tagged(tag_l as usize) };
+    let vv = unsafe { super::boxed::materialize_tagged(tag_v as usize) };
+    let list = vl.as_string();
+    let value = vv.as_string();
+    let out = if list.is_empty() {
+        value
+    } else {
+        format!("{},{}", list, value)
+    };
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
+/// Mirrors `fn_list_prepend(list, value)` with default delimiter `,`.
+extern "C" fn cfml_list_prepend_boxed_boxed(tag_l: i64, tag_v: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let vl = unsafe { super::boxed::materialize_tagged(tag_l as usize) };
+    let vv = unsafe { super::boxed::materialize_tagged(tag_v as usize) };
+    let list = vl.as_string();
+    let value = vv.as_string();
+    let out = if list.is_empty() {
+        value
+    } else {
+        format!("{},{}", value, list)
+    };
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
 /// The complete shim table. Order matters for `lookup_overload`: more specific
 /// signatures (e.g. `abs(Int)`) must precede broader ones (`abs(Numeric)`).
 pub static SHIMS: &[Shim] = &[
@@ -1534,6 +1735,97 @@ pub static SHIMS: &[Shim] = &[
         addr: cfml_array_contains_no_case_boxed_boxed as *const u8,
         bailable: false,
     },
+    // ── v0.103.0 — Boxed-aware array + list shims ────────────────────────
+    Shim {
+        name: "arrayfirst",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_first_boxed",
+        addr: cfml_array_first_boxed as *const u8,
+        bailable: true,
+    },
+    Shim {
+        name: "arraylast",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_last_boxed",
+        addr: cfml_array_last_boxed as *const u8,
+        bailable: true,
+    },
+    Shim {
+        name: "arraysum",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_sum_boxed",
+        addr: cfml_array_sum_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "arrayavg",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_avg_boxed",
+        addr: cfml_array_avg_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "listfirst",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_list_first_boxed",
+        addr: cfml_list_first_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "listlast",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_list_last_boxed",
+        addr: cfml_list_last_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "listrest",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_list_rest_boxed",
+        addr: cfml_list_rest_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "listgetat",
+        args_req: &[KindReq::Boxed, KindReq::Int],
+        args_abi: &[Kind::Boxed, Kind::Int],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_list_get_at_boxed_i64",
+        addr: cfml_list_get_at_boxed_i64 as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "listappend",
+        args_req: &[KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_list_append_boxed_boxed",
+        addr: cfml_list_append_boxed_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "listprepend",
+        args_req: &[KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_list_prepend_boxed_boxed",
+        addr: cfml_list_prepend_boxed_boxed as *const u8,
+        bailable: false,
+    },
 ];
 
 /// Lowercased lookup: `true` iff some shim has this exact name. Currently only
@@ -1744,6 +2036,118 @@ mod tests {
             assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
             assert!(lookup_overload(name, &[Kind::Boxed]).is_none());
         }
+
+        // v0.103.0 — array shims: 1-arg (Boxed) → Boxed; arrayFirst/Last are
+        // bailable, arraySum/Avg are infallible.
+        for name in ["arrayfirst", "arraylast", "arraysum", "arrayavg"] {
+            let idx = lookup_overload(name, &[Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+            assert!(lookup_overload(name, &[Kind::Int]).is_none());
+        }
+        assert!(SHIMS[lookup_overload("arrayfirst", &[Kind::Boxed]).unwrap()].bailable);
+        assert!(SHIMS[lookup_overload("arraylast", &[Kind::Boxed]).unwrap()].bailable);
+        assert!(!SHIMS[lookup_overload("arraysum", &[Kind::Boxed]).unwrap()].bailable);
+        assert!(!SHIMS[lookup_overload("arrayavg", &[Kind::Boxed]).unwrap()].bailable);
+
+        // v0.103.0 — list shims: 1-arg (Boxed) → Boxed (listFirst/Last/Rest).
+        for name in ["listfirst", "listlast", "listrest"] {
+            let idx = lookup_overload(name, &[Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+        }
+        // listGetAt(Boxed, Int) → Boxed.
+        let idx = lookup_overload("listgetat", &[Kind::Boxed, Kind::Int])
+            .expect("listgetat(Boxed,Int) must match");
+        assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+        assert!(lookup_overload("listgetat", &[Kind::Boxed]).is_none());
+        // listAppend / listPrepend (Boxed, Boxed) → Boxed.
+        for name in ["listappend", "listprepend"] {
+            let idx = lookup_overload(name, &[Kind::Boxed, Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed,Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+        }
+    }
+
+    #[test]
+    fn array_list_shims_match_interpreter() {
+        // v0.103.0 — spot-check the new shims against their interp
+        // counterparts. Each shim arena-boxes a CfmlValue that the JIT
+        // caller would observe via Kind::Boxed slot/return.
+        use super::super::arena::{Arena, ArenaGuard};
+        use super::super::boxed;
+        use cfml_common::dynamic::{CfmlArray, CfmlValue};
+
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+
+        let extract = |tagged: i64| -> CfmlValue {
+            unsafe { boxed::materialize_tagged(tagged as usize) }
+        };
+
+        // arrayFirst / arrayLast on a populated array.
+        let arr = boxed::box_value(CfmlValue::Array(CfmlArray::new(vec![
+            CfmlValue::Int(10),
+            CfmlValue::Int(20),
+            CfmlValue::Int(30),
+        ]))) as i64;
+        let mut bail = 0i64;
+        let first = cfml_array_first_boxed(arr, &mut bail);
+        assert_eq!(bail, 0);
+        assert!(matches!(extract(first), CfmlValue::Int(10)));
+        let last = cfml_array_last_boxed(arr, &mut bail);
+        assert_eq!(bail, 0);
+        assert!(matches!(extract(last), CfmlValue::Int(30)));
+
+        // arrayFirst on non-array BAILS.
+        let not_arr = boxed::box_value(CfmlValue::string("nope")) as i64;
+        let _ = cfml_array_first_boxed(not_arr, &mut bail);
+        assert_eq!(bail, 1, "arrayFirst on non-array must bail");
+
+        // arraySum / arrayAvg on mixed numerics.
+        let nums = boxed::box_value(CfmlValue::Array(CfmlArray::new(vec![
+            CfmlValue::Int(1),
+            CfmlValue::Double(2.5),
+            CfmlValue::string("3"),
+        ]))) as i64;
+        let sum = cfml_array_sum_boxed(nums);
+        assert!(matches!(extract(sum), CfmlValue::Double(d) if (d - 6.5).abs() < 1e-9));
+        let avg = cfml_array_avg_boxed(nums);
+        assert!(matches!(extract(avg), CfmlValue::Double(d) if (d - 6.5/3.0).abs() < 1e-9));
+
+        // arraySum on non-array → Int(0); arrayAvg on empty → Int(0).
+        let empty = boxed::box_value(CfmlValue::Array(CfmlArray::new(Vec::new()))) as i64;
+        assert!(matches!(extract(cfml_array_avg_boxed(empty)), CfmlValue::Int(0)));
+        assert!(matches!(extract(cfml_array_sum_boxed(not_arr)), CfmlValue::Int(0)));
+
+        // listFirst / listLast / listRest.
+        let csv = boxed::box_value(CfmlValue::string("a,b,c,d")) as i64;
+        assert_eq!(extract(cfml_list_first_boxed(csv)).as_string(), "a");
+        assert_eq!(extract(cfml_list_last_boxed(csv)).as_string(), "d");
+        assert_eq!(extract(cfml_list_rest_boxed(csv)).as_string(), "b,c,d");
+
+        // listGetAt: 1-based.
+        assert_eq!(extract(cfml_list_get_at_boxed_i64(csv, 2)).as_string(), "b");
+        // Out-of-range → empty.
+        assert_eq!(extract(cfml_list_get_at_boxed_i64(csv, 99)).as_string(), "");
+
+        // listAppend / listPrepend.
+        let list = boxed::box_value(CfmlValue::string("x,y")) as i64;
+        let val = boxed::box_value(CfmlValue::string("z")) as i64;
+        assert_eq!(
+            extract(cfml_list_append_boxed_boxed(list, val)).as_string(),
+            "x,y,z"
+        );
+        assert_eq!(
+            extract(cfml_list_prepend_boxed_boxed(list, val)).as_string(),
+            "z,x,y"
+        );
+        // Empty list: bare value, no leading delim.
+        let empty_str = boxed::box_value(CfmlValue::string("")) as i64;
+        assert_eq!(
+            extract(cfml_list_append_boxed_boxed(empty_str, val)).as_string(),
+            "z"
+        );
     }
 
     #[test]

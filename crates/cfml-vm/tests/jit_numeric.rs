@@ -1568,3 +1568,114 @@ fn array_contains_in_jitted_udf_matches_interpreter() {
     assert!(compiled >= 2, "has + hasNoCase must JIT, got {compiled}");
     assert_eq!(out, oracle);
 }
+
+#[test]
+fn array_first_last_in_jitted_udf_matches_interpreter() {
+    let src = r##"
+        function pick(arr) { return arrayFirst(arr) & "|" & arrayLast(arr); }
+        out = "";
+        arr = [10, 20, 30, 40];
+        for (k = 1; k <= 30; k++) {
+            out = out & pick(arr) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn array_first_bails_on_non_array_matches_interpreter() {
+    // arrayFirst on a non-array must throw the same runtime error under JIT
+    // as under the interpreter — i.e. the JIT bails and the interp re-run
+    // surfaces the throw, which cftry/cfcatch catches.
+    let src = r##"
+        function safeFirst(x) {
+            try { return arrayFirst(x); } catch (any e) { return "ERR"; }
+        }
+        out = "";
+        for (k = 1; k <= 30; k++) {
+            out = out & safeFirst("nope") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, _compiled) = run(src);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn array_sum_avg_in_jitted_udf_matches_interpreter() {
+    let src = r##"
+        function stats(arr) { return arraySum(arr) & "|" & arrayAvg(arr); }
+        out = "";
+        a = [1, 2, 3, 4, 5];
+        b = [10.5, 20.5];
+        for (k = 1; k <= 30; k++) {
+            out = out & stats(a) & ";" & stats(b) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn list_first_last_rest_in_jitted_udf_matches_interpreter() {
+    let src = r##"
+        function probe(list) {
+            return listFirst(list) & "|" & listLast(list) & "|" & listRest(list);
+        }
+        out = "";
+        for (k = 1; k <= 30; k++) {
+            out = out & probe("a,b,c,d") & ";" & probe("only") & ";" & probe("") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn list_get_at_in_jitted_udf_matches_interpreter() {
+    let src = r##"
+        function at(list, i) { return listGetAt(list, i); }
+        out = "";
+        for (k = 1; k <= 30; k++) {
+            out = out & at("a,b,c,d", 1) & "|" & at("a,b,c,d", 3)
+                & "|" & at("a,b,c,d", 99) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn list_append_prepend_in_jitted_udf_matches_interpreter() {
+    let src = r##"
+        function build(seed) {
+            var s = seed;
+            s = listAppend(s, "z");
+            s = listPrepend(s, "a");
+            return s;
+        }
+        out = "";
+        for (k = 1; k <= 30; k++) {
+            out = out & build("m,n") & ";" & build("") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
