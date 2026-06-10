@@ -2051,7 +2051,14 @@ fn sort_rows(rows: &mut Vec<Vec<CfmlValue>>, keys: &[Vec<CfmlValue>], order_by: 
     #[cfg(target_arch = "wasm32")]
     idx.sort_by(cmp);
 
-    *rows = idx.iter().map(|&i| rows[i].clone()).collect();
+    // Apply the permutation by MOVING rows out of the source vec via Option::take,
+    // not cloning them. At 500K rows × 12 cols the clone path did ~6M Arc::clone
+    // refcount bumps; this path does N moves with no refcount traffic.
+    let mut taken: Vec<Option<Vec<CfmlValue>>> = std::mem::take(rows).into_iter().map(Some).collect();
+    *rows = idx
+        .into_iter()
+        .map(|i| taken[i].take().expect("sort permutation must be a bijection"))
+        .collect();
 }
 
 fn apply_limit(rows: &mut Vec<Vec<CfmlValue>>, limit: &Option<LimitClause>) {

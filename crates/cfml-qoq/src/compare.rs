@@ -37,8 +37,37 @@ fn parse_num(s: &str) -> Option<f64> {
     t.parse::<f64>().ok()
 }
 
+/// Case-insensitive lexical compare. ASCII-only fast path is allocation-free
+/// (byte-by-byte fold to lowercase); only falls back to the allocating
+/// `to_lowercase()` path when either string contains a non-ASCII byte.
 fn str_cmp(a: &str, b: &str) -> Ordering {
-    a.to_lowercase().cmp(&b.to_lowercase())
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let min_len = ab.len().min(bb.len());
+    let mut i = 0;
+    while i < min_len {
+        let ba = ab[i];
+        let bbi = bb[i];
+        if ba >= 0x80 || bbi >= 0x80 {
+            return a.to_lowercase().cmp(&b.to_lowercase());
+        }
+        let ca = ba.to_ascii_lowercase();
+        let cb = bbi.to_ascii_lowercase();
+        if ca != cb {
+            return ca.cmp(&cb);
+        }
+        i += 1;
+    }
+    // Common prefix matched. If the tail (longer side) contains non-ASCII, the
+    // Unicode comparison rules may say otherwise — fall back. Otherwise the
+    // shorter string is less than the longer.
+    let tail = if ab.len() > min_len { &ab[min_len..] } else { &bb[min_len..] };
+    for &t in tail {
+        if t >= 0x80 {
+            return a.to_lowercase().cmp(&b.to_lowercase());
+        }
+    }
+    ab.len().cmp(&bb.len())
 }
 
 fn num_cmp(a: f64, b: f64) -> Ordering {
@@ -47,7 +76,28 @@ fn num_cmp(a: f64, b: f64) -> Ordering {
 
 /// SQL comparison with three-valued semantics: `None` when either operand is
 /// NULL (the result is "unknown"); otherwise `Some(ordering)`.
+///
+/// Same-type fast paths (String/String, Int/Int, Double/Double, Bool/Bool,
+/// Bool/Int) borrow directly from the inputs without allocating. The slower
+/// mixed-type path via `classify` still allocates for non-String values that
+/// need stringifying (Arrays/Structs etc., rare as QoQ cell values).
 pub fn compare_sql(a: &CfmlValue, b: &CfmlValue) -> Option<Ordering> {
+    if matches!(a, CfmlValue::Null) || matches!(b, CfmlValue::Null) {
+        return None;
+    }
+    match (a, b) {
+        (CfmlValue::String(sa), CfmlValue::String(sb)) => return Some(str_cmp(sa, sb)),
+        (CfmlValue::Int(ia), CfmlValue::Int(ib)) => return Some(ia.cmp(ib)),
+        (CfmlValue::Double(da), CfmlValue::Double(db)) => return Some(da.total_cmp(db)),
+        (CfmlValue::Bool(ba), CfmlValue::Bool(bb)) => return Some(ba.cmp(bb)),
+        (CfmlValue::Bool(ba), CfmlValue::Int(ib)) => {
+            return Some((if *ba { 1i64 } else { 0i64 }).cmp(ib));
+        }
+        (CfmlValue::Int(ia), CfmlValue::Bool(bb)) => {
+            return Some(ia.cmp(&(if *bb { 1i64 } else { 0i64 })));
+        }
+        _ => {}
+    }
     let (ca, cb) = (classify(a)?, classify(b)?);
     Some(match (ca, cb) {
         (Class::Num(x), Class::Num(y)) => num_cmp(x, y),
