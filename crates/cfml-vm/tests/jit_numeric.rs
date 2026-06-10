@@ -1417,3 +1417,154 @@ fn member_set_bails_on_component_struct() {
     let (out, _compiled) = run(src);
     assert_eq!(out, oracle, "bail on CFC-shaped struct must match interpreter");
 }
+
+// ── v0.101.0 — type/collection predicate shims ────────────────────────────
+
+#[test]
+fn isnumeric_predicate_in_jitted_udf_matches_interpreter() {
+    // isNumeric must bit-match the interpreter — JIT'd Boxed return must
+    // stringify as "YES"/"NO" (CfmlValue::Bool), not "1"/"0" (Int).
+    let src = r##"
+        function check(x) { return isNumeric(x); }
+        out = "";
+        for (k = 1; k <= 30; k++) {
+            out = out & check(42) & "|" & check("3.14") & "|"
+                & check("hello") & "|" & check(true) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1, "check() must JIT, got fn_compiled={compiled}");
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn type_predicate_family_in_jitted_udf_matches_interpreter() {
+    // isArray / isStruct / isBoolean / isSimpleValue all flow as Boxed
+    // (CfmlValue::Bool) and chain through `&` concat — JIT output must
+    // bit-match interpreter across heterogeneous Boxed arg types (Array,
+    // Struct, String, Bool). NOTE: `isNull(ident)` is codegen-special-cased
+    // to TryLoadLocal+IsNull (bypasses the builtin Call path), so the
+    // chained version uses isSimpleValue here. A separate test exercises
+    // isNull via a non-identifier arg (member access).
+    let src = r##"
+        function probe(x) {
+            return isArray(x) & "|" & isStruct(x) & "|" & isBoolean(x)
+                & "|" & isSimpleValue(x);
+        }
+        out = "";
+        arr = [1,2,3];
+        st = {a:1};
+        for (k = 1; k <= 30; k++) {
+            out = out & probe(arr) & ";" & probe(st) & ";"
+                & probe("text") & ";" & probe(false) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1, "probe() must JIT, got fn_compiled={compiled}");
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn isnull_via_member_access_in_jitted_udf_matches_interpreter() {
+    // `isNull(holder.value)` is NOT codegen-special-cased (only bare-
+    // identifier args are), so this exercises the `isnull` shim's Boxed
+    // Call path through the analyser + translator.
+    let src = r##"
+        function probe(holder) { return isNull(holder.value); }
+        out = "";
+        with_null = {value: javacast("null", "")};
+        with_int = {value: 5};
+        for (k = 1; k <= 30; k++) {
+            out = out & probe(with_null) & "|" & probe(with_int) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1, "probe() must JIT, got fn_compiled={compiled}");
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn collection_count_shims_in_jitted_udf_match_interpreter() {
+    // structCount + listLen return Int; arrayIsEmpty + structIsEmpty return
+    // Boxed Bool. Mix them through `&` concat to exercise both ret kinds.
+    let src = r##"
+        function summarise(arr, st, csv) {
+            return arrayIsEmpty(arr) & "|" & structIsEmpty(st) & "|"
+                & structCount(st) & "|" & listLen(csv);
+        }
+        out = "";
+        empty_arr = [];
+        empty_st = {};
+        st2 = {a:1, b:2, c:3};
+        for (k = 1; k <= 30; k++) {
+            out = out & summarise(empty_arr, empty_st, "") & ";"
+                & summarise([1,2], st2, "a,b,c,d") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn array_to_list_in_jitted_udf_matches_interpreter() {
+    let src = r##"
+        function join(arr) { return arrayToList(arr); }
+        out = "";
+        for (k = 1; k <= 30; k++) {
+            out = out & join(["a", "b", "c"]) & ";" & join([1,2,3]) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn struct_key_exists_in_jitted_udf_matches_interpreter() {
+    // structKeyExists must be case-insensitive on the key and match the
+    // interpreter exactly (Boxed Bool return).
+    let src = r##"
+        function probe(st, key) { return structKeyExists(st, key); }
+        out = "";
+        st = {foo: 1, Bar: 2};
+        for (k = 1; k <= 30; k++) {
+            out = out & probe(st, "FOO") & "|" & probe(st, "bar")
+                & "|" & probe(st, "missing") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 1);
+    assert_eq!(out, oracle);
+}
+
+#[test]
+fn array_contains_in_jitted_udf_matches_interpreter() {
+    let src = r##"
+        function has(arr, v) { return arrayContains(arr, v); }
+        function hasNoCase(arr, v) { return arrayContainsNoCase(arr, v); }
+        out = "";
+        arr = ["Foo", "bar", "Baz"];
+        for (k = 1; k <= 30; k++) {
+            out = out & has(arr, "Foo") & "|" & has(arr, "FOO") & "|"
+                & hasNoCase(arr, "FOO") & "|" & hasNoCase(arr, "qux") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert!(compiled >= 2, "has + hasNoCase must JIT, got {compiled}");
+    assert_eq!(out, oracle);
+}

@@ -652,6 +652,223 @@ extern "C" fn cfml_replace_no_case_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -
     super::arena::box_into_active(CfmlValue::string(out)) as i64
 }
 
+// ── v0.101.0 — type-predicate + collection-predicate Boxed shims ────────────
+// All mirror their `cfml-stdlib::builtins::fn_is_*` / `fn_*_is_empty` /
+// `fn_*_count` / `fn_*_key_exists` / `fn_*_contains` counterparts bit-for-bit.
+// Bool-returning shims wrap `CfmlValue::Bool(b)` into the active arena and
+// return it as Boxed — `Kind::Bool` can't escape the stack to a local/return,
+// so we go through Boxed to preserve interp semantics (Bool vs Int(1) differ
+// in stringification: "YES"/"NO"/"true"/"false" vs "1"/"0").
+//
+// IMPORTANT: every shim materialises its Boxed input via
+// `materialize_tagged`, NOT `borrow_tagged`. Since v0.99.6 the member-IC
+// can return SMI Int inline (low-bit-tagged i61), and `borrow_tagged`
+// panics on non-TAG_PTR. `materialize_tagged` synthesises `CfmlValue::Int`
+// for SMI and Arc-clones the pointee for heap tags (cheap for String /
+// Array / Struct, fine elsewhere). Owned `CfmlValue` lives the body's
+// lifetime — drops on return.
+
+/// Mirrors `fn_is_numeric`: Int/Double/Bool → true; String → parses as f64
+/// (after trim); everything else → false.
+extern "C" fn cfml_is_numeric_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let b = match &v {
+        CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::Bool(_) => true,
+        CfmlValue::String(s) => s.trim().parse::<f64>().is_ok(),
+        _ => false,
+    };
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
+/// Mirrors `fn_is_array`: only `CfmlValue::Array(_)` (QueryColumn excluded,
+/// Lucee@7 parity).
+extern "C" fn cfml_is_array_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::Bool(matches!(v, CfmlValue::Array(_)))) as i64
+}
+
+/// Mirrors `fn_is_struct`.
+extern "C" fn cfml_is_struct_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::Bool(matches!(v, CfmlValue::Struct(_)))) as i64
+}
+
+/// Mirrors `fn_is_boolean`: Bool/Int/Double → true; String that parses as f64
+/// or matches {true,false,yes,no} (case-insensitive, trimmed) → true; else false.
+extern "C" fn cfml_is_boolean_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let b = match &v {
+        CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) => true,
+        CfmlValue::String(s) => {
+            let trimmed = s.trim();
+            let lower = trimmed.to_lowercase();
+            matches!(lower.as_str(), "true" | "false" | "yes" | "no")
+                || trimmed.parse::<f64>().is_ok()
+        }
+        _ => false,
+    };
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
+/// Mirrors `fn_is_simple_value`: Bool/Int/Double/String → true; else false.
+extern "C" fn cfml_is_simple_value_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let b = matches!(
+        &v,
+        CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::String(_)
+    );
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
+/// Mirrors `fn_is_null`: true only for `CfmlValue::Null`. A Boxed argument
+/// is always present at the call site (the ABI carries a tag), so the
+/// interpreter's "missing arg" branch is unreachable from JIT'd code.
+/// SMI-tagged inputs are guaranteed non-Null (SMI encodes Int only), so
+/// the materialised value's Null match is precise.
+extern "C" fn cfml_is_null_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::Bool(matches!(v, CfmlValue::Null))) as i64
+}
+
+/// Mirrors `fn_array_is_empty`: empty if Array && len==0; non-Array → true
+/// (matches `_ => Bool(true)` interp fallback).
+extern "C" fn cfml_array_is_empty_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let b = match &v {
+        CfmlValue::Array(a) => a.is_empty(),
+        _ => true,
+    };
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
+/// Mirrors `fn_struct_is_empty`.
+extern "C" fn cfml_struct_is_empty_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let b = match &v {
+        CfmlValue::Struct(s) => s.is_empty(),
+        _ => true,
+    };
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
+/// Mirrors `fn_struct_count`: count of *visible* keys (hides the
+/// `__arguments_scope` / `__arguments_params` markers used internally for
+/// the arguments scope). Non-Struct → 0.
+extern "C" fn cfml_struct_count_boxed_i64(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    if let CfmlValue::Struct(s) = &v {
+        let keys: Vec<String> = s.keys();
+        let n = if keys.iter().any(|k| k == "__arguments_scope") {
+            keys.iter()
+                .filter(|k| k.as_str() != "__arguments_scope" && k.as_str() != "__arguments_params")
+                .count()
+        } else {
+            keys.len()
+        };
+        n as i64
+    } else {
+        0
+    }
+}
+
+/// Mirrors `fn_list_len(list)` with default delimiter `,`. Empty string → 0.
+/// Stringifies non-string args via `as_string()` (interp does the same via
+/// `get_str`).
+extern "C" fn cfml_list_len_boxed_i64(tagged: i64) -> i64 {
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let s = v.as_string();
+    if s.is_empty() {
+        return 0;
+    }
+    // CFML list split: each char in `delimiters` is a separate delimiter;
+    // empty items dropped. Default delimiter is a single comma.
+    s.split(',').filter(|p| !p.is_empty()).count() as i64
+}
+
+/// Mirrors `fn_array_to_list(array)` with default delimiter `,`. Non-Array →
+/// empty string.
+extern "C" fn cfml_array_to_list_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let out = if let CfmlValue::Array(a) = &v {
+        let items: Vec<String> = a.iter().map(|x| x.as_string()).collect();
+        items.join(",")
+    } else {
+        String::new()
+    };
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
+/// Mirrors `fn_struct_key_exists(struct, key)`: case-insensitive presence
+/// check that hides the internal `__arguments_*` markers. Non-Struct receiver
+/// → false.
+extern "C" fn cfml_struct_key_exists_boxed_boxed(tag_s: i64, tag_k: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let vs = unsafe { super::boxed::materialize_tagged(tag_s as usize) };
+    let vk = unsafe { super::boxed::materialize_tagged(tag_k as usize) };
+    let b = if let CfmlValue::Struct(s) = &vs {
+        let key = vk.as_string();
+        let lower = key.to_lowercase();
+        let keys: Vec<String> = s.keys();
+        let found_key = if keys.iter().any(|k| k == &key) {
+            Some(key.clone())
+        } else {
+            keys.into_iter().find(|k| k.to_lowercase() == lower)
+        };
+        match found_key {
+            Some(k)
+                if (k == "__arguments_scope" || k == "__arguments_params")
+                    && s.contains_key("__arguments_scope") =>
+            {
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
+    } else {
+        false
+    };
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
+/// Mirrors `fn_array_contains(array, value)`: case-sensitive stringified
+/// membership. Non-Array → false.
+extern "C" fn cfml_array_contains_boxed_boxed(tag_a: i64, tag_v: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let va = unsafe { super::boxed::materialize_tagged(tag_a as usize) };
+    let vv = unsafe { super::boxed::materialize_tagged(tag_v as usize) };
+    let b = if let CfmlValue::Array(arr) = &va {
+        let needle = vv.as_string();
+        arr.iter().any(|x| x.as_string() == needle)
+    } else {
+        false
+    };
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
+/// Mirrors `fn_array_contains_no_case(array, value)`.
+extern "C" fn cfml_array_contains_no_case_boxed_boxed(tag_a: i64, tag_v: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let va = unsafe { super::boxed::materialize_tagged(tag_a as usize) };
+    let vv = unsafe { super::boxed::materialize_tagged(tag_v as usize) };
+    let b = if let CfmlValue::Array(arr) = &va {
+        let needle = vv.as_string().to_lowercase();
+        arr.iter().any(|x| x.as_string().to_lowercase() == needle)
+    } else {
+        false
+    };
+    super::arena::box_into_active(CfmlValue::Bool(b)) as i64
+}
+
 /// The complete shim table. Order matters for `lookup_overload`: more specific
 /// signatures (e.g. `abs(Int)`) must precede broader ones (`abs(Numeric)`).
 pub static SHIMS: &[Shim] = &[
@@ -1188,6 +1405,133 @@ pub static SHIMS: &[Shim] = &[
         addr: cfml_struct_key_list_boxed as *const u8,
         bailable: false,
     },
+    // ── v0.101.0 — type/collection predicates + collection introspection ─
+    Shim {
+        name: "isnumeric",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_is_numeric_boxed",
+        addr: cfml_is_numeric_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "isarray",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_is_array_boxed",
+        addr: cfml_is_array_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "isstruct",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_is_struct_boxed",
+        addr: cfml_is_struct_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "isboolean",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_is_boolean_boxed",
+        addr: cfml_is_boolean_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "issimplevalue",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_is_simple_value_boxed",
+        addr: cfml_is_simple_value_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "isnull",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_is_null_boxed",
+        addr: cfml_is_null_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "arrayisempty",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_is_empty_boxed",
+        addr: cfml_array_is_empty_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "structisempty",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_struct_is_empty_boxed",
+        addr: cfml_struct_is_empty_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "structcount",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Int,
+        sym: "cfml_struct_count_boxed_i64",
+        addr: cfml_struct_count_boxed_i64 as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "listlen",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Int,
+        sym: "cfml_list_len_boxed_i64",
+        addr: cfml_list_len_boxed_i64 as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "arraytolist",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_to_list_boxed",
+        addr: cfml_array_to_list_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "structkeyexists",
+        args_req: &[KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_struct_key_exists_boxed_boxed",
+        addr: cfml_struct_key_exists_boxed_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "arraycontains",
+        args_req: &[KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_contains_boxed_boxed",
+        addr: cfml_array_contains_boxed_boxed as *const u8,
+        bailable: false,
+    },
+    Shim {
+        name: "arraycontainsnocase",
+        args_req: &[KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_array_contains_no_case_boxed_boxed",
+        addr: cfml_array_contains_no_case_boxed_boxed as *const u8,
+        bailable: false,
+    },
 ];
 
 /// Lowercased lookup: `true` iff some shim has this exact name. Currently only
@@ -1367,6 +1711,199 @@ mod tests {
             assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
             assert!(lookup_overload(name, &[Kind::Boxed, Kind::Boxed]).is_none());
         }
+
+        // v0.101.0 — type/collection predicates return Boxed (CfmlValue::Bool).
+        for name in [
+            "isnumeric",
+            "isarray",
+            "isstruct",
+            "isboolean",
+            "issimplevalue",
+            "isnull",
+            "arrayisempty",
+            "structisempty",
+            "arraytolist",
+        ] {
+            let idx = lookup_overload(name, &[Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed, "{name} ret must be Boxed");
+            assert!(lookup_overload(name, &[Kind::Int]).is_none());
+        }
+        // v0.101.0 — Int-returning collection introspection: structCount/listLen.
+        for name in ["structcount", "listlen"] {
+            let idx = lookup_overload(name, &[Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Int, "{name} ret must be Int");
+        }
+        // v0.101.0 — 2-arg (Boxed, Boxed) → Boxed predicates.
+        for name in ["structkeyexists", "arraycontains", "arraycontainsnocase"] {
+            let idx = lookup_overload(name, &[Kind::Boxed, Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed,Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+            assert!(lookup_overload(name, &[Kind::Boxed]).is_none());
+        }
+    }
+
+    #[test]
+    fn predicate_shims_match_interpreter() {
+        // v0.101.0 — spot-check the type/collection predicates against
+        // their cfml-stdlib::builtins::fn_* counterparts. Bit-exact: the
+        // shim arena-boxes the same CfmlValue::Bool the interpreter would
+        // return, so JIT'd callers see the same value when this flows out
+        // through a `Kind::Boxed` slot or return.
+        use super::super::arena::{Arena, ArenaGuard};
+        use super::super::boxed;
+        use cfml_common::dynamic::{CfmlArray, CfmlStruct, CfmlValue};
+        use indexmap::IndexMap;
+
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+
+        let extract_bool = |tagged: i64| -> bool {
+            let v = unsafe { boxed::borrow_tagged(tagged as usize) };
+            match v {
+                CfmlValue::Bool(b) => *b,
+                other => panic!("expected Bool, got {other:?}"),
+            }
+        };
+
+        // isNumeric: Int / Double / Bool / numeric-string → true.
+        let int_arg = boxed::box_value(CfmlValue::Int(42)) as i64;
+        let dbl_arg = boxed::box_value(CfmlValue::Double(1.5)) as i64;
+        let bool_arg = boxed::box_value(CfmlValue::Bool(true)) as i64;
+        let num_str = boxed::box_value(CfmlValue::string(" 3.14 ")) as i64;
+        let alpha_str = boxed::box_value(CfmlValue::string("hello")) as i64;
+        assert!(extract_bool(cfml_is_numeric_boxed(int_arg)));
+        assert!(extract_bool(cfml_is_numeric_boxed(dbl_arg)));
+        assert!(extract_bool(cfml_is_numeric_boxed(bool_arg)));
+        assert!(extract_bool(cfml_is_numeric_boxed(num_str)));
+        assert!(!extract_bool(cfml_is_numeric_boxed(alpha_str)));
+
+        // isBoolean: numeric + "yes"/"no"/"true"/"false" (case-insens, trimmed).
+        let yes_str = boxed::box_value(CfmlValue::string(" YES ")) as i64;
+        assert!(extract_bool(cfml_is_boolean_boxed(yes_str)));
+        assert!(extract_bool(cfml_is_boolean_boxed(num_str)));
+        assert!(!extract_bool(cfml_is_boolean_boxed(alpha_str)));
+
+        // isArray / isStruct / isSimpleValue / isNull discriminate.
+        let arr_arg =
+            boxed::box_value(CfmlValue::Array(CfmlArray::new(vec![CfmlValue::Int(1)]))) as i64;
+        let mut m = IndexMap::new();
+        m.insert("k".to_string(), CfmlValue::Int(1));
+        let struct_arg = boxed::box_value(CfmlValue::Struct(CfmlStruct::new(m))) as i64;
+        let null_arg = boxed::box_value(CfmlValue::Null) as i64;
+        assert!(extract_bool(cfml_is_array_boxed(arr_arg)));
+        assert!(!extract_bool(cfml_is_array_boxed(struct_arg)));
+        assert!(extract_bool(cfml_is_struct_boxed(struct_arg)));
+        assert!(!extract_bool(cfml_is_struct_boxed(arr_arg)));
+        assert!(extract_bool(cfml_is_simple_value_boxed(int_arg)));
+        assert!(extract_bool(cfml_is_simple_value_boxed(alpha_str)));
+        assert!(!extract_bool(cfml_is_simple_value_boxed(arr_arg)));
+        assert!(!extract_bool(cfml_is_simple_value_boxed(struct_arg)));
+        assert!(extract_bool(cfml_is_null_boxed(null_arg)));
+        assert!(!extract_bool(cfml_is_null_boxed(int_arg)));
+
+        // arrayIsEmpty / structIsEmpty default true for non-collection types.
+        let empty_arr = boxed::box_value(CfmlValue::Array(CfmlArray::new(Vec::new()))) as i64;
+        let empty_struct =
+            boxed::box_value(CfmlValue::Struct(CfmlStruct::new(IndexMap::new()))) as i64;
+        assert!(extract_bool(cfml_array_is_empty_boxed(empty_arr)));
+        assert!(!extract_bool(cfml_array_is_empty_boxed(arr_arg)));
+        assert!(extract_bool(cfml_array_is_empty_boxed(int_arg)));
+        assert!(extract_bool(cfml_struct_is_empty_boxed(empty_struct)));
+        assert!(!extract_bool(cfml_struct_is_empty_boxed(struct_arg)));
+
+        // structCount visible-key handling.
+        assert_eq!(cfml_struct_count_boxed_i64(struct_arg), 1);
+        assert_eq!(cfml_struct_count_boxed_i64(empty_struct), 0);
+        assert_eq!(cfml_struct_count_boxed_i64(int_arg), 0);
+        let mut argscope = IndexMap::new();
+        argscope.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
+        argscope.insert("__arguments_params".to_string(), CfmlValue::Bool(true));
+        argscope.insert("a".to_string(), CfmlValue::Int(1));
+        argscope.insert("b".to_string(), CfmlValue::Int(2));
+        let argscope_tag =
+            boxed::box_value(CfmlValue::Struct(CfmlStruct::new(argscope))) as i64;
+        assert_eq!(
+            cfml_struct_count_boxed_i64(argscope_tag),
+            2,
+            "structCount hides __arguments_* markers"
+        );
+
+        // listLen + arrayToList.
+        let csv = boxed::box_value(CfmlValue::string("a,b,c,d")) as i64;
+        assert_eq!(cfml_list_len_boxed_i64(csv), 4);
+        let blank = boxed::box_value(CfmlValue::string("")) as i64;
+        assert_eq!(cfml_list_len_boxed_i64(blank), 0);
+        let many_arr = boxed::box_value(CfmlValue::Array(CfmlArray::new(vec![
+            CfmlValue::Int(1),
+            CfmlValue::Int(2),
+            CfmlValue::Int(3),
+        ]))) as i64;
+        let joined = cfml_array_to_list_boxed(many_arr);
+        let v = unsafe { boxed::borrow_tagged(joined as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "1,2,3"));
+        let joined_nonarray = cfml_array_to_list_boxed(int_arg);
+        let v = unsafe { boxed::borrow_tagged(joined_nonarray as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == ""));
+
+        // structKeyExists (CI, hides __arguments_*).
+        let k_present = boxed::box_value(CfmlValue::string("K")) as i64;
+        let k_absent = boxed::box_value(CfmlValue::string("missing")) as i64;
+        let k_argmarker = boxed::box_value(CfmlValue::string("__arguments_scope")) as i64;
+        assert!(extract_bool(cfml_struct_key_exists_boxed_boxed(
+            struct_arg, k_present
+        )));
+        assert!(!extract_bool(cfml_struct_key_exists_boxed_boxed(
+            struct_arg, k_absent
+        )));
+        assert!(!extract_bool(cfml_struct_key_exists_boxed_boxed(
+            argscope_tag, k_argmarker
+        )));
+        // Non-struct receiver → false.
+        assert!(!extract_bool(cfml_struct_key_exists_boxed_boxed(
+            int_arg, k_present
+        )));
+
+        // arrayContains / arrayContainsNoCase.
+        let str_arr = boxed::box_value(CfmlValue::Array(CfmlArray::new(vec![
+            CfmlValue::string("Foo"),
+            CfmlValue::string("bar"),
+        ]))) as i64;
+        let needle_case = boxed::box_value(CfmlValue::string("FOO")) as i64;
+        let needle_exact = boxed::box_value(CfmlValue::string("Foo")) as i64;
+        let needle_missing = boxed::box_value(CfmlValue::string("baz")) as i64;
+        assert!(extract_bool(cfml_array_contains_boxed_boxed(
+            str_arr,
+            needle_exact
+        )));
+        assert!(!extract_bool(cfml_array_contains_boxed_boxed(
+            str_arr,
+            needle_case
+        )));
+        assert!(extract_bool(cfml_array_contains_no_case_boxed_boxed(
+            str_arr,
+            needle_case
+        )));
+        assert!(!extract_bool(cfml_array_contains_no_case_boxed_boxed(
+            str_arr,
+            needle_missing
+        )));
+        // Non-array receiver → false.
+        assert!(!extract_bool(cfml_array_contains_boxed_boxed(
+            int_arg,
+            needle_exact
+        )));
+
+        drop(_g);
+        for t in [
+            int_arg, dbl_arg, bool_arg, num_str, alpha_str, yes_str, arr_arg, struct_arg,
+            null_arg, empty_arr, empty_struct, argscope_tag, csv, blank, many_arr, str_arr,
+            needle_case, needle_exact, needle_missing, k_present, k_absent, k_argmarker,
+        ] {
+            drop(unsafe { boxed::reclaim_tagged(t as usize) });
+        }
+        arena.drain_except(None);
     }
 
     #[test]
