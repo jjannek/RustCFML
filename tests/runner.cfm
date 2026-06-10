@@ -364,6 +364,7 @@ try { include "core/test_named_args_no_numeric_alias.cfm"; } catch (any e) { wri
 //     identifier. Surfaced while booting WireBox (Injector.cfc uses
 //     `param arguments.target.$wbDelegateMap = {}`).
 try { include "core/test_param_dotted_lhs.cfm"; } catch (any e) { writeOutput("ERROR | core/test_param_dotted_lhs.cfm | " & e.message & chr(10)); }
+try { include "core/test_param_as_identifier.cfm"; } catch (any e) { writeOutput("ERROR | core/test_param_as_identifier.cfm | " & e.message & chr(10)); }
 //   - as_string_cycle_safety: stringifying a self-referential struct (now
 //     possible since structs are reference types) must terminate rather than
 //     overflow the native stack.

@@ -330,8 +330,15 @@ impl Parser {
         }
 
         // cfscript param statement: param name="varName" default="value";
-        // or shorthand: param varName = defaultValue;
-        if self.match_token(&Token::Param) {
+        // or shorthand: param varName = defaultValue;  /  param type varName = defaultValue;
+        // `param` is a SOFT keyword on Lucee/ACF/BoxLang: it only opens cfparam
+        // when followed by another identifier-like token (the var name, a type,
+        // or an attribute name like `name=`). Followed by `=`, `[`, `.`, `(`,
+        // etc., it is an ordinary identifier — fall through to the expression
+        // statement path. Wheels' vendor/wheels/public/helpers.cfm uses
+        // `param` as a for-in loop var with `param['default'] = ...` in the body.
+        if matches!(self.peek(0), Token::Param) && self.is_identifier_like_at(1) {
+            self.advance(); // consume `param`
             return self.parse_param_statement(stmt_loc);
         }
 
@@ -4384,20 +4391,14 @@ impl Parser {
                     pairs.push((Expression::Spread(Box::new(expr.clone())), expr));
                 } else {
                     // In struct literals, `=` is a key-value separator (like `:`),
-                    // NOT an assignment operator. We must parse the key without
-                    // consuming `=` as assignment.
-                    // Check for simple `identifier =` pattern first (most common case).
-                    // is_identifier_like_at covers soft-keyword keys too (component,
-                    // output, ...) so `{ component = x }` treats `component` as the
-                    // KEY rather than parsing `component = x` as an assignment expr.
-                    let is_key_eq = self.is_identifier_like_at(0)
-                        && matches!(self.peek(1), Token::Equal);
-                    let key = if is_key_eq {
-                        // Parse just the identifier, don't let parse_expression consume `=`
-                        self.parse_ternary()?
-                    } else {
-                        self.parse_expression()?
-                    };
+                    // NOT an assignment operator. parse_expression() is greedy and
+                    // would consume `"key" = value` as an assignment expression
+                    // (yielding the value, not the key), so always parse the key
+                    // at ternary precedence — that covers identifiers, soft
+                    // keywords (`{ component = x }`), string literals
+                    // (`{ "default" = x }`), and bracketed/parenthesized
+                    // expressions, but stops at `=`/`:`.
+                    let key = self.parse_ternary()?;
 
                     // Support both : and = for struct initialization
                     if self.match_token(&Token::Colon) || self.match_token(&Token::Equal) {
