@@ -89,6 +89,12 @@ pub struct CfmlCompiler {
     /// closure also inherits `None` and falls back to the application
     /// default at runtime).
     current_fn_local_mode: Option<bool>,
+    /// Set while compiling the bodies of a component's methods (the `for func
+    /// in &component.functions` loop in [`compile_component`]). Stamped onto
+    /// the resulting `BytecodeFunction.is_component_method` so the VM's
+    /// DefineFunction op skips the builtin-collision guard for methods. Lucee
+    /// allows `obj.canonicalize()` etc.
+    in_component_method: bool,
     /// Source file path this program is being compiled from, stamped onto every
     /// `BytecodeFunction` so app-scope functions carry a stable, serializable
     /// identity. `None` for in-memory/CLI direct compiles.
@@ -124,6 +130,12 @@ pub struct BytecodeFunction {
     /// application default (`this.localMode` in Application.cfc), falling
     /// back to classic if no app default is set.
     pub declared_local_mode: Option<bool>,
+    /// True when this function is a component method (declared inside a CFC
+    /// body). Lucee/ACF allow component methods to shadow built-in function
+    /// names — `obj.canonicalize()` dispatches to the method, not the BIF —
+    /// so the VM's DefineFunction guard against builtin-name collisions must
+    /// skip these. Top-level UDFs keep the guard.
+    pub is_component_method: bool,
 }
 
 /// Inspect a function/closure metadata attribute list for `localMode`.
@@ -346,12 +358,14 @@ impl CfmlCompiler {
                     source_file: None,
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
+                    is_component_method: false,
                 })],
             },
             loop_stack: Vec::new(),
             finally_stack: Vec::new(),
             function_depth: 0,
             current_fn_local_mode: None,
+            in_component_method: false,
             source_file: None,
         }
     }
@@ -2050,6 +2064,7 @@ impl CfmlCompiler {
             source_file: self.source_file.clone(),
             global_id: next_global_fn_id(),
             declared_local_mode: declared_mode,
+            is_component_method: self.in_component_method,
         };
 
         let global_id = bc_func.global_id as usize;
@@ -2245,6 +2260,7 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
+                    is_component_method: true,
                 };
                 self.program.functions.push(Arc::new(getter_func));
                 let getter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -2289,6 +2305,7 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
+                    is_component_method: true,
                 };
                 self.program.functions.push(Arc::new(setter_func));
                 let setter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -2307,7 +2324,12 @@ impl CfmlCompiler {
         instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
         instructions.push(BytecodeOp::StoreGlobal(component.name.clone()));
 
-        // Compile component methods and add them to the component struct
+        // Compile component methods and add them to the component struct.
+        // Set in_component_method so the resulting BytecodeFunction is flagged
+        // as a method — the VM's DefineFunction guard against builtin-name
+        // collisions skips methods (Lucee allows `obj.canonicalize()` etc.).
+        let prev_in_method = self.in_component_method;
+        self.in_component_method = true;
         for func in &component.functions {
             self.compile_function_decl(func, instructions);
             // SetProperty needs: stack = [object, value]
@@ -2317,6 +2339,7 @@ impl CfmlCompiler {
             instructions.push(BytecodeOp::SetProperty(func.name.clone()));
             instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
         }
+        self.in_component_method = prev_in_method;
 
         // Emit per-function metadata as __funcmeta_<name> keys
         for func in &component.functions {
@@ -3031,6 +3054,7 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: effective_declared,
+                    is_component_method: false,
                 };
 
                 let global_id = bc_func.global_id as usize;
@@ -3075,6 +3099,7 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: arrow_effective,
+                    is_component_method: false,
                 };
 
                 let global_id = bc_func.global_id as usize;

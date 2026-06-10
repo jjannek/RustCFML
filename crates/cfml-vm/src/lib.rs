@@ -4180,8 +4180,13 @@ impl CfmlVirtualMachine {
                     // DefineFunction op runs — fires on script load, which is
                     // UX-equivalent. Skip synthesized names so closures, arrow
                     // functions, and `__main__` are unaffected: only `function
-                    // abs(x) { … }`-style decls are rejected.
+                    // abs(x) { … }`-style decls are rejected. Component methods
+                    // are also exempt — Lucee/ACF allow a CFC to define a method
+                    // whose name matches a builtin (object dispatch wins over
+                    // the BIF for `obj.method()`); the guard would otherwise
+                    // poison the whole component (PR #79).
                     if !func_name.starts_with("__")
+                        && !bc_func_arc.is_component_method
                         && self.builtins.contains_key(func_name.as_str())
                     {
                         return Err(self.wrap_error(CfmlError::runtime(format!(

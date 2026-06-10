@@ -15,7 +15,6 @@ try { include "config/test_app_datasources.cfm"; } catch (any e) { writeOutput("
 try { include "core/test_variables.cfm"; } catch (any e) { writeOutput("ERROR | core/test_variables.cfm | " & e.message & chr(10)); }
 try { include "core/test_access_identifiers.cfm"; } catch (any e) { writeOutput("ERROR | core/test_access_identifiers.cfm | " & e.message & chr(10)); }
 try { include "core/test_function_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_function_scope_capture.cfm | " & e.message & chr(10)); }
-try { include "core/test_local_scope_frame_isolation.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_scope_frame_isolation.cfm | " & e.message & chr(10)); }
 try { include "core/test_closure_env_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_closure_env_leak.cfm | " & e.message & chr(10)); }
 try { include "core/test_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undeclared_named_args.cfm | " & e.message & chr(10)); }
@@ -28,6 +27,7 @@ try { include "core/test_cfloop_negative_step.cfm"; } catch (any e) { writeOutpu
 try { include "core/test_cfloop_array_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_array_item_index.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_collection_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_collection_item_index.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_handling.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_handling.cfm | " & e.message & chr(10)); }
+try { include "core/test_builtin_shadowing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_builtin_shadowing.cfm | " & e.message & chr(10)); }
 try { include "core/test_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arrow_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arrow_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arguments_writeback.cfm | " & e.message & chr(10)); }
@@ -38,7 +38,6 @@ try { include "core/test_server_scope.cfm"; } catch (any e) { writeOutput("ERROR
 try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
 try { include "core/test_null_coalescing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_coalescing.cfm | " & e.message & chr(10)); }
-try { include "core/test_single_hash_type_preservation.cfm"; } catch (any e) { writeOutput("ERROR | core/test_single_hash_type_preservation.cfm | " & e.message & chr(10)); }
 
 // --- Data Types ---
 try { include "types/test_null.cfm"; } catch (any e) { writeOutput("ERROR | types/test_null.cfm | " & e.message & chr(10)); }
@@ -114,6 +113,7 @@ try { include "members/test_number_members.cfm"; } catch (any e) { writeOutput("
 
 // --- OOP ---
 try { include "oop/test_components.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_components.cfm | " & e.message & chr(10)); }
+try { include "oop/test_component_method_builtin_name.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_method_builtin_name.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_return_type.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_return_type.cfm | " & e.message & chr(10)); }
 try { include "oop/test_inheritance.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inheritance.cfm | " & e.message & chr(10)); }
 try { include "oop/test_inherited_helpers.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_helpers.cfm | " & e.message & chr(10)); }

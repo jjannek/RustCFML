@@ -1034,6 +1034,7 @@ mod tests {
             source_file: None,
             global_id: 1,
             declared_local_mode: None,
+            is_component_method: false,
         }
     }
 
