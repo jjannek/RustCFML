@@ -429,6 +429,27 @@ pub fn analyze_loop(
                     useful_ops += 1;
                 }
 
+                // v0.99.8 — member-access reads count as useful work. The
+                // analyser also needs the receiver local interned for
+                // LoadLocalProperty so its slot kind (must be Boxed) is
+                // tracked through caller_kinds.
+                BytecodeOp::LoadLocalProperty(name, _prop) => {
+                    if is_reserved_scope(name) {
+                        return None;
+                    }
+                    intern(
+                        name,
+                        &mut slot_names,
+                        &mut slot_kinds,
+                        &mut slot_index,
+                        caller_kinds,
+                    )?;
+                    useful_ops += 1;
+                }
+                BytecodeOp::GetProperty(_) => {
+                    useful_ops += 1;
+                }
+
                 BytecodeOp::LoadLocal(name)
                 | BytecodeOp::StoreLocal(name)
                 | BytecodeOp::Increment(name)
@@ -497,16 +518,42 @@ pub fn analyze_loop(
     // ── 4. Simulate each block to validate kinds and operand-stack shape ───
     // (Operand stack starts and ends empty at each block boundary; booleans
     // never enter a slot or escape via a non-branch consumer.)
+    //
+    // v0.99.8 — slot-kind Infer fixpoint mirrors analysis.rs:561-591. Without
+    // this, a body like `total = total + obj.prop` (where `total` is Int and
+    // obj.prop is Boxed) would reject on the StoreLocal because Add(Int,
+    // Boxed) → Boxed mismatches the Int slot. The Infer pass monotonically
+    // upgrades the slot to Boxed; the final Check pass below then succeeds.
+    loop {
+        let mut changed = false;
+        for blk in &reach_blocks {
+            let mut _scratch: HashMap<usize, UdfRefBinding> = HashMap::new();
+            simulate_block(
+                code,
+                blk,
+                &slot_index,
+                &mut slot_kinds,
+                &udf_names,
+                udf_resolver,
+                &mut _scratch,
+                Some(&mut changed),
+            )?;
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut udf_call_at: HashMap<usize, UdfRefBinding> = HashMap::new();
     for blk in &reach_blocks {
         simulate_block(
             code,
             blk,
             &slot_index,
-            &slot_kinds,
+            &mut slot_kinds,
             &udf_names,
             udf_resolver,
             &mut udf_call_at,
+            None,
         )?;
     }
 
@@ -576,10 +623,11 @@ fn simulate_block(
     code: &[BytecodeOp],
     blk: &Block,
     slot_index: &HashMap<String, usize>,
-    slot_kinds: &[Kind],
+    slot_kinds: &mut [Kind],
     udf_names: &[String],
     udf_resolver: &UdfResolver<'_>,
     udf_call_at: &mut HashMap<usize, UdfRefBinding>,
+    mut changed: Option<&mut bool>,
 ) -> Option<()> {
     let mut stack: Vec<Kind> = Vec::new();
     macro_rules! pop {
@@ -616,10 +664,37 @@ fn simulate_block(
                     return None;
                 }
                 if v != slot_kinds[s] {
-                    return None;
+                    // v0.99.8 — Infer mode: monotonic upgrade Int → Float / Boxed,
+                    // Float → Boxed. Mirrors analysis.rs Mode::Infer behaviour so
+                    // a loop body that stores a Boxed result into an initially-
+                    // Int local (e.g. `total = total + obj.prop`) widens the slot
+                    // and a follow-up Check pass accepts. Outside Infer, reject.
+                    if let Some(c) = changed.as_deref_mut() {
+                        let cur = slot_kinds[s];
+                        let upgrade = match (cur, v) {
+                            (Kind::Int, Kind::Float) | (Kind::Int, Kind::Boxed) | (Kind::Float, Kind::Boxed) => true,
+                            _ => false,
+                        };
+                        if upgrade {
+                            slot_kinds[s] = v;
+                            *c = true;
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
                 }
             }
-            BytecodeOp::Add | BytecodeOp::Sub | BytecodeOp::Mul | BytecodeOp::Mod => {
+            // v0.99.6/v0.99.7/v0.99.8 — Add/Sub/Mul admit Boxed via
+            // num_bin_kind (matches analysis.rs:873-877). Mod stays Int/Float
+            // only (no cfml_jit_mod_boxed shim).
+            BytecodeOp::Add | BytecodeOp::Sub | BytecodeOp::Mul => {
+                let b = pop!();
+                let a = pop!();
+                stack.push(super::analysis::num_bin_kind(a, b)?);
+            }
+            BytecodeOp::Mod => {
                 let b = pop!();
                 let a = pop!();
                 if !matches!(a, Kind::Int | Kind::Float) || !matches!(b, Kind::Int | Kind::Float) {
@@ -709,6 +784,26 @@ fn simulate_block(
             BytecodeOp::Concat => {
                 let _b = pop_value!();
                 let _a = pop_value!();
+                stack.push(Kind::Boxed);
+            }
+
+            // v0.99.8 — `local.prop` member read (fused). Local slot must be
+            // Boxed (the IC shim takes a tagged ptr to a CfmlValue::Struct).
+            // Mirrors analysis.rs:823-838.
+            BytecodeOp::LoadLocalProperty(name, _prop) => {
+                let s = slot_of(name)?;
+                if slot_kinds[s] != Kind::Boxed {
+                    return None;
+                }
+                stack.push(Kind::Boxed);
+            }
+            // v0.99.8 — `obj.prop` member read. Receiver on the stack must be
+            // Boxed; result is Boxed. Mirrors analysis.rs:840-846.
+            BytecodeOp::GetProperty(_) => {
+                let v = pop!();
+                if v != Kind::Boxed {
+                    return None;
+                }
                 stack.push(Kind::Boxed);
             }
 
@@ -809,6 +904,20 @@ pub fn compile_loop(
     let concat_boxed_ref = backend
         .module
         .declare_func_in_func(backend.concat_boxed_id, &mut ctx.func);
+    // v0.99.6/v0.99.7/v0.99.8 — Add/Sub/Mul slow shims for Boxed operands.
+    let add_boxed_ref = backend
+        .module
+        .declare_func_in_func(backend.add_boxed_id, &mut ctx.func);
+    let sub_boxed_ref = backend
+        .module
+        .declare_func_in_func(backend.sub_boxed_id, &mut ctx.func);
+    let mul_boxed_ref = backend
+        .module
+        .declare_func_in_func(backend.mul_boxed_id, &mut ctx.func);
+    // v0.99.8 — Member-access IC shim (LoadLocalProperty + GetProperty).
+    let member_get_ref = backend
+        .module
+        .declare_func_in_func(backend.member_get_id, &mut ctx.func);
     let str_literal_ref = backend
         .module
         .declare_func_in_func(backend.str_literal_id, &mut ctx.func);
@@ -826,10 +935,23 @@ pub fn compile_loop(
     // the FunctionBuilder grabs neighbouring borrows. See translate.rs gotcha
     // #15 for the same trick.
     let mut str_literal_at: HashMap<usize, (*const u8, i64)> = HashMap::new();
+    // v0.99.8 — pre-allocate one IC slot per member-access call site and
+    // intern its property name (mirrors translate.rs:484-505). Keyed by ip
+    // so the codegen loop can grab the triple by IP.
+    let mut member_get_at: HashMap<usize, (*mut u64, *const u8, i64)> = HashMap::new();
     for blk in &plan.blocks {
         for ip in blk.start..blk.end {
-            if let BytecodeOp::String(s) = &func.instructions[ip] {
-                str_literal_at.insert(ip, backend.intern_literal(s));
+            match &func.instructions[ip] {
+                BytecodeOp::String(s) => {
+                    str_literal_at.insert(ip, backend.intern_literal(s));
+                }
+                BytecodeOp::LoadLocalProperty(_, prop)
+                | BytecodeOp::GetProperty(prop) => {
+                    let ic_ptr = backend.alloc_member_ic_slot();
+                    let (name_ptr, name_len) = backend.intern_member_name(prop);
+                    member_get_at.insert(ip, (ic_ptr, name_ptr, name_len));
+                }
+                _ => {}
             }
         }
     }
@@ -986,15 +1108,96 @@ pub fn compile_loop(
                         let slot = plan.slot_of(name).ok_or("osr: unknown local")?;
                         stack.push((b.use_var(vars[slot]), plan.slots[slot].kind));
                     }
+                    // v0.99.8 — fused `local.prop`. Mirrors translate.rs:653-676.
+                    // The local slot is Boxed by simulate_block's contract; call
+                    // the IC shim with the pre-allocated slot pointer + interned
+                    // name; check bail; push the result as Boxed.
+                    BytecodeOp::LoadLocalProperty(name, _prop) => {
+                        let slot = plan.slot_of(name).ok_or("osr: unknown local")?;
+                        let obj = b.use_var(vars[slot]);
+                        let (ic_ptr, name_ptr, name_len) = *member_get_at
+                            .get(&ip)
+                            .ok_or("osr: missing member IC slot")?;
+                        let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                        let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                        let nl_v = b.ins().iconst(I64, name_len);
+                        let bp = b.use_var(bail_var);
+                        let call = b
+                            .ins()
+                            .call(member_get_ref, &[obj, np_v, nl_v, ic_v, bp]);
+                        let r = b.inst_results(call)[0];
+                        let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                        let bail_set =
+                            b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                        let cont = b.create_block();
+                        b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                        b.switch_to_block(cont);
+                        stack.push((r, Kind::Boxed));
+                    }
+                    // v0.99.8 — `obj.prop` where receiver is on the stack
+                    // (Boxed). Same IC shape as LoadLocalProperty. Mirrors
+                    // translate.rs:679-702.
+                    BytecodeOp::GetProperty(_prop) => {
+                        let (obj, ok) = stack.pop().ok_or("osr: stack underflow")?;
+                        if ok != Kind::Boxed {
+                            return Err("osr: GetProperty receiver not Boxed".into());
+                        }
+                        let (ic_ptr, name_ptr, name_len) = *member_get_at
+                            .get(&ip)
+                            .ok_or("osr: missing member IC slot")?;
+                        let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                        let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                        let nl_v = b.ins().iconst(I64, name_len);
+                        let bp = b.use_var(bail_var);
+                        let call = b
+                            .ins()
+                            .call(member_get_ref, &[obj, np_v, nl_v, ic_v, bp]);
+                        let r = b.inst_results(call)[0];
+                        let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                        let bail_set =
+                            b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                        let cont = b.create_block();
+                        b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                        b.switch_to_block(cont);
+                        stack.push((r, Kind::Boxed));
+                    }
                     BytecodeOp::StoreLocal(name) => {
                         let slot = plan.slot_of(name).ok_or("osr: unknown local")?;
                         let (v, _) = stack.pop().ok_or("osr: stack underflow")?;
                         b.def_var(vars[slot], v);
                     }
 
-                    BytecodeOp::Add => translate::num_bin(&mut b, &mut stack, translate::NumOp::Add)?,
-                    BytecodeOp::Sub => translate::num_bin(&mut b, &mut stack, translate::NumOp::Sub)?,
-                    BytecodeOp::Mul => translate::num_bin(&mut b, &mut stack, translate::NumOp::Mul)?,
+                    // v0.99.6/v0.99.7/v0.99.8 — Add/Sub/Mul admit Boxed; if
+                    // either operand is Boxed, route through the SMI fast-path
+                    // helper. Mirrors translate.rs:712-739.
+                    op_variant @ (BytecodeOp::Add | BytecodeOp::Sub | BytecodeOp::Mul) => {
+                        let op = match op_variant {
+                            BytecodeOp::Add => translate::NumOp::Add,
+                            BytecodeOp::Sub => translate::NumOp::Sub,
+                            _ => translate::NumOp::Mul,
+                        };
+                        let either_boxed = matches!(stack.last(), Some((_, Kind::Boxed)))
+                            || matches!(stack.iter().rev().nth(1), Some((_, Kind::Boxed)));
+                        if either_boxed {
+                            let slow = match op {
+                                translate::NumOp::Add => add_boxed_ref,
+                                translate::NumOp::Sub => sub_boxed_ref,
+                                translate::NumOp::Mul => mul_boxed_ref,
+                            };
+                            translate::arith_boxed_smi(
+                                &mut b,
+                                &mut stack,
+                                op,
+                                box_int_ref,
+                                box_float_ref,
+                                slow,
+                                bail_var,
+                                ptr_ty,
+                            )?;
+                        } else {
+                            translate::num_bin(&mut b, &mut stack, op)?;
+                        }
+                    }
 
                     BytecodeOp::Div => {
                         let (rhs, rk) = stack.pop().ok_or("osr: stack underflow")?;
@@ -1372,14 +1575,17 @@ mod tests {
     }
 
     #[test]
-    fn analyze_loop_rejects_string_concat() {
-        // String concat → Concat op, not in supported subset.
+    fn analyze_loop_accepts_string_concat_with_boxed_slot() {
+        // Since v0.91.0, Concat + String are admitted; since v0.99.8 the
+        // slot-kind Infer fixpoint also upgrades an initially-Int slot to
+        // Boxed when the body stores a Concat result into it. Either way,
+        // a Boxed accumulator concatenating into itself is JIT-eligible.
         let f = compile_main("s = \"\"; for (i = 1; i <= 5; i++) { s = s & i; }");
         let (s, e) = first_loop_region(&f);
-        // The caller_kinds has no useful entry for `s` (it's a String), so
-        // even if we lie and call it Int the body's Concat op should reject.
-        let kinds = int_kinds(&["s", "i"]);
-        assert!(analyze_loop(&f, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).is_none());
+        let mut kinds = HashMap::new();
+        kinds.insert("s".into(), Kind::Boxed);
+        kinds.insert("i".into(), Kind::Int);
+        assert!(analyze_loop(&f, s, e, &kinds, &crate::jit::analysis::no_udf_resolver).is_some());
     }
 
     #[test]

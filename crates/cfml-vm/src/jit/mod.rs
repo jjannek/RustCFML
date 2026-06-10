@@ -795,7 +795,11 @@ fn build_caller_kinds(
             | BytecodeOp::MulLocalConst(n, _)
             | BytecodeOp::JumpIfLocalCmpConstFalse(n, _, _, _)
             | BytecodeOp::ForLoopStep(n, _, _, _, _)
-            | BytecodeOp::DeclareLocal(n) => n,
+            | BytecodeOp::DeclareLocal(n)
+            // v0.99.8 — the fused `local.prop` op names a local receiver
+            // that's never written elsewhere in the loop body but must be
+            // seeded as Boxed so analyze_loop accepts the member read.
+            | BytecodeOp::LoadLocalProperty(n, _) => n,
             _ => continue,
         };
         let lower = name.to_ascii_lowercase();

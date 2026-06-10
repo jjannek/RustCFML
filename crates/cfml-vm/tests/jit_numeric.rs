@@ -1217,3 +1217,90 @@ fn add_boxed_smi_handles_large_int_via_box_int_overflow() {
     assert_eq!(out, oracle, "SMI overflow path must match interpreter");
     assert!(compiled >= 1, "expected dbl() to be JIT-compiled, got {compiled}");
 }
+
+// ── v0.99.8 — OSR admission for member reads + Boxed arith ──────────────
+
+#[test]
+fn osr_member_read_in_main_loop_matches_interpreter() {
+    // `__main__`'s outer for-loop body reads `rec.a`/`rec.b` via the IC and
+    // accumulates the sum. CLI __main__ never JITs whole-fn (gotcha #22),
+    // so OSR is the only path that can specialise this loop. With v0.99.8
+    // OSR admits LoadLocalProperty + GetProperty + Boxed Add.
+    let src = r#"
+        rec = {a: 7, b: 3};
+        total = 0;
+        for (k = 1; k <= 200; k++) { total = total + rec.a + rec.b; }
+        writeOutput(total);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    assert_eq!(out, oracle, "OSR member-read loop must match interpreter");
+    assert!(
+        osr_compiled >= 1,
+        "expected OSR to fire on the member-read loop, got osr_compiled={osr_compiled}"
+    );
+}
+
+#[test]
+fn osr_member_read_with_sub_and_mul_matches_interpreter() {
+    // Exercises the v0.99.7 Sub/Mul Boxed admission inside OSR. Mirrors the
+    // `struct_member_kernel.cfm` bench shape (a + b*2 + c - d) directly in
+    // __main__.
+    let src = r#"
+        p = {a: 5, b: 2, c: 11, d: 3};
+        total = 0;
+        for (k = 1; k <= 200; k++) { total = total + p.a + p.b * 2 + p.c - p.d; }
+        writeOutput(total);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    assert_eq!(out, oracle, "OSR Sub/Mul Boxed member kernel must match interpreter");
+    assert!(
+        osr_compiled >= 1,
+        "expected OSR to fire on the Sub/Mul member kernel, got osr_compiled={osr_compiled}"
+    );
+}
+
+#[test]
+fn osr_member_read_case_insensitive_matches_interpreter() {
+    // Mixed-case key in the source vs lowercase key in the struct literal
+    // exercises the IC's cold-path CI scan + warm-path index reuse inside
+    // the OSR-compiled body.
+    let src = r#"
+        rec = {firstName: "Alice", age: 40};
+        out = "";
+        for (k = 1; k <= 100; k++) { out = out & rec.FIRSTNAME & "|" & rec.Age & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _fn_compiled, osr_compiled) = run_with_osr(src);
+    assert_eq!(out, oracle, "OSR member-read CI must match interpreter");
+    assert!(
+        osr_compiled >= 1,
+        "expected OSR to fire on the CI member-read loop, got osr_compiled={osr_compiled}"
+    );
+}
+
+#[test]
+fn osr_member_read_bails_on_non_struct_receiver_matches_interpreter() {
+    // When the receiver is an Array (not a Struct), the member-get shim
+    // sets *bail = 1 and the OSR body returns to the interpreter, which
+    // produces the legacy CFML behaviour for `arr.foo`. The output must
+    // still match the interpreter oracle.
+    let src = r#"
+        rec = [10, 20, 30];
+        // Read a property that does not exist on Array — interpreter
+        // path is what produces the canonical result; we just verify
+        // the JIT bails cleanly and yields the same output.
+        try {
+            out = "";
+            for (k = 1; k <= 50; k++) { out = out & rec.foo & ";"; }
+            writeOutput(out);
+        } catch (any e) {
+            writeOutput("err");
+        }
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, _fn_compiled, _osr_compiled) = run_with_osr(src);
+    assert_eq!(out, oracle, "OSR bail on non-Struct receiver must match interpreter");
+}
