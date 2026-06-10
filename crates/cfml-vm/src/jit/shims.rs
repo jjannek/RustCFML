@@ -108,6 +108,148 @@ pub extern "C" fn cfml_jit_member_get_boxed(
     arena::box_into_active(CfmlValue::Null) as i64
 }
 
+/// v0.100.0 — JIT inline-cache write for `obj.prop = value` on a
+/// `CfmlValue::Struct`. Mirror of [`cfml_jit_member_get_boxed`]; same
+/// `[cached_shape, cached_idx, cached_kind]` slot layout. `cached_kind`
+/// is touched but only as a hint for future reads through the SAME slot
+/// (in practice writes have their own slot — separate IC site).
+///
+/// Hot path (cached_shape == current_shape): `s.set_at_index(cached_idx, val)`
+/// — value-only update at known index, does NOT bump `shape_id`, so any
+/// reader-side IC for the same shape stays warm.
+///
+/// Cold path: case-insensitive key lookup. If the key exists at some
+/// index, value-overwrite via `set_at_index` (still no shape bump).
+/// If absent, `s.insert(name, val)` — that DOES bump `shape_id` because
+/// a new key changes the structural shape. Either way the IC is updated
+/// to `(new_shape, idx, kind)`.
+///
+/// **Bails** on:
+/// - non-`Struct` receiver (Components / Queries / Closures / NativeObjects
+///   have setter machinery the JIT can't replicate),
+/// - Components proper — any Struct carrying `__variables`, `__properties`,
+///   or `__super` (NativeObject parent). Those need the interpreter's
+///   property-writeback to `__variables` and parent `set_property`
+///   dispatch (see `BytecodeOp::SetProperty` in `lib.rs`).
+///
+/// Returns the receiver pointer unchanged. SetProperty's stack effect is
+/// "pop value, pop obj, mutate obj, push obj back" — passing obj through
+/// lets the translator emit a single shim call and re-push the return
+/// value. StoreLocalProperty discards the return.
+#[no_mangle]
+pub extern "C" fn cfml_jit_member_set_boxed(
+    obj_tagged: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    value_tagged: i64,
+    ic_slot: *mut u64,
+    bail: *mut i64,
+) -> i64 {
+    let obj_utag = obj_tagged as usize;
+    if obj_utag & boxed::TAG_MASK != boxed::TAG_PTR {
+        unsafe {
+            *bail = 1;
+        }
+        return obj_tagged;
+    }
+    let v = unsafe { boxed::borrow_tagged(obj_utag) };
+    let s = match v {
+        CfmlValue::Struct(s) => s,
+        _ => {
+            unsafe {
+                *bail = 1;
+            }
+            return obj_tagged;
+        }
+    };
+    // Bail on Components / NativeObject parents — interp has extra
+    // writeback semantics we don't replicate.
+    if s.contains_key("__variables")
+        || s.contains_key("__properties")
+        || s.contains_key("__super")
+    {
+        unsafe {
+            *bail = 1;
+        }
+        return obj_tagged;
+    }
+    // Materialise the incoming value as an owned CfmlValue. Arc-backed
+    // variants are refcount bumps; primitives are small copies. The
+    // tagged source remains in the caller's arena and will be reclaimed
+    // on body exit.
+    let owned = unsafe { boxed::materialize_tagged(value_tagged as usize) };
+    let shape = s.shape_id();
+    let cached_shape = unsafe { *ic_slot };
+    let cached_idx = unsafe { *ic_slot.add(1) };
+    if cached_shape == shape {
+        // Shape match guarantees `cached_idx` is in range — `set_at_index`
+        // can only return None if the index escaped its valid range, which
+        // is impossible under shape match. Track an Option so the slow
+        // path can recover ownership if (defensively) it did escape.
+        let mut held = Some(owned);
+        if s
+            .set_at_index(cached_idx as usize, held.take().unwrap())
+            .is_some()
+        {
+            // Hit. Update the kind hint to track the new value's encoding
+            // class. Reads through a co-located IC would refresh on their
+            // own next visit; updating here keeps a shared slot consistent.
+            let new_kind = match s.get_at_index(cached_idx as usize) {
+                Some(ref v) => kind_code_for(v),
+                None => 3,
+            };
+            unsafe {
+                *ic_slot.add(2) = new_kind;
+            }
+            return obj_tagged;
+        }
+        // Defensive: shouldn't reach here under shape match. Bail.
+        unsafe {
+            *bail = 1;
+        }
+        return obj_tagged;
+    }
+    // Cold path. Look up the key case-insensitively; if found, overwrite
+    // at that index (no shape bump). If absent, insert (shape bump).
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+    let (final_idx, _) = match s.get_ci_indexed(name) {
+        Some((i, _)) => {
+            let prev = s.set_at_index(i, owned);
+            (i, prev)
+        }
+        None => {
+            // Brand-new key — insert bumps shape_id.
+            s.insert(name.to_string(), owned);
+            // Look up the just-inserted index. New keys append, so it's
+            // `len - 1`, but using `get_ci_indexed` is robust to the
+            // implementation detail.
+            match s.get_ci_indexed(name) {
+                Some((i, _)) => (i, None),
+                // Unreachable in practice: we just inserted it.
+                None => {
+                    unsafe {
+                        *bail = 1;
+                    }
+                    return obj_tagged;
+                }
+            }
+        }
+    };
+    let new_shape = s.shape_id();
+    let new_kind = match s.get_at_index(final_idx) {
+        Some(ref v) => kind_code_for(v),
+        None => 3,
+    };
+    unsafe {
+        *ic_slot = new_shape;
+        *ic_slot.add(1) = final_idx as u64;
+        *ic_slot.add(2) = new_kind;
+    }
+    obj_tagged
+}
+
 #[inline]
 fn kind_code_for(v: &CfmlValue) -> u64 {
     match v {
@@ -470,6 +612,123 @@ mod tests {
         drop(_g);
         drop(unsafe { boxed::reclaim_tagged(a as usize) });
         drop(unsafe { boxed::reclaim_tagged(b as usize) });
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn member_set_cold_then_warm_via_set_at_index() {
+        // v0.100.0 — first call populates IC via cold path (existing key);
+        // value-overwrites in place (no shape bump). Second call hits the
+        // cached (shape, idx) and uses set_at_index directly.
+        use cfml_common::dynamic::CfmlStruct;
+        use indexmap::IndexMap;
+        let mut m = IndexMap::new();
+        m.insert("x".to_string(), CfmlValue::Int(1));
+        let s = CfmlStruct::new(m);
+        let shape_before = s.shape_id();
+        let obj_tag = boxed::box_value(CfmlValue::Struct(s.clone())) as i64;
+        let name = b"x";
+        let mut slot = [0u64; 3];
+        let mut bail = 0i64;
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let v1 = cfml_jit_box_int(42);
+        let r1 = cfml_jit_member_set_boxed(
+            obj_tag,
+            name.as_ptr(),
+            name.len() as i64,
+            v1,
+            slot.as_mut_ptr(),
+            &mut bail,
+        );
+        assert_eq!(r1, obj_tag, "shim returns obj_tagged passthrough");
+        assert_eq!(bail, 0, "no bail expected on cold-path overwrite");
+        assert_eq!(s.shape_id(), shape_before, "overwrite must not bump shape");
+        assert_eq!(slot[0], shape_before, "IC slot now caches the shape");
+        assert!(matches!(s.get("x"), Some(CfmlValue::Int(42))));
+
+        // Warm call — same shape, hits set_at_index fast path.
+        let v2 = cfml_jit_box_int(99);
+        let r2 = cfml_jit_member_set_boxed(
+            obj_tag,
+            name.as_ptr(),
+            name.len() as i64,
+            v2,
+            slot.as_mut_ptr(),
+            &mut bail,
+        );
+        assert_eq!(r2, obj_tag);
+        assert_eq!(bail, 0);
+        assert_eq!(s.shape_id(), shape_before, "warm hit still no shape bump");
+        assert!(matches!(s.get("x"), Some(CfmlValue::Int(99))));
+        drop(_g);
+        drop(unsafe { boxed::reclaim_tagged(obj_tag as usize) });
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn member_set_new_key_bumps_shape() {
+        use cfml_common::dynamic::CfmlStruct;
+        let s = CfmlStruct::empty();
+        let shape_before = s.shape_id();
+        let obj_tag = boxed::box_value(CfmlValue::Struct(s.clone())) as i64;
+        let name = b"newkey";
+        let mut slot = [0u64; 3];
+        let mut bail = 0i64;
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let v = cfml_jit_box_int(7);
+        let _ = cfml_jit_member_set_boxed(
+            obj_tag,
+            name.as_ptr(),
+            name.len() as i64,
+            v,
+            slot.as_mut_ptr(),
+            &mut bail,
+        );
+        assert_eq!(bail, 0);
+        assert_ne!(s.shape_id(), shape_before, "new key must bump shape");
+        assert_eq!(slot[0], s.shape_id(), "IC slot tracks new shape");
+        assert!(matches!(s.get("newkey"), Some(CfmlValue::Int(7))));
+        drop(_g);
+        drop(unsafe { boxed::reclaim_tagged(obj_tag as usize) });
+        arena.drain_except(None);
+    }
+
+    #[test]
+    fn member_set_bails_on_component_like_struct() {
+        // Shim must bail when the receiver Struct carries `__variables` —
+        // the marker the interpreter uses to recognise CFCs.
+        use cfml_common::dynamic::CfmlStruct;
+        use indexmap::IndexMap;
+        let mut m = IndexMap::new();
+        m.insert("flag".to_string(), CfmlValue::Int(0));
+        m.insert(
+            "__variables".to_string(),
+            CfmlValue::strukt(IndexMap::new()),
+        );
+        let s = CfmlStruct::new(m);
+        let obj_tag = boxed::box_value(CfmlValue::Struct(s.clone())) as i64;
+        let name = b"flag";
+        let mut slot = [0u64; 3];
+        let mut bail = 0i64;
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+        let v = cfml_jit_box_int(1);
+        let r = cfml_jit_member_set_boxed(
+            obj_tag,
+            name.as_ptr(),
+            name.len() as i64,
+            v,
+            slot.as_mut_ptr(),
+            &mut bail,
+        );
+        assert_eq!(r, obj_tag, "passthrough even on bail");
+        assert_eq!(bail, 1, "must bail on CFC-shaped struct");
+        // The underlying flag must NOT have been written by the shim.
+        assert!(matches!(s.get("flag"), Some(CfmlValue::Int(0))));
+        drop(_g);
+        drop(unsafe { boxed::reclaim_tagged(obj_tag as usize) });
         arena.drain_except(None);
     }
 

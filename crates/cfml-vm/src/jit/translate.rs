@@ -153,6 +153,9 @@ pub struct Backend {
     /// v0.99.5 — FuncId for `cfml_jit_member_get_boxed`, the IC shim for
     /// `obj.prop` member access on a `CfmlValue::Struct` receiver.
     pub(super) member_get_id: FuncId,
+    /// v0.100.0 — FuncId for `cfml_jit_member_set_boxed`, the IC shim for
+    /// `obj.prop = value` writes on a `CfmlValue::Struct` receiver.
+    pub(super) member_set_id: FuncId,
     /// v0.99.5 — IC slot storage. Each entry is a heap-allocated
     /// `[cached_shape, cached_idx]` pair. `Box::as_ref().get()` returns a
     /// raw pointer that's stable for the box's lifetime; the Vec just
@@ -202,6 +205,11 @@ impl Backend {
         builder.symbol(
             "cfml_jit_member_get_boxed",
             super::shims::cfml_jit_member_get_boxed as *const u8,
+        );
+        // v0.100.0 member-write IC shim.
+        builder.symbol(
+            "cfml_jit_member_set_boxed",
+            super::shims::cfml_jit_member_set_boxed as *const u8,
         );
         // Register every allowlisted builtin shim (Option A — Tier-1 native
         // calls). Each is a pure `extern "C"` Rust fn whose semantics mirror
@@ -339,6 +347,23 @@ impl Backend {
                 .declare_function("cfml_jit_member_get_boxed", Linkage::Import, &sig)
                 .map_err(|e| e.to_string())?
         };
+        // v0.100.0 — member-write IC shim:
+        //   fn(obj_tagged: i64, name_ptr: *const u8, name_len: i64,
+        //      value_tagged: i64, ic_slot: *mut u64, bail: *mut i64) -> i64
+        // Returns obj_tagged unchanged (passthrough; SetProperty re-pushes it).
+        let member_set_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(I64)); // obj_tagged
+            sig.params.push(AbiParam::new(ptr_ty)); // name_ptr
+            sig.params.push(AbiParam::new(I64)); // name_len
+            sig.params.push(AbiParam::new(I64)); // value_tagged
+            sig.params.push(AbiParam::new(ptr_ty)); // ic_slot
+            sig.params.push(AbiParam::new(ptr_ty)); // bail
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_jit_member_set_boxed", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
 
         Ok(Self {
             module,
@@ -357,6 +382,7 @@ impl Backend {
             str_literal_id,
             string_literals: Vec::new(),
             member_get_id,
+            member_set_id,
             member_ic_slots: Vec::new(),
             member_names: Vec::new(),
         })
@@ -475,6 +501,10 @@ impl Backend {
         let member_get_ref = self
             .module
             .declare_func_in_func(self.member_get_id, &mut ctx.func);
+        // v0.100.0 member-set shim.
+        let member_set_ref = self
+            .module
+            .declare_func_in_func(self.member_set_id, &mut ctx.func);
 
         // v0.90.0 — intern every String literal in the reachable code
         // before the FunctionBuilder borrows take effect. The resulting
@@ -487,6 +517,9 @@ impl Backend {
         // keyed by IP and embedded into the IR as constants. Same
         // before-FunctionBuilder rationale as gotcha #15.
         let mut member_get_at: HashMap<usize, (*mut u64, *const u8, i64)> = HashMap::new();
+        // v0.100.0 — IC slots for member-write sites (SetProperty,
+        // StoreLocalProperty). Same slot layout as the read IC.
+        let mut member_set_at: HashMap<usize, (*mut u64, *const u8, i64)> = HashMap::new();
         for blk in &plan.blocks {
             for ip in blk.start..blk.end {
                 match &func.instructions[ip] {
@@ -498,6 +531,12 @@ impl Backend {
                         let ic_ptr = self.alloc_member_ic_slot();
                         let (name_ptr, name_len) = self.intern_member_name(prop);
                         member_get_at.insert(ip, (ic_ptr, name_ptr, name_len));
+                    }
+                    BytecodeOp::StoreLocalProperty(_, prop)
+                    | BytecodeOp::SetProperty(prop) => {
+                        let ic_ptr = self.alloc_member_ic_slot();
+                        let (name_ptr, name_len) = self.intern_member_name(prop);
+                        member_set_at.insert(ip, (ic_ptr, name_ptr, name_len));
                     }
                     _ => {}
                 }
@@ -704,6 +743,67 @@ impl Backend {
                             let slot = plan.slot_of(name).ok_or("jit: unknown local")?;
                             let (v, _) = stack.pop().ok_or("jit: stack underflow")?;
                             b.def_var(vars[slot], v);
+                        }
+
+                        // v0.100.0 — `obj.prop = value`. Pop value
+                        // (Int/Float/Boxed; non-Boxed gets boxed via the
+                        // same shims Concat uses), pop obj (Boxed), call
+                        // the write-IC shim. Shim returns obj_tagged
+                        // passthrough; push it back so the compiler-emitted
+                        // writeback chain sees the same value the
+                        // interpreter would.
+                        BytecodeOp::SetProperty(_) => {
+                            let (val_raw, vk) = stack.pop().ok_or("jit: stack underflow")?;
+                            let (obj, ok) = stack.pop().ok_or("jit: stack underflow")?;
+                            if ok != Kind::Boxed {
+                                return Err("jit: SetProperty receiver not Boxed".into());
+                            }
+                            let val = ensure_boxed(&mut b, box_int_ref, box_float_ref, val_raw, vk);
+                            let (ic_ptr, name_ptr, name_len) = *member_set_at
+                                .get(&ip)
+                                .ok_or("jit: missing member-set IC slot")?;
+                            let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                            let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                            let nl_v = b.ins().iconst(I64, name_len);
+                            let bp = b.use_var(bail_var);
+                            let call = b
+                                .ins()
+                                .call(member_set_ref, &[obj, np_v, nl_v, val, ic_v, bp]);
+                            let r = b.inst_results(call)[0];
+                            let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                            let bail_set =
+                                b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                            let cont = b.create_block();
+                            b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                            b.switch_to_block(cont);
+                            stack.push((r, Kind::Boxed));
+                        }
+
+                        // v0.100.0 — fused `local.prop = value`. Pop value
+                        // (Int/Float/Boxed; box non-Boxed), read local
+                        // (Boxed); call the write-IC shim. No push.
+                        BytecodeOp::StoreLocalProperty(name, _prop) => {
+                            let slot = plan.slot_of(name).ok_or("jit: unknown local")?;
+                            let (val_raw, vk) = stack.pop().ok_or("jit: stack underflow")?;
+                            let val = ensure_boxed(&mut b, box_int_ref, box_float_ref, val_raw, vk);
+                            let obj = b.use_var(vars[slot]);
+                            let (ic_ptr, name_ptr, name_len) = *member_set_at
+                                .get(&ip)
+                                .ok_or("jit: missing member-set IC slot")?;
+                            let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                            let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                            let nl_v = b.ins().iconst(I64, name_len);
+                            let bp = b.use_var(bail_var);
+                            let call = b
+                                .ins()
+                                .call(member_set_ref, &[obj, np_v, nl_v, val, ic_v, bp]);
+                            let _r = b.inst_results(call)[0];
+                            let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                            let bail_set =
+                                b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                            let cont = b.create_block();
+                            b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                            b.switch_to_block(cont);
                         }
 
                         // v0.99.6/v0.99.7 — Add/Sub/Mul admit Boxed operands;

@@ -279,6 +279,20 @@ impl CfmlStruct {
         self.0.read().map.get_index(idx).map(|(_, v)| v.clone())
     }
 
+    /// v0.100.0 — write a value at a specific IndexMap entry index. Used by
+    /// the JIT member-write IC's fast path: when a cached `(shape, idx)` hit
+    /// confirms the key is at the position we recorded, replace the value
+    /// in place. Does NOT bump `shape_id` — the key set is unchanged, only
+    /// the value at that slot. Returns the previous value, or `None` if the
+    /// index is out of range (defensive — shape match implies in-range).
+    #[inline]
+    pub fn set_at_index(&self, idx: usize, value: CfmlValue) -> Option<CfmlValue> {
+        let mut g = self.0.write();
+        g.map
+            .get_index_mut(idx)
+            .map(|(_, slot)| std::mem::replace(slot, value))
+    }
+
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.read().map.contains_key(key)

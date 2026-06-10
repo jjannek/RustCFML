@@ -493,6 +493,19 @@ pub fn analyze(
                 // v0.99.5 — `obj.prop` where obj is on the stack. Operand
                 // tracking happens in simulate_block; Pass 1 just admits.
                 BytecodeOp::GetProperty(_) => {}
+                // v0.100.0 — `obj.prop = value`. Operand tracking happens
+                // in simulate_block; Pass 1 just admits.
+                BytecodeOp::SetProperty(_) => {}
+                // v0.100.0 — fused `local.prop = value`. Treats the local
+                // as a Read+Write (value not stored back through the slot,
+                // but the in-place mutation conceptually touches it).
+                BytecodeOp::StoreLocalProperty(name, _prop) => {
+                    if is_reserved_scope(name) {
+                        return None;
+                    }
+                    let s = intern(name, &mut locals, &mut local_slot);
+                    events.push(Ev::Read(s));
+                }
                 BytecodeOp::StoreLocal(name) => {
                     if is_reserved_scope(name) {
                         return None;
@@ -843,6 +856,37 @@ fn simulate_block(
                     return None;
                 }
                 stack.push(Kind::Boxed);
+            }
+            // v0.100.0 — SetProperty pops value (Int/Float/Boxed) + obj
+            // (Boxed); pushes obj back. The codegen boxes non-Boxed values
+            // via the same `ensure_boxed` helper Concat uses. Stack effect
+            // is "pop 2, push 1" — net consume 1 (the value).
+            BytecodeOp::SetProperty(_) => {
+                let val = pop!();
+                let obj = pop!();
+                if obj != Kind::Boxed {
+                    return None;
+                }
+                if !matches!(val, Kind::Int | Kind::Float | Kind::Boxed) {
+                    return None;
+                }
+                stack.push(Kind::Boxed);
+            }
+            // v0.100.0 — StoreLocalProperty pops value (Int/Float/Boxed);
+            // no push. Local slot must be Boxed (the shim takes a tagged
+            // ptr to a CfmlValue::Struct).
+            BytecodeOp::StoreLocalProperty(name, _prop) => {
+                let s = slot_index(name)?;
+                if slot_kind[s] != Kind::Boxed {
+                    if let Mode::Check { .. } = &mode {
+                        return None;
+                    }
+                    return None;
+                }
+                let val = pop!();
+                if !matches!(val, Kind::Int | Kind::Float | Kind::Boxed) {
+                    return None;
+                }
             }
             BytecodeOp::StoreLocal(name) => {
                 let s = slot_index(name)?;

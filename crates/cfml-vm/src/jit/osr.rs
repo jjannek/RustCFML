@@ -450,6 +450,26 @@ pub fn analyze_loop(
                     useful_ops += 1;
                 }
 
+                // v0.100.0 — member-access writes count as useful work.
+                // StoreLocalProperty also needs the receiver local interned
+                // (slot must be Boxed at simulate_block time).
+                BytecodeOp::StoreLocalProperty(name, _prop) => {
+                    if is_reserved_scope(name) {
+                        return None;
+                    }
+                    intern(
+                        name,
+                        &mut slot_names,
+                        &mut slot_kinds,
+                        &mut slot_index,
+                        caller_kinds,
+                    )?;
+                    useful_ops += 1;
+                }
+                BytecodeOp::SetProperty(_) => {
+                    useful_ops += 1;
+                }
+
                 BytecodeOp::LoadLocal(name)
                 | BytecodeOp::StoreLocal(name)
                 | BytecodeOp::Increment(name)
@@ -806,6 +826,31 @@ fn simulate_block(
                 }
                 stack.push(Kind::Boxed);
             }
+            // v0.100.0 — `obj.prop = value`. Pops value (Int/Float/Boxed)
+            // + obj (Boxed); pushes obj back. Mirrors analysis.rs.
+            BytecodeOp::SetProperty(_) => {
+                let val = pop!();
+                let obj = pop!();
+                if obj != Kind::Boxed {
+                    return None;
+                }
+                if !matches!(val, Kind::Int | Kind::Float | Kind::Boxed) {
+                    return None;
+                }
+                stack.push(Kind::Boxed);
+            }
+            // v0.100.0 — `local.prop = value`. Pops value
+            // (Int/Float/Boxed); local slot must be Boxed. No push.
+            BytecodeOp::StoreLocalProperty(name, _prop) => {
+                let s = slot_of(name)?;
+                if slot_kinds[s] != Kind::Boxed {
+                    return None;
+                }
+                let val = pop!();
+                if !matches!(val, Kind::Int | Kind::Float | Kind::Boxed) {
+                    return None;
+                }
+            }
 
             BytecodeOp::LoadGlobal(name) => {
                 if let Some(canon) = builtins::canonical_name(name) {
@@ -918,6 +963,10 @@ pub fn compile_loop(
     let member_get_ref = backend
         .module
         .declare_func_in_func(backend.member_get_id, &mut ctx.func);
+    // v0.100.0 — Member-write IC shim (SetProperty + StoreLocalProperty).
+    let member_set_ref = backend
+        .module
+        .declare_func_in_func(backend.member_set_id, &mut ctx.func);
     let str_literal_ref = backend
         .module
         .declare_func_in_func(backend.str_literal_id, &mut ctx.func);
@@ -939,6 +988,8 @@ pub fn compile_loop(
     // intern its property name (mirrors translate.rs:484-505). Keyed by ip
     // so the codegen loop can grab the triple by IP.
     let mut member_get_at: HashMap<usize, (*mut u64, *const u8, i64)> = HashMap::new();
+    // v0.100.0 — IC slots for write sites (mirrors translate.rs).
+    let mut member_set_at: HashMap<usize, (*mut u64, *const u8, i64)> = HashMap::new();
     for blk in &plan.blocks {
         for ip in blk.start..blk.end {
             match &func.instructions[ip] {
@@ -950,6 +1001,12 @@ pub fn compile_loop(
                     let ic_ptr = backend.alloc_member_ic_slot();
                     let (name_ptr, name_len) = backend.intern_member_name(prop);
                     member_get_at.insert(ip, (ic_ptr, name_ptr, name_len));
+                }
+                BytecodeOp::StoreLocalProperty(_, prop)
+                | BytecodeOp::SetProperty(prop) => {
+                    let ic_ptr = backend.alloc_member_ic_slot();
+                    let (name_ptr, name_len) = backend.intern_member_name(prop);
+                    member_set_at.insert(ip, (ic_ptr, name_ptr, name_len));
                 }
                 _ => {}
             }
@@ -1165,6 +1222,61 @@ pub fn compile_loop(
                         let slot = plan.slot_of(name).ok_or("osr: unknown local")?;
                         let (v, _) = stack.pop().ok_or("osr: stack underflow")?;
                         b.def_var(vars[slot], v);
+                    }
+
+                    // v0.100.0 — `obj.prop = value`. Mirrors translate.rs.
+                    // Box non-Boxed values via the same shims Concat uses.
+                    BytecodeOp::SetProperty(_) => {
+                        let (val_raw, vk) = stack.pop().ok_or("osr: stack underflow")?;
+                        let (obj, ok) = stack.pop().ok_or("osr: stack underflow")?;
+                        if ok != Kind::Boxed {
+                            return Err("osr: SetProperty receiver not Boxed".into());
+                        }
+                        let val = translate::ensure_boxed(&mut b, box_int_ref, box_float_ref, val_raw, vk);
+                        let (ic_ptr, name_ptr, name_len) = *member_set_at
+                            .get(&ip)
+                            .ok_or("osr: missing member-set IC slot")?;
+                        let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                        let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                        let nl_v = b.ins().iconst(I64, name_len);
+                        let bp = b.use_var(bail_var);
+                        let call = b
+                            .ins()
+                            .call(member_set_ref, &[obj, np_v, nl_v, val, ic_v, bp]);
+                        let r = b.inst_results(call)[0];
+                        let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                        let bail_set =
+                            b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                        let cont = b.create_block();
+                        b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                        b.switch_to_block(cont);
+                        stack.push((r, Kind::Boxed));
+                    }
+
+                    // v0.100.0 — `local.prop = value`. Box non-Boxed values
+                    // via the same shims Concat uses.
+                    BytecodeOp::StoreLocalProperty(name, _prop) => {
+                        let slot = plan.slot_of(name).ok_or("osr: unknown local")?;
+                        let (val_raw, vk) = stack.pop().ok_or("osr: stack underflow")?;
+                        let val = translate::ensure_boxed(&mut b, box_int_ref, box_float_ref, val_raw, vk);
+                        let obj = b.use_var(vars[slot]);
+                        let (ic_ptr, name_ptr, name_len) = *member_set_at
+                            .get(&ip)
+                            .ok_or("osr: missing member-set IC slot")?;
+                        let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                        let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                        let nl_v = b.ins().iconst(I64, name_len);
+                        let bp = b.use_var(bail_var);
+                        let call = b
+                            .ins()
+                            .call(member_set_ref, &[obj, np_v, nl_v, val, ic_v, bp]);
+                        let _r = b.inst_results(call)[0];
+                        let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                        let bail_set =
+                            b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                        let cont = b.create_block();
+                        b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                        b.switch_to_block(cont);
                     }
 
                     // v0.99.6/v0.99.7/v0.99.8 — Add/Sub/Mul admit Boxed; if

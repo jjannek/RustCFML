@@ -1304,3 +1304,116 @@ fn osr_member_read_bails_on_non_struct_receiver_matches_interpreter() {
     let (out, _fn_compiled, _osr_compiled) = run_with_osr(src);
     assert_eq!(out, oracle, "OSR bail on non-Struct receiver must match interpreter");
 }
+
+#[test]
+fn member_set_store_local_property_matches_interpreter() {
+    // v0.100.0 — fused `local.prop = value` (StoreLocalProperty). The
+    // write IC populates on the first call and value-overwrites at the
+    // cached index on every subsequent call (no shape bump → reads of
+    // the same struct stay warm too).
+    let src = r##"
+        function tag(p, label) {
+            p.label = label;
+            return p.label & "/" & p.name;
+        }
+        out = "";
+        rec = {name: "row", label: "init"};
+        for (k = 1; k <= 200; k++) { out = out & tag(rec, "x" & k) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "StoreLocalProperty IC must match interpreter");
+    assert!(compiled >= 1, "expected tag() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn member_set_property_via_setproperty_matches_interpreter() {
+    // v0.100.0 — SetProperty path: `obj.prop = v` where obj is on the
+    // stack (e.g. `obj.inner.field = v`-style or aliased temporaries).
+    // Exercised here with a fn that aliases its param then writes.
+    let src = r##"
+        function bump(p) {
+            var q = p;
+            q.count = q.count + 1;
+            return q.count;
+        }
+        out = "";
+        rec = {count: 0};
+        for (k = 1; k <= 100; k++) { out = out & bump(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "SetProperty IC must match interpreter");
+    assert!(compiled >= 1, "expected bump() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn member_set_case_insensitive_matches_interpreter() {
+    // v0.100.0 — mixed-case property name in source vs struct literal.
+    // First write goes through the cold path (ci scan); subsequent hits
+    // use the cached idx with no scan.
+    let src = r##"
+        function brand(p, v) {
+            p.Brand = v;
+            return p.brand;
+        }
+        out = "";
+        rec = {brand: ""};
+        for (k = 1; k <= 80; k++) { out = out & brand(rec, "x" & k) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "case-insensitive write IC must match interpreter");
+    assert!(compiled >= 1, "expected brand() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn member_set_new_key_bumps_shape_matches_interpreter() {
+    // v0.100.0 — first write inserts a NEW key; that bumps shape_id.
+    // Subsequent writes hit the same key at the (now-cached) index with
+    // no further shape change. Output must match the interpreter.
+    let src = r##"
+        function attach(p, label) {
+            p.tag = label;
+            return p.tag;
+        }
+        out = "";
+        for (k = 1; k <= 50; k++) {
+            rec = {name: "row"};
+            // Each iteration uses a fresh struct so the IC sees a
+            // brand-new shape on iter-1 of each call and a cached
+            // shape thereafter would be a miss → still re-resolves.
+            out = out & attach(rec, "t" & k) & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "new-key write IC must match interpreter");
+    assert!(compiled >= 1, "expected attach() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn member_set_bails_on_component_struct() {
+    // v0.100.0 — Components carry `__variables`/`__properties` and have
+    // setter machinery the JIT shim doesn't replicate; the shim sets
+    // *bail = 1 and the interpreter re-runs the call. Hand-rolled
+    // "looks like a CFC" struct (carrying `__variables`) is enough to
+    // exercise the bail path without needing real CFC machinery.
+    let src = r##"
+        function tweak(p) {
+            p.flag = 1;
+            return p.flag;
+        }
+        out = "";
+        rec = {flag: 0, __variables: {}};
+        for (k = 1; k <= 30; k++) { out = out & tweak(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, _compiled) = run(src);
+    assert_eq!(out, oracle, "bail on CFC-shaped struct must match interpreter");
+}
