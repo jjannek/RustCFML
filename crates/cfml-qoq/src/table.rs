@@ -19,62 +19,15 @@ pub struct QoQTable {
 }
 
 impl QoQTable {
-    /// Build from query data (row-major → column-major, a one-time O(R·C) cost).
-    /// For a source `CfmlQuery` handle, read it under a guard first:
-    /// `query.with_read(|d| QoQTable::from_query_data(name, d))`.
-    ///
-    /// Optimised for the dominant case in QoQ workloads: source queries built
-    /// positionally (via `addRow` / `queryNew(columns, types, rows)`) where each
-    /// row's `IndexMap` keys are in insertion order matching `columns`. We use
-    /// `get_index(ci)` (Vec-style positional access) instead of `get(name)`
-    /// (hash lookup) — and fall back to `get(name)` if the row's `ci`-th key
-    /// doesn't match the expected column name (e.g. after an out-of-order
-    /// `queryAddColumn`). Columns are built in parallel via rayon on host
-    /// targets (not wasm).
+    /// Build from query data. With column-major `CfmlQueryData` the conversion
+    /// is now a zero-cost clone of the column vectors (the old row-major →
+    /// column-major loop is gone).
     pub fn from_query_data(name: &str, query: &CfmlQueryData) -> Self {
-        let col_count = query.columns.len();
-        let row_count = query.rows.len();
-        let rows = &query.rows;
-        let columns = &query.columns;
-
-        // Per-column builder: for each column ci, walk all rows once and read
-        // the cell. Positional `get_index` is hot; named `get` is the fallback.
-        let build_column = |ci: usize| -> Vec<CfmlValue> {
-            let col_name = &columns[ci];
-            let mut col = Vec::with_capacity(row_count);
-            for row in rows {
-                let v = match row.get_index(ci) {
-                    Some((k, v)) if k.eq_ignore_ascii_case(col_name) => v.clone(),
-                    _ => row.get(col_name).cloned().unwrap_or(CfmlValue::Null),
-                };
-                col.push(v);
-            }
-            col
-        };
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let data: Vec<Vec<CfmlValue>> = {
-            use rayon::prelude::*;
-            // Only fan out when there's enough work to amortise rayon overhead.
-            // Threshold matches the engine's PARALLEL_ROW_THRESHOLD.
-            const PARALLEL_CELL_THRESHOLD: usize = 10_000;
-            if col_count > 1 && row_count >= PARALLEL_CELL_THRESHOLD {
-                (0..col_count)
-                    .into_par_iter()
-                    .map(build_column)
-                    .collect()
-            } else {
-                (0..col_count).map(build_column).collect()
-            }
-        };
-        #[cfg(target_arch = "wasm32")]
-        let data: Vec<Vec<CfmlValue>> = (0..col_count).map(build_column).collect();
-
         QoQTable {
             name: name.to_string(),
-            columns: columns.clone(),
-            data,
-            row_count,
+            columns: query.columns.clone(),
+            data: query.data.clone(),
+            row_count: query.row_count(),
         }
     }
 

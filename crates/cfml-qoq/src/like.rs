@@ -22,6 +22,25 @@ enum Elem {
 #[derive(Debug, Clone)]
 pub struct Compiled {
     elems: Vec<Elem>,
+    /// Specialised fast-path for the dominant pattern shapes (`%lit%`, `lit%`,
+    /// `%lit`, `lit`). When set, [`Compiled::matches`] does an ASCII-CI byte
+    /// search and skips the per-row `Vec<char>` allocation + char lowercasing
+    /// that the general path needs.
+    fast: Option<FastPath>,
+}
+
+/// Pre-detected pattern shape for cheap matching. `needle` is the literal run
+/// between (or outside) `%` wildcards, already ASCII-lowercased at compile time.
+#[derive(Debug, Clone)]
+enum FastPath {
+    /// `literal` — no wildcards. Case-insensitive equality.
+    Equals(String),
+    /// `literal%` — case-insensitive prefix match.
+    StartsWith(String),
+    /// `%literal` — case-insensitive suffix match.
+    EndsWith(String),
+    /// `%literal%` — case-insensitive substring match.
+    Contains(String),
 }
 
 /// Compile a LIKE pattern into elements, honouring the escape char (the char
@@ -47,7 +66,99 @@ pub fn compile(pattern: &str, escape: Option<char>) -> Compiled {
             }
         }
     }
-    Compiled { elems }
+    let fast = detect_fast_path(&elems);
+    Compiled { elems, fast }
+}
+
+/// Recognise the four dominant pattern shapes — `lit`, `lit%`, `%lit`, `%lit%` —
+/// over a pure-ASCII literal run. Anything else (embedded `%`, `_`, non-ASCII
+/// literals) falls back to the general matcher.
+fn detect_fast_path(elems: &[Elem]) -> Option<FastPath> {
+    fn lit_run_ascii(es: &[Elem]) -> Option<String> {
+        let mut out = String::with_capacity(es.len());
+        for e in es {
+            match e {
+                Elem::Lit(c) if c.is_ascii() => out.push(*c),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    let n = elems.len();
+    let starts_pct = matches!(elems.first(), Some(Elem::Any));
+    let ends_pct = matches!(elems.last(), Some(Elem::Any));
+    let body = match (starts_pct, ends_pct) {
+        (false, false) => &elems[..],
+        (true, false) if n >= 1 => &elems[1..],
+        (false, true) if n >= 1 => &elems[..n - 1],
+        (true, true) if n >= 2 => &elems[1..n - 1],
+        _ => return None,
+    };
+    let lit = lit_run_ascii(body)?;
+    Some(match (starts_pct, ends_pct) {
+        (false, false) => FastPath::Equals(lit),
+        (false, true) => FastPath::StartsWith(lit),
+        (true, false) => FastPath::EndsWith(lit),
+        (true, true) => FastPath::Contains(lit),
+    })
+}
+
+/// Case-insensitive ASCII substring search. Both haystack and needle bytes are
+/// compared via `eq_ignore_ascii_case`, no allocation.
+#[inline]
+fn ascii_ci_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0];
+    let end = haystack.len() - needle.len();
+    let mut i = 0;
+    while i <= end {
+        if haystack[i].eq_ignore_ascii_case(&first) {
+            let mut ok = true;
+            for j in 1..needle.len() {
+                if !haystack[i + j].eq_ignore_ascii_case(&needle[j]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn ascii_ci_starts_with(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack[..needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+#[inline]
+fn ascii_ci_ends_with(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack[haystack.len() - needle.len()..]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+#[inline]
+fn ascii_ci_equals(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() == needle.len()
+        && haystack
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 #[inline]
@@ -59,6 +170,21 @@ fn lower(c: char) -> char {
 impl Compiled {
     /// Does `text` match this compiled LIKE pattern? Case-insensitive.
     pub fn matches(&self, text: &str) -> bool {
+        // ASCII-CI fast path for the dominant `%lit%` / `lit%` / `%lit` / `lit`
+        // shapes. Skips the per-row `Vec<char>` allocation and lower-cases on
+        // the fly via byte compare. Falls back to the general matcher if the
+        // haystack contains non-ASCII bytes.
+        if let Some(fp) = &self.fast {
+            if text.is_ascii() {
+                let h = text.as_bytes();
+                return match fp {
+                    FastPath::Equals(n) => ascii_ci_equals(h, n.as_bytes()),
+                    FastPath::StartsWith(n) => ascii_ci_starts_with(h, n.as_bytes()),
+                    FastPath::EndsWith(n) => ascii_ci_ends_with(h, n.as_bytes()),
+                    FastPath::Contains(n) => ascii_ci_contains(h, n.as_bytes()),
+                };
+            }
+        }
         let pat = &self.elems;
         let txt: Vec<char> = text.chars().map(lower).collect();
 

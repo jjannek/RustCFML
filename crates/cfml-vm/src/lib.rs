@@ -5502,16 +5502,9 @@ impl CfmlVirtualMachine {
                 if let (Some(CfmlValue::Query(q1)), Some(CfmlValue::Query(q2))) =
                     (args.first(), args.get(1))
                 {
-                    let (q2_cols, q2_rows) = q2.with_read(|d| (d.columns.clone(), d.rows.clone()));
-                    q1.with_write(|d| {
-                        for col in &q2_cols {
-                            let col_lower = col.to_lowercase();
-                            if !d.columns.iter().any(|c| c.to_lowercase() == col_lower) {
-                                d.columns.push(col.clone());
-                            }
-                        }
-                        d.rows.extend(q2_rows);
-                    });
+                    let q2_data: cfml_common::dynamic::CfmlQueryData =
+                        q2.with_read(|d| d.clone());
+                    q1.with_write(|d| d.append_query(&q2_data));
                     return Ok(CfmlValue::Bool(true));
                 }
                 return Ok(CfmlValue::Bool(false));
@@ -5529,18 +5522,16 @@ impl CfmlVirtualMachine {
                     };
                     let new_row = new_row.snapshot();
                     let ok = q.with_write(|d| {
-                        if pos >= 1 && pos <= d.rows.len() {
-                            let mut row: IndexMap<String, CfmlValue> = IndexMap::new();
-                            for col in &d.columns {
-                                let col_lower = col.to_lowercase();
+                        if pos >= 1 && pos <= d.row_count() {
+                            for ci in 0..d.columns.len() {
+                                let col_name = d.columns[ci].clone();
                                 let val = new_row
                                     .iter()
-                                    .find(|(k, _)| k.to_lowercase() == col_lower)
+                                    .find(|(k, _)| k.eq_ignore_ascii_case(&col_name))
                                     .map(|(_, v)| v.clone())
                                     .unwrap_or(CfmlValue::Null);
-                                row.insert(col.clone(), val);
+                                d.data[ci][pos - 1] = val;
                             }
-                            d.rows[pos - 1] = row;
                             true
                         } else {
                             false
@@ -7035,7 +7026,10 @@ impl CfmlVirtualMachine {
                             }
                             // querySort sorts IN PLACE (reference-typed): write the
                             // ordered rows back to the shared handle, return it.
-                            q.with_write(|d| d.rows = rows);
+                            q.with_write(|d| {
+                                let cols = d.columns.clone();
+                                *d = cfml_common::dynamic::CfmlQueryData::from_named_rows(cols, rows);
+                            });
                             self.arg_ref_writeback = None;
                             return Ok(CfmlValue::Query(q.clone()));
                         }
@@ -10335,7 +10329,10 @@ impl CfmlVirtualMachine {
                             }
                         }
                         // Member .sort() sorts the receiver IN PLACE (reference-typed).
-                        q.with_write(|d| d.rows = rows);
+                        q.with_write(|d| {
+                            let cols = d.columns.clone();
+                            *d = cfml_common::dynamic::CfmlQueryData::from_named_rows(cols, rows);
+                        });
                         return Ok(object.clone());
                     }
                     return Ok(object.clone());

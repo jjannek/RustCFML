@@ -520,6 +520,14 @@ impl<'a, I: Invoker> Engine<'a, I> {
         core: &SelectCore,
         tables: &TableSet,
     ) -> Result<Vec<Vec<usize>>, CfmlError> {
+        // Hash-join fast path (H4): every INNER JOIN with a single equi
+        // `ResolvedColumn = ResolvedColumn` ON folds in O(L + R) instead of
+        // the generic nested-loop's O(L × R). Falls back to the generic
+        // builder for non-equi / OUTER / cross / multi-clause ONs.
+        if let Some(result) = self.try_hash_join_chain(core, tables) {
+            return result;
+        }
+
         let row_counts = tables.row_counts();
         let join_types: Vec<JoinType> = core.joins.iter().map(|j| j.join_type).collect();
         let joins = &core.joins;
@@ -551,6 +559,135 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 size, MAX_INTERSECTIONS
             ))
         })
+    }
+
+    /// Hash-join detector + driver. Returns `Some(Ok(intersections))` for two
+    /// patterns:
+    ///
+    /// 1. **Explicit equi-joins** — every `JOIN` in `core.joins` is
+    ///    `INNER ... ON ResolvedCol = ResolvedCol`, with one side pointing at
+    ///    the newly-added right table and the other at any already-joined
+    ///    table.
+    /// 2. **Comma joins with WHERE-pushdown** — every join is CROSS (`FROM a, b,
+    ///    c`), and the WHERE clause is an AND-chain that includes an equi
+    ///    predicate for each new table (linking it to an already-joined one).
+    ///    The equi predicates are used as implicit join keys; the rest of the
+    ///    WHERE is still evaluated per row by `filter_where`. Re-evaluating the
+    ///    consumed predicates is correct (they're satisfied by construction
+    ///    after the hash probe) — at worst, a few microseconds of redundant
+    ///    work per surviving row.
+    ///
+    /// `None` ⇒ fall back to the generic nested-loop `build_intersections`
+    /// (OUTER joins, non-equi ONs, expressions, unbound columns, cross joins
+    /// without WHERE-pushdown predicates).
+    fn try_hash_join_chain(
+        &self,
+        core: &SelectCore,
+        tables: &TableSet,
+    ) -> Option<Result<Vec<Vec<usize>>, CfmlError>> {
+        if core.joins.is_empty() {
+            return None;
+        }
+
+        // Pattern 1: every join has its own equi ON.
+        if core.joins.iter().all(|j| j.join_type == JoinType::Inner && j.on.is_some()) {
+            let mut probes: Vec<(usize, usize, usize, usize)> =
+                Vec::with_capacity(core.joins.len());
+            let mut ok = true;
+            for (k, j) in core.joins.iter().enumerate() {
+                let on = j.on.as_ref().unwrap();
+                let Some((lt, lc, rt, rc)) = equi_pair(on) else { ok = false; break };
+                let new_ti = k + 1;
+                let probe = if lt == new_ti && rt <= k {
+                    (rt, rc, lt, lc)
+                } else if rt == new_ti && lt <= k {
+                    (lt, lc, rt, rc)
+                } else {
+                    ok = false;
+                    break;
+                };
+                probes.push(probe);
+            }
+            if ok {
+                return Some(self.hash_join_chain(tables, &probes));
+            }
+        }
+
+        // Pattern 2: comma joins (every join is CROSS with no ON) — pull join
+        // keys out of the WHERE clause.
+        let all_comma = core
+            .joins
+            .iter()
+            .all(|j| j.join_type == JoinType::Cross && j.on.is_none());
+        if !all_comma {
+            return None;
+        }
+        let where_eq = collect_equi_conjuncts(core.where_clause.as_ref());
+        if where_eq.is_empty() {
+            return None;
+        }
+        let mut probes: Vec<(usize, usize, usize, usize)> =
+            Vec::with_capacity(core.joins.len());
+        let mut used = vec![false; where_eq.len()];
+        for k in 0..core.joins.len() {
+            let new_ti = k + 1;
+            let mut found: Option<(usize, (usize, usize, usize, usize))> = None;
+            for (i, &(t1, c1, t2, c2)) in where_eq.iter().enumerate() {
+                if used[i] {
+                    continue;
+                }
+                let probe = if t1 == new_ti && t2 <= k {
+                    Some((t2, c2, t1, c1))
+                } else if t2 == new_ti && t1 <= k {
+                    Some((t1, c1, t2, c2))
+                } else {
+                    None
+                };
+                if let Some(p) = probe {
+                    found = Some((i, p));
+                    break;
+                }
+            }
+            let (idx, probe) = found?;
+            used[idx] = true;
+            probes.push(probe);
+        }
+        Some(self.hash_join_chain(tables, &probes))
+    }
+
+    fn hash_join_chain(
+        &self,
+        tables: &TableSet,
+        probes: &[(usize, usize, usize, usize)],
+    ) -> Result<Vec<Vec<usize>>, CfmlError> {
+        use std::collections::HashMap;
+        let row0 = tables.tables[0].row_count;
+        let mut inters: Vec<Vec<usize>> = (1..=row0).map(|r| vec![r]).collect();
+        for &(lt, lc, rt, rc) in probes {
+            let right_tbl = &tables.tables[rt];
+            // Hash index: stringified right-key → list of 1-based right rows.
+            let mut idx: HashMap<String, Vec<usize>> =
+                HashMap::with_capacity(right_tbl.row_count);
+            for r in 1..=right_tbl.row_count {
+                let key = group_key(&[right_tbl.get(r, rc)]);
+                idx.entry(key).or_default().push(r);
+            }
+            // Probe: for each left intersection, look up the right rows with a
+            // matching key and emit one extended intersection per match.
+            let mut next: Vec<Vec<usize>> = Vec::with_capacity(inters.len());
+            for inter in &inters {
+                let lkey = group_key(&[tables.value(inter, lt, lc)]);
+                if let Some(rows) = idx.get(&lkey) {
+                    for &r in rows {
+                        let mut cand = inter.clone();
+                        cand.push(r);
+                        next.push(cand);
+                    }
+                }
+            }
+            inters = next;
+        }
+        Ok(inters)
     }
 
     /// A `Sync` companion engine sharing this query's tables/params/registry but
@@ -697,6 +834,33 @@ impl<'a, I: Invoker> Engine<'a, I> {
         group_by: &[Expr],
         tables: &TableSet,
     ) -> Result<Vec<Vec<Vec<usize>>>, CfmlError> {
+        // Compute the group key for every row in parallel (PureInvoker, no UDFs
+        // touched on the GROUP BY expressions in practice), then fold into a
+        // single IndexMap sequentially to preserve first-seen order. The key
+        // build is O(R·G) and was a sequential 200ms+ on the 1M-row bench.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.parallel && intersections.len() >= PARALLEL_ROW_THRESHOLD {
+            use rayon::prelude::*;
+            let pure = PureInvoker;
+            let pe = self.pure_engine(&pure);
+            let keys: Result<Vec<String>, CfmlError> = intersections
+                .par_iter()
+                .map(|inter| {
+                    let mut key_vals = Vec::with_capacity(group_by.len());
+                    for g in group_by {
+                        key_vals.push(pe.eval(g, tables, RowCtx::Row(inter))?);
+                    }
+                    Ok(group_key(&key_vals))
+                })
+                .collect();
+            let keys = keys?;
+            let mut groups: IndexMap<String, Vec<Vec<usize>>> = IndexMap::new();
+            for (inter, k) in intersections.iter().zip(keys.into_iter()) {
+                groups.entry(k).or_default().push(inter.clone());
+            }
+            return Ok(groups.into_values().collect());
+        }
+
         let mut groups: IndexMap<String, Vec<Vec<usize>>> = IndexMap::new();
         for inter in intersections {
             let mut key_vals = Vec::with_capacity(group_by.len());
@@ -1086,13 +1250,10 @@ impl<'a, I: Invoker> Engine<'a, I> {
 
     fn eval_scalar_subquery(&self, select: &SelectStatement) -> CfmlResult {
         let q = self.run_statement(select)?;
-        let Some(first_col) = q.columns.first() else {
-            return Ok(CfmlValue::Null);
-        };
         Ok(q
-            .rows
+            .data
             .first()
-            .and_then(|r| r.get(first_col).cloned())
+            .and_then(|c| c.first().cloned())
             .unwrap_or(CfmlValue::Null))
     }
 
@@ -1101,14 +1262,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         select: &SelectStatement,
     ) -> Result<Vec<CfmlValue>, CfmlError> {
         let q = self.run_statement(select)?;
-        let Some(first_col) = q.columns.first() else {
-            return Ok(Vec::new());
-        };
-        Ok(q
-            .rows
-            .iter()
-            .map(|r| r.get(first_col).cloned().unwrap_or(CfmlValue::Null))
-            .collect())
+        Ok(q.data.first().cloned().unwrap_or_default())
     }
 
     // ── Function dispatch ───────────────────────────────────────────────
@@ -1559,6 +1713,45 @@ fn non_numeric(v: &CfmlValue) -> CfmlError {
     ))
 }
 
+// ── Hash-join helpers (H4 / H5) ─────────────────────────────────────────
+
+/// Recognise `ResolvedCol = ResolvedCol` and return both sides' `(ti, ci)`.
+fn equi_pair(e: &Expr) -> Option<(usize, usize, usize, usize)> {
+    if let Expr::Binary { left, op: BinaryOp::Eq, right } = e {
+        if let (
+            Expr::ResolvedColumn { ti: lt, ci: lc, .. },
+            Expr::ResolvedColumn { ti: rt, ci: rc, .. },
+        ) = (&**left, &**right)
+        {
+            if lt != rt {
+                return Some((*lt as usize, *lc as usize, *rt as usize, *rc as usize));
+            }
+        }
+    }
+    None
+}
+
+/// Walk an optional WHERE expression as an AND-chain and collect every
+/// `ResolvedCol = ResolvedCol` conjunct linking two distinct tables.
+/// Non-AND/non-equi nodes are ignored (per-row filters stay where they are).
+fn collect_equi_conjuncts(expr: Option<&Expr>) -> Vec<(usize, usize, usize, usize)> {
+    fn walk(e: &Expr, out: &mut Vec<(usize, usize, usize, usize)>) {
+        if let Expr::Binary { op: BinaryOp::And, left, right, .. } = e {
+            walk(left, out);
+            walk(right, out);
+            return;
+        }
+        if let Some(p) = equi_pair(e) {
+            out.push(p);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(e) = expr {
+        walk(e, &mut out);
+    }
+    out
+}
+
 // ── Column-ref binding (H1) ──────────────────────────────────────────────
 
 /// Rewrite every `Expr::Column` in this core's outer scope into
@@ -1766,19 +1959,20 @@ fn derive_column_names(columns: &[SelectColumn]) -> Vec<String> {
 }
 
 fn build_query(columns: Vec<String>, rows: Vec<Vec<CfmlValue>>) -> CfmlQueryData {
-    let mut out_rows = Vec::with_capacity(rows.len());
+    // Transpose row-major engine output into column-major storage. Each output
+    // row is a `Vec<CfmlValue>` in `columns` order; pivoting once here saves the
+    // ~74 ms per-query IndexMap allocation pass that the row-major build had.
+    let col_count = columns.len();
+    let row_count = rows.len();
+    let mut data: Vec<Vec<CfmlValue>> =
+        (0..col_count).map(|_| Vec::with_capacity(row_count)).collect();
     for row in rows {
-        let mut map = IndexMap::with_capacity(columns.len());
-        for (i, c) in columns.iter().enumerate() {
-            map.insert(c.clone(), row.get(i).cloned().unwrap_or(CfmlValue::Null));
+        let mut it = row.into_iter();
+        for ci in 0..col_count {
+            data[ci].push(it.next().unwrap_or(CfmlValue::Null));
         }
-        out_rows.push(map);
     }
-    CfmlQueryData {
-        columns,
-        rows: out_rows,
-        sql: None,
-    }
+    CfmlQueryData { columns, data, sql: None }
 }
 
 // ── DISTINCT / ORDER BY / LIMIT ─────────────────────────────────────────

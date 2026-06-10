@@ -834,18 +834,14 @@ impl CfmlValue {
                     return self.clone();
                 }
                 visited.push(ptr);
-                let (columns, rows, sql) =
-                    q.with_read(|d| (d.columns.clone(), d.rows.clone(), d.sql.clone()));
-                let rows = rows
+                let (columns, data, sql) =
+                    q.with_read(|d| (d.columns.clone(), d.data.clone(), d.sql.clone()));
+                let data = data
                     .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .map(|(k, v)| (k, v.deep_copy_guarded(visited)))
-                            .collect()
-                    })
+                    .map(|col| col.into_iter().map(|v| v.deep_copy_guarded(visited)).collect())
                     .collect();
                 visited.pop();
-                CfmlValue::Query(CfmlQuery::from_parts_sql(columns, rows, sql))
+                CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql }))
             }
             other => other.clone(),
         }
@@ -998,14 +994,272 @@ pub enum CfmlAccess {
     Remote,
 }
 
-/// Row-major backing data for a CFML query — the store behind the shared
+/// Column-major backing data for a CFML query — the store behind the shared
 /// [`CfmlQuery`] handle. Held directly (no lock) by the QoQ engine while it
 /// builds a result; wrapped in a `CfmlQuery` handle at the value boundary.
+///
+/// `data[col_idx]` is one column's values in row order. All inner `Vec`s have
+/// the same length (= [`row_count`](Self::row_count)). The outer `Vec` is
+/// parallel to `columns`. Use [`row_at`](Self::row_at) /
+/// [`synthesise_rows`](Self::synthesise_rows) to get a row-shaped view for
+/// CFML callers that want struct rows.
 #[derive(Debug, Clone, Default)]
 pub struct CfmlQueryData {
     pub columns: Vec<String>,
-    pub rows: Vec<IndexMap<String, CfmlValue>>,
+    pub data: Vec<Vec<CfmlValue>>,
     pub sql: Option<String>,
+}
+
+impl CfmlQueryData {
+    /// Empty data block with the given columns.
+    pub fn new(columns: Vec<String>) -> Self {
+        let n = columns.len();
+        Self { columns, data: (0..n).map(|_| Vec::new()).collect(), sql: None }
+    }
+
+    /// Build from columns + already-row-shaped rows (the legacy IndexMap shape).
+    /// Rows are unpacked into column-major storage; unknown columns in rows
+    /// extend the column list (matching Lucee/ACF row-then-column behaviour).
+    pub fn from_named_rows(
+        columns: Vec<String>,
+        rows: Vec<IndexMap<String, CfmlValue>>,
+    ) -> Self {
+        let mut q = Self::new(columns);
+        for row in rows {
+            q.push_row_named(row);
+        }
+        q
+    }
+
+    #[inline]
+    pub fn column_count(&self) -> usize { self.columns.len() }
+
+    #[inline]
+    pub fn row_count(&self) -> usize { self.data.first().map_or(0, |c| c.len()) }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.row_count() == 0 }
+
+    /// Case-insensitive column lookup.
+    #[inline]
+    pub fn column_index_ci(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c.eq_ignore_ascii_case(name))
+    }
+
+    /// Borrow a cell by (row, col_idx).
+    #[inline]
+    pub fn cell(&self, row: usize, col_idx: usize) -> Option<&CfmlValue> {
+        self.data.get(col_idx).and_then(|c| c.get(row))
+    }
+
+    #[inline]
+    pub fn cell_mut(&mut self, row: usize, col_idx: usize) -> Option<&mut CfmlValue> {
+        self.data.get_mut(col_idx).and_then(|c| c.get_mut(row))
+    }
+
+    /// Set a cell by column name (CI). Unknown columns are added (pre-existing
+    /// rows in that new column are Null). Returns false if `row` is out of range.
+    pub fn set_cell_named(&mut self, row: usize, name: &str, val: CfmlValue) -> bool {
+        if row >= self.row_count() {
+            return false;
+        }
+        if let Some(ci) = self.column_index_ci(name) {
+            self.data[ci][row] = val;
+        } else {
+            self.columns.push(name.to_string());
+            let rows = self.row_count();
+            let mut col = vec![CfmlValue::Null; rows];
+            col[row] = val;
+            self.data.push(col);
+        }
+        true
+    }
+
+    /// Borrow one column's values by index.
+    #[inline]
+    pub fn column_data(&self, col_idx: usize) -> Option<&Vec<CfmlValue>> {
+        self.data.get(col_idx)
+    }
+
+    /// Borrow one column's values by name (CI). Zero-copy.
+    #[inline]
+    pub fn column_data_ci(&self, name: &str) -> Option<&Vec<CfmlValue>> {
+        self.column_index_ci(name).and_then(|i| self.data.get(i))
+    }
+
+    /// Synthesise a single row as an `IndexMap` keyed by canonical column names.
+    pub fn row_at(&self, row: usize) -> Option<IndexMap<String, CfmlValue>> {
+        if row >= self.row_count() {
+            return None;
+        }
+        let mut m = IndexMap::with_capacity(self.columns.len());
+        for (ci, col) in self.columns.iter().enumerate() {
+            m.insert(col.clone(), self.data[ci][row].clone());
+        }
+        Some(m)
+    }
+
+    /// Synthesise every row as an `IndexMap` (used by Debug, serde, snapshot).
+    pub fn synthesise_rows(&self) -> Vec<IndexMap<String, CfmlValue>> {
+        (0..self.row_count()).map(|r| self.row_at(r).unwrap()).collect()
+    }
+
+    /// Fast path for `queryAddRow([positional])`. Extra values are dropped;
+    /// missing cells filled with Null.
+    pub fn push_row_positional(&mut self, mut vals: Vec<CfmlValue>) {
+        let n = self.columns.len();
+        vals.resize_with(n, || CfmlValue::Null);
+        for (ci, v) in vals.into_iter().enumerate() {
+            self.data[ci].push(v);
+        }
+    }
+
+    /// Append a row keyed by column name (CI). Any column in `row` that is not
+    /// already known extends `columns` (and back-fills prior rows with Null).
+    /// Missing columns get Null. Keeps the column-major invariant.
+    pub fn push_row_named(&mut self, row: IndexMap<String, CfmlValue>) {
+        // Extend columns with any new keys (rare in practice — most rows have
+        // the same shape).
+        for k in row.keys() {
+            if self.column_index_ci(k).is_none() {
+                self.columns.push(k.clone());
+                let prev = self.row_count();
+                self.data.push(vec![CfmlValue::Null; prev]);
+            }
+        }
+        // Lowercase the row keys once for the lookup loop (case-insensitive
+        // match against canonical columns).
+        for ci in 0..self.columns.len() {
+            let col_name = self.columns[ci].as_str();
+            let val = row
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
+                .map(|(_, v)| v.clone())
+                .unwrap_or(CfmlValue::Null);
+            self.data[ci].push(val);
+        }
+    }
+
+    pub fn insert_row_positional(&mut self, at: usize, mut vals: Vec<CfmlValue>) {
+        let n = self.columns.len();
+        vals.resize_with(n, || CfmlValue::Null);
+        for (ci, v) in vals.into_iter().enumerate() {
+            self.data[ci].insert(at, v);
+        }
+    }
+
+    pub fn insert_row_named(&mut self, at: usize, row: IndexMap<String, CfmlValue>) {
+        for k in row.keys() {
+            if self.column_index_ci(k).is_none() {
+                self.columns.push(k.clone());
+                let prev = self.row_count();
+                self.data.push(vec![CfmlValue::Null; prev]);
+            }
+        }
+        for ci in 0..self.columns.len() {
+            let col_name = self.columns[ci].as_str();
+            let val = row
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
+                .map(|(_, v)| v.clone())
+                .unwrap_or(CfmlValue::Null);
+            self.data[ci].insert(at, val);
+        }
+    }
+
+    /// Remove a row and return its synthesised `IndexMap`, or None if oob.
+    pub fn remove_row(&mut self, row: usize) -> Option<IndexMap<String, CfmlValue>> {
+        if row >= self.row_count() {
+            return None;
+        }
+        let m = self.row_at(row);
+        for col in &mut self.data {
+            col.remove(row);
+        }
+        m
+    }
+
+    pub fn swap_rows(&mut self, r1: usize, r2: usize) {
+        for col in &mut self.data {
+            col.swap(r1, r2);
+        }
+    }
+
+    pub fn reverse_rows(&mut self) {
+        for col in &mut self.data {
+            col.reverse();
+        }
+    }
+
+    /// Add a column, truncating/padding `values` to `row_count`.
+    pub fn add_column(&mut self, name: String, values: Vec<CfmlValue>) {
+        let r = self.row_count();
+        let mut col = values;
+        if col.len() > r {
+            col.truncate(r);
+        } else if col.len() < r {
+            col.resize_with(r, || CfmlValue::Null);
+        }
+        self.columns.push(name);
+        self.data.push(col);
+    }
+
+    /// Remove a column by case-insensitive name. Returns true if it existed.
+    pub fn remove_column_by_name(&mut self, name: &str) -> bool {
+        if let Some(idx) = self.column_index_ci(name) {
+            self.columns.remove(idx);
+            self.data.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Append the rows of `other`, adding any missing columns and filling with
+    /// Null where columns don't overlap.
+    pub fn append_query(&mut self, other: &CfmlQueryData) {
+        for col in &other.columns {
+            if self.column_index_ci(col).is_none() {
+                self.columns.push(col.clone());
+                let r = self.row_count();
+                self.data.push(vec![CfmlValue::Null; r]);
+            }
+        }
+        let or = other.row_count();
+        for ci in 0..self.columns.len() {
+            let col_name = self.columns[ci].as_str();
+            match other.column_index_ci(col_name) {
+                Some(oci) => {
+                    self.data[ci].extend(other.data[oci].iter().cloned());
+                }
+                None => {
+                    let new_len = self.data[ci].len() + or;
+                    self.data[ci].resize_with(new_len, || CfmlValue::Null);
+                }
+            }
+        }
+    }
+
+    /// Prepend the rows of `other`. Columns merge as with `append_query`.
+    pub fn prepend_query(&mut self, other: &CfmlQueryData) {
+        for col in &other.columns {
+            if self.column_index_ci(col).is_none() {
+                self.columns.push(col.clone());
+                let r = self.row_count();
+                self.data.push(vec![CfmlValue::Null; r]);
+            }
+        }
+        let or = other.row_count();
+        for ci in 0..self.columns.len() {
+            let col_name = self.columns[ci].as_str();
+            let mut prefix: Vec<CfmlValue> = match other.column_index_ci(col_name) {
+                Some(oci) => other.data[oci].clone(),
+                None => vec![CfmlValue::Null; or],
+            };
+            prefix.append(&mut self.data[ci]);
+            self.data[ci] = prefix;
+        }
+    }
 }
 
 /// Shared, interior-mutable backing for a CFML query — the query analogue of
@@ -1031,11 +1285,7 @@ pub struct CfmlQuery(Arc<PlRwLock<CfmlQueryData>>);
 impl CfmlQuery {
     /// A query with the given columns and no rows.
     pub fn new(columns: Vec<String>) -> Self {
-        CfmlQuery(Arc::new(PlRwLock::new(CfmlQueryData {
-            columns,
-            rows: Vec::new(),
-            sql: None,
-        })))
+        CfmlQuery(Arc::new(PlRwLock::new(CfmlQueryData::new(columns))))
     }
 
     /// Wrap an already-built data block (e.g. a QoQ result) into a handle.
@@ -1044,18 +1294,28 @@ impl CfmlQuery {
         CfmlQuery(Arc::new(PlRwLock::new(data)))
     }
 
-    /// Build from columns + rows (sql = None).
+    /// Build from columns + row-shaped data (sql = None). Rows are unpacked
+    /// into column-major storage.
     pub fn from_parts(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue>>) -> Self {
-        CfmlQuery::from_data(CfmlQueryData { columns, rows, sql: None })
+        CfmlQuery::from_data(CfmlQueryData::from_named_rows(columns, rows))
     }
 
-    /// Build from columns + rows + originating SQL.
+    /// Build from columns + row-shaped data + originating SQL.
     pub fn from_parts_sql(
         columns: Vec<String>,
         rows: Vec<IndexMap<String, CfmlValue>>,
         sql: Option<String>,
     ) -> Self {
-        CfmlQuery::from_data(CfmlQueryData { columns, rows, sql })
+        let mut d = CfmlQueryData::from_named_rows(columns, rows);
+        d.sql = sql;
+        CfmlQuery::from_data(d)
+    }
+
+    /// Clone the raw column-major backing arc so QoQ can hold a read guard
+    /// across `run_statement` and borrow column slices zero-copy. Internal.
+    #[inline]
+    pub fn backing(&self) -> Arc<PlRwLock<CfmlQueryData>> {
+        Arc::clone(&self.0)
     }
 
     /// Two handles onto the same backing store (reference identity).
@@ -1078,18 +1338,18 @@ impl CfmlQuery {
 
     #[inline]
     pub fn column_count(&self) -> usize {
-        self.0.read().columns.len()
+        self.0.read().column_count()
     }
 
     #[inline]
     pub fn row_count(&self) -> usize {
-        self.0.read().rows.len()
+        self.0.read().row_count()
     }
 
     /// True when the query has no rows.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.read().rows.is_empty()
+        self.0.read().is_empty()
     }
 
     /// Case-insensitive column presence check.
@@ -1108,54 +1368,42 @@ impl CfmlQuery {
             .join(",")
     }
 
-    /// A point-in-time copy of the rows.
+    /// A point-in-time snapshot of the rows as `IndexMap`s. Synthesised from
+    /// column-major storage on demand.
     #[inline]
     pub fn rows(&self) -> Vec<IndexMap<String, CfmlValue>> {
-        self.0.read().rows.clone()
+        self.0.read().synthesise_rows()
     }
 
     /// Snapshot of a single 0-based row, or `None` if out of range.
     pub fn get_row(&self, row0: usize) -> Option<IndexMap<String, CfmlValue>> {
-        self.0.read().rows.get(row0).cloned()
+        self.0.read().row_at(row0)
     }
 
     /// All values for a column (case-insensitive), one per row, in row order.
     /// `None` if the column doesn't exist. Used to build a `QueryColumn` proxy.
     pub fn column_values_ci(&self, name: &str) -> Option<Vec<CfmlValue>> {
-        let g = self.0.read();
-        if !g.columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
-            return None;
-        }
-        Some(
-            g.rows
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(CfmlValue::Null)
-                })
-                .collect(),
-        )
+        self.0.read().column_data_ci(name).map(|c| c.clone())
     }
 
     /// Append a row in place (interior mutability — visible to all aliases).
     /// This is the **O(1)** push that fixes the old O(n²) query build.
     #[inline]
     pub fn add_row(&self, row: IndexMap<String, CfmlValue>) {
-        self.0.write().rows.push(row);
+        self.0.write().push_row_named(row);
+    }
+
+    /// Append a row from positional cell values (fast path — no IndexMap alloc
+    /// per row). Extra values are dropped; missing cells are Null.
+    #[inline]
+    pub fn add_row_positional(&self, vals: Vec<CfmlValue>) {
+        self.0.write().push_row_positional(vals);
     }
 
     /// Set a cell at 0-based `row0` for `column` (in place). Returns false if
     /// the row is out of range.
     pub fn set_cell(&self, row0: usize, column: String, value: CfmlValue) -> bool {
-        let mut g = self.0.write();
-        if row0 < g.rows.len() {
-            g.rows[row0].insert(column, value);
-            true
-        } else {
-            false
-        }
+        self.0.write().set_cell_named(row0, &column, value)
     }
 
     pub fn sql(&self) -> Option<String> {
@@ -1187,7 +1435,7 @@ impl fmt::Debug for CfmlQuery {
         let d = self.0.read();
         f.debug_struct("CfmlQuery")
             .field("columns", &d.columns)
-            .field("rows", &d.rows)
+            .field("rows", &d.synthesise_rows())
             .field("sql", &d.sql)
             .finish()
     }
@@ -1241,8 +1489,8 @@ impl serde::Serialize for CfmlValue {
                 let mut map = s.serialize_map(Some(3))?;
                 map.serialize_entry("_cftype", "query")?;
                 map.serialize_entry("columns", &d.columns)?;
-                let rows: Vec<std::collections::HashMap<&str, &CfmlValue>> = d
-                    .rows
+                let synth = d.synthesise_rows();
+                let rows: Vec<std::collections::HashMap<&str, &CfmlValue>> = synth
                     .iter()
                     .map(|row| row.iter().map(|(k, v)| (k.as_str(), v)).collect())
                     .collect();
