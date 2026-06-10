@@ -35,7 +35,10 @@ const MAX_INTERSECTIONS: usize = 30_000_000;
 /// and no subquery anywhere), so evaluation never needs the non-`Send` VM
 /// callback. Non-wasm only.
 #[cfg(not(target_arch = "wasm32"))]
-const PARALLEL_ROW_THRESHOLD: usize = 10_000;
+// Lowered from 10_000 to 1_000 (v0.105.0) — measured against BoxLang, which
+// fans out at 50–100. Above ~1k rows the rayon fan-out cost is dwarfed by the
+// per-row WHERE/projection evaluation; below that, the sequential path wins.
+const PARALLEL_ROW_THRESHOLD: usize = 1_000;
 
 /// Bind parameters supplied to a parameterised QoQ query.
 #[derive(Debug, Default)]

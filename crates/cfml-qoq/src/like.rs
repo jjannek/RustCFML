@@ -1,8 +1,13 @@
 //! SQL `LIKE` pattern matching: `%` = any sequence, `_` = any single char,
 //! with optional `ESCAPE` char. Case-insensitive (CFML convention).
 //!
-//! Uses the linear-time iterative wildcard algorithm (single backtrack point
-//! per `%`), so it cannot blow up on pathological patterns like `%%%%a`.
+//! Dispatch:
+//! - Trivial ASCII shapes (`lit`, `lit%`, `%lit`) take a non-allocating
+//!   anchored ASCII-CI byte compare.
+//! - Everything else (`%lit%` contains, embedded `%`/`_`, non-ASCII, escape
+//!   chars) routes through the `regex` crate, which under the hood uses
+//!   Teddy / Aho-Corasick / Boyer-Moore for literal-bearing patterns and a
+//!   SIMD-backed DFA otherwise. Compiled once per pattern in [`compile`].
 
 #[derive(PartialEq, Debug, Clone)]
 enum Elem {
@@ -21,30 +26,30 @@ enum Elem {
 /// parallel filter.
 #[derive(Debug, Clone)]
 pub struct Compiled {
-    elems: Vec<Elem>,
-    /// Specialised fast-path for the dominant pattern shapes (`%lit%`, `lit%`,
-    /// `%lit`, `lit`). When set, [`Compiled::matches`] does an ASCII-CI byte
-    /// search and skips the per-row `Vec<char>` allocation + char lowercasing
-    /// that the general path needs.
-    fast: Option<FastPath>,
+    inner: Inner,
 }
 
-/// Pre-detected pattern shape for cheap matching. `needle` is the literal run
-/// between (or outside) `%` wildcards, already ASCII-lowercased at compile time.
 #[derive(Debug, Clone)]
-enum FastPath {
-    /// `literal` — no wildcards. Case-insensitive equality.
+enum Inner {
+    /// `literal` — anchored ASCII-CI equality.
     Equals(String),
-    /// `literal%` — case-insensitive prefix match.
+    /// `literal%` — anchored ASCII-CI prefix.
     StartsWith(String),
-    /// `%literal` — case-insensitive suffix match.
+    /// `%literal` — anchored ASCII-CI suffix.
     EndsWith(String),
-    /// `%literal%` — case-insensitive substring match.
+    /// `%literal%` — ASCII-CI substring. Hand-rolled byte loop is measurably
+    /// faster than `regex::is_match` on short needles + 1M-row scans (the
+    /// regex crate's per-call dispatch cost dominates when the literal
+    /// prefilter is the whole match).
     Contains(String),
+    /// Anything else: a regex compiled with `(?i)`. Anchors are emitted
+    /// only at edges that don't begin/end with `%`, so the crate's literal
+    /// extraction can pick the strongest prefilter.
+    Regex(regex::Regex),
 }
 
-/// Compile a LIKE pattern into elements, honouring the escape char (the char
-/// after `escape` is always a literal, even `%`/`_`).
+/// Compile a LIKE pattern, honouring the escape char (the char after
+/// `escape` is always a literal, even `%`/`_`).
 pub fn compile(pattern: &str, escape: Option<char>) -> Compiled {
     let esc = escape.map(|c| c.to_ascii_lowercase());
     let mut elems = Vec::new();
@@ -66,14 +71,13 @@ pub fn compile(pattern: &str, escape: Option<char>) -> Compiled {
             }
         }
     }
-    let fast = detect_fast_path(&elems);
-    Compiled { elems, fast }
+    Compiled { inner: build_inner(&elems) }
 }
 
-/// Recognise the four dominant pattern shapes — `lit`, `lit%`, `%lit`, `%lit%` —
-/// over a pure-ASCII literal run. Anything else (embedded `%`, `_`, non-ASCII
-/// literals) falls back to the general matcher.
-fn detect_fast_path(elems: &[Elem]) -> Option<FastPath> {
+/// Pick the cheapest matcher for the compiled element sequence. Trivial
+/// anchored ASCII shapes (`lit`, `lit%`, `%lit`) get inlined byte compares;
+/// everything else builds a `regex::Regex` once per pattern.
+fn build_inner(elems: &[Elem]) -> Inner {
     fn lit_run_ascii(es: &[Elem]) -> Option<String> {
         let mut out = String::with_capacity(es.len());
         for e in es {
@@ -87,24 +91,79 @@ fn detect_fast_path(elems: &[Elem]) -> Option<FastPath> {
     let n = elems.len();
     let starts_pct = matches!(elems.first(), Some(Elem::Any));
     let ends_pct = matches!(elems.last(), Some(Elem::Any));
+    // `lit`, `lit%`, `%lit` over a pure-ASCII literal run → anchored ASCII-CI
+    // byte compare. `%lit%` (Contains) goes to regex — its Teddy/memmem
+    // implementation beats a hand-rolled O(n·m) ASCII loop on long haystacks
+    // (Q6 in the bench was the headline cost).
+    if !starts_pct && !ends_pct {
+        if let Some(lit) = lit_run_ascii(elems) {
+            return Inner::Equals(lit);
+        }
+    } else if !starts_pct && ends_pct && n >= 1 {
+        if let Some(lit) = lit_run_ascii(&elems[..n - 1]) {
+            return Inner::StartsWith(lit);
+        }
+    } else if starts_pct && !ends_pct && n >= 1 {
+        if let Some(lit) = lit_run_ascii(&elems[1..]) {
+            return Inner::EndsWith(lit);
+        }
+    } else if starts_pct && ends_pct && n >= 2 {
+        if let Some(lit) = lit_run_ascii(&elems[1..n - 1]) {
+            return Inner::Contains(lit);
+        }
+    }
+    Inner::Regex(build_regex(elems))
+}
+
+/// Translate the compiled LIKE elements into a `(?i)`-flagged regex usable
+/// with `is_match` (which already scans for a match anywhere in the haystack).
+///
+/// Anchoring: leading/trailing `%` are *omitted*, not turned into `.*`.
+/// `%Harry%` ⇒ `(?i)harry` — the `regex` crate then sees a pure literal and
+/// dispatches to Teddy/memmem (SIMD substring) instead of a general DFA scan.
+/// `Harry%` ⇒ `(?i)^harry`. `%Harry` ⇒ `(?i)harry$`. `H_arry` ⇒
+/// `(?i)^h.arry$`. This matches the LIKE semantics exactly: a LIKE pattern
+/// must consume the entire string, so anchors are added at any edge that
+/// isn't a `%`.
+fn build_regex(elems: &[Elem]) -> regex::Regex {
+    let n = elems.len();
+    let starts_pct = matches!(elems.first(), Some(Elem::Any));
+    let ends_pct = matches!(elems.last(), Some(Elem::Any));
     let body = match (starts_pct, ends_pct) {
         (false, false) => &elems[..],
         (true, false) if n >= 1 => &elems[1..],
         (false, true) if n >= 1 => &elems[..n - 1],
         (true, true) if n >= 2 => &elems[1..n - 1],
-        _ => return None,
+        // patterns that are just `%` (or `%%…`) match everything
+        _ => return regex::Regex::new("").unwrap(),
     };
-    let lit = lit_run_ascii(body)?;
-    Some(match (starts_pct, ends_pct) {
-        (false, false) => FastPath::Equals(lit),
-        (false, true) => FastPath::StartsWith(lit),
-        (true, false) => FastPath::EndsWith(lit),
-        (true, true) => FastPath::Contains(lit),
-    })
+    let mut pat = String::with_capacity(body.len() * 2 + 8);
+    pat.push_str("(?is)");
+    if !starts_pct {
+        pat.push('^');
+    }
+    for e in body {
+        match e {
+            Elem::Any => pat.push_str(".*"),
+            Elem::One => pat.push('.'),
+            Elem::Lit(c) => {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                pat.push_str(&regex::escape(s));
+            }
+        }
+    }
+    if !ends_pct {
+        pat.push('$');
+    }
+    // `unwrap` is safe: every construction above is a valid regex by
+    // construction (we only emit `^`, `$`, `.`, `.*`, and escaped literals).
+    regex::Regex::new(&pat).unwrap()
 }
 
 /// Case-insensitive ASCII substring search. Both haystack and needle bytes are
-/// compared via `eq_ignore_ascii_case`, no allocation.
+/// compared via `eq_ignore_ascii_case`, no allocation. Measurably faster than
+/// `regex::Regex::is_match` for short needles on the 1M-row bench (Q6).
 #[inline]
 fn ascii_ci_contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
@@ -170,63 +229,56 @@ fn lower(c: char) -> char {
 impl Compiled {
     /// Does `text` match this compiled LIKE pattern? Case-insensitive.
     pub fn matches(&self, text: &str) -> bool {
-        // ASCII-CI fast path for the dominant `%lit%` / `lit%` / `%lit` / `lit`
-        // shapes. Skips the per-row `Vec<char>` allocation and lower-cases on
-        // the fly via byte compare. Falls back to the general matcher if the
-        // haystack contains non-ASCII bytes.
-        if let Some(fp) = &self.fast {
-            if text.is_ascii() {
-                let h = text.as_bytes();
-                return match fp {
-                    FastPath::Equals(n) => ascii_ci_equals(h, n.as_bytes()),
-                    FastPath::StartsWith(n) => ascii_ci_starts_with(h, n.as_bytes()),
-                    FastPath::EndsWith(n) => ascii_ci_ends_with(h, n.as_bytes()),
-                    FastPath::Contains(n) => ascii_ci_contains(h, n.as_bytes()),
-                };
+        match &self.inner {
+            // Anchored ASCII-CI fast paths: non-allocating, branch-light. If
+            // the haystack contains non-ASCII bytes, fall back to a regex —
+            // `regex` does the right thing on Unicode case folding under
+            // `(?i)`, which the byte path cannot.
+            Inner::Equals(n) if text.is_ascii() => {
+                ascii_ci_equals(text.as_bytes(), n.as_bytes())
             }
-        }
-        let pat = &self.elems;
-        let txt: Vec<char> = text.chars().map(lower).collect();
-
-        let mut i = 0usize; // index into txt
-        let mut j = 0usize; // index into pat
-        let mut star_j: Option<usize> = None;
-        let mut star_i = 0usize;
-
-        while i < txt.len() {
-            match pat.get(j) {
-                Some(Elem::Lit(c)) if *c == txt[i] => {
-                    i += 1;
-                    j += 1;
-                }
-                Some(Elem::One) => {
-                    i += 1;
-                    j += 1;
-                }
-                Some(Elem::Any) => {
-                    star_j = Some(j);
-                    star_i = i;
-                    j += 1;
-                }
-                _ => {
-                    // mismatch: backtrack to the last `%`, consuming one more char
-                    if let Some(sj) = star_j {
-                        j = sj + 1;
-                        star_i += 1;
-                        i = star_i;
-                    } else {
-                        return false;
-                    }
-                }
+            Inner::StartsWith(n) if text.is_ascii() => {
+                ascii_ci_starts_with(text.as_bytes(), n.as_bytes())
             }
+            Inner::EndsWith(n) if text.is_ascii() => {
+                ascii_ci_ends_with(text.as_bytes(), n.as_bytes())
+            }
+            Inner::Contains(n) if text.is_ascii() => {
+                ascii_ci_contains(text.as_bytes(), n.as_bytes())
+            }
+            Inner::Equals(n) => {
+                // Non-ASCII haystack: build a one-off anchored regex on the
+                // already-lowercased literal. Rare path — exact-match LIKEs
+                // are dominantly ASCII identifiers in practice.
+                regex_for_literal(n, /*anchor_start*/ true, /*anchor_end*/ true).is_match(text)
+            }
+            Inner::StartsWith(n) => {
+                regex_for_literal(n, true, false).is_match(text)
+            }
+            Inner::EndsWith(n) => {
+                regex_for_literal(n, false, true).is_match(text)
+            }
+            Inner::Contains(n) => {
+                regex_for_literal(n, false, false).is_match(text)
+            }
+            Inner::Regex(r) => r.is_match(text),
         }
-
-        // consume trailing `%`
-        while matches!(pat.get(j), Some(Elem::Any)) {
-            j += 1;
-        }
-        j == pat.len()
     }
+}
+
+/// Build a `(?i)`-flagged regex for a literal (already-lowercased) needle
+/// with optional anchors. Used only on the cold non-ASCII fallback paths.
+fn regex_for_literal(n: &str, anchor_start: bool, anchor_end: bool) -> regex::Regex {
+    let mut pat = String::with_capacity(n.len() + 8);
+    pat.push_str("(?is)");
+    if anchor_start {
+        pat.push('^');
+    }
+    pat.push_str(&regex::escape(n));
+    if anchor_end {
+        pat.push('$');
+    }
+    regex::Regex::new(&pat).unwrap()
 }
 
 /// Compile-and-match in one call. Convenience for non-hot paths and tests; the
