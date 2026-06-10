@@ -365,6 +365,16 @@ try { include "core/test_application_metadata.cfm"; } catch (any e) { writeOutpu
 //     option-forwarding. Surfaced while booting Wheels (contentFor section
 //     detection reads StructKeyList(arguments)).
 try { include "core/test_named_args_no_numeric_alias.cfm"; } catch (any e) { writeOutput("ERROR | core/test_named_args_no_numeric_alias.cfm | " & e.message & chr(10)); }
+//   - named_args_array_view: the arguments scope of a NAMED-argument call must
+//     stay array-addressable (hybrid array/struct) exactly like a positional
+//     call — ArrayLen(arguments) counts the args and arguments[1] reads the
+//     first declared slot / first value. RustCFML returned ArrayLen == 0 for
+//     every named call (and null for arguments[1] on paramless fns), so
+//     Wheels' paramless config setter $set() — which branches on
+//     ArrayLen(arguments) > 1 and reads arguments[1] — silently wrote every
+//     setting as an empty value and the ORM introspected the wrong (default
+//     in-memory) database.
+try { include "core/test_named_args_array_view.cfm"; } catch (any e) { writeOutput("ERROR | core/test_named_args_array_view.cfm | " & e.message & chr(10)); }
 //   - param_dotted_lhs: the cfscript `param` shorthand must accept a dotted /
 //     scoped lvalue (`param arguments.obj.key = default`), not just a bare
 //     identifier. Surfaced while booting WireBox (Injector.cfc uses
