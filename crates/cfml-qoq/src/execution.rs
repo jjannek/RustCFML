@@ -17,7 +17,8 @@ use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 
 use crate::ast::*;
-use crate::compare::{compare_total, group_key, sql_equal};
+use crate::compare::{compare_sql, compare_total, group_key, sql_equal};
+use crate::compiled::{self, CmpOp, CompiledExpr};
 use crate::function::{QoQFnKind, QoQFunctionRegistry};
 use crate::functions;
 use crate::intersection::build_intersections;
@@ -422,7 +423,12 @@ impl<'a, I: Invoker> Engine<'a, I> {
         let columns = derive_column_names(&select_cols);
 
         let intersections = self.build_core_intersections(&core, &tables)?;
-        let filtered = self.filter_where(intersections, &core.where_clause, &tables)?;
+        // Compile the WHERE clause once into the specialised CompiledExpr form
+        // (see `compiled.rs`); the per-row evaluator dispatches on it in fewer
+        // match arms than the full AST eval. Unrecognised subtrees fall through
+        // to the existing AST evaluator via `CompiledExpr::Generic`.
+        let compiled_where: Option<CompiledExpr> = core.where_clause.as_ref().map(compiled::compile);
+        let filtered = self.filter_where(intersections, compiled_where.as_ref(), &tables)?;
 
         let has_agg = select_cols.iter().any(|c| expr_has_aggregate(&c.expr, self.registry))
             || core
@@ -711,7 +717,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
     fn filter_where(
         &self,
         intersections: Vec<Vec<usize>>,
-        where_clause: &Option<Expr>,
+        where_clause: Option<&CompiledExpr>,
         tables: &TableSet,
     ) -> Result<Vec<Vec<usize>>, CfmlError> {
         let Some(expr) = where_clause else {
@@ -728,7 +734,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
             let kept: Result<Vec<Option<Vec<usize>>>, CfmlError> = intersections
                 .into_par_iter()
                 .map(|inter| {
-                    let v = pe.eval(expr, tables, RowCtx::Row(&inter))?;
+                    let v = pe.eval_compiled(expr, tables, RowCtx::Row(&inter))?;
                     Ok(if is_truthy(&v) { Some(inter) } else { None })
                 })
                 .collect();
@@ -736,7 +742,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         }
         let mut out = Vec::new();
         for inter in intersections {
-            let v = self.eval(expr, tables, RowCtx::Row(&inter))?;
+            let v = self.eval_compiled(expr, tables, RowCtx::Row(&inter))?;
             if is_truthy(&v) {
                 out.push(inter);
             }
@@ -1011,6 +1017,115 @@ impl<'a, I: Invoker> Engine<'a, I> {
             ),
 
             Expr::ScalarSubquery(select) => self.eval_scalar_subquery(select),
+        }
+    }
+
+    /// Per-row evaluator over the pre-compiled expression form built by
+    /// [`compiled::compile`] at bind time. Falls back to [`Self::eval`] for any
+    /// subtree shape we haven't specialised (encoded as `CompiledExpr::Generic`).
+    fn eval_compiled(
+        &self,
+        ce: &CompiledExpr,
+        tables: &TableSet,
+        ctx: RowCtx,
+    ) -> CfmlResult {
+        match ce {
+            CompiledExpr::Null => Ok(CfmlValue::Null),
+            CompiledExpr::LitBool(b) => Ok(CfmlValue::Bool(*b)),
+            CompiledExpr::LitInt(i) => Ok(CfmlValue::Int(*i)),
+            CompiledExpr::LitDouble(d) => Ok(CfmlValue::Double(*d)),
+            CompiledExpr::LitString(s) => Ok(CfmlValue::string(s.as_ref())),
+            CompiledExpr::Column { ti, ci } => {
+                Ok(self.eval_resolved_column(*ti, *ci, tables, ctx))
+            }
+            CompiledExpr::And(parts) => {
+                let mut any_unknown = false;
+                for p in parts {
+                    let v = self.eval_compiled(p, tables, ctx)?;
+                    match tri(&v) {
+                        Some(false) => return Ok(CfmlValue::Bool(false)),
+                        None => any_unknown = true,
+                        Some(true) => {}
+                    }
+                }
+                Ok(if any_unknown {
+                    CfmlValue::Null
+                } else {
+                    CfmlValue::Bool(true)
+                })
+            }
+            CompiledExpr::Or(parts) => {
+                let mut any_unknown = false;
+                for p in parts {
+                    let v = self.eval_compiled(p, tables, ctx)?;
+                    match tri(&v) {
+                        Some(true) => return Ok(CfmlValue::Bool(true)),
+                        None => any_unknown = true,
+                        Some(false) => {}
+                    }
+                }
+                Ok(if any_unknown {
+                    CfmlValue::Null
+                } else {
+                    CfmlValue::Bool(false)
+                })
+            }
+            CompiledExpr::Not(inner) => {
+                let v = self.eval_compiled(inner, tables, ctx)?;
+                Ok(match tri(&v) {
+                    Some(true) => CfmlValue::Bool(false),
+                    Some(false) => CfmlValue::Bool(true),
+                    None => CfmlValue::Null,
+                })
+            }
+            CompiledExpr::IsNull { expr, negated } => {
+                let v = self.eval_compiled(expr, tables, ctx)?;
+                let is_null = matches!(v, CfmlValue::Null);
+                Ok(CfmlValue::Bool(is_null ^ negated))
+            }
+            CompiledExpr::ColCmpLit { ti, ci, op, rhs } => {
+                let v = self.eval_resolved_column(*ti, *ci, tables, ctx);
+                Ok(cmp_to_bool_value(&v, *op, rhs))
+            }
+            CompiledExpr::Cmp { lhs, op, rhs } => {
+                let l = self.eval_compiled(lhs, tables, ctx)?;
+                let r = self.eval_compiled(rhs, tables, ctx)?;
+                Ok(cmp_to_bool_value(&l, *op, &r))
+            }
+            CompiledExpr::ColInLits {
+                ti,
+                ci,
+                negated,
+                lits,
+            } => {
+                let v = self.eval_resolved_column(*ti, *ci, tables, ctx);
+                if matches!(v, CfmlValue::Null) {
+                    return Ok(CfmlValue::Null);
+                }
+                let mut found_null = false;
+                for lit in lits {
+                    match sql_equal(&v, lit) {
+                        Some(true) => return Ok(CfmlValue::Bool(!negated)),
+                        Some(false) => {}
+                        None => found_null = true,
+                    }
+                }
+                Ok(membership_result(false, found_null, *negated))
+            }
+            CompiledExpr::LikeConst {
+                lhs,
+                negated,
+                compiled,
+            } => {
+                let v = self.eval_compiled(lhs, tables, ctx)?;
+                if matches!(v, CfmlValue::Null) {
+                    return Ok(CfmlValue::Null);
+                }
+                let s = v.as_string();
+                let m = compiled.matches(&s);
+                Ok(CfmlValue::Bool(m ^ *negated))
+            }
+            CompiledExpr::Generic(e) => self.eval(e, tables, ctx),
         }
     }
 
@@ -1513,6 +1628,22 @@ fn aggregate_numeric(name: &str, col: &[CfmlValue]) -> CfmlValue {
 // ── Boolean / operator helpers ──────────────────────────────────────────
 
 /// Three-valued truth of a value: `None` = unknown (NULL).
+/// Compiled-expression comparison helper: applies a [`CmpOp`] to two values
+/// via [`compare_sql`] and wraps the 3-valued result back into a CfmlValue.
+fn cmp_to_bool_value(l: &CfmlValue, op: CmpOp, r: &CfmlValue) -> CfmlValue {
+    match compare_sql(l, r) {
+        None => CfmlValue::Null,
+        Some(ord) => CfmlValue::Bool(match op {
+            CmpOp::Eq => ord == Ordering::Equal,
+            CmpOp::Neq => ord != Ordering::Equal,
+            CmpOp::Lt => ord == Ordering::Less,
+            CmpOp::Lte => ord != Ordering::Greater,
+            CmpOp::Gt => ord == Ordering::Greater,
+            CmpOp::Gte => ord != Ordering::Less,
+        }),
+    }
+}
+
 fn tri(v: &CfmlValue) -> Option<bool> {
     match v {
         CfmlValue::Null => None,

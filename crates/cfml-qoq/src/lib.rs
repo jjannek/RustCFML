@@ -7,6 +7,7 @@
 
 pub mod ast;
 pub mod compare;
+pub mod compiled;
 pub mod execution;
 pub mod function;
 pub mod functions;
