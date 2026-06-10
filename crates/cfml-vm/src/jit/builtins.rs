@@ -27,6 +27,10 @@ pub enum KindReq {
     /// `Kind::Int` or `Kind::Float` — promoted at the ABI to the shim's
     /// `args_abi` slot via `to_f64` / `to_i64`.
     Numeric,
+    /// Must be exactly `Kind::Boxed` (Option-γ tag-pointer). v0.92.0+ —
+    /// crosses to the shim as a raw `i64` holding the tagged pointer; the
+    /// shim borrows the underlying `CfmlValue` via `boxed::borrow_tagged`.
+    Boxed,
 }
 
 impl KindReq {
@@ -35,6 +39,7 @@ impl KindReq {
             (KindReq::Int, Kind::Int) => true,
             (KindReq::Float, Kind::Float) => true,
             (KindReq::Numeric, Kind::Int | Kind::Float) => true,
+            (KindReq::Boxed, Kind::Boxed) => true,
             _ => false,
         }
     }
@@ -237,6 +242,72 @@ extern "C" fn cfml_bit_mask_clear_i64(number: i64, start: i64, length: i64) -> i
 /// to `2 ^ 10`.
 extern "C" fn cfml_pow_fn_f64(base: f64, exp: f64) -> f64 {
     base.powf(exp)
+}
+
+// ── v0.92.0 Boxed-argument shims ────────────────────────────────────────────
+// Each one takes a tagged `i64` (TAG_PTR-encoded `*const CfmlValue` from
+// `boxed.rs`), borrows the underlying value via `boxed::borrow_tagged`, and
+// either returns an `i64` (numeric ret_kind) or constructs a fresh
+// `CfmlValue` and pushes it into the active arena (Boxed ret_kind).
+//
+// All six mirror their `cfml-stdlib::builtins::fn_*` counterparts bit-for-bit
+// and are infallible by design: `len` is defensive (returns 0 for unknown
+// types in interp), and the case/trim shims use `as_string()` which works on
+// every `CfmlValue` variant. No bail path needed.
+
+/// Mirrors `fn_len`: `String → s.len()` (bytes), `Bool/Int/Double → chars of
+/// the stringified form`, `Array/Struct/Binary → element count`,
+/// `QueryColumn → chars of stringified first row`, anything else → `0`.
+extern "C" fn cfml_len_boxed_i64(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    match v {
+        CfmlValue::String(s) => s.len() as i64,
+        CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) => {
+            v.as_string().chars().count() as i64
+        }
+        CfmlValue::Array(a) => a.len() as i64,
+        CfmlValue::Struct(s) => s.len() as i64,
+        CfmlValue::Binary(b) => b.len() as i64,
+        CfmlValue::QueryColumn(_) => v.as_string().chars().count() as i64,
+        _ => 0,
+    }
+}
+
+/// Mirrors `fn_ucase`: `CfmlValue::string(v.as_string().to_uppercase())`,
+/// boxed into the active arena. Result kind: `Boxed`.
+extern "C" fn cfml_ucase_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::string(v.as_string().to_uppercase())) as i64
+}
+
+/// Mirrors `fn_lcase`.
+extern "C" fn cfml_lcase_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::string(v.as_string().to_lowercase())) as i64
+}
+
+/// Mirrors `fn_trim`.
+extern "C" fn cfml_trim_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::string(v.as_string().trim().to_string())) as i64
+}
+
+/// Mirrors `fn_ltrim`.
+extern "C" fn cfml_ltrim_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::string(v.as_string().trim_start().to_string())) as i64
+}
+
+/// Mirrors `fn_rtrim`.
+extern "C" fn cfml_rtrim_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    super::arena::box_into_active(CfmlValue::string(v.as_string().trim_end().to_string())) as i64
 }
 
 /// The complete shim table. Order matters for `lookup_overload`: more specific
@@ -512,6 +583,55 @@ pub static SHIMS: &[Shim] = &[
         sym: "cfml_pow_fn_f64",
         addr: cfml_pow_fn_f64 as *const u8,
     },
+    // ── v0.92.0 — Boxed-argument string/array shims ──────────────────────
+    Shim {
+        name: "len",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Int,
+        sym: "cfml_len_boxed_i64",
+        addr: cfml_len_boxed_i64 as *const u8,
+    },
+    Shim {
+        name: "ucase",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_ucase_boxed",
+        addr: cfml_ucase_boxed as *const u8,
+    },
+    Shim {
+        name: "lcase",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_lcase_boxed",
+        addr: cfml_lcase_boxed as *const u8,
+    },
+    Shim {
+        name: "trim",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_trim_boxed",
+        addr: cfml_trim_boxed as *const u8,
+    },
+    Shim {
+        name: "ltrim",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_ltrim_boxed",
+        addr: cfml_ltrim_boxed as *const u8,
+    },
+    Shim {
+        name: "rtrim",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_rtrim_boxed",
+        addr: cfml_rtrim_boxed as *const u8,
+    },
 ];
 
 /// Lowercased lookup: `true` iff some shim has this exact name. Currently only
@@ -595,6 +715,89 @@ mod tests {
         assert!(lookup_overload("nope", &[Kind::Int]).is_none());
         assert!(lookup_overload("abs", &[Kind::Int, Kind::Int]).is_none());
         assert!(lookup_overload("min", &[Kind::Int]).is_none());
+    }
+
+    #[test]
+    fn boxed_overloads_match_only_boxed_args() {
+        use super::super::analysis::Kind;
+        // len / uCase / lCase / trim / ltrim / rtrim each accept exactly
+        // one Boxed argument. Int and Float must miss.
+        for name in ["len", "ucase", "lcase", "trim", "ltrim", "rtrim"] {
+            assert!(
+                lookup_overload(name, &[Kind::Boxed]).is_some(),
+                "{name}(Boxed) must match"
+            );
+            assert!(
+                lookup_overload(name, &[Kind::Int]).is_none(),
+                "{name}(Int) must not match"
+            );
+            assert!(
+                lookup_overload(name, &[Kind::Float]).is_none(),
+                "{name}(Float) must not match"
+            );
+        }
+        // len returns Int; the case/trim family return Boxed.
+        let idx = lookup_overload("len", &[Kind::Boxed]).unwrap();
+        assert_eq!(SHIMS[idx].ret_kind, Kind::Int);
+        for name in ["ucase", "lcase", "trim", "ltrim", "rtrim"] {
+            let idx = lookup_overload(name, &[Kind::Boxed]).unwrap();
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed, "{name} ret must be Boxed");
+        }
+    }
+
+    #[test]
+    fn boxed_shims_match_interpreter() {
+        use super::super::arena::{Arena, ArenaGuard};
+        use super::super::boxed;
+        use cfml_common::dynamic::CfmlValue;
+
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+
+        // len on a String returns byte length.
+        let s = boxed::box_value(CfmlValue::string("héllo")) as i64;
+        assert_eq!(cfml_len_boxed_i64(s), "héllo".len() as i64);
+        // len on Int stringifies and counts chars: "12345" → 5.
+        let i = boxed::box_value(CfmlValue::Int(12345)) as i64;
+        assert_eq!(cfml_len_boxed_i64(i), 5);
+        // len on Array.
+        let a = boxed::box_value(CfmlValue::Array(cfml_common::dynamic::CfmlArray::new(vec![
+            CfmlValue::Int(1),
+            CfmlValue::Int(2),
+            CfmlValue::Int(3),
+        ]))) as i64;
+        assert_eq!(cfml_len_boxed_i64(a), 3);
+
+        // ucase / lcase / trim / ltrim / rtrim — produce arena-allocated boxes
+        // whose underlying value matches the interpreter.
+        let mixed = boxed::box_value(CfmlValue::string("  AbCd  ")) as i64;
+        let upper = cfml_ucase_boxed(mixed);
+        let v = unsafe { boxed::borrow_tagged(upper as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "  ABCD  "));
+
+        let lower = cfml_lcase_boxed(mixed);
+        let v = unsafe { boxed::borrow_tagged(lower as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "  abcd  "));
+
+        let t = cfml_trim_boxed(mixed);
+        let v = unsafe { boxed::borrow_tagged(t as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "AbCd"));
+
+        let lt = cfml_ltrim_boxed(mixed);
+        let v = unsafe { boxed::borrow_tagged(lt as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "AbCd  "));
+
+        let rt = cfml_rtrim_boxed(mixed);
+        let v = unsafe { boxed::borrow_tagged(rt as usize) };
+        assert!(matches!(v, CfmlValue::String(s) if s.as_str() == "  AbCd"));
+
+        drop(_g);
+        // Reclaim the manually-boxed inputs; arena drains the shim outputs.
+        drop(unsafe { boxed::reclaim_tagged(s as usize) });
+        drop(unsafe { boxed::reclaim_tagged(i as usize) });
+        drop(unsafe { boxed::reclaim_tagged(a as usize) });
+        drop(unsafe { boxed::reclaim_tagged(mixed as usize) });
+        arena.drain_except(None);
     }
 
     #[test]

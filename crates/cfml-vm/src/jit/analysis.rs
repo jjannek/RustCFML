@@ -969,9 +969,16 @@ fn simulate_block(
                 let marker = stack.pop()?;
                 match marker {
                     Kind::Builtin(name) => {
-                        // Builtin shims have static ABIs that only admit
-                        // Int/Float operands today (Option-A surface).
-                        if arg_kinds.iter().any(|k| !matches!(k, Kind::Int | Kind::Float)) {
+                        // v0.92.0: builtin shims may now also accept Boxed
+                        // operands (Option-γ tag-pointer) for string/array
+                        // surface shims (len, uCase, …). Bool / Builtin /
+                        // UdfRef are still hard-rejected; the per-overload
+                        // `KindReq` decides which of Int / Float / Boxed an
+                        // accepted shim actually takes at this position.
+                        if arg_kinds
+                            .iter()
+                            .any(|k| !matches!(k, Kind::Int | Kind::Float | Kind::Boxed))
+                        {
                             return None;
                         }
                         let shim_idx = builtins::lookup_overload(name, &arg_kinds)?;

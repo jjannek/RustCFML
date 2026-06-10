@@ -737,3 +737,56 @@ fn osr_rejects_thin_udf_wrapper_loop() {
         "thin UDF-wrapper outer loop must be rejected by the admission heuristic (got osr_compiled={osr_compiled})"
     );
 }
+
+// ── v0.92.0 — Boxed-argument string shims (len / uCase / lCase / trim…) ──
+
+#[test]
+fn ucase_lcase_concat_in_jitted_udf_matches_interpreter() {
+    // `tag(s)` takes a Boxed param, calls uCase + lCase (both Boxed → Boxed
+    // shims), and concatenates. Whole-function JIT must engage and produce
+    // byte-identical output to the interpreter oracle.
+    let src = r#"
+        function tag(s) { return uCase(s) & ":" & lCase(s); }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & tag("AbCd-#k#") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "uCase/lCase Boxed shim output must match the interpreter");
+    assert!(compiled >= 1, "expected tag() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn len_of_boxed_string_arg_returns_int_in_jit() {
+    // `sz(s)` calls len(s) which returns Int through a Boxed-arg shim. The
+    // value flows back into arithmetic — proving the Int return kind plumbs
+    // back into the standard numeric lattice from a Boxed callsite.
+    let src = r#"
+        function sz(s) { return len(s) * 2 + 1; }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & sz("len-#k#") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "len() Boxed shim output must match the interpreter");
+    assert!(compiled >= 1, "expected sz() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn trim_family_in_jitted_udf_matches_interpreter() {
+    // trim / ltrim / rtrim each accept Boxed → return Boxed. Compose them
+    // through a Concat to confirm a chain of Boxed-producing shims survives
+    // round-trip through the arena.
+    let src = r#"
+        function clean(s) { return trim(s) & "|" & ltrim(s) & "|" & rtrim(s); }
+        out = "";
+        for (k = 1; k <= 80; k++) { out = out & clean("  AbC-#k#  ") & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "trim-family Boxed shim output must match the interpreter");
+    assert!(compiled >= 1, "expected clean() to be JIT-compiled, got {compiled}");
+}
