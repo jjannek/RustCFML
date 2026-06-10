@@ -3931,15 +3931,43 @@ fn fn_list_last(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_list_rest(args: Vec<CfmlValue>) -> CfmlResult {
+    // Lucee/ACF/BoxLang parity: return the LITERAL substring of `list` from
+    // the start of element 2 to the end — preserving interior/trailing empty
+    // elements and the original delimiter chars. Empty-collapsing only
+    // applies to the leading run of delimiters (so "/a/b/" treats "a" as
+    // element 1) and to the run of delimiters that ends element 1.
     let list = get_str(&args, 0);
     let delimiter = get_delimiter(&args, 1);
-    let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
-    let items = cfml_list_split(&list, &delimiter);
-    if items.len() > 1 {
-        Ok(CfmlValue::string(items[1..].join(&first_delim)))
-    } else {
-        Ok(CfmlValue::string(String::new()))
+    let is_delim = |c: char| delimiter.contains(c);
+    let mut iter = list.char_indices().peekable();
+    // Skip leading delimiter chars (collapse leading empty elements).
+    while let Some(&(_, c)) = iter.peek() {
+        if is_delim(c) {
+            iter.next();
+        } else {
+            break;
+        }
     }
+    // Consume the first non-empty element.
+    while let Some(&(_, c)) = iter.peek() {
+        if is_delim(c) {
+            break;
+        }
+        iter.next();
+    }
+    // Skip the run of delimiters that ends element 1.
+    while let Some(&(_, c)) = iter.peek() {
+        if is_delim(c) {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    let rest = match iter.peek() {
+        Some(&(i, _)) => &list[i..],
+        None => "",
+    };
+    Ok(CfmlValue::string(rest.to_string()))
 }
 
 fn fn_list_remove_duplicates(args: Vec<CfmlValue>) -> CfmlResult {
