@@ -4,7 +4,7 @@
 //! Uses the linear-time iterative wildcard algorithm (single backtrack point
 //! per `%`), so it cannot blow up on pathological patterns like `%%%%a`.
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum Elem {
     /// `%`
     Any,
@@ -19,7 +19,7 @@ enum Elem {
 /// row (the QoQ engine pre-compiles literal patterns once per query). `Send +
 /// Sync`, so the shared compiled-pattern cache is safe to read across the rayon
 /// parallel filter.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Compiled {
     elems: Vec<Elem>,
 }

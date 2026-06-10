@@ -496,6 +496,7 @@ impl Parser {
             negated,
             pattern: Box::new(pattern),
             escape,
+            compiled: None,
         })
     }
 

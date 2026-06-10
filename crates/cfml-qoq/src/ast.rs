@@ -7,6 +7,8 @@
 
 use cfml_common::dynamic::CfmlValue;
 
+use crate::like;
+
 /// Top-level parsed statement. QoQ only executes `SELECT`.
 #[derive(Debug, Clone)]
 pub enum Statement {
@@ -122,6 +124,12 @@ pub enum Expr {
     Star { table: Option<String> },
     /// `column` or `table.column`.
     Column { table: Option<String>, name: String },
+    /// Bind-resolved column reference: a `(table_index, column_index)` slot
+    /// into the current `TableSet`. Produced by [`bind_core`] (execution.rs)
+    /// from `Column` once per query (after `resolve_tables` + `expand_columns`)
+    /// so per-row eval skips the linear table+column name scan. `name` is kept
+    /// for `derive_column_names` and error messages.
+    ResolvedColumn { ti: u32, ci: u32, name: String },
     /// A literal value (number, string, NULL, TRUE/FALSE).
     Literal(CfmlValue),
     /// `left <op> right`.
@@ -152,6 +160,11 @@ pub enum Expr {
         negated: bool,
         pattern: Box<Expr>,
         escape: Option<Box<Expr>>,
+        /// Pre-compiled matcher when `pattern` (and `escape`, if present) is a
+        /// constant literal. Populated by `bind_expr` (execution.rs) once per
+        /// query so per-row `eval_like` skips recompiling. `None` for
+        /// non-literal patterns (parameter / expression).
+        compiled: Option<like::Compiled>,
     },
     /// `(SELECT …)` used as a scalar value (first row, first column).
     ScalarSubquery(Box<SelectStatement>),

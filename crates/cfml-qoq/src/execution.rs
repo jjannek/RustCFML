@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use cfml_common::dynamic::{CfmlQuery, CfmlQueryData, CfmlValue};
 use cfml_common::vm::{CfmlError, CfmlResult};
@@ -75,9 +75,10 @@ pub fn execute(
     // custom CFML UDF and there are no subqueries/derived tables — i.e. row
     // evaluation never needs the (non-`Send`) VM callback or a recursive run.
     let parallel = is_parallel_safe(select, registry);
-    // Pre-compile every constant-pattern LIKE once (keyed by the pattern node's
-    // address) so the per-row filter reuses it instead of recompiling per row.
-    let like_cache = build_like_cache(select);
+    // Constant-pattern LIKE matchers are pre-compiled by `bind_expr` directly
+    // onto the cloned AST node (`Expr::Like.compiled`) per `run_core`, so the
+    // per-row filter reuses it instead of recompiling per row.
+    //
     // The sequential invoker owns the VM callback behind a `RefCell` so the
     // engine's methods can be `&self` (the only thing that ever needed `&mut`).
     let seq = SeqInvoker {
@@ -89,7 +90,6 @@ pub fn execute(
         registry,
         inv: &seq,
         parallel,
-        like_cache: &like_cache,
     };
     let query = engine.run_statement(select)?;
     Ok(CfmlValue::Query(CfmlQuery::from_data(query)))
@@ -193,131 +193,11 @@ fn expr_is_pure(e: &Expr, reg: &QoQFunctionRegistry) -> bool {
                 && expr_is_pure(pattern, reg)
                 && escape.as_ref().map(|e| expr_is_pure(e, reg)).unwrap_or(true)
         }
-        Expr::Star { .. } | Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) => true,
-    }
-}
-
-/// Walk the statement and pre-compile every LIKE whose pattern (and escape, if
-/// any) is a constant literal, keyed by the pattern `Expr` node's address. The
-/// per-row `eval_like` then reuses the compiled matcher instead of recompiling.
-fn build_like_cache(stmt: &SelectStatement) -> HashMap<usize, like::Compiled> {
-    let mut cache = HashMap::new();
-    collect_likes_select(stmt, &mut cache);
-    cache
-}
-
-fn collect_likes_select(s: &SelectStatement, cache: &mut HashMap<usize, like::Compiled>) {
-    collect_likes_core(&s.body, cache);
-    for u in &s.unions {
-        collect_likes_core(&u.select, cache);
-    }
-    for ob in &s.order_by {
-        collect_likes_expr(&ob.expr, cache);
-    }
-}
-
-fn collect_likes_core(c: &SelectCore, cache: &mut HashMap<usize, like::Compiled>) {
-    if let Some(TableRef::Derived { select, .. }) = &c.from {
-        collect_likes_select(select, cache);
-    }
-    for j in &c.joins {
-        if let TableRef::Derived { select, .. } = &j.table {
-            collect_likes_select(select, cache);
-        }
-        if let Some(on) = &j.on {
-            collect_likes_expr(on, cache);
-        }
-    }
-    if let Some(w) = &c.where_clause {
-        collect_likes_expr(w, cache);
-    }
-    for g in &c.group_by {
-        collect_likes_expr(g, cache);
-    }
-    if let Some(h) = &c.having {
-        collect_likes_expr(h, cache);
-    }
-    for col in &c.columns {
-        collect_likes_expr(&col.expr, cache);
-    }
-}
-
-fn collect_likes_expr(e: &Expr, cache: &mut HashMap<usize, like::Compiled>) {
-    match e {
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            collect_likes_expr(expr, cache);
-            collect_likes_expr(pattern, cache);
-            if let Some(es) = escape {
-                collect_likes_expr(es, cache);
-            }
-            // Cache only when the pattern is a non-NULL literal and the escape
-            // (if present) is also a literal — i.e. constant for the whole query.
-            if let Expr::Literal(pv) = &**pattern {
-                if !matches!(pv, CfmlValue::Null) {
-                    let esc = match escape.as_deref() {
-                        None => Some(None),
-                        Some(Expr::Literal(ev)) => Some(ev.as_string().chars().next()),
-                        Some(_) => None, // non-literal escape → can't pre-compile
-                    };
-                    if let Some(esc) = esc {
-                        let key = (&**pattern) as *const Expr as usize;
-                        cache.insert(key, like::compile(&pv.as_string(), esc));
-                    }
-                }
-            }
-        }
-        Expr::Binary { left, right, .. } => {
-            collect_likes_expr(left, cache);
-            collect_likes_expr(right, cache);
-        }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
-            collect_likes_expr(expr, cache)
-        }
-        Expr::Function { args, .. } => {
-            for a in args {
-                collect_likes_expr(a, cache);
-            }
-        }
-        Expr::Case {
-            operand,
-            whens,
-            else_expr,
-        } => {
-            if let Some(o) = operand {
-                collect_likes_expr(o, cache);
-            }
-            for w in whens {
-                collect_likes_expr(&w.when, cache);
-                collect_likes_expr(&w.then, cache);
-            }
-            if let Some(e) = else_expr {
-                collect_likes_expr(e, cache);
-            }
-        }
-        Expr::InList { expr, list, .. } => {
-            collect_likes_expr(expr, cache);
-            for e in list {
-                collect_likes_expr(e, cache);
-            }
-        }
-        Expr::InSubquery { expr, select, .. } => {
-            collect_likes_expr(expr, cache);
-            collect_likes_select(select, cache);
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            collect_likes_expr(expr, cache);
-            collect_likes_expr(low, cache);
-            collect_likes_expr(high, cache);
-        }
-        Expr::ScalarSubquery(select) => collect_likes_select(select, cache),
-        Expr::Star { .. } | Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) => {}
+        Expr::Star { .. }
+        | Expr::Column { .. }
+        | Expr::ResolvedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_) => true,
     }
 }
 
@@ -438,7 +318,11 @@ fn walk_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String>) {
             }
         }
         Expr::ScalarSubquery(select) => walk_select(select, out, seen),
-        Expr::Star { .. } | Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) => {}
+        Expr::Star { .. }
+        | Expr::Column { .. }
+        | Expr::ResolvedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_) => {}
     }
 }
 
@@ -467,10 +351,6 @@ struct Engine<'a, I: Invoker> {
     /// Only read by the rayon path, so it's dead on wasm32.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     parallel: bool,
-    /// Constant LIKE patterns pre-compiled once, keyed by the pattern `Expr`
-    /// node's address. Read-only (built before execution), so it's shared
-    /// across the rayon parallel filter without locking.
-    like_cache: &'a HashMap<usize, like::Compiled>,
 }
 
 impl<'a, I: Invoker> Engine<'a, I> {
@@ -518,19 +398,27 @@ impl<'a, I: Invoker> Engine<'a, I> {
 
     fn run_core(
         &self,
-        core: &SelectCore,
-        order_by: &[OrderByExpr],
+        core_in: &SelectCore,
+        order_by_in: &[OrderByExpr],
     ) -> Result<CoreResult, CfmlError> {
-        let tables = self.resolve_tables(core)?;
+        let tables = self.resolve_tables(core_in)?;
 
         if tables.is_empty() {
-            return self.run_no_from(core, order_by);
+            return self.run_no_from(core_in, order_by_in);
         }
 
-        let select_cols = expand_columns(&core.columns, &tables)?;
+        // Clone the core + ORDER BY so we can rewrite column refs into
+        // pre-resolved `(ti, ci)` slots before any per-row evaluation. The
+        // clone is O(expression-tree) — microseconds — vs the per-row
+        // `resolve_column` linear scan it eliminates over 1M rows.
+        let mut core: SelectCore = core_in.clone();
+        let mut order_by: Vec<OrderByExpr> = order_by_in.to_vec();
+
+        let mut select_cols = expand_columns(&core.columns, &tables)?;
+        bind_core(&mut core, &mut select_cols, &mut order_by, &tables);
         let columns = derive_column_names(&select_cols);
 
-        let intersections = self.build_core_intersections(core, &tables)?;
+        let intersections = self.build_core_intersections(&core, &tables)?;
         let filtered = self.filter_where(intersections, &core.where_clause, &tables)?;
 
         let has_agg = select_cols.iter().any(|c| expr_has_aggregate(&c.expr, self.registry))
@@ -541,9 +429,9 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 .unwrap_or(false);
 
         let (mut rows, mut sort_keys) = if has_agg || !core.group_by.is_empty() {
-            self.exec_aggregate(core, &select_cols, &filtered, &tables, order_by)?
+            self.exec_aggregate(&core, &select_cols, &filtered, &tables, &order_by)?
         } else {
-            self.exec_simple(&select_cols, &filtered, &tables, order_by)?
+            self.exec_simple(&select_cols, &filtered, &tables, &order_by)?
         };
 
         if core.distinct {
@@ -677,7 +565,6 @@ impl<'a, I: Invoker> Engine<'a, I> {
             registry: self.registry,
             inv: pure,
             parallel: false,
-            like_cache: self.like_cache,
         }
     }
 
@@ -882,6 +769,8 @@ impl<'a, I: Invoker> Engine<'a, I> {
 
             Expr::Column { table, name } => self.eval_column(table.as_deref(), name, tables, ctx),
 
+            Expr::ResolvedColumn { ti, ci, .. } => Ok(self.eval_resolved_column(*ti, *ci, tables, ctx)),
+
             Expr::Param(p) => self.eval_param(p),
 
             Expr::Function { name, args, distinct } => {
@@ -943,10 +832,41 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 negated,
                 pattern,
                 escape,
-            } => self.eval_like(expr, *negated, pattern, escape.as_deref(), tables, ctx),
+                compiled,
+            } => self.eval_like(
+                expr,
+                *negated,
+                pattern,
+                escape.as_deref(),
+                compiled.as_ref(),
+                tables,
+                ctx,
+            ),
 
             Expr::ScalarSubquery(select) => self.eval_scalar_subquery(select),
         }
+    }
+
+    /// Fast path for an already-bound column ref: skip the linear
+    /// `resolve_column` (case-insensitive table-name + column-name scan) that
+    /// `eval_column` performs. `ti`/`ci` are pre-resolved into the local
+    /// `TableSet`.
+    #[inline]
+    fn eval_resolved_column(
+        &self,
+        ti: u32,
+        ci: u32,
+        tables: &TableSet,
+        ctx: RowCtx,
+    ) -> CfmlValue {
+        let inter: &[usize] = match ctx {
+            RowCtx::Row(i) => i,
+            RowCtx::Group(part) => match part.first() {
+                Some(i) => i,
+                None => return CfmlValue::Null,
+            },
+        };
+        tables.value(inter, ti as usize, ci as usize)
     }
 
     fn eval_column(
@@ -1137,6 +1057,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         negated: bool,
         pattern: &Expr,
         escape: Option<&Expr>,
+        compiled: Option<&like::Compiled>,
         tables: &TableSet,
         ctx: RowCtx,
     ) -> CfmlResult {
@@ -1145,11 +1066,10 @@ impl<'a, I: Invoker> Engine<'a, I> {
             return Ok(CfmlValue::Null);
         }
         let text = v.as_string();
-        // Constant pattern: use the once-per-query pre-compiled matcher (keyed by
-        // the pattern node's address), avoiding a recompile on every row.
-        let key = pattern as *const Expr as usize;
-        if let Some(compiled) = self.like_cache.get(&key) {
-            return Ok(CfmlValue::Bool(compiled.matches(&text) ^ negated));
+        // Constant pattern: use the once-per-query pre-compiled matcher embedded
+        // on the AST node by `bind_expr`, avoiding a recompile on every row.
+        if let Some(c) = compiled {
+            return Ok(CfmlValue::Bool(c.matches(&text) ^ negated));
         }
         // Dynamic pattern (or a NULL literal, which isn't cached): evaluate it.
         let p = self.eval(pattern, tables, ctx)?;
@@ -1639,6 +1559,141 @@ fn non_numeric(v: &CfmlValue) -> CfmlError {
     ))
 }
 
+// ── Column-ref binding (H1) ──────────────────────────────────────────────
+
+/// Rewrite every `Expr::Column` in this core's outer scope into
+/// `Expr::ResolvedColumn { ti, ci }` against the freshly-built `TableSet`,
+/// so per-row evaluation can skip the linear `resolve_column` lookup.
+///
+/// Scope: WHERE, GROUP BY, HAVING, JOIN ON, the (expanded) SELECT list, and
+/// any pushed-down ORDER BY. Subqueries (`ScalarSubquery`/`InSubquery`) and
+/// derived tables in FROM are *not* descended — they have their own table
+/// scope and are bound when their own `run_core` runs.
+///
+/// Unresolvable column refs are left as `Expr::Column` and will produce
+/// the usual "column not found" error at eval time (same behaviour as before).
+fn bind_core(
+    core: &mut SelectCore,
+    expanded_cols: &mut [SelectColumn],
+    order_by: &mut [OrderByExpr],
+    tables: &TableSet,
+) {
+    if let Some(w) = core.where_clause.as_mut() {
+        bind_expr(w, tables);
+    }
+    for g in core.group_by.iter_mut() {
+        bind_expr(g, tables);
+    }
+    if let Some(h) = core.having.as_mut() {
+        bind_expr(h, tables);
+    }
+    for j in core.joins.iter_mut() {
+        if let Some(on) = j.on.as_mut() {
+            bind_expr(on, tables);
+        }
+    }
+    for sc in expanded_cols.iter_mut() {
+        bind_expr(&mut sc.expr, tables);
+    }
+    for ob in order_by.iter_mut() {
+        bind_expr(&mut ob.expr, tables);
+    }
+}
+
+fn bind_expr(expr: &mut Expr, tables: &TableSet) {
+    match expr {
+        Expr::Column { table, name } => {
+            if let Some((ti, ci)) = tables.resolve_column(table.as_deref(), name) {
+                let resolved = Expr::ResolvedColumn {
+                    ti: ti as u32,
+                    ci: ci as u32,
+                    name: std::mem::take(name),
+                };
+                *expr = resolved;
+            }
+        }
+        // Already bound — no-op (idempotent for safety).
+        Expr::ResolvedColumn { .. } => {}
+        Expr::Binary { left, right, .. } => {
+            bind_expr(left, tables);
+            bind_expr(right, tables);
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => bind_expr(inner, tables),
+        Expr::Function { args, .. } => {
+            for a in args {
+                bind_expr(a, tables);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                bind_expr(o, tables);
+            }
+            for w in whens.iter_mut() {
+                bind_expr(&mut w.when, tables);
+                bind_expr(&mut w.then, tables);
+            }
+            if let Some(e) = else_expr {
+                bind_expr(e, tables);
+            }
+        }
+        Expr::InList { expr: lhs, list, .. } => {
+            bind_expr(lhs, tables);
+            for e in list {
+                bind_expr(e, tables);
+            }
+        }
+        Expr::Between {
+            expr: lhs,
+            low,
+            high,
+            ..
+        } => {
+            bind_expr(lhs, tables);
+            bind_expr(low, tables);
+            bind_expr(high, tables);
+        }
+        Expr::Like {
+            expr: lhs,
+            pattern,
+            escape,
+            compiled,
+            ..
+        } => {
+            bind_expr(lhs, tables);
+            bind_expr(pattern, tables);
+            if let Some(e) = escape {
+                bind_expr(e, tables);
+            }
+            // Pre-compile constant literal patterns (and constant escape, if
+            // present) — once per query, used on every row.
+            if compiled.is_none() {
+                if let Expr::Literal(pv) = &**pattern {
+                    if !matches!(pv, CfmlValue::Null) {
+                        let esc = match escape.as_deref() {
+                            None => Some(None),
+                            Some(Expr::Literal(ev)) => Some(ev.as_string().chars().next()),
+                            Some(_) => None, // non-literal escape → don't pre-compile
+                        };
+                        if let Some(esc) = esc {
+                            *compiled = Some(like::compile(&pv.as_string(), esc));
+                        }
+                    }
+                }
+            }
+        }
+        // Subqueries get their own scope; don't descend.
+        Expr::InSubquery { expr: lhs, .. } => bind_expr(lhs, tables),
+        Expr::ScalarSubquery(_) => {}
+        Expr::Star { .. } | Expr::Literal(_) | Expr::Param(_) => {}
+    }
+}
+
 // ── Projection / column-name helpers ────────────────────────────────────
 
 /// Expand `*` and `table.*` into explicit column references.
@@ -1695,6 +1750,7 @@ fn derive_column_names(columns: &[SelectColumn]) -> Vec<String> {
         let base = match (&sc.alias, &sc.expr) {
             (Some(a), _) => a.clone(),
             (None, Expr::Column { name, .. }) => name.clone(),
+            (None, Expr::ResolvedColumn { name, .. }) => name.clone(),
             (None, Expr::Function { name, .. }) => name.clone(),
             _ => format!("column_{}", i),
         };
