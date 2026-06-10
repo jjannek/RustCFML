@@ -100,11 +100,22 @@ impl Kind {
     }
 }
 
-/// Result kind of a `+`/`-`/`*`/`%` on numeric operands: `Float` if either
-/// operand is `Float`, else `Int`. `None` if either operand is a boolean.
+/// Result kind of a `+`/`-`/`*`/`%` on numeric or Boxed operands.
+///
+/// * Pure Int,Int → Int (raw `iadd`/`isub`/`imul`).
+/// * Any Float operand (Int|Float, Float|Float) → Float (promote both, use
+///   the float op).
+/// * Any Boxed operand → Boxed. The translator emits a tag-check fast path
+///   (SMI Int + SMI Int → inline `iadd` + retag) with the existing
+///   `cfml_jit_add_boxed` shim as the slow path. Bool / Builtin / UdfRef
+///   reject as before.
 pub fn num_bin_kind(a: Kind, b: Kind) -> Option<Kind> {
-    if !a.is_num() || !b.is_num() {
+    let admissible = |k: Kind| matches!(k, Kind::Int | Kind::Float | Kind::Boxed);
+    if !admissible(a) || !admissible(b) {
         return None;
+    }
+    if a == Kind::Boxed || b == Kind::Boxed {
+        return Some(Kind::Boxed);
     }
     Some(if a == Kind::Float || b == Kind::Float {
         Kind::Float
@@ -857,17 +868,33 @@ fn simulate_block(
                 }
             }
 
-            // `+ - *`: Int,Int → Int; any Float → Float; Bool operand rejects.
-            BytecodeOp::Add | BytecodeOp::Sub | BytecodeOp::Mul => {
+            // v0.99.6 — `+` admits Boxed operands (SMI fast path + add_boxed
+            // slow shim). Sub/Mul stay Int/Float-only until matching slow
+            // shims land (a Sub/Mul on a struct member would error in the
+            // interpreter anyway for non-numeric types).
+            BytecodeOp::Add => {
                 let b = pop!();
                 let a = pop!();
                 stack.push(num_bin_kind(a, b)?);
             }
+            // `- *`: Int,Int → Int; any Float → Float; Bool operand rejects.
+            BytecodeOp::Sub | BytecodeOp::Mul => {
+                let b = pop!();
+                let a = pop!();
+                if !a.is_num() || !b.is_num() {
+                    return None;
+                }
+                stack.push(num_bin_kind(a, b)?);
+            }
             // `%`: Int,Int → Int (`srem`); any float operand → Float (via the
-            // `cfml_fmod` libcall shim — see translate.rs).
+            // `cfml_fmod` libcall shim — see translate.rs). Boxed not yet
+            // admitted (would need a `cfml_jit_mod_boxed` slow path).
             BytecodeOp::Mod => {
                 let b = pop!();
                 let a = pop!();
+                if !a.is_num() || !b.is_num() {
+                    return None;
+                }
                 stack.push(num_bin_kind(a, b)?);
             }
             // `^`: always Float (interpreter uses `f64::powf` on `to_number(.)`

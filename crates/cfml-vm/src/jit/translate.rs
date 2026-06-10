@@ -159,7 +159,7 @@ pub struct Backend {
     /// "never populated" sentinel (CfmlStruct shape IDs start at 1), so
     /// the first call's shape check always misses and the slow path
     /// populates the IC.
-    pub(super) member_ic_slots: Vec<Box<std::cell::UnsafeCell<[u64; 2]>>>,
+    pub(super) member_ic_slots: Vec<Box<std::cell::UnsafeCell<[u64; 3]>>>,
     /// v0.99.5 — interned property names referenced by emitted IC calls.
     /// Same stable-address rationale as `string_literals`.
     pub(super) member_names: Vec<Box<str>>,
@@ -350,12 +350,17 @@ impl Backend {
         })
     }
 
-    /// v0.99.5 — allocate one IC slot (`[cached_shape, cached_idx]`,
-    /// initialised to `[0, 0]`) and return its raw pointer for embedding
-    /// into emitted IR. The Box itself is owned by `self.member_ic_slots`
-    /// for the life of the Backend, so the pointer stays valid.
+    /// v0.99.6 — allocate one IC slot
+    /// (`[cached_shape, cached_idx, cached_kind]`, initialised to `[0, 0, 0]`)
+    /// and return its raw pointer for embedding into emitted IR. The Box
+    /// itself is owned by `self.member_ic_slots` for the life of the
+    /// Backend, so the pointer stays valid.
+    ///
+    /// `cached_kind` semantics: 0 = never populated, 1 = Int (SMI fast
+    /// encode), 2 = Double, 3 = other (heap-box clone). See
+    /// `shims::cfml_jit_member_get_boxed`.
     pub(super) fn alloc_member_ic_slot(&mut self) -> *mut u64 {
-        let slot = Box::new(std::cell::UnsafeCell::new([0u64; 2]));
+        let slot = Box::new(std::cell::UnsafeCell::new([0u64; 3]));
         let ptr = slot.get() as *mut u64;
         self.member_ic_slots.push(slot);
         ptr
@@ -442,7 +447,7 @@ impl Backend {
         let concat_boxed_ref = self
             .module
             .declare_func_in_func(self.concat_boxed_id, &mut ctx.func);
-        let _add_boxed_ref = self
+        let add_boxed_ref = self
             .module
             .declare_func_in_func(self.add_boxed_id, &mut ctx.func);
         let str_literal_ref = self
@@ -683,7 +688,27 @@ impl Backend {
                             b.def_var(vars[slot], v);
                         }
 
-                        BytecodeOp::Add => num_bin(&mut b, &mut stack, NumOp::Add)?,
+                        // v0.99.6 — `Add` admits Boxed operands; if either
+                        // side is Boxed, route through the SMI tag-check
+                        // fast path with `cfml_jit_add_boxed` as the slow
+                        // shim.
+                        BytecodeOp::Add => {
+                            let either_boxed = matches!(stack.last(), Some((_, Kind::Boxed)))
+                                || matches!(stack.iter().rev().nth(1), Some((_, Kind::Boxed)));
+                            if either_boxed {
+                                add_boxed_smi(
+                                    &mut b,
+                                    &mut stack,
+                                    box_int_ref,
+                                    box_float_ref,
+                                    add_boxed_ref,
+                                    bail_var,
+                                    ptr_ty,
+                                )?;
+                            } else {
+                                num_bin(&mut b, &mut stack, NumOp::Add)?;
+                            }
+                        }
                         BytecodeOp::Sub => num_bin(&mut b, &mut stack, NumOp::Sub)?,
                         BytecodeOp::Mul => num_bin(&mut b, &mut stack, NumOp::Mul)?,
 
@@ -1188,6 +1213,116 @@ pub(super) fn num_bin(b: &mut FunctionBuilder, stack: &mut Vec<(Value, Kind)>, o
         };
         stack.push((r, Kind::Int));
     }
+    Ok(())
+}
+
+/// v0.99.6 — `+` on polymorphic operands with an inline SMI Int fast path.
+///
+/// Both operands must already be promoted to tagged i64 (Boxed form); the
+/// caller does that via [`ensure_boxed`] when the analyser-declared kind is
+/// `Int` or `Float`.
+///
+/// Emitted IR:
+/// ```text
+///     entry:
+///         a_xor = a XOR TAG_INT
+///         b_xor = b XOR TAG_INT
+///         both_smi = ((a_xor OR b_xor) AND TAG_MASK) == 0
+///         brif both_smi → smi_block, slow_block
+///
+///     smi_block:
+///         ua = a SAR 3            ; arithmetic shift right by 3
+///         ub = b SAR 3
+///         raw = ua + ub
+///         shifted = raw SHL 3
+///         recovered = shifted SAR 3
+///         fits = recovered == raw   ; SMI-fit overflow check
+///         brif fits → smi_ok, smi_overflow
+///
+///     smi_ok:
+///         tagged = shifted OR TAG_INT
+///         jump common(tagged)
+///
+///     smi_overflow:
+///         boxed = cfml_jit_box_int(raw)
+///         jump common(boxed)
+///
+///     slow_block:
+///         result = cfml_jit_add_boxed(a, b, bail)
+///         jump common(result)
+///
+///     common(result):
+///         ; push (result, Kind::Boxed)
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub(super) fn add_boxed_smi(
+    b: &mut FunctionBuilder,
+    stack: &mut Vec<(Value, Kind)>,
+    box_int: cranelift_codegen::ir::FuncRef,
+    box_float: cranelift_codegen::ir::FuncRef,
+    add_boxed: cranelift_codegen::ir::FuncRef,
+    bail_var: Variable,
+    ptr_ty: types::Type,
+) -> Result<(), String> {
+    let _ = ptr_ty; // bail pointer is i64-sized on every supported target
+    let (rhs, rk) = stack.pop().ok_or("jit: stack underflow")?;
+    let (lhs, lk) = stack.pop().ok_or("jit: stack underflow")?;
+    let a = ensure_boxed(b, box_int, box_float, lhs, lk);
+    let bv = ensure_boxed(b, box_int, box_float, rhs, rk);
+
+    // Tag-discriminate.
+    let a_xor = b.ins().bxor_imm(a, super::boxed::TAG_INT as i64);
+    let b_xor = b.ins().bxor_imm(bv, super::boxed::TAG_INT as i64);
+    let or = b.ins().bor(a_xor, b_xor);
+    let masked = b.ins().band_imm(or, super::boxed::TAG_MASK as i64);
+    let both_smi = b.ins().icmp_imm(IntCC::Equal, masked, 0);
+
+    let smi_block = b.create_block();
+    let slow_block = b.create_block();
+    let smi_ok = b.create_block();
+    let smi_overflow = b.create_block();
+    let common = b.create_block();
+    b.append_block_param(common, I64);
+
+    b.ins().brif(both_smi, smi_block, &[], slow_block, &[]);
+
+    // SMI block.
+    b.switch_to_block(smi_block);
+    let ua = b.ins().sshr_imm(a, 3);
+    let ub = b.ins().sshr_imm(bv, 3);
+    let raw = b.ins().iadd(ua, ub);
+    let shifted = b.ins().ishl_imm(raw, 3);
+    let recovered = b.ins().sshr_imm(shifted, 3);
+    let fits = b.ins().icmp(IntCC::Equal, recovered, raw);
+    b.ins().brif(fits, smi_ok, &[], smi_overflow, &[]);
+
+    // SMI ok.
+    b.switch_to_block(smi_ok);
+    let tagged = b.ins().bor_imm(shifted, super::boxed::TAG_INT as i64);
+    let tagged_arg: cranelift_codegen::ir::BlockArg = tagged.into();
+    b.ins().jump(common, &[tagged_arg]);
+
+    // SMI overflow.
+    b.switch_to_block(smi_overflow);
+    let boxed = {
+        let call = b.ins().call(box_int, &[raw]);
+        b.inst_results(call)[0]
+    };
+    let boxed_arg: cranelift_codegen::ir::BlockArg = boxed.into();
+    b.ins().jump(common, &[boxed_arg]);
+
+    // Slow block.
+    b.switch_to_block(slow_block);
+    let bp = b.use_var(bail_var);
+    let call = b.ins().call(add_boxed, &[a, bv, bp]);
+    let slow_r = b.inst_results(call)[0];
+    let slow_arg: cranelift_codegen::ir::BlockArg = slow_r.into();
+    b.ins().jump(common, &[slow_arg]);
+
+    // Common.
+    b.switch_to_block(common);
+    let result = b.block_params(common)[0];
+    stack.push((result, Kind::Boxed));
     Ok(())
 }
 

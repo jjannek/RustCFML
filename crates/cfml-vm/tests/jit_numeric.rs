@@ -1076,3 +1076,77 @@ fn html_format_shims_in_jitted_udf_match_interpreter() {
     assert_eq!(out, oracle, "html-format Boxed shims must match the interpreter");
     assert!(compiled >= 1, "expected fmt() to be JIT-compiled, got {compiled}");
 }
+
+#[test]
+fn member_get_numeric_add_uses_smi_fast_path() {
+    // v0.99.6 — `obj.a + obj.b + obj.c + obj.d` over a struct of Ints.
+    // Each member read returns an SMI Int (via the IC kind hint); each Add
+    // takes the SMI fast path (no heap allocation per iteration). Output
+    // must be bit-identical to the interpreter.
+    let src = r##"
+        function sum4(p) { return p.a + p.b + p.c + p.d; }
+        out = "";
+        rec = {a: 1, b: 2, c: 3, d: 4};
+        for (k = 1; k <= 200; k++) { out = out & sum4(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "Add on Boxed Int operands must match interpreter");
+    assert!(compiled >= 1, "expected sum4() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn add_mixed_int_and_struct_int_member_smi() {
+    // v0.99.6 — `5 + p.a`: lhs is raw Int (boxed to SMI by box_int shim),
+    // rhs is Boxed-from-IC (SMI). SMI fast path triggers.
+    let src = r##"
+        function bumped(p) { return 5 + p.a; }
+        out = "";
+        rec = {a: 10};
+        for (k = 1; k <= 80; k++) { out = out & bumped(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "mixed Int + Boxed Add must match interpreter");
+    assert!(compiled >= 1, "expected bumped() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn add_boxed_smi_slow_path_string_member_concats_per_interpreter() {
+    // v0.99.6 — `obj.s + obj.t` where both members are Strings. The
+    // shim's SMI tag-check fails; the slow path falls through to
+    // cfml_jit_add_boxed which, per interpreter parity, string-concats
+    // two String operands (gotcha #18).
+    let src = r##"
+        function combine(p) { return p.s + p.t; }
+        out = "";
+        rec = {s: "foo", t: "bar"};
+        for (k = 1; k <= 40; k++) { out = out & combine(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "String + String slow path must match interpreter");
+    assert!(compiled >= 1, "expected combine() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn add_boxed_smi_handles_large_int_via_box_int_overflow() {
+    // v0.99.6 — `p.big + p.big` where p.big is just under i61 max. The
+    // SMI Add overflows out of i61; the JIT must take the smi_overflow
+    // edge (call cfml_jit_box_int on the raw i64). Match interpreter.
+    let src = r##"
+        function dbl(p) { return p.big + p.big; }
+        // 2^60 - 1 = 1152921504606846975 (i61 max). Doubled exceeds i61.
+        rec = {big: 1152921504606846975};
+        out = "";
+        for (k = 1; k <= 30; k++) { out = out & dbl(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "SMI overflow path must match interpreter");
+    assert!(compiled >= 1, "expected dbl() to be JIT-compiled, got {compiled}");
+}

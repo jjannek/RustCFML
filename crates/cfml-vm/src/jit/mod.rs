@@ -892,11 +892,13 @@ fn run_osr_compiled(
                 analysis::Kind::Int => CfmlValue::Int(buf[i]),
                 analysis::Kind::Float => CfmlValue::Double(f64::from_bits(buf[i] as u64)),
                 analysis::Kind::Boxed => {
-                    // SAFETY: the tag at this slot either came from our entry
-                    // `box_into_active` or from a shim allocation during the
-                    // body; both kinds are tracked by the active arena and
-                    // still live until drain below.
-                    unsafe { boxed::borrow_tagged(buf[i] as usize).clone() }
+                    // SAFETY: heap-tag tags came from our entry
+                    // `box_into_active` or a shim allocation; SMI tags
+                    // (v0.99.6) carry no heap memory. `materialize_tagged`
+                    // handles both (synthesises Int for SMI, clones for
+                    // heap). The heap box is reclaimed by the arena drain
+                    // immediately below.
+                    unsafe { boxed::materialize_tagged(buf[i] as usize) }
                 }
                 _ => unreachable!("OSR slots are always Int / Float / Boxed"),
             };

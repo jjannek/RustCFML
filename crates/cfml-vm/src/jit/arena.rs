@@ -122,8 +122,17 @@ impl Drop for ArenaGuard {
 /// unchanged. Panics in debug builds if no arena is installed; in release
 /// builds it reclaims and drops the tag (an obvious leak, but at least
 /// not undefined behaviour).
+///
+/// v0.99.6 — **SMI tags (`TAG_INT`) carry no heap memory and are skipped.**
+/// The arena's drain path would correctly synthesise a stack `CfmlValue::Int`
+/// and drop it, but that's pointless work; the fast path here makes the
+/// numeric-struct hot loop allocation-free.
 #[inline]
 pub fn track(tag: usize) -> usize {
+    if tag & boxed::TAG_MASK != boxed::TAG_PTR {
+        // SMI / non-heap tags: nothing to track.
+        return tag;
+    }
     ACTIVE_ARENA.with(|a| {
         let p = a.get();
         if p.is_null() {
