@@ -827,6 +827,82 @@ fn asc_returns_int_from_boxed_arg_in_jit() {
 }
 
 #[test]
+fn member_get_loadlocalproperty_matches_interpreter() {
+    // v0.99.5 — JIT'd `local.prop` (fused LoadLocalProperty) over a
+    // Boxed-param struct receiver. First call populates the IC; every
+    // subsequent call hits `shape == cached_shape` and reads via
+    // `map.get_index(cached_idx)` directly. Test runs 200 iterations on
+    // the same struct shape to exercise the hot path.
+    let src = r##"
+        function name(p) { return p.firstName & " " & p.lastName; }
+        out = "";
+        person = {firstName: "Alex", lastName: "Skinner", age: 42};
+        for (k = 1; k <= 200; k++) { out = out & name(person) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "LoadLocalProperty IC must match interpreter");
+    assert!(compiled >= 1, "expected name() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn member_get_case_insensitive_matches_interpreter() {
+    // v0.99.5 — CFML keys are case-insensitive. Mixed-case prop name in
+    // the source vs the struct literal must still resolve. The IC's
+    // first miss does a case-insensitive scan, caches the matched index;
+    // subsequent calls hit by index without re-scanning.
+    let src = r##"
+        function id(p) { return p.ID & "/" & p.Name; }
+        out = "";
+        rec = {id: 7, name: "row7"};
+        for (k = 1; k <= 80; k++) { out = out & id(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "case-insensitive member IC must match interpreter");
+    assert!(compiled >= 1, "expected id() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn member_get_missing_key_returns_null_matches_interpreter() {
+    // v0.99.5 — `obj.missing` returns Null (interpreter semantics for
+    // GetProperty on a Struct without the key). The shim's cold path
+    // returns Null without updating the IC. Concat with " " stringifies
+    // Null to empty so output is comparable.
+    let src = r##"
+        function maybe(p) { return "<" & p.absent & ">"; }
+        out = "";
+        rec = {hello: "world"};
+        for (k = 1; k <= 60; k++) { out = out & maybe(rec) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "missing-key member IC path must match interpreter");
+    assert!(compiled >= 1, "expected maybe() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn member_get_bails_on_non_struct_receiver_matches_interpreter() {
+    // v0.99.5 — IC shim bails when receiver is not a Struct, so the
+    // interpreter re-runs the call and produces the same observable
+    // behaviour (CFML's lookup_property on a non-struct returns Null).
+    let src = r##"
+        function probe(x) { return "[" & x.something & "]"; }
+        out = "";
+        // x is an Int (Boxed at the ABI). Receiver shape is non-Struct
+        // every call → shim sets bail=1; engine re-interprets.
+        for (k = 1; k <= 30; k++) { out = out & probe(k) & ";"; }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, _compiled) = run(src);
+    assert_eq!(out, oracle, "non-struct receiver bail must match interpreter");
+}
+
+#[test]
 fn array_len_shim_matches_interpreter() {
     // v0.99.3 bail plumbing — arrayLen(Boxed) → Int. Pure-array path is
     // the happy case (no bail); struct/numeric fall-throughs covered by

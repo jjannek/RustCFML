@@ -146,6 +146,23 @@ pub struct Backend {
     /// each literal at a stable address for the life of the JIT module, so
     /// the IR can hold a raw pointer to it.
     pub(super) string_literals: Vec<Box<str>>,
+    /// v0.99.5 — FuncId for `cfml_jit_member_get_boxed`, the IC shim for
+    /// `obj.prop` member access on a `CfmlValue::Struct` receiver.
+    pub(super) member_get_id: FuncId,
+    /// v0.99.5 — IC slot storage. Each entry is a heap-allocated
+    /// `[cached_shape, cached_idx]` pair. `Box::as_ref().get()` returns a
+    /// raw pointer that's stable for the box's lifetime; the Vec just
+    /// holds the boxes (growing the Vec moves the 8-byte Box handles,
+    /// not the heap allocations they point at), so the IC pointers we
+    /// hand into JIT'd code remain valid until Backend drops. Each box
+    /// is initialised to `[0, 0]` — shape `0` is reserved as the
+    /// "never populated" sentinel (CfmlStruct shape IDs start at 1), so
+    /// the first call's shape check always misses and the slow path
+    /// populates the IC.
+    pub(super) member_ic_slots: Vec<Box<std::cell::UnsafeCell<[u64; 2]>>>,
+    /// v0.99.5 — interned property names referenced by emitted IC calls.
+    /// Same stable-address rationale as `string_literals`.
+    pub(super) member_names: Vec<Box<str>>,
 }
 
 impl Backend {
@@ -175,6 +192,11 @@ impl Backend {
         builder.symbol("cfml_jit_concat_boxed", cfml_jit_concat_boxed as *const u8);
         builder.symbol("cfml_jit_add_boxed", cfml_jit_add_boxed as *const u8);
         builder.symbol("cfml_jit_str_literal", cfml_jit_str_literal as *const u8);
+        // v0.99.5 member-access IC shim.
+        builder.symbol(
+            "cfml_jit_member_get_boxed",
+            super::shims::cfml_jit_member_get_boxed as *const u8,
+        );
         // Register every allowlisted builtin shim (Option A — Tier-1 native
         // calls). Each is a pure `extern "C"` Rust fn whose semantics mirror
         // the interpreter's `cfml-stdlib::builtins::fn_*` entry.
@@ -292,6 +314,21 @@ impl Backend {
                 .declare_function("cfml_jit_str_literal", Linkage::Import, &sig)
                 .map_err(|e| e.to_string())?
         };
+        // v0.99.5 — member-access IC shim:
+        //   fn(obj_tagged: i64, name_ptr: *const u8, name_len: i64,
+        //      ic_slot: *mut u64, bail: *mut i64) -> i64
+        let member_get_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(I64)); // obj_tagged
+            sig.params.push(AbiParam::new(ptr_ty)); // name_ptr
+            sig.params.push(AbiParam::new(I64)); // name_len
+            sig.params.push(AbiParam::new(ptr_ty)); // ic_slot
+            sig.params.push(AbiParam::new(ptr_ty)); // bail
+            sig.returns.push(AbiParam::new(I64));
+            module
+                .declare_function("cfml_jit_member_get_boxed", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
 
         Ok(Self {
             module,
@@ -307,7 +344,36 @@ impl Backend {
             add_boxed_id,
             str_literal_id,
             string_literals: Vec::new(),
+            member_get_id,
+            member_ic_slots: Vec::new(),
+            member_names: Vec::new(),
         })
+    }
+
+    /// v0.99.5 — allocate one IC slot (`[cached_shape, cached_idx]`,
+    /// initialised to `[0, 0]`) and return its raw pointer for embedding
+    /// into emitted IR. The Box itself is owned by `self.member_ic_slots`
+    /// for the life of the Backend, so the pointer stays valid.
+    pub(super) fn alloc_member_ic_slot(&mut self) -> *mut u64 {
+        let slot = Box::new(std::cell::UnsafeCell::new([0u64; 2]));
+        let ptr = slot.get() as *mut u64;
+        self.member_ic_slots.push(slot);
+        ptr
+    }
+
+    /// v0.99.5 — intern a property name (same stable-address discipline
+    /// as `intern_literal`).
+    pub(super) fn intern_member_name(&mut self, name: &str) -> (*const u8, i64) {
+        for boxed in &self.member_names {
+            if boxed.as_ref() == name {
+                return (boxed.as_ptr(), boxed.len() as i64);
+            }
+        }
+        let boxed: Box<str> = name.into();
+        let ptr = boxed.as_ptr();
+        let len = boxed.len() as i64;
+        self.member_names.push(boxed);
+        (ptr, len)
     }
 
     /// Intern a string literal at a stable heap location and return the
@@ -382,16 +448,35 @@ impl Backend {
         let str_literal_ref = self
             .module
             .declare_func_in_func(self.str_literal_id, &mut ctx.func);
+        // v0.99.5 member-get shim.
+        let member_get_ref = self
+            .module
+            .declare_func_in_func(self.member_get_id, &mut ctx.func);
 
         // v0.90.0 — intern every String literal in the reachable code
         // before the FunctionBuilder borrows take effect. The resulting
         // (ptr, len) pairs are keyed by IP and pulled into the codegen
         // loop below as constants.
         let mut str_literal_at: HashMap<usize, (*const u8, i64)> = HashMap::new();
+        // v0.99.5 — pre-scan member-access call sites (LoadLocalProperty,
+        // GetProperty), allocating one IC slot per site and interning each
+        // property name. The triple `(ic_slot_ptr, name_ptr, name_len)` is
+        // keyed by IP and embedded into the IR as constants. Same
+        // before-FunctionBuilder rationale as gotcha #15.
+        let mut member_get_at: HashMap<usize, (*mut u64, *const u8, i64)> = HashMap::new();
         for blk in &plan.blocks {
             for ip in blk.start..blk.end {
-                if let BytecodeOp::String(s) = &func.instructions[ip] {
-                    str_literal_at.insert(ip, self.intern_literal(s));
+                match &func.instructions[ip] {
+                    BytecodeOp::String(s) => {
+                        str_literal_at.insert(ip, self.intern_literal(s));
+                    }
+                    BytecodeOp::LoadLocalProperty(_, prop)
+                    | BytecodeOp::GetProperty(prop) => {
+                        let ic_ptr = self.alloc_member_ic_slot();
+                        let (name_ptr, name_len) = self.intern_member_name(prop);
+                        member_get_at.insert(ip, (ic_ptr, name_ptr, name_len));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -536,6 +621,61 @@ impl Backend {
                         BytecodeOp::LoadLocal(name) => {
                             let slot = plan.slot_of(name).ok_or("jit: unknown local")?;
                             stack.push((b.use_var(vars[slot]), plan.slot_kind[slot]));
+                        }
+                        // v0.99.5 — fused `local.prop`. Read the local
+                        // (must be Boxed kind per the analyser), then call
+                        // the IC shim with the pre-allocated slot pointer
+                        // and interned property name. Bail wires same as
+                        // any bailable shim.
+                        BytecodeOp::LoadLocalProperty(name, _prop) => {
+                            let slot = plan.slot_of(name).ok_or("jit: unknown local")?;
+                            let obj = b.use_var(vars[slot]);
+                            let (ic_ptr, name_ptr, name_len) = *member_get_at
+                                .get(&ip)
+                                .ok_or("jit: missing member IC slot")?;
+                            let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                            let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                            let nl_v = b.ins().iconst(I64, name_len);
+                            let bp = b.use_var(bail_var);
+                            let call = b
+                                .ins()
+                                .call(member_get_ref, &[obj, np_v, nl_v, ic_v, bp]);
+                            let r = b.inst_results(call)[0];
+                            // Post-call bail check (mirrors the bailable
+                            // builtin shim pattern from v0.99.3).
+                            let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                            let bail_set =
+                                b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                            let cont = b.create_block();
+                            b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                            b.switch_to_block(cont);
+                            stack.push((r, Kind::Boxed));
+                        }
+                        // v0.99.5 — `obj.prop` where obj is on the stack
+                        // (Boxed). Same IC shape as LoadLocalProperty.
+                        BytecodeOp::GetProperty(_prop) => {
+                            let (obj, ok) = stack.pop().ok_or("jit: stack underflow")?;
+                            if ok != Kind::Boxed {
+                                return Err("jit: GetProperty receiver not Boxed".into());
+                            }
+                            let (ic_ptr, name_ptr, name_len) = *member_get_at
+                                .get(&ip)
+                                .ok_or("jit: missing member IC slot")?;
+                            let ic_v = b.ins().iconst(ptr_ty, ic_ptr as i64);
+                            let np_v = b.ins().iconst(ptr_ty, name_ptr as i64);
+                            let nl_v = b.ins().iconst(I64, name_len);
+                            let bp = b.use_var(bail_var);
+                            let call = b
+                                .ins()
+                                .call(member_get_ref, &[obj, np_v, nl_v, ic_v, bp]);
+                            let r = b.inst_results(call)[0];
+                            let bail_val = b.ins().load(I64, MemFlags::new(), bp, 0);
+                            let bail_set =
+                                b.ins().icmp_imm(IntCC::NotEqual, bail_val, 0);
+                            let cont = b.create_block();
+                            b.ins().brif(bail_set, bail_block, &[], cont, &[]);
+                            b.switch_to_block(cont);
+                            stack.push((r, Kind::Boxed));
                         }
                         BytecodeOp::StoreLocal(name) => {
                             let slot = plan.slot_of(name).ok_or("jit: unknown local")?;

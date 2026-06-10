@@ -252,6 +252,33 @@ impl CfmlStruct {
             .map(|(_, v)| v.clone())
     }
 
+    /// v0.99.5 — case-insensitive lookup that also returns the IndexMap
+    /// entry index. Used by the JIT member-access inline cache:
+    /// `(name → idx)` is stable while `shape_id` doesn't change, so the
+    /// IC can hit `map.get_index(cached_idx)` on the fast path. Walks the
+    /// map twice in the cold case (exact, then ci-scan) — same shape as
+    /// `get_ci` but threaded with `.enumerate()`.
+    pub fn get_ci_indexed(&self, key: &str) -> Option<(usize, CfmlValue)> {
+        let g = self.0.read();
+        if let Some((i, _, v)) = g.map.get_full(key) {
+            return Some((i, v.clone()));
+        }
+        g.map
+            .iter()
+            .enumerate()
+            .find(|(_, (k, _))| k.eq_ignore_ascii_case(key))
+            .map(|(i, (_, v))| (i, v.clone()))
+    }
+
+    /// v0.99.5 — read the value at a specific IndexMap entry index. Used
+    /// by the JIT IC's fast path after the cached shape matched. Returns
+    /// `None` if the index is out of range (shouldn't happen when shape
+    /// matched, but defensive).
+    #[inline]
+    pub fn get_at_index(&self, idx: usize) -> Option<CfmlValue> {
+        self.0.read().map.get_index(idx).map(|(_, v)| v.clone())
+    }
+
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.read().map.contains_key(key)

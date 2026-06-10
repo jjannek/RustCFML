@@ -467,6 +467,21 @@ pub fn analyze(
                     let s = intern(name, &mut locals, &mut local_slot);
                     events.push(Ev::Read(s));
                 }
+                // v0.99.5 — fused LoadLocal + GetProperty for `local.prop`.
+                // Treats the local as a Read (so dataflow knows it's used).
+                // simulate_block enforces that the local's slot is Boxed
+                // (the shim takes a tagged ptr; Int/Float slots can't
+                // carry a struct).
+                BytecodeOp::LoadLocalProperty(name, _prop) => {
+                    if is_reserved_scope(name) {
+                        return None;
+                    }
+                    let s = intern(name, &mut locals, &mut local_slot);
+                    events.push(Ev::Read(s));
+                }
+                // v0.99.5 — `obj.prop` where obj is on the stack. Operand
+                // tracking happens in simulate_block; Pass 1 just admits.
+                BytecodeOp::GetProperty(_) => {}
                 BytecodeOp::StoreLocal(name) => {
                     if is_reserved_scope(name) {
                         return None;
@@ -786,6 +801,37 @@ fn simulate_block(
 
             BytecodeOp::LoadLocal(name) => {
                 stack.push(slot_kind[slot_index(name)?]);
+            }
+            // v0.99.5 — LoadLocalProperty pushes Boxed unconditionally.
+            // The local's slot kind must already be Boxed (the shim takes
+            // a tagged ptr to a CfmlValue::Struct; a numeric slot would
+            // need on-the-fly boxing the JIT can't do for these ops).
+            // In Infer mode that means: don't upgrade — if the slot is
+            // still Int, the final consistency pass will reject. Check
+            // mode rejects directly.
+            BytecodeOp::LoadLocalProperty(name, _prop) => {
+                let s = slot_index(name)?;
+                if slot_kind[s] != Kind::Boxed {
+                    if let Mode::Check { .. } = &mode {
+                        return None;
+                    }
+                    // In Infer mode, just don't push — the analyser may
+                    // upgrade the slot kind via later writes and the next
+                    // fixpoint iteration revisits. (Return None for this
+                    // simulate to abort the block — `analyze` rejects the
+                    // whole function on any block error, which is the
+                    // safe response.)
+                    return None;
+                }
+                stack.push(Kind::Boxed);
+            }
+            // v0.99.5 — GetProperty pops Boxed, pushes Boxed.
+            BytecodeOp::GetProperty(_) => {
+                let v = pop!();
+                if v != Kind::Boxed {
+                    return None;
+                }
+                stack.push(Kind::Boxed);
             }
             BytecodeOp::StoreLocal(name) => {
                 let s = slot_index(name)?;

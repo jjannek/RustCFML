@@ -22,6 +22,69 @@ use cfml_common::dynamic::CfmlValue;
 use super::arena;
 use super::boxed;
 
+/// v0.99.5 — JIT inline-cache lookup for `obj.prop` on a `CfmlValue::Struct`.
+///
+/// `ic_slot` points at a `[u64; 2]` owned by the [`super::translate::Backend`]
+/// (allocated as a `Box<UnsafeCell<[u64; 2]>>` so the address is stable for
+/// the Backend's lifetime). Layout: `[cached_shape, cached_idx]`. The
+/// sentinel `cached_shape == 0` is "never populated" — `CfmlStruct` shape
+/// IDs start at 1.
+///
+/// Hot path (cached_shape == current_shape): hit `map.get_index(cached_idx)`,
+/// box the value into the arena, return the tagged pointer. Cold path:
+/// case-insensitive lookup via `get_ci_indexed`, repopulate the IC, return.
+/// Missing key returns `Null` (matches the interpreter's `GetProperty`
+/// branch on `Struct`).
+///
+/// **Bails when the receiver is not a `Struct`.** The IC only specialises
+/// for plain structs in this first cut; Components / Queries / Closures /
+/// Native objects all have more elaborate dispatch (accessors, column
+/// proxies, etc.) and fall back to the interpreter via `*bail = 1`.
+#[no_mangle]
+pub extern "C" fn cfml_jit_member_get_boxed(
+    obj_tagged: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    ic_slot: *mut u64,
+    bail: *mut i64,
+) -> i64 {
+    let v = unsafe { borrow(obj_tagged) };
+    let s = match v {
+        CfmlValue::Struct(s) => s,
+        _ => {
+            unsafe {
+                *bail = 1;
+            }
+            return 0;
+        }
+    };
+    let shape = s.shape_id();
+    // SAFETY: ic_slot points to a `[u64; 2]` owned by Backend.
+    let cached_shape = unsafe { *ic_slot };
+    let cached_idx = unsafe { *ic_slot.add(1) };
+    if cached_shape == shape {
+        if let Some(val) = s.get_at_index(cached_idx as usize) {
+            return arena::box_into_active(val) as i64;
+        }
+        // Fall through to slow path on out-of-range — defensive.
+    }
+    // SAFETY: name_ptr is an interned `&'static str` pointer from
+    // Backend's `member_names` (analogous to v0.90.0's string-literal
+    // interning), and name_len is its byte length.
+    let name = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    };
+    if let Some((idx, val)) = s.get_ci_indexed(name) {
+        unsafe {
+            *ic_slot = shape;
+            *ic_slot.add(1) = idx as u64;
+        }
+        return arena::box_into_active(val) as i64;
+    }
+    // Missing key — interp returns `Null`. Mirror that.
+    arena::box_into_active(CfmlValue::Null) as i64
+}
+
 /// Local copy of the interpreter's `to_number` (private in `lib.rs`); kept
 /// here so the shim is a single self-contained translation unit.
 fn to_number(val: &CfmlValue) -> Option<f64> {
