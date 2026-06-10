@@ -252,10 +252,12 @@ extern "C" fn cfml_pow_fn_f64(base: f64, exp: f64) -> f64 {
 }
 
 // ── v0.92.0 Boxed-argument shims ────────────────────────────────────────────
-// Each one takes a tagged `i64` (TAG_PTR-encoded `*const CfmlValue` from
-// `boxed.rs`), borrows the underlying value via `boxed::borrow_tagged`, and
-// either returns an `i64` (numeric ret_kind) or constructs a fresh
-// `CfmlValue` and pushes it into the active arena (Boxed ret_kind).
+// Each one takes a tagged `i64` (TAG_PTR-encoded `*const CfmlValue` or
+// inline SMI from `boxed.rs`), materialises the underlying value via
+// `boxed::materialize_tagged` (handles both heap and SMI tags — see
+// gotcha #32 in JIT_NEXT_SESSION.md), and either returns an `i64`
+// (numeric ret_kind) or constructs a fresh `CfmlValue` and pushes it
+// into the active arena (Boxed ret_kind).
 //
 // All six mirror their `cfml-stdlib::builtins::fn_*` counterparts bit-for-bit
 // and are infallible by design: `len` is defensive (returns 0 for unknown
@@ -267,8 +269,8 @@ extern "C" fn cfml_pow_fn_f64(base: f64, exp: f64) -> f64 {
 /// `QueryColumn → chars of stringified first row`, anything else → `0`.
 extern "C" fn cfml_len_boxed_i64(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
-    match v {
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    match &v {
         CfmlValue::String(s) => s.len() as i64,
         CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) => {
             v.as_string().chars().count() as i64
@@ -285,35 +287,35 @@ extern "C" fn cfml_len_boxed_i64(tagged: i64) -> i64 {
 /// boxed into the active arena. Result kind: `Boxed`.
 extern "C" fn cfml_ucase_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     super::arena::box_into_active(CfmlValue::string(v.as_string().to_uppercase())) as i64
 }
 
 /// Mirrors `fn_lcase`.
 extern "C" fn cfml_lcase_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     super::arena::box_into_active(CfmlValue::string(v.as_string().to_lowercase())) as i64
 }
 
 /// Mirrors `fn_trim`.
 extern "C" fn cfml_trim_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     super::arena::box_into_active(CfmlValue::string(v.as_string().trim().to_string())) as i64
 }
 
 /// Mirrors `fn_ltrim`.
 extern "C" fn cfml_ltrim_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     super::arena::box_into_active(CfmlValue::string(v.as_string().trim_start().to_string())) as i64
 }
 
 /// Mirrors `fn_rtrim`.
 extern "C" fn cfml_rtrim_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     super::arena::box_into_active(CfmlValue::string(v.as_string().trim_end().to_string())) as i64
 }
 
@@ -321,7 +323,7 @@ extern "C" fn cfml_rtrim_boxed(tagged: i64) -> i64 {
 /// Lucee/RustCFML `reverse()` is string-only (arrays go through `arrayReverse`).
 extern "C" fn cfml_reverse_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s: String = v.as_string().chars().rev().collect();
     super::arena::box_into_active(CfmlValue::string(s)) as i64
 }
@@ -329,21 +331,21 @@ extern "C" fn cfml_reverse_boxed(tagged: i64) -> i64 {
 /// Mirrors `fn_asc`: first char of stringified arg as its `i64` code point,
 /// or `0` for empty. CFML returns `Int`.
 extern "C" fn cfml_asc_boxed_i64(tagged: i64) -> i64 {
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     v.as_string().chars().next().map_or(0, |c| c as i64)
 }
 
 /// Mirrors `fn_strip_cr`: drops every `\r` from the stringified arg.
 extern "C" fn cfml_strip_cr_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     super::arena::box_into_active(CfmlValue::string(v.as_string().replace('\r', ""))) as i64
 }
 
 /// Mirrors `fn_html_edit_format`: `& < > "` → entity refs.
 extern "C" fn cfml_html_edit_format_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v
         .as_string()
         .replace('&', "&amp;")
@@ -356,7 +358,7 @@ extern "C" fn cfml_html_edit_format_boxed(tagged: i64) -> i64 {
 /// Mirrors `fn_html_code_format`: htmlEditFormat then `<pre>…</pre>` wrap.
 extern "C" fn cfml_html_code_format_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let inner = v
         .as_string()
         .replace('&', "&amp;")
@@ -369,7 +371,7 @@ extern "C" fn cfml_html_code_format_boxed(tagged: i64) -> i64 {
 /// Mirrors `fn_encode_for_html`: same as htmlEditFormat plus `'` and `/` escapes.
 extern "C" fn cfml_encode_for_html_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v
         .as_string()
         .replace('&', "&amp;")
@@ -390,7 +392,7 @@ extern "C" fn cfml_encode_for_html_boxed(tagged: i64) -> i64 {
 extern "C" fn cfml_url_encoded_format_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
     use std::fmt::Write;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v.as_string();
     let mut result = String::new();
     for c in s.chars() {
@@ -410,7 +412,7 @@ extern "C" fn cfml_url_encoded_format_boxed(tagged: i64) -> i64 {
 /// Mirrors `fn_url_decode`.
 extern "C" fn cfml_url_decode_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v.as_string();
     let mut result = String::new();
     let mut bytes: Vec<u8> = Vec::new();
@@ -464,7 +466,7 @@ extern "C" fn cfml_url_decode_boxed(tagged: i64) -> i64 {
 /// Mirrors `fn_js_string_format`: escapes `\`, `'`, `"`, `\n`, `\r`, `\t`.
 extern "C" fn cfml_js_string_format_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let escaped = v
         .as_string()
         .replace('\\', "\\\\")
@@ -485,7 +487,7 @@ extern "C" fn cfml_js_string_format_boxed(tagged: i64) -> i64 {
 /// Mirrors `fn_left(string, count)`.
 extern "C" fn cfml_left_boxed_int(tagged: i64, count: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v.as_string();
     let n = count.max(0) as usize;
     let chars: Vec<char> = s.chars().collect();
@@ -496,7 +498,7 @@ extern "C" fn cfml_left_boxed_int(tagged: i64, count: i64) -> i64 {
 /// Mirrors `fn_right(string, count)`.
 extern "C" fn cfml_right_boxed_int(tagged: i64, count: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v.as_string();
     let n = count.max(0) as usize;
     let chars: Vec<char> = s.chars().collect();
@@ -508,7 +510,7 @@ extern "C" fn cfml_right_boxed_int(tagged: i64, count: i64) -> i64 {
 /// Mirrors `fn_mid(string, start, length)` (3-arg form).
 extern "C" fn cfml_mid_boxed_int_int(tagged: i64, start: i64, length: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v.as_string();
     let start = (start.max(1) as usize).saturating_sub(1);
     let length = length.max(0) as usize;
@@ -525,7 +527,7 @@ extern "C" fn cfml_mid_boxed_int_int(tagged: i64, start: i64, length: i64) -> i6
 /// Mirrors `fn_repeat_string(string, count)`.
 extern "C" fn cfml_repeat_string_boxed_int(tagged: i64, count: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let s = v.as_string();
     let n = count.max(0) as usize;
     super::arena::box_into_active(CfmlValue::string(s.repeat(n))) as i64
@@ -534,8 +536,8 @@ extern "C" fn cfml_repeat_string_boxed_int(tagged: i64, count: i64) -> i64 {
 /// Mirrors `fn_find(substring, string)` (2-arg form). 1-based index of the
 /// first occurrence, or 0 if not found.
 extern "C" fn cfml_find_boxed_boxed_i64(needle: i64, hay: i64) -> i64 {
-    let n = unsafe { super::boxed::borrow_tagged(needle as usize) };
-    let h = unsafe { super::boxed::borrow_tagged(hay as usize) };
+    let n = unsafe { super::boxed::materialize_tagged(needle as usize) };
+    let h = unsafe { super::boxed::materialize_tagged(hay as usize) };
     let substring = n.as_string();
     let string = h.as_string();
     if let Some(pos) = string.find(&*substring) {
@@ -547,8 +549,8 @@ extern "C" fn cfml_find_boxed_boxed_i64(needle: i64, hay: i64) -> i64 {
 
 /// Mirrors `fn_find_no_case(substring, string)`.
 extern "C" fn cfml_find_no_case_boxed_boxed_i64(needle: i64, hay: i64) -> i64 {
-    let n = unsafe { super::boxed::borrow_tagged(needle as usize) };
-    let h = unsafe { super::boxed::borrow_tagged(hay as usize) };
+    let n = unsafe { super::boxed::materialize_tagged(needle as usize) };
+    let h = unsafe { super::boxed::materialize_tagged(hay as usize) };
     let substring = n.as_string().to_lowercase();
     let string = h.as_string().to_lowercase();
     if let Some(pos) = string.find(&substring) {
@@ -562,9 +564,9 @@ extern "C" fn cfml_find_no_case_boxed_boxed_i64(needle: i64, hay: i64) -> i64 {
 /// (single replacement, case-sensitive).
 extern "C" fn cfml_replace_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let vs = unsafe { super::boxed::borrow_tagged(tag_s as usize) };
-    let vf = unsafe { super::boxed::borrow_tagged(tag_f as usize) };
-    let vr = unsafe { super::boxed::borrow_tagged(tag_r as usize) };
+    let vs = unsafe { super::boxed::materialize_tagged(tag_s as usize) };
+    let vf = unsafe { super::boxed::materialize_tagged(tag_f as usize) };
+    let vr = unsafe { super::boxed::materialize_tagged(tag_r as usize) };
     let out = vs.as_string().replacen(&*vf.as_string(), &vr.as_string(), 1);
     super::arena::box_into_active(CfmlValue::string(out)) as i64
 }
@@ -582,8 +584,8 @@ extern "C" fn cfml_replace_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -> i64 {
 // interpreter so it throws the same `Can't cast` runtime error.**
 extern "C" fn cfml_array_len_boxed_i64(tagged: i64, bail: *mut i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
-    match v {
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    match &v {
         CfmlValue::Array(a) => a.len() as i64,
         CfmlValue::QueryColumn(_) => {
             // Surface as a bail; interpreter throws on re-run.
@@ -611,8 +613,8 @@ extern "C" fn cfml_array_len_boxed_i64(tagged: i64, bail: *mut i64) -> i64 {
 /// `""` for non-struct inputs (infallible — same as interpreter).
 extern "C" fn cfml_struct_key_list_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
-    let out = if let CfmlValue::Struct(s) = v {
+    let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
+    let out = if let CfmlValue::Struct(s) = &v {
         // Inline `visible_struct_keys`: hide the arguments-scope markers.
         let keys: Vec<String> = s.keys();
         let visible: Vec<String> = if keys.iter().any(|k| k == "__arguments_scope") {
@@ -632,9 +634,9 @@ extern "C" fn cfml_struct_key_list_boxed(tagged: i64) -> i64 {
 /// Mirrors `fn_replace_no_case(string, find, replaceWith)` with default scope="one".
 extern "C" fn cfml_replace_no_case_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
-    let vs = unsafe { super::boxed::borrow_tagged(tag_s as usize) };
-    let vf = unsafe { super::boxed::borrow_tagged(tag_f as usize) };
-    let vr = unsafe { super::boxed::borrow_tagged(tag_r as usize) };
+    let vs = unsafe { super::boxed::materialize_tagged(tag_s as usize) };
+    let vf = unsafe { super::boxed::materialize_tagged(tag_f as usize) };
+    let vr = unsafe { super::boxed::materialize_tagged(tag_r as usize) };
     let string = vs.as_string();
     let find = vf.as_string();
     let replace_with = vr.as_string();
@@ -2002,6 +2004,49 @@ mod tests {
         drop(unsafe { boxed::reclaim_tagged(cr_in as usize) });
         drop(unsafe { boxed::reclaim_tagged(html_in as usize) });
         arena.drain_except(None);
+    }
+
+    #[test]
+    fn pre_v0101_shims_accept_smi_int_inputs() {
+        // Regression for the v0.99.6+ SMI hazard: when an Int flows out of
+        // the member-IC as a tag-pointer SMI and is passed to a v0.99.0–
+        // v0.99.3 shim, the shim must `materialize_tagged` (not
+        // `borrow_tagged`, which panics on non-TAG_PTR). Pre-fix this would
+        // have aborted; post-fix the shim sees `CfmlValue::Int(n)` exactly
+        // as if it had been heap-boxed.
+        use super::super::arena::{Arena, ArenaGuard};
+        use super::super::boxed;
+
+        let mut arena = Arena::new();
+        let _g = ArenaGuard::install(&mut arena);
+
+        // SMI-tagged Int 42 — fits in i61.
+        let smi = boxed::try_tag_smi_int(42).expect("42 fits in SMI");
+        assert!(boxed::is_smi_int(smi));
+
+        // len("42") = 2 chars via the Int/Double arm.
+        assert_eq!(cfml_len_boxed_i64(smi as i64), 2);
+
+        // ucase("42") = "42" — verifies the Boxed→Boxed string path.
+        let out = cfml_ucase_boxed(smi as i64);
+        let v = unsafe { boxed::borrow_tagged(out as usize) };
+        assert!(matches!(v, cfml_common::dynamic::CfmlValue::String(s) if s.as_str() == "42"));
+
+        // asc("42") = '4' as i64 = 52 — verifies the Boxed→Int (non-len) path.
+        assert_eq!(cfml_asc_boxed_i64(smi as i64), '4' as i64);
+
+        // 2-arg shim: find("4", "42") = 1 — verifies multi-arg SMI in both slots.
+        let needle = boxed::try_tag_smi_int(4).expect("4 fits in SMI");
+        assert_eq!(cfml_find_boxed_boxed_i64(needle as i64, smi as i64), 1);
+
+        // arrayLen on an SMI Int → 0 (no bail; matches interp fn_array_len fallthrough).
+        let mut bail: i64 = 0;
+        assert_eq!(cfml_array_len_boxed_i64(smi as i64, &mut bail), 0);
+        assert_eq!(bail, 0);
+
+        drop(_g);
+        arena.drain_except(None);
+        // SMI values need no reclaim — they don't own heap memory.
     }
 
     #[test]
