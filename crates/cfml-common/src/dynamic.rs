@@ -836,9 +836,17 @@ impl CfmlValue {
                 visited.push(ptr);
                 let (columns, data, sql) =
                     q.with_read(|d| (d.columns.clone(), d.data.clone(), d.sql.clone()));
-                let data = data
+                // Genuinely deep-copy each column so the duplicate shares NO
+                // storage with the original. Arc::clone alone wouldn't suffice —
+                // a later mutation through `duplicate(q)` would CoW the column
+                // but the per-cell nested arrays/structs would still alias.
+                let data: Vec<Arc<Vec<CfmlValue>>> = data
                     .into_iter()
-                    .map(|col| col.into_iter().map(|v| v.deep_copy_guarded(visited)).collect())
+                    .map(|col| {
+                        Arc::new(
+                            col.iter().map(|v| v.deep_copy_guarded(visited)).collect(),
+                        )
+                    })
                     .collect();
                 visited.pop();
                 CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql }))
@@ -1006,7 +1014,12 @@ pub enum CfmlAccess {
 #[derive(Debug, Clone, Default)]
 pub struct CfmlQueryData {
     pub columns: Vec<String>,
-    pub data: Vec<Vec<CfmlValue>>,
+    /// Column-major data. Each column is wrapped in `Arc<Vec<_>>` so that
+    /// `CfmlQueryData::clone()` is O(columns) Arc bumps instead of deep-cloning
+    /// every cell. Mutations go through `Arc::make_mut` — free when the column
+    /// Arc is unique (the common case for in-place builders), copy-on-write
+    /// otherwise.
+    pub data: Vec<Arc<Vec<CfmlValue>>>,
     pub sql: Option<String>,
 }
 
@@ -1014,7 +1027,7 @@ impl CfmlQueryData {
     /// Empty data block with the given columns.
     pub fn new(columns: Vec<String>) -> Self {
         let n = columns.len();
-        Self { columns, data: (0..n).map(|_| Vec::new()).collect(), sql: None }
+        Self { columns, data: (0..n).map(|_| Arc::new(Vec::new())).collect(), sql: None }
     }
 
     /// Build from columns + already-row-shaped rows (the legacy IndexMap shape).
@@ -1054,7 +1067,7 @@ impl CfmlQueryData {
 
     #[inline]
     pub fn cell_mut(&mut self, row: usize, col_idx: usize) -> Option<&mut CfmlValue> {
-        self.data.get_mut(col_idx).and_then(|c| c.get_mut(row))
+        self.data.get_mut(col_idx).and_then(|c| Arc::make_mut(c).get_mut(row))
     }
 
     /// Set a cell by column name (CI). Unknown columns are added (pre-existing
@@ -1064,13 +1077,13 @@ impl CfmlQueryData {
             return false;
         }
         if let Some(ci) = self.column_index_ci(name) {
-            self.data[ci][row] = val;
+            Arc::make_mut(&mut self.data[ci])[row] = val;
         } else {
             self.columns.push(name.to_string());
             let rows = self.row_count();
             let mut col = vec![CfmlValue::Null; rows];
             col[row] = val;
-            self.data.push(col);
+            self.data.push(Arc::new(col));
         }
         true
     }
@@ -1078,12 +1091,20 @@ impl CfmlQueryData {
     /// Borrow one column's values by index.
     #[inline]
     pub fn column_data(&self, col_idx: usize) -> Option<&Vec<CfmlValue>> {
-        self.data.get(col_idx)
+        self.data.get(col_idx).map(|a| a.as_ref())
     }
 
     /// Borrow one column's values by name (CI). Zero-copy.
     #[inline]
     pub fn column_data_ci(&self, name: &str) -> Option<&Vec<CfmlValue>> {
+        self.column_index_ci(name).and_then(|i| self.data.get(i)).map(|a| a.as_ref())
+    }
+
+    /// Borrow one column's Arc directly — lets callers cheaply `Arc::clone` and
+    /// share the column without re-cloning. Used by `column_values_ci` to hand
+    /// the same Arc straight to `CfmlValue::QueryColumn`.
+    #[inline]
+    pub fn column_arc_ci(&self, name: &str) -> Option<&Arc<Vec<CfmlValue>>> {
         self.column_index_ci(name).and_then(|i| self.data.get(i))
     }
 
@@ -1110,7 +1131,7 @@ impl CfmlQueryData {
         let n = self.columns.len();
         vals.resize_with(n, || CfmlValue::Null);
         for (ci, v) in vals.into_iter().enumerate() {
-            self.data[ci].push(v);
+            Arc::make_mut(&mut self.data[ci]).push(v);
         }
     }
 
@@ -1124,7 +1145,7 @@ impl CfmlQueryData {
             if self.column_index_ci(k).is_none() {
                 self.columns.push(k.clone());
                 let prev = self.row_count();
-                self.data.push(vec![CfmlValue::Null; prev]);
+                self.data.push(Arc::new(vec![CfmlValue::Null; prev]));
             }
         }
         // Lowercase the row keys once for the lookup loop (case-insensitive
@@ -1136,7 +1157,7 @@ impl CfmlQueryData {
                 .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
                 .map(|(_, v)| v.clone())
                 .unwrap_or(CfmlValue::Null);
-            self.data[ci].push(val);
+            Arc::make_mut(&mut self.data[ci]).push(val);
         }
     }
 
@@ -1144,7 +1165,7 @@ impl CfmlQueryData {
         let n = self.columns.len();
         vals.resize_with(n, || CfmlValue::Null);
         for (ci, v) in vals.into_iter().enumerate() {
-            self.data[ci].insert(at, v);
+            Arc::make_mut(&mut self.data[ci]).insert(at, v);
         }
     }
 
@@ -1153,7 +1174,7 @@ impl CfmlQueryData {
             if self.column_index_ci(k).is_none() {
                 self.columns.push(k.clone());
                 let prev = self.row_count();
-                self.data.push(vec![CfmlValue::Null; prev]);
+                self.data.push(Arc::new(vec![CfmlValue::Null; prev]));
             }
         }
         for ci in 0..self.columns.len() {
@@ -1163,7 +1184,7 @@ impl CfmlQueryData {
                 .find(|(k, _)| k.eq_ignore_ascii_case(col_name))
                 .map(|(_, v)| v.clone())
                 .unwrap_or(CfmlValue::Null);
-            self.data[ci].insert(at, val);
+            Arc::make_mut(&mut self.data[ci]).insert(at, val);
         }
     }
 
@@ -1174,20 +1195,20 @@ impl CfmlQueryData {
         }
         let m = self.row_at(row);
         for col in &mut self.data {
-            col.remove(row);
+            Arc::make_mut(col).remove(row);
         }
         m
     }
 
     pub fn swap_rows(&mut self, r1: usize, r2: usize) {
         for col in &mut self.data {
-            col.swap(r1, r2);
+            Arc::make_mut(col).swap(r1, r2);
         }
     }
 
     pub fn reverse_rows(&mut self) {
         for col in &mut self.data {
-            col.reverse();
+            Arc::make_mut(col).reverse();
         }
     }
 
@@ -1201,7 +1222,7 @@ impl CfmlQueryData {
             col.resize_with(r, || CfmlValue::Null);
         }
         self.columns.push(name);
-        self.data.push(col);
+        self.data.push(Arc::new(col));
     }
 
     /// Remove a column by case-insensitive name. Returns true if it existed.
@@ -1222,7 +1243,7 @@ impl CfmlQueryData {
             if self.column_index_ci(col).is_none() {
                 self.columns.push(col.clone());
                 let r = self.row_count();
-                self.data.push(vec![CfmlValue::Null; r]);
+                self.data.push(Arc::new(vec![CfmlValue::Null; r]));
             }
         }
         let or = other.row_count();
@@ -1230,11 +1251,12 @@ impl CfmlQueryData {
             let col_name = self.columns[ci].as_str();
             match other.column_index_ci(col_name) {
                 Some(oci) => {
-                    self.data[ci].extend(other.data[oci].iter().cloned());
+                    let extra = other.data[oci].iter().cloned();
+                    Arc::make_mut(&mut self.data[ci]).extend(extra);
                 }
                 None => {
                     let new_len = self.data[ci].len() + or;
-                    self.data[ci].resize_with(new_len, || CfmlValue::Null);
+                    Arc::make_mut(&mut self.data[ci]).resize_with(new_len, || CfmlValue::Null);
                 }
             }
         }
@@ -1246,18 +1268,19 @@ impl CfmlQueryData {
             if self.column_index_ci(col).is_none() {
                 self.columns.push(col.clone());
                 let r = self.row_count();
-                self.data.push(vec![CfmlValue::Null; r]);
+                self.data.push(Arc::new(vec![CfmlValue::Null; r]));
             }
         }
         let or = other.row_count();
         for ci in 0..self.columns.len() {
             let col_name = self.columns[ci].as_str();
             let mut prefix: Vec<CfmlValue> = match other.column_index_ci(col_name) {
-                Some(oci) => other.data[oci].clone(),
+                Some(oci) => (*other.data[oci]).clone(),
                 None => vec![CfmlValue::Null; or],
             };
-            prefix.append(&mut self.data[ci]);
-            self.data[ci] = prefix;
+            let owned = Arc::make_mut(&mut self.data[ci]);
+            prefix.append(owned);
+            *owned = prefix;
         }
     }
 }
@@ -1382,8 +1405,10 @@ impl CfmlQuery {
 
     /// All values for a column (case-insensitive), one per row, in row order.
     /// `None` if the column doesn't exist. Used to build a `QueryColumn` proxy.
-    pub fn column_values_ci(&self, name: &str) -> Option<Vec<CfmlValue>> {
-        self.0.read().column_data_ci(name).map(|c| c.clone())
+    /// Returns the column's Arc directly — sharing storage with the underlying
+    /// query (zero copy). Mutations through the query will CoW the column.
+    pub fn column_values_ci(&self, name: &str) -> Option<Arc<Vec<CfmlValue>>> {
+        self.0.read().column_arc_ci(name).cloned()
     }
 
     /// Append a row in place (interior mutability — visible to all aliases).

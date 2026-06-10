@@ -1705,8 +1705,9 @@ impl CfmlVirtualMachine {
                     CfmlValue::string(q.column_list())
                 } else if let Some(col_data) = q.column_values_ci(name) {
                     // QueryColumn proxy: acts as Array for indexing/iteration
-                    // but stringifies to first row (Lucee parity).
-                    CfmlValue::QueryColumn(std::sync::Arc::new(col_data))
+                    // but stringifies to first row (Lucee parity). Shares the
+                    // column's Arc directly with the source query (zero-copy).
+                    CfmlValue::QueryColumn(col_data)
                 } else {
                     CfmlValue::Null
                 }
@@ -3720,9 +3721,7 @@ impl CfmlVirtualMachine {
                             match &index {
                                 CfmlValue::String(name) => {
                                     if let Some(col_data) = q.column_values_ci(name.as_str()) {
-                                        stack.push(CfmlValue::QueryColumn(
-                                            std::sync::Arc::new(col_data),
-                                        ));
+                                        stack.push(CfmlValue::QueryColumn(col_data));
                                     } else if let Ok(n) = name.trim().parse::<i64>() {
                                         stack.push(row_at_oneless(n));
                                     } else {
@@ -4020,7 +4019,7 @@ impl CfmlVirtualMachine {
                                         // proxy — acts as Array for indexing/iteration/length,
                                         // but stringifies to the first row (Lucee parity).
                                         if let Some(col_data) = q.column_values_ci(name) {
-                                            stack.push(CfmlValue::QueryColumn(std::sync::Arc::new(col_data)));
+                                            stack.push(CfmlValue::QueryColumn(col_data));
                                         } else {
                                             stack.push(CfmlValue::Null);
                                         }
@@ -5561,7 +5560,7 @@ impl CfmlVirtualMachine {
                                     .find(|(k, _)| k.eq_ignore_ascii_case(&col_name))
                                     .map(|(_, v)| v.clone())
                                     .unwrap_or(CfmlValue::Null);
-                                d.data[ci][pos - 1] = val;
+                                std::sync::Arc::make_mut(&mut d.data[ci])[pos - 1] = val;
                             }
                             true
                         } else {

@@ -4483,7 +4483,7 @@ fn fn_query_set_row(args: Vec<CfmlValue>) -> CfmlResult {
                     .find(|(k, _)| k.eq_ignore_ascii_case(&col_name))
                     .map(|(_, v)| v.clone())
                     .unwrap_or(CfmlValue::Null);
-                data.data[ci][row_idx] = val;
+                std::sync::Arc::make_mut(&mut data.data[ci])[row_idx] = val;
             }
             return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
         }
@@ -9873,10 +9873,10 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
                     row_count.saturating_sub(offset)
                 };
                 let end = std::cmp::min(offset + length, row_count);
-                let new_data: Vec<Vec<CfmlValue>> = if offset < row_count {
-                    d.data.iter().map(|col| col[offset..end].to_vec()).collect()
+                let new_data: Vec<std::sync::Arc<Vec<CfmlValue>>> = if offset < row_count {
+                    d.data.iter().map(|col| std::sync::Arc::new(col[offset..end].to_vec())).collect()
                 } else {
-                    d.columns.iter().map(|_| Vec::new()).collect()
+                    d.columns.iter().map(|_| std::sync::Arc::new(Vec::new())).collect()
                 };
                 CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None }
             });

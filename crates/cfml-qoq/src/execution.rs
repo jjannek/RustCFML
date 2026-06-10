@@ -915,7 +915,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
             let tbl = QoQTable {
                 name: String::new(),
                 columns: columns.to_vec(),
-                data: row.iter().map(|v| vec![v.clone()]).collect(),
+                data: row.iter().map(|v| std::sync::Arc::new(vec![v.clone()])).collect(),
                 row_count: 1,
             };
             let ts = TableSet { tables: vec![tbl] };
@@ -1380,7 +1380,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         select: &SelectStatement,
     ) -> Result<Vec<CfmlValue>, CfmlError> {
         let q = self.run_statement(select)?;
-        Ok(q.data.first().cloned().unwrap_or_default())
+        Ok(q.data.first().map(|a| (**a).clone()).unwrap_or_default())
     }
 
     // ── Function dispatch ───────────────────────────────────────────────
@@ -2106,6 +2106,7 @@ fn build_query(columns: Vec<String>, rows: Vec<Vec<CfmlValue>>) -> CfmlQueryData
             data[ci].push(it.next().unwrap_or(CfmlValue::Null));
         }
     }
+    let data = data.into_iter().map(std::sync::Arc::new).collect();
     CfmlQueryData { columns, data, sql: None }
 }
 

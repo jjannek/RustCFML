@@ -4,6 +4,8 @@
 //! sentinel** for outer joins (a missing row on one side of a LEFT/RIGHT/FULL
 //! join). `get(0, _)` therefore returns `Null`.
 
+use std::sync::Arc;
+
 use cfml_common::dynamic::{CfmlQueryData, CfmlValue};
 
 /// A source table converted to column-major layout for O(1) cell access.
@@ -13,15 +15,17 @@ pub struct QoQTable {
     pub name: String,
     /// Column names, in order.
     pub columns: Vec<String>,
-    /// Column-major data: `data[col_idx][row_idx0]`.
-    pub data: Vec<Vec<CfmlValue>>,
+    /// Column-major data: `data[col_idx][row_idx0]`. Columns are shared Arcs
+    /// with the source `CfmlQueryData` — `from_query_data` is O(columns) Arc
+    /// bumps, not deep-clone of N×R cells.
+    pub data: Vec<Arc<Vec<CfmlValue>>>,
     pub row_count: usize,
 }
 
 impl QoQTable {
-    /// Build from query data. With column-major `CfmlQueryData` the conversion
-    /// is now a zero-cost clone of the column vectors (the old row-major →
-    /// column-major loop is gone).
+    /// Build from query data. With column-major Arc'd `CfmlQueryData` this is
+    /// now N Arc refcount bumps (one per column) — no cell-level cloning at
+    /// all.
     pub fn from_query_data(name: &str, query: &CfmlQueryData) -> Self {
         QoQTable {
             name: name.to_string(),
