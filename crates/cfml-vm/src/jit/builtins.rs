@@ -374,6 +374,217 @@ extern "C" fn cfml_encode_for_html_boxed(tagged: i64) -> i64 {
     super::arena::box_into_active(CfmlValue::string(s)) as i64
 }
 
+// ── v0.99.2 single-arg Boxed→Boxed string shims ─────────────────────────────
+// urlEncodedFormat / urlDecode / jsStringFormat — all bit-exact mirrors of
+// the cfml-stdlib::builtins::fn_url_encode / fn_url_decode / fn_js_string_format
+// implementations. Infallible.
+
+/// Mirrors `fn_url_encode` (registered as `urlEncodedFormat`).
+extern "C" fn cfml_url_encoded_format_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    use std::fmt::Write;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v.as_string();
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => result.push(c),
+            ' ' => result.push('+'),
+            _ => {
+                for b in c.to_string().as_bytes() {
+                    let _ = write!(result, "%{:02X}", b);
+                }
+            }
+        }
+    }
+    super::arena::box_into_active(CfmlValue::string(result)) as i64
+}
+
+/// Mirrors `fn_url_decode`.
+extern "C" fn cfml_url_decode_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v.as_string();
+    let mut result = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' => {
+                let hex: String = chars.by_ref().take(2).collect();
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    bytes.push(byte);
+                }
+                if chars.peek() != Some(&'%') {
+                    if let Ok(decoded) = String::from_utf8(bytes.clone()) {
+                        result.push_str(&decoded);
+                    } else {
+                        for b in &bytes {
+                            result.push(*b as char);
+                        }
+                    }
+                    bytes.clear();
+                }
+            }
+            '+' => {
+                if !bytes.is_empty() {
+                    if let Ok(decoded) = String::from_utf8(bytes.clone()) {
+                        result.push_str(&decoded);
+                    }
+                    bytes.clear();
+                }
+                result.push(' ');
+            }
+            _ => {
+                if !bytes.is_empty() {
+                    if let Ok(decoded) = String::from_utf8(bytes.clone()) {
+                        result.push_str(&decoded);
+                    }
+                    bytes.clear();
+                }
+                result.push(c);
+            }
+        }
+    }
+    if !bytes.is_empty() {
+        if let Ok(decoded) = String::from_utf8(bytes.clone()) {
+            result.push_str(&decoded);
+        }
+    }
+    super::arena::box_into_active(CfmlValue::string(result)) as i64
+}
+
+/// Mirrors `fn_js_string_format`: escapes `\`, `'`, `"`, `\n`, `\r`, `\t`.
+extern "C" fn cfml_js_string_format_boxed(tagged: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let escaped = v
+        .as_string()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    super::arena::box_into_active(CfmlValue::string(escaped)) as i64
+}
+
+// ── v0.99.2 multi-arg Boxed shims ────────────────────────────────────────────
+// left / right / mid / repeatString — accept a leading Boxed string and one
+// or two Int counts. find / findNoCase return Int from two Boxed strings.
+// replace / replaceNoCase 3-arg forms (scope defaults to "one"). All
+// infallible — argument coercion via `.max(0)` / `.saturating_sub`.
+
+/// Mirrors `fn_left(string, count)`.
+extern "C" fn cfml_left_boxed_int(tagged: i64, count: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v.as_string();
+    let n = count.max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    let out: String = chars[..n.min(chars.len())].iter().collect();
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
+/// Mirrors `fn_right(string, count)`.
+extern "C" fn cfml_right_boxed_int(tagged: i64, count: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v.as_string();
+    let n = count.max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(n);
+    let out: String = chars[start..].iter().collect();
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
+/// Mirrors `fn_mid(string, start, length)` (3-arg form).
+extern "C" fn cfml_mid_boxed_int_int(tagged: i64, start: i64, length: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v.as_string();
+    let start = (start.max(1) as usize).saturating_sub(1);
+    let length = length.max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    let out: String = if start >= chars.len() {
+        String::new()
+    } else {
+        let end = (start + length).min(chars.len());
+        chars[start..end].iter().collect()
+    };
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
+/// Mirrors `fn_repeat_string(string, count)`.
+extern "C" fn cfml_repeat_string_boxed_int(tagged: i64, count: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let v = unsafe { super::boxed::borrow_tagged(tagged as usize) };
+    let s = v.as_string();
+    let n = count.max(0) as usize;
+    super::arena::box_into_active(CfmlValue::string(s.repeat(n))) as i64
+}
+
+/// Mirrors `fn_find(substring, string)` (2-arg form). 1-based index of the
+/// first occurrence, or 0 if not found.
+extern "C" fn cfml_find_boxed_boxed_i64(needle: i64, hay: i64) -> i64 {
+    let n = unsafe { super::boxed::borrow_tagged(needle as usize) };
+    let h = unsafe { super::boxed::borrow_tagged(hay as usize) };
+    let substring = n.as_string();
+    let string = h.as_string();
+    if let Some(pos) = string.find(&*substring) {
+        (pos + 1) as i64
+    } else {
+        0
+    }
+}
+
+/// Mirrors `fn_find_no_case(substring, string)`.
+extern "C" fn cfml_find_no_case_boxed_boxed_i64(needle: i64, hay: i64) -> i64 {
+    let n = unsafe { super::boxed::borrow_tagged(needle as usize) };
+    let h = unsafe { super::boxed::borrow_tagged(hay as usize) };
+    let substring = n.as_string().to_lowercase();
+    let string = h.as_string().to_lowercase();
+    if let Some(pos) = string.find(&substring) {
+        (pos + 1) as i64
+    } else {
+        0
+    }
+}
+
+/// Mirrors `fn_replace(string, find, replaceWith)` with default scope="one"
+/// (single replacement, case-sensitive).
+extern "C" fn cfml_replace_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let vs = unsafe { super::boxed::borrow_tagged(tag_s as usize) };
+    let vf = unsafe { super::boxed::borrow_tagged(tag_f as usize) };
+    let vr = unsafe { super::boxed::borrow_tagged(tag_r as usize) };
+    let out = vs.as_string().replacen(&*vf.as_string(), &vr.as_string(), 1);
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
+/// Mirrors `fn_replace_no_case(string, find, replaceWith)` with default scope="one".
+extern "C" fn cfml_replace_no_case_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -> i64 {
+    use cfml_common::dynamic::CfmlValue;
+    let vs = unsafe { super::boxed::borrow_tagged(tag_s as usize) };
+    let vf = unsafe { super::boxed::borrow_tagged(tag_f as usize) };
+    let vr = unsafe { super::boxed::borrow_tagged(tag_r as usize) };
+    let string = vs.as_string();
+    let find = vf.as_string();
+    let replace_with = vr.as_string();
+    let find_lower = find.to_lowercase();
+    let lower = string.to_lowercase();
+    let out = if let Some(pos) = lower.find(&find_lower) {
+        let mut result = String::new();
+        result.push_str(&string[..pos]);
+        result.push_str(&replace_with);
+        result.push_str(&string[pos + find.len()..]);
+        result
+    } else {
+        string.to_string()
+    };
+    super::arena::box_into_active(CfmlValue::string(out)) as i64
+}
+
 /// The complete shim table. Order matters for `lookup_overload`: more specific
 /// signatures (e.g. `abs(Int)`) must precede broader ones (`abs(Numeric)`).
 pub static SHIMS: &[Shim] = &[
@@ -744,6 +955,96 @@ pub static SHIMS: &[Shim] = &[
         sym: "cfml_encode_for_html_boxed",
         addr: cfml_encode_for_html_boxed as *const u8,
     },
+    // ── v0.99.2 — more single-arg Boxed→Boxed string shims ───────────────
+    Shim {
+        name: "urlencodedformat",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_url_encoded_format_boxed",
+        addr: cfml_url_encoded_format_boxed as *const u8,
+    },
+    Shim {
+        name: "urldecode",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_url_decode_boxed",
+        addr: cfml_url_decode_boxed as *const u8,
+    },
+    Shim {
+        name: "jsstringformat",
+        args_req: &[KindReq::Boxed],
+        args_abi: &[Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_js_string_format_boxed",
+        addr: cfml_js_string_format_boxed as *const u8,
+    },
+    // ── v0.99.2 — multi-arg Boxed shims ──────────────────────────────────
+    Shim {
+        name: "left",
+        args_req: &[KindReq::Boxed, KindReq::Int],
+        args_abi: &[Kind::Boxed, Kind::Int],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_left_boxed_int",
+        addr: cfml_left_boxed_int as *const u8,
+    },
+    Shim {
+        name: "right",
+        args_req: &[KindReq::Boxed, KindReq::Int],
+        args_abi: &[Kind::Boxed, Kind::Int],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_right_boxed_int",
+        addr: cfml_right_boxed_int as *const u8,
+    },
+    Shim {
+        name: "mid",
+        args_req: &[KindReq::Boxed, KindReq::Int, KindReq::Int],
+        args_abi: &[Kind::Boxed, Kind::Int, Kind::Int],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_mid_boxed_int_int",
+        addr: cfml_mid_boxed_int_int as *const u8,
+    },
+    Shim {
+        name: "repeatstring",
+        args_req: &[KindReq::Boxed, KindReq::Int],
+        args_abi: &[Kind::Boxed, Kind::Int],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_repeat_string_boxed_int",
+        addr: cfml_repeat_string_boxed_int as *const u8,
+    },
+    Shim {
+        name: "find",
+        args_req: &[KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Int,
+        sym: "cfml_find_boxed_boxed_i64",
+        addr: cfml_find_boxed_boxed_i64 as *const u8,
+    },
+    Shim {
+        name: "findnocase",
+        args_req: &[KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Int,
+        sym: "cfml_find_no_case_boxed_boxed_i64",
+        addr: cfml_find_no_case_boxed_boxed_i64 as *const u8,
+    },
+    Shim {
+        name: "replace",
+        args_req: &[KindReq::Boxed, KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_replace_3_boxed",
+        addr: cfml_replace_3_boxed as *const u8,
+    },
+    Shim {
+        name: "replacenocase",
+        args_req: &[KindReq::Boxed, KindReq::Boxed, KindReq::Boxed],
+        args_abi: &[Kind::Boxed, Kind::Boxed, Kind::Boxed],
+        ret_kind: Kind::Boxed,
+        sym: "cfml_replace_no_case_3_boxed",
+        addr: cfml_replace_no_case_3_boxed as *const u8,
+    },
 ];
 
 /// Lowercased lookup: `true` iff some shim has this exact name. Currently only
@@ -832,9 +1133,8 @@ mod tests {
     #[test]
     fn boxed_overloads_match_only_boxed_args() {
         use super::super::analysis::Kind;
-        // len / uCase / lCase / trim / ltrim / rtrim / reverse / asc /
-        // stripCr / htmlEditFormat / htmlCodeFormat / encodeForHtml each
-        // accept exactly one Boxed argument. Int and Float must miss.
+        // Single-arg Boxed shims: must accept exactly Boxed; Int/Float must
+        // miss. Covers the v0.99.0 / v0.99.1 / v0.99.2 surface.
         for name in [
             "len",
             "ucase",
@@ -848,6 +1148,9 @@ mod tests {
             "htmleditformat",
             "htmlcodeformat",
             "encodeforhtml",
+            "urlencodedformat",
+            "urldecode",
+            "jsstringformat",
         ] {
             assert!(
                 lookup_overload(name, &[Kind::Boxed]).is_some(),
@@ -878,9 +1181,48 @@ mod tests {
             "htmleditformat",
             "htmlcodeformat",
             "encodeforhtml",
+            "urlencodedformat",
+            "urldecode",
+            "jsstringformat",
         ] {
             let idx = lookup_overload(name, &[Kind::Boxed]).unwrap();
             assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed, "{name} ret must be Boxed");
+        }
+
+        // Multi-arg Boxed shims (v0.99.2).
+        // (Boxed, Int) → Boxed: left, right, repeatString.
+        for name in ["left", "right", "repeatstring"] {
+            assert!(
+                lookup_overload(name, &[Kind::Boxed, Kind::Int]).is_some(),
+                "{name}(Boxed, Int) must match"
+            );
+            assert!(
+                lookup_overload(name, &[Kind::Int, Kind::Int]).is_none(),
+                "{name}(Int, Int) must not match"
+            );
+            let idx = lookup_overload(name, &[Kind::Boxed, Kind::Int]).unwrap();
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+        }
+        // (Boxed, Int, Int) → Boxed: mid.
+        {
+            let idx = lookup_overload("mid", &[Kind::Boxed, Kind::Int, Kind::Int])
+                .expect("mid(Boxed,Int,Int) must match");
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+            assert!(lookup_overload("mid", &[Kind::Boxed, Kind::Int]).is_none());
+        }
+        // (Boxed, Boxed) → Int: find, findNoCase.
+        for name in ["find", "findnocase"] {
+            let idx = lookup_overload(name, &[Kind::Boxed, Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed,Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Int);
+            assert!(lookup_overload(name, &[Kind::Int, Kind::Int]).is_none());
+        }
+        // (Boxed, Boxed, Boxed) → Boxed: replace, replaceNoCase.
+        for name in ["replace", "replacenocase"] {
+            let idx = lookup_overload(name, &[Kind::Boxed, Kind::Boxed, Kind::Boxed])
+                .unwrap_or_else(|| panic!("{name}(Boxed,Boxed,Boxed) must match"));
+            assert_eq!(SHIMS[idx].ret_kind, Kind::Boxed);
+            assert!(lookup_overload(name, &[Kind::Boxed, Kind::Boxed]).is_none());
         }
     }
 

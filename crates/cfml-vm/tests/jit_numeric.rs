@@ -827,6 +827,88 @@ fn asc_returns_int_from_boxed_arg_in_jit() {
 }
 
 #[test]
+fn url_and_js_string_format_shims_match_interpreter() {
+    // v0.99.2 single-arg Boxed→Boxed shims: urlEncodedFormat / urlDecode /
+    // jsStringFormat. Chain through Concat to exercise all three.
+    let src = r##"
+        function fmt(s) {
+            return urlEncodedFormat(s) & "|" & jsStringFormat(s) & "|"
+                & urlDecode(urlEncodedFormat(s));
+        }
+        out = "";
+        for (k = 1; k <= 60; k++) {
+            out = out & fmt("a b+c/d=#k# 'q' ""r"" \t") & ";";
+        }
+        writeOutput(out);
+    "##;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "url / jsStringFormat shims must match interpreter");
+    assert!(compiled >= 1, "expected fmt() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn left_right_mid_shims_match_interpreter() {
+    // v0.99.2 (Boxed, Int[, Int]) → Boxed shims. Confirms the multi-arg
+    // Boxed+Int ABI path: arg 0 crosses as tagged ptr (to_i64 pass-through),
+    // args 1+ cross as int (to_i64 no-op).
+    let src = r#"
+        function slice(s, i) {
+            return left(s, i) & "|" & right(s, i) & "|" & mid(s, i, 3);
+        }
+        out = "";
+        for (k = 1; k <= 60; k++) {
+            out = out & slice("abcdefghij-#k#", (k % 5) + 1) & ";";
+        }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "left/right/mid Boxed shims must match interpreter");
+    assert!(compiled >= 1, "expected slice() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn find_and_replace_shims_match_interpreter() {
+    // v0.99.2 (Boxed, Boxed) → Int (find/findNoCase) and
+    // (Boxed, Boxed, Boxed) → Boxed (replace/replaceNoCase). The find result
+    // flows back into arithmetic, proving the Int return kind plumbs out of a
+    // multi-Boxed-arg callsite.
+    let src = r#"
+        function check(s, needle, with) {
+            var pos = find(needle, s) + findNoCase(needle, s);
+            return pos & ":" & replace(s, needle, with) & "|"
+                & replaceNoCase(s, needle, with);
+        }
+        out = "";
+        for (k = 1; k <= 60; k++) {
+            out = out & check("AbCdAbCd-#k#", "ab", "X") & ";";
+        }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "find/replace Boxed shims must match interpreter");
+    assert!(compiled >= 1, "expected check() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
+fn repeat_string_shim_matches_interpreter() {
+    // (Boxed, Int) → Boxed; output grows with k so we exercise the arena's
+    // string-box arena allocation under volume too.
+    let src = r#"
+        function band(s, n) { return repeatString(s, n) & "."; }
+        out = "";
+        for (k = 1; k <= 30; k++) { out = out & band("ab-#k#", k % 4) & ";"; }
+        writeOutput(out);
+    "#;
+    let oracle = run_interpreter(src);
+    let (out, compiled) = run(src);
+    assert_eq!(out, oracle, "repeatString Boxed shim must match interpreter");
+    assert!(compiled >= 1, "expected band() to be JIT-compiled, got {compiled}");
+}
+
+#[test]
 fn html_format_shims_in_jitted_udf_match_interpreter() {
     // htmlEditFormat / htmlCodeFormat / encodeForHtml / stripCr — chained
     // through a Concat. Confirms the entity-escape semantics match interp
