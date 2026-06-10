@@ -305,6 +305,27 @@ impl Parser {
             })));
         }
 
+        // Bare-typed top-level function: `struct function f() {...}` (no access
+        // modifier). Lucee/ACF/BoxLang accept return-type annotations on
+        // top-level cfscript functions exactly like component methods. Restrict
+        // to plain Identifier so `component`/`interface` declaration branches
+        // below still fire.
+        if matches!(self.peek(0), Token::Identifier(_)) {
+            let mut lookahead = 1;
+            while matches!(self.peek(lookahead), Token::Dot) && matches!(self.peek(lookahead + 1), Token::Identifier(_)) {
+                lookahead += 2;
+            }
+            if matches!(self.peek(lookahead), Token::Function) {
+                for _ in 0..lookahead {
+                    self.advance();
+                }
+                self.advance(); // consume `function`
+                return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
+                    func: self.parse_function()?,
+                })));
+            }
+        }
+
         // `component` is a SOFT keyword: it introduces a CFC only when it actually
         // begins a declaration (`component {`, `component Name ...`, `component
         // extends=...`, `component output="false" ...`). Used anywhere else — a
