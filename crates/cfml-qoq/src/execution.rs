@@ -21,7 +21,7 @@ use crate::compare::{append_group_key, compare_sql, compare_total, group_key, sq
 use crate::compiled::{self, CmpOp, CompiledExpr};
 use crate::function::{QoQFnKind, QoQFunctionRegistry};
 use crate::functions;
-use crate::intersection::build_intersections;
+use crate::intersection::{build_intersections, Intersections};
 use crate::like::{self, like_match};
 use crate::table::{QoQTable, TableSet};
 
@@ -334,7 +334,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String>) {
 #[derive(Clone, Copy)]
 enum RowCtx<'b> {
     Row(&'b [usize]),
-    Group(&'b [Vec<usize>]),
+    Group(&'b Intersections),
 }
 
 /// Result of executing one SELECT core. Column-major end-to-end: every
@@ -566,7 +566,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         &self,
         core: &SelectCore,
         tables: &TableSet,
-    ) -> Result<Vec<Vec<usize>>, CfmlError> {
+    ) -> Result<Intersections, CfmlError> {
         // Hash-join fast path (H4): every INNER JOIN with a single equi
         // `ResolvedColumn = ResolvedColumn` ON folds in O(L + R) instead of
         // the generic nested-loop's O(L × R). Falls back to the generic
@@ -631,7 +631,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         &self,
         core: &SelectCore,
         tables: &TableSet,
-    ) -> Option<Result<Vec<Vec<usize>>, CfmlError>> {
+    ) -> Option<Result<Intersections, CfmlError>> {
         if core.joins.is_empty() {
             return None;
         }
@@ -706,11 +706,14 @@ impl<'a, I: Invoker> Engine<'a, I> {
         &self,
         tables: &TableSet,
         probes: &[(usize, usize, usize, usize)],
-    ) -> Result<Vec<Vec<usize>>, CfmlError> {
+    ) -> Result<Intersections, CfmlError> {
         use std::collections::HashMap;
         let row0 = tables.tables[0].row_count;
-        let mut inters: Vec<Vec<usize>> = (1..=row0).map(|r| vec![r]).collect();
-        for &(lt, lc, rt, rc) in probes {
+        let mut inters = Intersections::with_capacity(1, row0);
+        for r in 1..=row0 {
+            inters.flat.push(r);
+        }
+        for (k, &(lt, lc, rt, rc)) in probes.iter().enumerate() {
             let right_tbl = &tables.tables[rt];
             // Hash index: stringified right-key → list of 1-based right rows.
             let mut idx: HashMap<String, Vec<usize>> =
@@ -719,16 +722,14 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 let key = group_key(&[right_tbl.get(r, rc)]);
                 idx.entry(key).or_default().push(r);
             }
-            // Probe: for each left intersection, look up the right rows with a
-            // matching key and emit one extended intersection per match.
-            let mut next: Vec<Vec<usize>> = Vec::with_capacity(inters.len());
-            for inter in &inters {
+            let new_width = k + 2;
+            let mut next = Intersections::with_capacity(new_width, inters.len());
+            for inter in inters.iter() {
                 let lkey = group_key(&[tables.value(inter, lt, lc)]);
                 if let Some(rows) = idx.get(&lkey) {
                     for &r in rows {
-                        let mut cand = inter.clone();
-                        cand.push(r);
-                        next.push(cand);
+                        next.flat.extend_from_slice(inter);
+                        next.flat.push(r);
                     }
                 }
             }
@@ -754,35 +755,48 @@ impl<'a, I: Invoker> Engine<'a, I> {
 
     fn filter_where(
         &self,
-        intersections: Vec<Vec<usize>>,
+        intersections: Intersections,
         where_clause: Option<&CompiledExpr>,
         tables: &TableSet,
-    ) -> Result<Vec<Vec<usize>>, CfmlError> {
+    ) -> Result<Intersections, CfmlError> {
         let Some(expr) = where_clause else {
             return Ok(intersections);
         };
+        let width = intersections.width;
         // Pure statement + many rows → evaluate the predicate across cores.
-        // `into_par_iter().collect()` preserves order; `flatten` drops the
-        // rows that didn't match.
         #[cfg(not(target_arch = "wasm32"))]
         if self.parallel && intersections.len() >= PARALLEL_ROW_THRESHOLD {
             use rayon::prelude::*;
             let pure = PureInvoker;
             let pe = self.pure_engine(&pure);
-            let kept: Result<Vec<Option<Vec<usize>>>, CfmlError> = intersections
-                .into_par_iter()
-                .map(|inter| {
-                    let v = pe.eval_compiled(expr, tables, RowCtx::Row(&inter))?;
-                    Ok(if is_truthy(&v) { Some(inter) } else { None })
+            let n_workers = rayon::current_num_threads().max(1);
+            let rows_per_chunk = (intersections.len() / (n_workers * 4)).max(1024);
+            let chunk_results: Result<Vec<Vec<usize>>, CfmlError> = intersections
+                .par_chunks_rows(rows_per_chunk)
+                .map(|chunk| {
+                    let mut keep = Vec::new();
+                    for inter in chunk.iter() {
+                        let v = pe.eval_compiled(expr, tables, RowCtx::Row(inter))?;
+                        if is_truthy(&v) {
+                            keep.extend_from_slice(inter);
+                        }
+                    }
+                    Ok(keep)
                 })
                 .collect();
-            return Ok(kept?.into_iter().flatten().collect());
+            let chunk_results = chunk_results?;
+            let total: usize = chunk_results.iter().map(|c| c.len()).sum();
+            let mut flat = Vec::with_capacity(total);
+            for c in chunk_results {
+                flat.extend(c);
+            }
+            return Ok(Intersections { width, flat });
         }
-        let mut out = Vec::new();
-        for inter in intersections {
-            let v = self.eval_compiled(expr, tables, RowCtx::Row(&inter))?;
+        let mut out = Intersections::new(width);
+        for inter in intersections.iter() {
+            let v = self.eval_compiled(expr, tables, RowCtx::Row(inter))?;
             if is_truthy(&v) {
-                out.push(inter);
+                out.push_row(inter);
             }
         }
         Ok(out)
@@ -796,7 +810,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
     fn exec_simple(
         &self,
         select_cols: &[SelectColumn],
-        intersections: &[Vec<usize>],
+        intersections: &Intersections,
         tables: &TableSet,
         order_by: &[OrderByExpr],
     ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>, usize), CfmlError> {
@@ -825,17 +839,16 @@ impl<'a, I: Invoker> Engine<'a, I> {
             let pe = self.pure_engine(&pure);
             let n_workers = rayon::current_num_threads().max(1);
             let chunk_size = (n_rows / (n_workers * 4)).max(1024);
-            let chunks: Vec<&[Vec<usize>]> = intersections.chunks(chunk_size).collect();
             type Chunk = (Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>);
-            let chunk_results: Result<Vec<Chunk>, CfmlError> = chunks
-                .par_iter()
+            let chunk_results: Result<Vec<Chunk>, CfmlError> = intersections
+                .par_chunks_rows(chunk_size)
                 .map(|chunk| {
                     let len = chunk.len();
                     let mut data: Vec<Vec<CfmlValue>> =
                         (0..n_cols).map(|_| Vec::with_capacity(len)).collect();
                     let mut keys: Vec<Vec<CfmlValue>> =
                         (0..n_keys).map(|_| Vec::with_capacity(len)).collect();
-                    for inter in *chunk {
+                    for inter in chunk.iter() {
                         let ctx = RowCtx::Row(inter);
                         for (ci, sc) in select_cols.iter().enumerate() {
                             data[ci].push(pe.eval(&sc.expr, tables, ctx)?);
@@ -876,7 +889,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
             (0..n_cols).map(|_| Vec::with_capacity(n_rows)).collect();
         let mut keys: Vec<Vec<CfmlValue>> =
             (0..n_keys).map(|_| Vec::with_capacity(n_rows)).collect();
-        for inter in intersections {
+        for inter in intersections.iter() {
             let ctx = RowCtx::Row(inter);
             for (ci, sc) in select_cols.iter().enumerate() {
                 data[ci].push(self.eval(&sc.expr, tables, ctx)?);
@@ -1151,14 +1164,14 @@ impl<'a, I: Invoker> Engine<'a, I> {
         &self,
         core: &SelectCore,
         select_cols: &[SelectColumn],
-        intersections: &[Vec<usize>],
+        intersections: &Intersections,
         tables: &TableSet,
         order_by: &[OrderByExpr],
     ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>, usize), CfmlError> {
-        let partitions: Vec<Vec<Vec<usize>>> = if core.group_by.is_empty() {
+        let partitions: Vec<Intersections> = if core.group_by.is_empty() {
             // Pure aggregate (no GROUP BY): one partition over all rows — even
             // if empty, which still yields one row (COUNT = 0, etc.).
-            vec![intersections.to_vec()]
+            vec![intersections.clone()]
         } else {
             self.partition(intersections, &core.group_by, tables)?
         };
@@ -1193,10 +1206,11 @@ impl<'a, I: Invoker> Engine<'a, I> {
 
     fn partition(
         &self,
-        intersections: &[Vec<usize>],
+        intersections: &Intersections,
         group_by: &[Expr],
         tables: &TableSet,
-    ) -> Result<Vec<Vec<Vec<usize>>>, CfmlError> {
+    ) -> Result<Vec<Intersections>, CfmlError> {
+        let width = intersections.width;
         // Compute the group key for every row in parallel (PureInvoker, no UDFs
         // touched on the GROUP BY expressions in practice), then fold into a
         // single IndexMap sequentially to preserve first-seen order. The key
@@ -1206,9 +1220,11 @@ impl<'a, I: Invoker> Engine<'a, I> {
             use rayon::prelude::*;
             let pure = PureInvoker;
             let pe = self.pure_engine(&pure);
-            let keys: Result<Vec<String>, CfmlError> = intersections
-                .par_iter()
-                .map(|inter| {
+            let n_rows = intersections.len();
+            let keys: Result<Vec<String>, CfmlError> = (0..n_rows)
+                .into_par_iter()
+                .map(|i| {
+                    let inter = intersections.row(i);
                     let mut key_vals = Vec::with_capacity(group_by.len());
                     for g in group_by {
                         key_vals.push(pe.eval(g, tables, RowCtx::Row(inter))?);
@@ -1217,21 +1233,28 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 })
                 .collect();
             let keys = keys?;
-            let mut groups: IndexMap<String, Vec<Vec<usize>>> = IndexMap::new();
-            for (inter, k) in intersections.iter().zip(keys.into_iter()) {
-                groups.entry(k).or_default().push(inter.clone());
+            let mut groups: IndexMap<String, Intersections> = IndexMap::new();
+            for (i, k) in keys.into_iter().enumerate() {
+                let inter = intersections.row(i);
+                groups
+                    .entry(k)
+                    .or_insert_with(|| Intersections::new(width))
+                    .push_row(inter);
             }
             return Ok(groups.into_values().collect());
         }
 
-        let mut groups: IndexMap<String, Vec<Vec<usize>>> = IndexMap::new();
-        for inter in intersections {
+        let mut groups: IndexMap<String, Intersections> = IndexMap::new();
+        for inter in intersections.iter() {
             let mut key_vals = Vec::with_capacity(group_by.len());
             for g in group_by {
                 key_vals.push(self.eval(g, tables, RowCtx::Row(inter))?);
             }
             let k = group_key(&key_vals);
-            groups.entry(k).or_default().push(inter.clone());
+            groups
+                .entry(k)
+                .or_insert_with(|| Intersections::new(width))
+                .push_row(inter);
         }
         Ok(groups.into_values().collect())
     }
@@ -1549,10 +1572,12 @@ impl<'a, I: Invoker> Engine<'a, I> {
     ) -> CfmlValue {
         let inter: &[usize] = match ctx {
             RowCtx::Row(i) => i,
-            RowCtx::Group(part) => match part.first() {
-                Some(i) => i,
-                None => return CfmlValue::Null,
-            },
+            RowCtx::Group(part) => {
+                if part.is_empty() {
+                    return CfmlValue::Null;
+                }
+                part.row(0)
+            }
         };
         tables.value(inter, ti as usize, ci as usize)
     }
@@ -1566,10 +1591,13 @@ impl<'a, I: Invoker> Engine<'a, I> {
     ) -> CfmlResult {
         match ctx {
             RowCtx::Row(inter) => self.column_value(table, name, tables, inter),
-            RowCtx::Group(part) => match part.first() {
-                Some(inter) => self.column_value(table, name, tables, inter),
-                None => Ok(CfmlValue::Null),
-            },
+            RowCtx::Group(part) => {
+                if part.is_empty() {
+                    Ok(CfmlValue::Null)
+                } else {
+                    self.column_value(table, name, tables, part.row(0))
+                }
+            }
         }
     }
 
@@ -1821,10 +1849,13 @@ impl<'a, I: Invoker> Engine<'a, I> {
         // Aggregates need a partition. In a Row context (no grouping) treat the
         // single row as a one-element partition.
         let single;
-        let partition: &[Vec<usize>] = match ctx {
+        let partition: &Intersections = match ctx {
             RowCtx::Group(p) => p,
             RowCtx::Row(r) => {
-                single = vec![r.to_vec()];
+                single = Intersections {
+                    width: r.len(),
+                    flat: r.to_vec(),
+                };
                 &single
             }
         };
@@ -1857,9 +1888,18 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 col = nonnull;
             }
             if lname == "group_concat" || lname == "string_agg" {
-                let sep = match args.get(1) {
-                    Some(e) => self.eval(e, tables, RowCtx::Row(&partition[0.min(partition.len().saturating_sub(1))]))?.as_string(),
-                    None => ",".to_string(),
+                let sep = if partition.is_empty() {
+                    match args.get(1) {
+                        Some(_) => ",".to_string(),
+                        None => ",".to_string(),
+                    }
+                } else {
+                    match args.get(1) {
+                        Some(e) => self
+                            .eval(e, tables, RowCtx::Row(partition.row(0)))?
+                            .as_string(),
+                        None => ",".to_string(),
+                    }
                 };
                 let parts: Vec<String> = col
                     .iter()
@@ -1896,10 +1936,10 @@ impl<'a, I: Invoker> Engine<'a, I> {
         &self,
         arg: &Expr,
         tables: &TableSet,
-        partition: &[Vec<usize>],
+        partition: &Intersections,
     ) -> Result<Vec<CfmlValue>, CfmlError> {
         let mut out = Vec::with_capacity(partition.len());
-        for inter in partition {
+        for inter in partition.iter() {
             out.push(self.eval(arg, tables, RowCtx::Row(inter))?);
         }
         Ok(out)
