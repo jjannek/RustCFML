@@ -28,6 +28,14 @@ try { include "core/test_cfloop_array_item_index.cfm"; } catch (any e) { writeOu
 try { include "core/test_cfloop_collection_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_collection_item_index.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_handling.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_handling.cfm | " & e.message & chr(10)); }
 try { include "core/test_builtin_shadowing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_builtin_shadowing.cfm | " & e.message & chr(10)); }
+//   - builtin_data_shadow: a plain DATA variable named like a builtin
+//     (val = "29") must not make the builtin uncallable in call position —
+//     Val(val) throws "Variable is not a function" at template scope,
+//     function-local, and cross-stack (a caller's local.val poisons the
+//     callee's Val()). Surfaced in Wheels' $convertToString (Global.cfc does
+//     `local.val = arguments.value; ... return Val(val);`) — killed
+//     hasChanged() and with it every UPDATE statement.
+try { include "core/test_builtin_data_shadow.cfm"; } catch (any e) { writeOutput("ERROR | core/test_builtin_data_shadow.cfm | " & e.message & chr(10)); }
 try { include "core/test_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arrow_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arrow_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arguments_writeback.cfm | " & e.message & chr(10)); }
