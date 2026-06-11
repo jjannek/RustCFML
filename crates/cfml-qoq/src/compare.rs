@@ -138,39 +138,46 @@ fn fmt_num(n: f64) -> String {
     }
 }
 
+/// Append one value's type-tagged key bytes to `key`. Shared between
+/// `group_key` and column-major dedup so we can hash a row without materialising
+/// a `Vec<CfmlValue>` of its cells.
+pub fn append_group_key(key: &mut String, v: &CfmlValue) {
+    match v {
+        CfmlValue::Null => key.push_str("N\u{1}"),
+        CfmlValue::Bool(b) => {
+            key.push('B');
+            key.push(if *b { 'T' } else { 'F' });
+            key.push('\u{1}');
+        }
+        CfmlValue::Int(i) => {
+            key.push('#');
+            key.push_str(&i.to_string());
+            key.push('\u{1}');
+        }
+        CfmlValue::Double(d) => {
+            key.push('#');
+            key.push_str(&fmt_num(*d));
+            key.push('\u{1}');
+        }
+        CfmlValue::String(s) => {
+            key.push('S');
+            key.push_str(&s.to_lowercase());
+            key.push('\u{1}');
+        }
+        other => {
+            key.push('S');
+            key.push_str(&other.as_string().to_lowercase());
+            key.push('\u{1}');
+        }
+    }
+}
+
 /// A canonical, type-tagged key string for DISTINCT and GROUP BY partitioning.
 /// The type tag prevents `1` (Int) and `"1"` (String) from collapsing together.
 pub fn group_key(values: &[CfmlValue]) -> String {
     let mut key = String::new();
     for v in values {
-        match v {
-            CfmlValue::Null => key.push_str("N\u{1}"),
-            CfmlValue::Bool(b) => {
-                key.push('B');
-                key.push(if *b { 'T' } else { 'F' });
-                key.push('\u{1}');
-            }
-            CfmlValue::Int(i) => {
-                key.push('#');
-                key.push_str(&i.to_string());
-                key.push('\u{1}');
-            }
-            CfmlValue::Double(d) => {
-                key.push('#');
-                key.push_str(&fmt_num(*d));
-                key.push('\u{1}');
-            }
-            CfmlValue::String(s) => {
-                key.push('S');
-                key.push_str(&s.to_lowercase());
-                key.push('\u{1}');
-            }
-            other => {
-                key.push('S');
-                key.push_str(&other.as_string().to_lowercase());
-                key.push('\u{1}');
-            }
-        }
+        append_group_key(&mut key, v);
     }
     key
 }

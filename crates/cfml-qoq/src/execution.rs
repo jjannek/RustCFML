@@ -17,7 +17,7 @@ use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 
 use crate::ast::*;
-use crate::compare::{compare_sql, compare_total, group_key, sql_equal};
+use crate::compare::{append_group_key, compare_sql, compare_total, group_key, sql_equal};
 use crate::compiled::{self, CmpOp, CompiledExpr};
 use crate::function::{QoQFnKind, QoQFunctionRegistry};
 use crate::functions;
@@ -337,12 +337,21 @@ enum RowCtx<'b> {
     Group(&'b [Vec<usize>]),
 }
 
-/// Result of executing one SELECT core.
+/// Result of executing one SELECT core. Column-major end-to-end: every
+/// downstream stage (UNION extend, dedup, sort, limit, build_query) operates
+/// on `Vec<Vec<CfmlValue>>` where `data[ci]` is the column ci's values and
+/// has length `row_count`. This lets `exec_no_join_fused` build passthrough
+/// columns by indexing the source column array directly — no per-row eval,
+/// no per-cell `CfmlValue::clone()` chain overhead, no row-major→col-major
+/// transpose at the very end.
 struct CoreResult {
     columns: Vec<String>,
-    rows: Vec<Vec<CfmlValue>>,
-    /// Parallel to `rows`: the ORDER BY key values for each row (empty when no
-    /// statement-level ORDER BY was supplied to the core).
+    row_count: usize,
+    /// Column-major output: `data[ci]` has length `row_count`.
+    data: Vec<Vec<CfmlValue>>,
+    /// Column-major ORDER BY keys: `sort_keys[k]` has length `row_count`
+    /// (outer Vec empty when no statement-level ORDER BY was supplied to
+    /// the core).
     sort_keys: Vec<Vec<CfmlValue>>,
 }
 
@@ -370,16 +379,17 @@ impl<'a, I: Invoker> Engine<'a, I> {
         };
         let body = self.run_core(&stmt.body, body_order)?;
         let columns = body.columns;
-        let mut rows = body.rows;
+        let mut data = body.data;
+        let mut row_count = body.row_count;
 
         if stmt.unions.is_empty() {
             let sort_keys = body.sort_keys;
-            sort_rows(&mut rows, &sort_keys, &stmt.order_by);
-            apply_limit(&mut rows, &stmt.limit);
-            return Ok(build_query(columns, rows));
+            sort_cols(&mut data, &sort_keys, &stmt.order_by, row_count);
+            row_count = apply_limit_cols(&mut data, &stmt.limit, row_count);
+            return Ok(build_query(columns, data, row_count));
         }
 
-        // UNION: append each arm, then dedup if any arm is a distinct UNION.
+        // UNION: extend each output column with the corresponding arm column.
         let any_distinct = stmt.unions.iter().any(|u| !u.all);
         for u in &stmt.unions {
             let arm = self.run_core(&u.select, &[])?;
@@ -390,14 +400,19 @@ impl<'a, I: Invoker> Engine<'a, I> {
                     arm.columns.len()
                 )));
             }
-            rows.extend(arm.rows);
+            for (ci, arm_col) in arm.data.into_iter().enumerate() {
+                data[ci].extend(arm_col);
+            }
+            row_count += arm.row_count;
         }
         if any_distinct {
-            dedup_rows(&mut rows);
+            row_count = dedup_cols(&mut data, row_count);
         }
-        self.order_by_output(&mut rows, &columns, &stmt.order_by)?;
-        apply_limit(&mut rows, &stmt.limit);
-        Ok(build_query(columns, rows))
+        let mut sort_keys: Vec<Vec<CfmlValue>> = Vec::new();
+        self.build_output_sort_keys(&data, row_count, &columns, &stmt.order_by, &mut sort_keys)?;
+        sort_cols(&mut data, &sort_keys, &stmt.order_by, row_count);
+        row_count = apply_limit_cols(&mut data, &stmt.limit, row_count);
+        Ok(build_query(columns, data, row_count))
     }
 
     fn run_core(
@@ -422,13 +437,11 @@ impl<'a, I: Invoker> Engine<'a, I> {
         bind_core(&mut core, &mut select_cols, &mut order_by, &tables);
         let columns = derive_column_names(&select_cols);
 
-        let intersections = self.build_core_intersections(&core, &tables)?;
         // Compile the WHERE clause once into the specialised CompiledExpr form
         // (see `compiled.rs`); the per-row evaluator dispatches on it in fewer
         // match arms than the full AST eval. Unrecognised subtrees fall through
         // to the existing AST evaluator via `CompiledExpr::Generic`.
         let compiled_where: Option<CompiledExpr> = core.where_clause.as_ref().map(compiled::compile);
-        let filtered = self.filter_where(intersections, compiled_where.as_ref(), &tables)?;
 
         let has_agg = select_cols.iter().any(|c| expr_has_aggregate(&c.expr, self.registry))
             || core
@@ -437,25 +450,46 @@ impl<'a, I: Invoker> Engine<'a, I> {
                 .map(|h| expr_has_aggregate(h, self.registry))
                 .unwrap_or(false);
 
-        let (mut rows, mut sort_keys) = if has_agg || !core.group_by.is_empty() {
-            self.exec_aggregate(&core, &select_cols, &filtered, &tables, &order_by)?
+        // Fast path — single table, no joins, no aggregation: fuse WHERE +
+        // projection + sort-key build into one parallel pass over the source
+        // row indices. Skips:
+        //   • the 1M-element `Vec<Vec<usize>>` intersection seed allocation
+        //   • the separate `filter_where` materialisation pass
+        //   • per-row 1-element `Vec<usize>` intersection allocations
+        // Single-row `inter` lives on the stack (`[r]`) inside the worker.
+        let can_fused = !has_agg
+            && core.group_by.is_empty()
+            && core.having.is_none()
+            && core.joins.is_empty()
+            && tables.tables.len() == 1;
+
+        let (mut data, mut sort_keys, mut row_count) = if can_fused {
+            self.exec_no_join_fused(&select_cols, compiled_where.as_ref(), &tables, &order_by)?
         } else {
-            self.exec_simple(&select_cols, &filtered, &tables, &order_by)?
+            let intersections = self.build_core_intersections(&core, &tables)?;
+            let filtered = self.filter_where(intersections, compiled_where.as_ref(), &tables)?;
+            if has_agg || !core.group_by.is_empty() {
+                self.exec_aggregate(&core, &select_cols, &filtered, &tables, &order_by)?
+            } else {
+                self.exec_simple(&select_cols, &filtered, &tables, &order_by)?
+            }
         };
 
         if core.distinct {
-            dedup_rows_and_keys(&mut rows, &mut sort_keys);
+            row_count = dedup_cols_and_keys(&mut data, &mut sort_keys, row_count);
         }
         if let Some(n) = core.top {
-            if rows.len() > n {
-                rows.truncate(n);
-                sort_keys.truncate(n);
+            if row_count > n {
+                truncate_cols(&mut data, n);
+                truncate_cols(&mut sort_keys, n);
+                row_count = n;
             }
         }
 
         Ok(CoreResult {
             columns,
-            rows,
+            row_count,
+            data,
             sort_keys,
         })
     }
@@ -481,10 +515,14 @@ impl<'a, I: Invoker> Engine<'a, I> {
         for ob in order_by {
             key.push(self.order_key(ob, &tables, RowCtx::Row(&inter), &row)?);
         }
+        // 1-row output → each column is a 1-element Vec.
+        let data: Vec<Vec<CfmlValue>> = row.into_iter().map(|v| vec![v]).collect();
+        let sort_keys: Vec<Vec<CfmlValue>> = key.into_iter().map(|v| vec![v]).collect();
         Ok(CoreResult {
             columns,
-            rows: vec![row],
-            sort_keys: vec![key],
+            row_count: 1,
+            data,
+            sort_keys,
         })
     }
 
@@ -750,52 +788,363 @@ impl<'a, I: Invoker> Engine<'a, I> {
         Ok(out)
     }
 
+    /// Multi-table / joined exec path. Like `exec_no_join_fused`, but each
+    /// "row" is an intersection (`Vec<usize>`) of 1-based row indices, one per
+    /// table. Writes column-major directly via chunked parallel evaluation;
+    /// each cell is moved (not cloned) from the eval result into its output
+    /// column.
     fn exec_simple(
         &self,
         select_cols: &[SelectColumn],
         intersections: &[Vec<usize>],
         tables: &TableSet,
         order_by: &[OrderByExpr],
-    ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>), CfmlError> {
-        // Pure statement + many rows → project (and build sort keys) per row
-        // across cores. `par_iter().collect()` preserves row order.
+    ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>, usize), CfmlError> {
+        let n_rows = intersections.len();
+        let n_cols = select_cols.len();
+        let n_keys = order_by.len();
+
+        // ORDER BY's bare-int-literal alias (`ORDER BY 1`) needs to read back
+        // the just-projected row's k-th cell. Pre-compute the alias slot per
+        // sort key (None for normal expression keys).
+        let int_alias: Vec<Option<usize>> = order_by
+            .iter()
+            .map(|ob| {
+                if let Expr::Literal(CfmlValue::Int(n)) = &ob.expr {
+                    Some((*n - 1).max(0) as usize)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         #[cfg(not(target_arch = "wasm32"))]
-        if self.parallel && intersections.len() >= PARALLEL_ROW_THRESHOLD {
+        if self.parallel && n_rows >= PARALLEL_ROW_THRESHOLD {
             use rayon::prelude::*;
             let pure = PureInvoker;
             let pe = self.pure_engine(&pure);
-            let built: Result<Vec<(Vec<CfmlValue>, Vec<CfmlValue>)>, CfmlError> = intersections
+            let n_workers = rayon::current_num_threads().max(1);
+            let chunk_size = (n_rows / (n_workers * 4)).max(1024);
+            let chunks: Vec<&[Vec<usize>]> = intersections.chunks(chunk_size).collect();
+            type Chunk = (Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>);
+            let chunk_results: Result<Vec<Chunk>, CfmlError> = chunks
                 .par_iter()
-                .map(|inter| {
-                    let mut row = Vec::with_capacity(select_cols.len());
-                    for sc in select_cols {
-                        row.push(pe.eval(&sc.expr, tables, RowCtx::Row(inter))?);
+                .map(|chunk| {
+                    let len = chunk.len();
+                    let mut data: Vec<Vec<CfmlValue>> =
+                        (0..n_cols).map(|_| Vec::with_capacity(len)).collect();
+                    let mut keys: Vec<Vec<CfmlValue>> =
+                        (0..n_keys).map(|_| Vec::with_capacity(len)).collect();
+                    for inter in *chunk {
+                        let ctx = RowCtx::Row(inter);
+                        for (ci, sc) in select_cols.iter().enumerate() {
+                            data[ci].push(pe.eval(&sc.expr, tables, ctx)?);
+                        }
+                        for (k, ob) in order_by.iter().enumerate() {
+                            let v = match int_alias[k] {
+                                Some(idx) => data
+                                    .get(idx)
+                                    .and_then(|c| c.last())
+                                    .cloned()
+                                    .unwrap_or(CfmlValue::Null),
+                                None => pe.eval(&ob.expr, tables, ctx)?,
+                            };
+                            keys[k].push(v);
+                        }
                     }
-                    let mut key = Vec::with_capacity(order_by.len());
-                    for ob in order_by {
-                        key.push(pe.order_key(ob, tables, RowCtx::Row(inter), &row)?);
-                    }
-                    Ok((row, key))
+                    Ok((data, keys))
                 })
                 .collect();
-            let (rows, keys): (Vec<_>, Vec<_>) = built?.into_iter().unzip();
-            return Ok((rows, keys));
+            let chunk_results = chunk_results?;
+            let mut data: Vec<Vec<CfmlValue>> =
+                (0..n_cols).map(|_| Vec::with_capacity(n_rows)).collect();
+            let mut keys: Vec<Vec<CfmlValue>> =
+                (0..n_keys).map(|_| Vec::with_capacity(n_rows)).collect();
+            for (chunk_data, chunk_keys) in chunk_results {
+                for (ci, col) in chunk_data.into_iter().enumerate() {
+                    data[ci].extend(col);
+                }
+                for (k, col) in chunk_keys.into_iter().enumerate() {
+                    keys[k].extend(col);
+                }
+            }
+            return Ok((data, keys, n_rows));
         }
-        let mut rows = Vec::with_capacity(intersections.len());
-        let mut keys = Vec::with_capacity(intersections.len());
+
+        // Sequential fallback.
+        let mut data: Vec<Vec<CfmlValue>> =
+            (0..n_cols).map(|_| Vec::with_capacity(n_rows)).collect();
+        let mut keys: Vec<Vec<CfmlValue>> =
+            (0..n_keys).map(|_| Vec::with_capacity(n_rows)).collect();
         for inter in intersections {
-            let mut row = Vec::with_capacity(select_cols.len());
-            for sc in select_cols {
-                row.push(self.eval(&sc.expr, tables, RowCtx::Row(inter))?);
+            let ctx = RowCtx::Row(inter);
+            for (ci, sc) in select_cols.iter().enumerate() {
+                data[ci].push(self.eval(&sc.expr, tables, ctx)?);
             }
-            let mut key = Vec::with_capacity(order_by.len());
-            for ob in order_by {
-                key.push(self.order_key(ob, tables, RowCtx::Row(inter), &row)?);
+            for (k, ob) in order_by.iter().enumerate() {
+                let v = match int_alias[k] {
+                    Some(idx) => data
+                        .get(idx)
+                        .and_then(|c| c.last())
+                        .cloned()
+                        .unwrap_or(CfmlValue::Null),
+                    None => self.eval(&ob.expr, tables, ctx)?,
+                };
+                keys[k].push(v);
             }
-            rows.push(row);
-            keys.push(key);
         }
-        Ok((rows, keys))
+        Ok((data, keys, n_rows))
+    }
+
+    /// Single-table, no-join, no-aggregate fast path. Two phases:
+    ///
+    /// 1. **Filter**: build `survivors: Vec<usize>` of 1-based source-row
+    ///    indices that pass WHERE. Parallel across the row range when
+    ///    eligible.
+    /// 2. **Column build** (one rayon worker per output column + per sort
+    ///    key): if the expression is a bare `Expr::ResolvedColumn{ti=0, ci}`,
+    ///    the output column is built by indexing the source column directly —
+    ///    no per-cell `eval()` dispatch chain. Otherwise the column is built
+    ///    by per-row eval. No per-row `Vec<CfmlValue>` allocations.
+    fn exec_no_join_fused(
+        &self,
+        select_cols: &[SelectColumn],
+        where_compiled: Option<&CompiledExpr>,
+        tables: &TableSet,
+        order_by: &[OrderByExpr],
+    ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>, usize), CfmlError> {
+        let row_count = tables.tables[0].row_count;
+
+        // Phase 1: filter into a flat `Vec<usize>` of surviving 1-based row
+        // indices. With a parallel-safe statement and enough rows, fan out the
+        // WHERE predicate across cores.
+        let survivors: Vec<usize> = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if self.parallel && row_count >= PARALLEL_ROW_THRESHOLD {
+                    use rayon::prelude::*;
+                    let pure = PureInvoker;
+                    let pe = self.pure_engine(&pure);
+                    if let Some(w) = where_compiled {
+                        let result: Result<Vec<Option<usize>>, CfmlError> = (1..=row_count)
+                            .into_par_iter()
+                            .map(|r| {
+                                let inter = [r];
+                                let v = pe.eval_compiled(w, tables, RowCtx::Row(&inter))?;
+                                Ok(if is_truthy(&v) { Some(r) } else { None })
+                            })
+                            .collect();
+                        result?.into_iter().flatten().collect()
+                    } else {
+                        (1..=row_count).collect()
+                    }
+                } else {
+                    let mut out = Vec::with_capacity(row_count);
+                    if let Some(w) = where_compiled {
+                        for r in 1..=row_count {
+                            let inter = [r];
+                            let v = self.eval_compiled(w, tables, RowCtx::Row(&inter))?;
+                            if is_truthy(&v) {
+                                out.push(r);
+                            }
+                        }
+                    } else {
+                        out.extend(1..=row_count);
+                    }
+                    out
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let mut out = Vec::with_capacity(row_count);
+                if let Some(w) = where_compiled {
+                    for r in 1..=row_count {
+                        let inter = [r];
+                        let v = self.eval_compiled(w, tables, RowCtx::Row(&inter))?;
+                        if is_truthy(&v) {
+                            out.push(r);
+                        }
+                    }
+                } else {
+                    out.extend(1..=row_count);
+                }
+                out
+            }
+        };
+
+        // Phase 2a: build each output projection column. The build can
+        // parallelise across columns when the statement is parallel-safe and
+        // the survivor set is large; otherwise sequential.
+        let n_surv = survivors.len();
+        let data = self.build_cols_for_exprs(
+            select_cols.iter().map(|sc| &sc.expr),
+            &survivors,
+            tables,
+        )?;
+
+        // Phase 2b: sort keys. `order_key` special-cases bare integer literals
+        // as 1-based references into the projected row — handle that here by
+        // aliasing the corresponding output column rather than re-evaluating.
+        let mut sort_keys: Vec<Vec<CfmlValue>> = Vec::with_capacity(order_by.len());
+        // Collect non-literal exprs to bulk-build, preserving slot positions.
+        let mut slot_for_expr: Vec<usize> = Vec::new();
+        let mut exprs_to_eval: Vec<&Expr> = Vec::new();
+        for (k, ob) in order_by.iter().enumerate() {
+            if let Expr::Literal(CfmlValue::Int(n)) = &ob.expr {
+                let idx = (*n - 1).max(0) as usize;
+                sort_keys.push(
+                    data.get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| vec![CfmlValue::Null; n_surv]),
+                );
+            } else {
+                slot_for_expr.push(k);
+                exprs_to_eval.push(&ob.expr);
+                sort_keys.push(Vec::new()); // placeholder
+            }
+        }
+        if !exprs_to_eval.is_empty() {
+            let built = self.build_cols_for_exprs(exprs_to_eval.into_iter(), &survivors, tables)?;
+            for (slot, col) in slot_for_expr.into_iter().zip(built.into_iter()) {
+                sort_keys[slot] = col;
+            }
+        }
+
+        Ok((data, sort_keys, n_surv))
+    }
+
+    /// Build one output column per expression, indexing into `survivors`
+    /// (1-based source-row indices, with 0 meaning the NULL sentinel for
+    /// outer-join misses — irrelevant in the no-join fused path).
+    ///
+    /// Passthrough fast-path: `Expr::ResolvedColumn{ti, ci}` skips the eval
+    /// dispatch chain and reads the source column array directly. For Q1
+    /// this fires on 10 of 12 select columns and all 3 ORDER BY keys.
+    fn build_cols_for_exprs<'e, It>(
+        &self,
+        exprs: It,
+        survivors: &[usize],
+        tables: &TableSet,
+    ) -> Result<Vec<Vec<CfmlValue>>, CfmlError>
+    where
+        It: IntoIterator<Item = &'e Expr>,
+    {
+        let exprs: Vec<&Expr> = exprs.into_iter().collect();
+        let n_surv = survivors.len();
+        let n_exprs = exprs.len();
+        let mut out: Vec<Option<Vec<CfmlValue>>> = (0..n_exprs).map(|_| None).collect();
+
+        // Sort exprs into two buckets:
+        //   • Passthrough — `Expr::ResolvedColumn{ti, ci}` — built by direct
+        //     column indexing, no eval dispatch.
+        //   • Everything else — evaluated.
+        let mut needs_eval: Vec<usize> = Vec::new();
+        for (i, e) in exprs.iter().enumerate() {
+            if !matches!(e, Expr::ResolvedColumn { .. }) {
+                needs_eval.push(i);
+            }
+        }
+
+        // 1. Passthrough columns. With many survivors, build each column with
+        //    rayon par_iter; otherwise sequential. The work is a cheap
+        //    `Arc<Vec<CfmlValue>>` indexed clone per cell, so spinning up a
+        //    parallel pass is only worthwhile above the row threshold.
+        for (i, e) in exprs.iter().enumerate() {
+            if let Expr::ResolvedColumn { ti, ci, .. } = e {
+                let src = &tables.tables[*ti as usize].data[*ci as usize];
+                let col: Vec<CfmlValue> = {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if self.parallel && n_surv >= PARALLEL_ROW_THRESHOLD {
+                            use rayon::prelude::*;
+                            survivors
+                                .par_iter()
+                                .map(|&r| passthrough_cell(src, r))
+                                .collect()
+                        } else {
+                            survivors
+                                .iter()
+                                .map(|&r| passthrough_cell(src, r))
+                                .collect()
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        survivors.iter().map(|&r| passthrough_cell(src, r)).collect()
+                    }
+                };
+                out[i] = Some(col);
+            }
+        }
+
+        // 2. Non-passthrough exprs. Run ONE chunked parallel pass over the
+        //    survivors that evaluates ALL of them per row, then concatenate
+        //    each chunk's column-major output. This brings back the old fused
+        //    per-row pattern's worker utilisation, but writes column-major
+        //    so we avoid the row-major→col-major transpose at the end of the
+        //    pipeline.
+        if !needs_eval.is_empty() {
+            let n_e = needs_eval.len();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if self.parallel && n_surv >= PARALLEL_ROW_THRESHOLD {
+                    use rayon::prelude::*;
+                    let pure = PureInvoker;
+                    let pe = self.pure_engine(&pure);
+                    let n_workers = rayon::current_num_threads().max(1);
+                    let chunk_size = (n_surv / (n_workers * 4)).max(1024);
+                    let chunks: Vec<&[usize]> = survivors.chunks(chunk_size).collect();
+                    let chunk_results: Result<Vec<Vec<Vec<CfmlValue>>>, CfmlError> = chunks
+                        .par_iter()
+                        .map(|chunk| {
+                            let mut cols: Vec<Vec<CfmlValue>> =
+                                (0..n_e).map(|_| Vec::with_capacity(chunk.len())).collect();
+                            for &r in *chunk {
+                                let inter = [r];
+                                let ctx = RowCtx::Row(&inter);
+                                for (k, &j) in needs_eval.iter().enumerate() {
+                                    cols[k].push(pe.eval(exprs[j], tables, ctx)?);
+                                }
+                            }
+                            Ok(cols)
+                        })
+                        .collect();
+                    let chunk_results = chunk_results?;
+                    let mut concat: Vec<Vec<CfmlValue>> =
+                        (0..n_e).map(|_| Vec::with_capacity(n_surv)).collect();
+                    for chunk in chunk_results {
+                        for (k, col) in chunk.into_iter().enumerate() {
+                            concat[k].extend(col);
+                        }
+                    }
+                    for (k, &i) in needs_eval.iter().enumerate() {
+                        out[i] = Some(std::mem::take(&mut concat[k]));
+                    }
+                } else {
+                    for &i in &needs_eval {
+                        let mut col = Vec::with_capacity(n_surv);
+                        for &r in survivors {
+                            let inter = [r];
+                            col.push(self.eval(exprs[i], tables, RowCtx::Row(&inter))?);
+                        }
+                        out[i] = Some(col);
+                    }
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                for &i in &needs_eval {
+                    let mut col = Vec::with_capacity(n_surv);
+                    for &r in survivors {
+                        let inter = [r];
+                        col.push(self.eval(exprs[i], tables, RowCtx::Row(&inter))?);
+                    }
+                    out[i] = Some(col);
+                }
+            }
+        }
+
+        Ok(out.into_iter().map(|o| o.unwrap_or_default()).collect())
     }
 
     fn exec_aggregate(
@@ -805,7 +1154,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         intersections: &[Vec<usize>],
         tables: &TableSet,
         order_by: &[OrderByExpr],
-    ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>), CfmlError> {
+    ) -> Result<(Vec<Vec<CfmlValue>>, Vec<Vec<CfmlValue>>, usize), CfmlError> {
         let partitions: Vec<Vec<Vec<usize>>> = if core.group_by.is_empty() {
             // Pure aggregate (no GROUP BY): one partition over all rows — even
             // if empty, which still yields one row (COUNT = 0, etc.).
@@ -834,7 +1183,12 @@ impl<'a, I: Invoker> Engine<'a, I> {
             rows.push(row);
             keys.push(key);
         }
-        Ok((rows, keys))
+        // Aggregate result sets are typically small — transpose row-major →
+        // column-major sequentially here.
+        let row_count = rows.len();
+        let data = rows_to_cols(rows, select_cols.len());
+        let sort_keys = rows_to_cols(keys, order_by.len());
+        Ok((data, sort_keys, row_count))
     }
 
     fn partition(
@@ -900,33 +1254,85 @@ impl<'a, I: Invoker> Engine<'a, I> {
 
     /// Order a UNION's merged rows by output column (position / name / expr over
     /// the output columns).
-    fn order_by_output(
+    /// Build column-major sort keys for a UNION-merged output: each key is a
+    /// column of length `row_count`. Bare integer-literal ORDER BY items
+    /// (`ORDER BY 1`, …) alias the corresponding output column directly; named
+    /// references resolve through a synthetic single-row TableSet per row.
+    fn build_output_sort_keys(
         &self,
-        rows: &mut Vec<Vec<CfmlValue>>,
+        data: &[Vec<CfmlValue>],
+        row_count: usize,
         columns: &[String],
         order_by: &[OrderByExpr],
+        sort_keys: &mut Vec<Vec<CfmlValue>>,
     ) -> Result<(), CfmlError> {
-        if order_by.is_empty() || rows.len() < 2 {
+        if order_by.is_empty() || row_count < 2 {
             return Ok(());
         }
-        let mut keys: Vec<Vec<CfmlValue>> = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            // Synthetic single-row table over the output columns.
-            let tbl = QoQTable {
-                name: String::new(),
-                columns: columns.to_vec(),
-                data: row.iter().map(|v| std::sync::Arc::new(vec![v.clone()])).collect(),
-                row_count: 1,
-            };
-            let ts = TableSet { tables: vec![tbl] };
-            let inter = vec![1usize];
-            let mut key = Vec::with_capacity(order_by.len());
-            for ob in order_by {
-                key.push(self.order_key(ob, &ts, RowCtx::Row(&inter), row)?);
+        let mut cols: Vec<Vec<CfmlValue>> =
+            (0..order_by.len()).map(|_| Vec::with_capacity(row_count)).collect();
+
+        // Resolve each OB expr to a direct output-column alias when possible:
+        // a bare integer literal (`ORDER BY 1`) names position k-1; a bare
+        // `Expr::Column { name }` whose `name` matches one of the output
+        // `columns` (case-insensitively) names that position. Hitting either
+        // path lets us skip the synthetic per-row TableSet for that key —
+        // the key column IS the referenced output column.
+        let col_alias: Vec<Option<usize>> = order_by
+            .iter()
+            .map(|ob| match &ob.expr {
+                Expr::Literal(CfmlValue::Int(n)) => Some((*n - 1).max(0) as usize),
+                Expr::Column { name, table: None } => columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(name)),
+                Expr::ResolvedColumn { name, .. } => columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(name)),
+                _ => None,
+            })
+            .collect();
+
+        let need_synth = col_alias.iter().any(|x| x.is_none());
+        // Pre-fill aliased keys in one column-major pass (no per-row synth):
+        // the key column IS the referenced output column.
+        for (k, alias) in col_alias.iter().enumerate() {
+            if let Some(idx) = alias {
+                if let Some(src) = data.get(*idx) {
+                    cols[k] = src.clone();
+                } else {
+                    cols[k] = vec![CfmlValue::Null; row_count];
+                }
             }
-            keys.push(key);
         }
-        sort_rows(rows, &keys, order_by);
+
+        if need_synth {
+            for i in 0..row_count {
+                // Build the synthetic single-row TableSet directly from the
+                // column data — no intermediate row buffer. Old row-major
+                // path's `data: row.iter().map(|v| Arc::new(vec![v.clone()]))`
+                // was one clone per cell; this matches that.
+                let synth_data: Vec<std::sync::Arc<Vec<CfmlValue>>> = data
+                    .iter()
+                    .map(|col| std::sync::Arc::new(vec![col[i].clone()]))
+                    .collect();
+                let tbl = QoQTable {
+                    name: String::new(),
+                    columns: columns.to_vec(),
+                    data: synth_data,
+                    row_count: 1,
+                };
+                let ts = TableSet { tables: vec![tbl] };
+                let inter = [1usize];
+                for (k, ob) in order_by.iter().enumerate() {
+                    if col_alias[k].is_some() {
+                        continue;
+                    }
+                    let v = self.order_key(ob, &ts, RowCtx::Row(&inter), &[])?;
+                    cols[k].push(v);
+                }
+            }
+        }
+        *sort_keys = cols;
         Ok(())
     }
 
@@ -2092,12 +2498,49 @@ fn derive_column_names(columns: &[SelectColumn]) -> Vec<String> {
     names
 }
 
-fn build_query(columns: Vec<String>, rows: Vec<Vec<CfmlValue>>) -> CfmlQueryData {
-    // Transpose row-major engine output into column-major storage. Each output
-    // row is a `Vec<CfmlValue>` in `columns` order; pivoting once here saves the
-    // ~74 ms per-query IndexMap allocation pass that the row-major build had.
-    let col_count = columns.len();
+/// Final column-major output → CFML query data. With CoreResult now
+/// column-major end-to-end, this is a thin Arc-wrap; the row-major transpose
+/// machinery is gone (see git history if you need to resurrect it).
+fn build_query(
+    columns: Vec<String>,
+    data: Vec<Vec<CfmlValue>>,
+    _row_count: usize,
+) -> CfmlQueryData {
+    let data = data.into_iter().map(std::sync::Arc::new).collect();
+    CfmlQueryData {
+        columns,
+        data,
+        sql: None,
+    }
+}
+
+/// Read one passthrough cell — the inner loop of every passthrough column
+/// build. 0 is the NULL sentinel for outer-join misses.
+#[inline]
+fn passthrough_cell(src: &[CfmlValue], r: usize) -> CfmlValue {
+    if r == 0 {
+        CfmlValue::Null
+    } else {
+        src.get(r - 1).cloned().unwrap_or(CfmlValue::Null)
+    }
+}
+
+/// Row-major → column-major transpose used by `exec_simple` /
+/// `exec_aggregate` to lift their internal row-major output into the
+/// `CoreResult` column-major shape. Parallel above the threshold using
+/// disjoint raw-pointer reads; see commit history for the safety
+/// argument (this is the v0.110 build_query_parallel logic moved here).
+fn rows_to_cols(rows: Vec<Vec<CfmlValue>>, col_count: usize) -> Vec<Vec<CfmlValue>> {
     let row_count = rows.len();
+    if col_count == 0 || row_count == 0 {
+        return (0..col_count).map(|_| Vec::new()).collect();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if row_count >= PARALLEL_BUILD_THRESHOLD && col_count >= 2 {
+        return rows_to_cols_parallel(rows, col_count, row_count);
+    }
+
     let mut data: Vec<Vec<CfmlValue>> =
         (0..col_count).map(|_| Vec::with_capacity(row_count)).collect();
     for row in rows {
@@ -2106,40 +2549,131 @@ fn build_query(columns: Vec<String>, rows: Vec<Vec<CfmlValue>>) -> CfmlQueryData
             data[ci].push(it.next().unwrap_or(CfmlValue::Null));
         }
     }
-    let data = data.into_iter().map(std::sync::Arc::new).collect();
-    CfmlQueryData { columns, data, sql: None }
+    data
 }
 
-// ── DISTINCT / ORDER BY / LIMIT ─────────────────────────────────────────
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_BUILD_THRESHOLD: usize = 5_000;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rows_to_cols_parallel(
+    rows: Vec<Vec<CfmlValue>>,
+    col_count: usize,
+    row_count: usize,
+) -> Vec<Vec<CfmlValue>> {
+    use rayon::prelude::*;
+
+    // Flatten on main thread — empty inner Vecs drop here, not on rayon
+    // workers (the v0.108 20× regression).
+    let total = row_count * col_count;
+    let mut flat: Vec<CfmlValue> = Vec::with_capacity(total);
+    for row in rows {
+        let len_before = flat.len();
+        flat.extend(row);
+        let added = flat.len() - len_before;
+        if added < col_count {
+            for _ in added..col_count {
+                flat.push(CfmlValue::Null);
+            }
+        } else if added > col_count {
+            flat.truncate(len_before + col_count);
+        }
+    }
+    debug_assert_eq!(flat.len(), total);
+
+    let cap = flat.capacity();
+    let ptr = flat.as_mut_ptr();
+    std::mem::forget(flat);
+    let ptr_addr = ptr as usize;
+
+    let cols: Vec<Vec<CfmlValue>> = (0..col_count)
+        .into_par_iter()
+        .map(|ci| {
+            let base = ptr_addr as *mut CfmlValue;
+            let mut col = Vec::with_capacity(row_count);
+            for r in 0..row_count {
+                // SAFETY: every (r, ci) is read by exactly one worker (ci),
+                // so the ptr::read calls are pairwise non-aliasing. Each
+                // cell was initialised by the flatten step above.
+                let v = unsafe { std::ptr::read(base.add(r * col_count + ci)) };
+                col.push(v);
+            }
+            col
+        })
+        .collect();
+
+    // SAFETY: every cell has been moved out; reclaim the backing buffer
+    // as an empty Vec on the main thread (same thread as the original
+    // alloc).
+    unsafe {
+        drop(Vec::from_raw_parts(ptr, 0, cap));
+    }
+
+    cols
+}
+
+// ── DISTINCT / ORDER BY / LIMIT (column-major) ──────────────────────────
 
 fn dedup_values(values: &mut Vec<CfmlValue>) {
     let mut seen = HashSet::new();
     values.retain(|v| seen.insert(group_key(std::slice::from_ref(v))));
 }
 
-fn dedup_rows(rows: &mut Vec<Vec<CfmlValue>>) {
+/// Compute the per-row keep mask for a col-major dataset. Builds the
+/// type-tagged group key one cell at a time directly off the column data —
+/// no per-row `Vec<CfmlValue>` materialisation, no per-cell `Arc::clone`.
+fn dedup_keep_mask(data: &[Vec<CfmlValue>], row_count: usize) -> Vec<bool> {
     let mut seen = HashSet::new();
-    rows.retain(|row| seen.insert(group_key(row)));
+    let mut keep = Vec::with_capacity(row_count);
+    let mut key_buf = String::new();
+    for i in 0..row_count {
+        key_buf.clear();
+        for col in data {
+            append_group_key(&mut key_buf, &col[i]);
+        }
+        keep.push(seen.insert(std::mem::take(&mut key_buf)));
+    }
+    keep
 }
 
-fn dedup_rows_and_keys(rows: &mut Vec<Vec<CfmlValue>>, keys: &mut Vec<Vec<CfmlValue>>) {
-    let mut seen = HashSet::new();
-    let mut i = 0;
-    let mut keep = Vec::with_capacity(rows.len());
-    for row in rows.iter() {
-        keep.push(seen.insert(group_key(row)));
+fn apply_keep_mask(data: &mut [Vec<CfmlValue>], keep: &[bool]) -> usize {
+    let mut kept = 0;
+    for col in data.iter_mut() {
+        let mut i = 0;
+        col.retain(|_| {
+            let k = keep[i];
+            i += 1;
+            k
+        });
     }
-    rows.retain(|_| {
-        let k = keep[i];
-        i += 1;
-        k
-    });
-    let mut j = 0;
-    keys.retain(|_| {
-        let k = keep[j];
-        j += 1;
-        k
-    });
+    for &k in keep {
+        if k {
+            kept += 1;
+        }
+    }
+    kept
+}
+
+fn dedup_cols(data: &mut [Vec<CfmlValue>], row_count: usize) -> usize {
+    let keep = dedup_keep_mask(data, row_count);
+    apply_keep_mask(data, &keep)
+}
+
+fn dedup_cols_and_keys(
+    data: &mut [Vec<CfmlValue>],
+    keys: &mut [Vec<CfmlValue>],
+    row_count: usize,
+) -> usize {
+    // Dedup is keyed on output row data, not sort keys.
+    let keep = dedup_keep_mask(data, row_count);
+    apply_keep_mask(data, &keep);
+    apply_keep_mask(keys, &keep)
+}
+
+fn truncate_cols(data: &mut [Vec<CfmlValue>], n: usize) {
+    for col in data.iter_mut() {
+        col.truncate(n);
+    }
 }
 
 /// Above this many rows, ORDER BY uses a parallel (stable) sort on non-wasm
@@ -2149,16 +2683,30 @@ fn dedup_rows_and_keys(rows: &mut Vec<Vec<CfmlValue>>, keys: &mut Vec<Vec<CfmlVa
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_SORT_THRESHOLD: usize = 2048;
 
-fn sort_rows(rows: &mut Vec<Vec<CfmlValue>>, keys: &[Vec<CfmlValue>], order_by: &[OrderByExpr]) {
-    if order_by.is_empty() || rows.len() < 2 {
+/// Column-major ORDER BY: build a permutation by sorting row-index slots
+/// using the sort-key columns, then apply that permutation to every output
+/// column (and discard the sort keys — they aren't needed downstream).
+fn sort_cols(
+    data: &mut [Vec<CfmlValue>],
+    keys: &[Vec<CfmlValue>],
+    order_by: &[OrderByExpr],
+    row_count: usize,
+) {
+    if order_by.is_empty() || row_count < 2 {
         return;
     }
     let null = CfmlValue::Null;
     let dirs: Vec<SortDirection> = order_by.iter().map(|o| o.direction).collect();
     let cmp = |&a: &usize, &b: &usize| -> Ordering {
         for (c, dir) in dirs.iter().enumerate() {
-            let ka = keys[a].get(c).unwrap_or(&null);
-            let kb = keys[b].get(c).unwrap_or(&null);
+            let ka = keys
+                .get(c)
+                .and_then(|col| col.get(a))
+                .unwrap_or(&null);
+            let kb = keys
+                .get(c)
+                .and_then(|col| col.get(b))
+                .unwrap_or(&null);
             let mut ord = compare_total(ka, kb);
             if *dir == SortDirection::Desc {
                 ord = ord.reverse();
@@ -2170,7 +2718,7 @@ fn sort_rows(rows: &mut Vec<Vec<CfmlValue>>, keys: &[Vec<CfmlValue>], order_by: 
         Ordering::Equal
     };
 
-    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    let mut idx: Vec<usize> = (0..row_count).collect();
     #[cfg(not(target_arch = "wasm32"))]
     {
         if idx.len() >= PARALLEL_SORT_THRESHOLD {
@@ -2183,21 +2731,49 @@ fn sort_rows(rows: &mut Vec<Vec<CfmlValue>>, keys: &[Vec<CfmlValue>], order_by: 
     #[cfg(target_arch = "wasm32")]
     idx.sort_by(cmp);
 
-    // Apply the permutation by MOVING rows out of the source vec via Option::take,
-    // not cloning them. At 500K rows × 12 cols the clone path did ~6M Arc::clone
-    // refcount bumps; this path does N moves with no refcount traffic.
-    let mut taken: Vec<Option<Vec<CfmlValue>>> = std::mem::take(rows).into_iter().map(Some).collect();
-    *rows = idx
-        .into_iter()
-        .map(|i| taken[i].take().expect("sort permutation must be a bijection"))
-        .collect();
+    // Apply the permutation to each output column by MOVING cells out via
+    // `Option::take`. No clones, no refcount traffic. With multi-column
+    // outputs the per-column work parallelises trivially.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        data.par_iter_mut().for_each(|col| {
+            let mut taken: Vec<Option<CfmlValue>> =
+                std::mem::take(col).into_iter().map(Some).collect();
+            *col = idx
+                .iter()
+                .map(|&i| taken[i].take().expect("sort permutation must be a bijection"))
+                .collect();
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    for col in data.iter_mut() {
+        let mut taken: Vec<Option<CfmlValue>> =
+            std::mem::take(col).into_iter().map(Some).collect();
+        *col = idx
+            .iter()
+            .map(|&i| taken[i].take().expect("sort permutation must be a bijection"))
+            .collect();
+    }
 }
 
-fn apply_limit(rows: &mut Vec<Vec<CfmlValue>>, limit: &Option<LimitClause>) {
-    if let Some(l) = limit {
-        let len = rows.len();
-        let start = l.offset.min(len);
-        let end = l.offset.saturating_add(l.count).min(len);
-        *rows = rows[start..end].to_vec();
+fn apply_limit_cols(
+    data: &mut [Vec<CfmlValue>],
+    limit: &Option<LimitClause>,
+    row_count: usize,
+) -> usize {
+    let Some(l) = limit else {
+        return row_count;
+    };
+    let start = l.offset.min(row_count);
+    let end = l.offset.saturating_add(l.count).min(row_count);
+    let new_len = end.saturating_sub(start);
+    for col in data.iter_mut() {
+        if start == 0 {
+            col.truncate(end);
+        } else {
+            *col = col[start..end].to_vec();
+        }
     }
+    new_len
 }
