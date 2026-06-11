@@ -126,6 +126,29 @@ If the number of supplied parameters doesn't match what the statements consume, 
 
 The same `queryExecute` API works in the WebAssembly/Cloudflare Workers build, where PostgreSQL is reached through a [Hyperdrive](https://developers.cloudflare.com/hyperdrive/) binding (via `postgres.js`). The placeholder rewriting and multi-statement handling described above apply there too, so application code is portable between the native server and the edge build. See **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**.
 
-## Not supported
+## Query-of-Queries
 
-- **Query-of-Queries (QoQ)** — running SQL `SELECT` over in-memory query objects is not supported.
+Pass `dbtype="query"` to run an in-memory SQL `SELECT` over query variables already in scope — no datasource, no driver, no JDBC. The engine lives in `crates/cfml-qoq` and is pure Rust; it parallelises filter/projection/sort across cores (non-wasm).
+
+```cfm
+<cfscript>
+employees = queryExecute("SELECT * FROM users WHERE active = 1");  // real DB
+top = queryExecute(
+    "SELECT name, salary FROM employees WHERE salary > :min ORDER BY salary DESC",
+    { min: 50000 },
+    { dbtype: "query" }                                              // QoQ
+);
+</cfscript>
+```
+
+Supported: `SELECT` (with `*`, `table.*`, aliases), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (multi-key, ASC/DESC), `DISTINCT`, `LIMIT`/`OFFSET`; `INNER`/`LEFT`/`RIGHT`/`FULL [OUTER] JOIN ... ON`, `CROSS` and comma joins; `UNION` / `UNION ALL`; `IN (SELECT ...)`, scalar subqueries in the SELECT list, derived `FROM (SELECT ...) AS t`; `CASE`, `CAST`/`CONVERT`, `BETWEEN`, `LIKE [ESCAPE]`, `IS [NOT] NULL`; positional `?` and named `:name` params (incl. `cfqueryparam`); `returntype` `query`/`array`/`struct`. Extensible — `register_native_qoq_fn` exposes a Rust function as both a BIF and a QoQ function; `queryRegisterFunction(name, udf[, "aggregate"])` registers a CFML UDF for use in SQL.
+
+Following BoxLang, RustCFML's QoQ is a **strict superset** of Lucee's: `LIMIT`/`OFFSET`, scalar subqueries, derived tables and `CASE` are accepted here but rejected by Lucee QoQ (it uses `TOP`). Same input → more accepted; not a wrong-result divergence — but SQL that uses those features is not portable back to Lucee. Correlated subqueries are **not** supported (subqueries run once, uncorrelated). See **[Known Issues §9](known-issues.md)** for the full superset table.
+
+Performance (1M-row source, [bdw429s/cfml-qoq-perf-tests](https://github.com/bdw429s/cfml-qoq-perf-tests), 5-run median, same machine, lower is better):
+
+| Engine | Total (ms) | vs RustCFML |
+|---|---:|---:|
+| **RustCFML** v0.112 | **1,116** | **1.00×** |
+| BoxLang 1.14 | 1,368 | 1.23× slower |
+| Lucee 7.0.4 | 7,884 | 7.1× slower |

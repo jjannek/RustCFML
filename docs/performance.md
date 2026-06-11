@@ -29,6 +29,30 @@ Serving a "Hello World" `.cfm` page in `--production` mode against a warmed Luce
 
 To reproduce: build `--release`, serve a one-line `<cfoutput>Hello World</cfoutput>` page with `--production`, warm with `ab -n 20000 -c 50`, then measure with `ab -t 8 -c <N>` (add `-k` for keep-alive).
 
+## Query-of-Queries
+
+`queryExecute(sql, params, {dbtype:"query"})` runs in-memory SQL `SELECT` against query variables already in scope, on a pure-Rust engine (`crates/cfml-qoq` — no JDBC, no HSQLDB). Filter, projection, dedup and sort are parallelised across cores with rayon on non-wasm targets.
+
+Running [bdw429s/cfml-qoq-perf-tests](https://github.com/bdw429s/cfml-qoq-perf-tests) — 10 representative SELECTs against a 1M-row `employees` query — in serve mode with the source query cached in `application` scope, 5-run median on a 14-core Apple M-series, lower is better:
+
+| Query | RustCFML v0.112 | BoxLang 1.14 | Lucee 7.0.4 |
+|---|---:|---:|---:|
+| 1. basic SELECT + WHERE + ORDER BY | 126 | **63** | 985 |
+| 2. UNION                           | **70**  | 73   | 565 |
+| 3. non-grouping aggregate          | **18**  | 143  | 278 |
+| 4. grouped aggregate               | **38**  | 91   | 110 |
+| 5. string concat                   | **38**  | 73   | 141 |
+| 6. `LIKE '%Harry%'`                | **15**  | 25   | 73  |
+| 7. 2-table comma join              | 171     | **72** | 1,162 |
+| 8. 3-table comma join              | 217     | **214** | 1,209 |
+| 9. ANSI 3-table join               | 166     | **110** | 1,209 |
+| 10. 5× UNION DISTINCT              | **258** | 383  | 2,351 |
+| **Total**                          | **1,116** | 1,368 | 7,884 |
+
+RustCFML wins six of ten queries and the total against BoxLang (1.23× faster overall), and is roughly 7× faster than Lucee. The single largest gap to BoxLang is on simple single-table scans (Q1, Q7) where BoxLang's compiled column representation makes per-cell clones cheaper; the gaps narrow under aggregation and `UNION DISTINCT` where the rayon-parallel paths dominate.
+
+To reproduce: clone [bdw429s/cfml-qoq-perf-tests](https://github.com/bdw429s/cfml-qoq-perf-tests), substitute the `cfloop` test driver for a `for` loop (Lucee/BoxLang only — RustCFML supports both), then run `test_rcf.cfm` from each engine's serve mode with the source query cached in `application` scope (the script does this) so the 1M-row build is paid once.
+
 ## Production mode caching
 
 By default the server re-validates files on each request (statting `Application.cfc` resolution and every cached bytecode entry) so edits are picked up live. Passing `--production` (or `RUSTCFML_PRODUCTION=1`) enables three persistent in-memory caches:

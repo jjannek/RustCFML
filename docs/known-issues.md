@@ -108,7 +108,6 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cffile action="...">` outside the supported actions | Throws "not implemented". |
 | `<cfthread action="...">` outside run/join/terminate | Throws "not supported". |
 | Nested `<cftransaction>` | Throws — nesting unsupported. |
-| Query-of-Queries | Unsupported (explicit). |
 
 ## 7. Partially-ignored parameters 🔇
 

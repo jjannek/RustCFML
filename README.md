@@ -74,6 +74,18 @@ Serving a "Hello World" `.cfm` page in `--production` mode against a warmed Luce
 
 RustCFML serves roughly 2–3.5× the throughput at about a tenth of the memory, with no JVM warmup. Both engines benefit from HTTP keep-alive; RustCFML scales further with it, sustaining ~26,000 req/s. See **[Performance](docs/performance.md)** for full methodology and production-mode caching.
 
+### Query-of-Queries
+
+Running [bdw429s/cfml-qoq-perf-tests](https://github.com/bdw429s/cfml-qoq-perf-tests) — 10 representative SELECTs against a 1M-row in-memory `employees` query — in serve mode, 5-run median, same machine, lower is better:
+
+| Engine | Total (ms) | vs RustCFML |
+|---|---:|---:|
+| **RustCFML** v0.112 | **1,116** | **1.00×** |
+| BoxLang 1.14 | 1,368 | 1.23× slower |
+| Lucee 7.0.4 | 7,884 | 7.1× slower |
+
+RustCFML wins six of ten queries outright (and the total) against BoxLang, including the 5×UNION DISTINCT and the grouped-aggregate cases. Pure-Rust SQL engine in `crates/cfml-qoq` — no JDBC, no HSQLDB, parallelised across cores with rayon (non-wasm).
+
 ## Documentation
 
 | Topic | Description |
@@ -117,7 +129,7 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 - **Complete CFML language** — CFScript and tag syntax (a preprocessor converts 50+ tags to CFScript), components with inheritance and interfaces, closures, member functions, and higher-order functions across arrays, structs, queries, and lists.
 - **400+ built-in functions** — strings, arrays, structs, dates, math, lists, queries, JSON, XML, regex, encoding, hashing, and modern password hashing (bcrypt/scrypt/argon2).
 - **Batteries-included web server** — `Application.cfc` lifecycle, sessions (in-process, Memcached, or clustered), cookies, authentication, URL rewriting, and file uploads.
-- **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
+- **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; in-memory **Query-of-Queries** (`dbtype="query"`) on a pure-Rust SQL engine — see the perf table below; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
 - **Real concurrency** — `cfthread` runs bodies on real OS threads with shared `application`/`request`/`session` scopes and `cflock`. See **[Threading](docs/threads.md)**.
 - **Run anywhere** — native binaries, self-contained single-file apps, and a WebAssembly target that runs on Cloudflare Workers.
 - **Extensible** — drop in first-class built-ins and classes written in Rust ([native modules](docs/native-modules.md)).
@@ -126,7 +138,6 @@ See **[Compatibility & Status](docs/status.md)** for implementation status.
 
 ### Not Supported
 
-- **Query-of-Queries (QoQ)** — SQL SELECT on in-memory query objects
 - Image functions, Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
 - `cfschedule`, `cfwddx`
 
