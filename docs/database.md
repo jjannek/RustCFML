@@ -147,8 +147,8 @@ Following BoxLang, RustCFML's QoQ is a **strict superset** of Lucee's: `LIMIT`/`
 
 Performance (1M-row source, [bdw429s/cfml-qoq-perf-tests](https://github.com/bdw429s/cfml-qoq-perf-tests), 5-run median, same machine, lower is better):
 
-| Engine | Total (ms) | vs RustCFML |
+| Engine | Total (ms) | RustCFML speedup |
 |---|---:|---:|
-| **RustCFML** v0.112 | **1,116** | **1.00×** |
-| BoxLang 1.14 | 1,368 | 1.23× slower |
-| Lucee 7.0.4 | 7,884 | 7.1× slower |
+| **RustCFML** v0.112 | **1,116** | — |
+| BoxLang 1.14 | 1,368 | **1.23× faster** |
+| Lucee 7.0.4 | 7,884 | **7.1× faster** |

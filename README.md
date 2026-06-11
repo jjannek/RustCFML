@@ -78,13 +78,13 @@ RustCFML serves roughly 2–3.5× the throughput at about a tenth of the memory,
 
 Running [bdw429s/cfml-qoq-perf-tests](https://github.com/bdw429s/cfml-qoq-perf-tests) — 10 representative SELECTs against a 1M-row in-memory `employees` query — in serve mode, 5-run median, same machine, lower is better:
 
-| Engine | Total (ms) | vs RustCFML |
+| Engine | Total (ms) | RustCFML speedup |
 |---|---:|---:|
-| **RustCFML** v0.112 | **1,116** | **1.00×** |
-| BoxLang 1.14 | 1,368 | 1.23× slower |
-| Lucee 7.0.4 | 7,884 | 7.1× slower |
+| **RustCFML** v0.112 | **1,116** | — |
+| BoxLang 1.14 | 1,368 | **1.23× faster** |
+| Lucee 7.0.4 | 7,884 | **7.1× faster** |
 
-RustCFML wins six of ten queries outright (and the total) against BoxLang, including the 5×UNION DISTINCT and the grouped-aggregate cases. Pure-Rust SQL engine in `crates/cfml-qoq` — no JDBC, no HSQLDB, parallelised across cores with rayon (non-wasm).
+RustCFML wins six of ten queries outright (and the total), including the 5×UNION DISTINCT and the grouped-aggregate cases. Pure-Rust SQL engine in `crates/cfml-qoq` — no JDBC, no HSQLDB, parallelised across cores with rayon (non-wasm).
 
 ## Documentation
 
