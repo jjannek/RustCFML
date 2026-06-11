@@ -9078,6 +9078,16 @@ impl CfmlVirtualMachine {
                             ));
                         }
                     };
+                    // Optional second arg: a struct exposed inside the body as
+                    // the `attributes` scope (same pattern as cfthread's
+                    // attribute pass-through). This is the workaround for
+                    // closure capture not carrying function values across the
+                    // method-call boundary — callers thread the data through
+                    // explicitly.
+                    let attributes = match args.get(1) {
+                        Some(v @ CfmlValue::Struct(_)) => Some(v.clone()),
+                        _ => None,
+                    };
 
                     #[cfg(feature = "real-threads")]
                     let spawn = self.thread_spawn_fn;
@@ -9085,7 +9095,7 @@ impl CfmlVirtualMachine {
                     let spawn: Option<ThreadSpawnFn> = None;
 
                     if let Some(spawn_fn) = spawn {
-                        let seed = self.build_thread_seed(callback, None);
+                        let seed = self.build_thread_seed(callback, attributes);
                         let handle = spawn_fn(seed);
                         let fut = async_kernel::FutureNative::from_handle(handle);
                         return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
@@ -9093,7 +9103,7 @@ impl CfmlVirtualMachine {
 
                     // Inline fallback (wasm / real-threads off): run now, store
                     // a resolved Future. Output is captured inside run_thread_body.
-                    let r = self.run_thread_body(&callback, None, parent_locals);
+                    let r = self.run_thread_body(&callback, attributes, parent_locals);
                     let fut = async_kernel::FutureNative::resolved(r);
                     return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
                 }

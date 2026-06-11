@@ -150,8 +150,36 @@ impl FutureNative {
         Ok(CfmlValue::Null)
     }
 
-    fn is_done(&self) -> bool {
-        self.result.is_some()
+    fn is_done(&mut self) -> bool {
+        if self.result.is_some() {
+            return true;
+        }
+        // Non-blockingly drain the channel: if the body has already
+        // published, cache the result so subsequent get()/isDone calls are
+        // O(1). Without this, `isDone()` would lie until someone called
+        // `get()` and `anyOf`/poll-style loops would spin forever.
+        let taken: Option<ThreadHandle> = {
+            let mut slot = self.handle.lock().unwrap();
+            slot.take()
+        };
+        if let Some(mut handle) = taken {
+            match handle.rx.try_recv() {
+                Ok(res) => {
+                    if let Some(j) = handle.join.take() {
+                        let _ = j.join();
+                    }
+                    self.result = Some(res);
+                    return true;
+                }
+                Err(_) => {
+                    // Not ready — put the handle back.
+                    let mut slot = self.handle.lock().unwrap();
+                    *slot = Some(handle);
+                    return false;
+                }
+            }
+        }
+        false
     }
 
     fn is_cancelled(&self) -> bool {
@@ -225,7 +253,10 @@ impl CfmlNative for FutureNative {
         // Allow `future.done` / `future.status` / `future.error` as property
         // reads — same shape WireBox uses elsewhere.
         match name.to_ascii_lowercase().as_str() {
-            "done" => Some(CfmlValue::Bool(self.is_done())),
+            // Property read is &self only; report the cached state without
+            // polling. Callers wanting authoritative "done" should invoke
+            // the isDone() method (which can poll).
+            "done" => Some(CfmlValue::Bool(self.result.is_some())),
             "status" => Some(CfmlValue::string(self.status_str())),
             "error" => Some(CfmlValue::string(self.error_message())),
             _ => None,

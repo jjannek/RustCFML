@@ -2445,11 +2445,15 @@ impl Parser {
 
     fn parse_component(&mut self) -> Result<Component, ParseError> {
         let loc = self.current_location();
-        // Parse component name: can be `component Name` or `component name="Name"`
-        // Only consume an identifier as the name if it's NOT followed by '=' (which
-        // would indicate a metadata attribute like output="false" or hint="...").
+        // Parse component name: can be `component Name extends=...` (rare,
+        // RustCFML-tolerant — CFML normally derives the name from the
+        // filename). Consume an identifier as the name only when it's
+        // followed by `extends` or `implements` — otherwise a bare ident
+        // before `{` or another ident is a bare-bool attribute (e.g.
+        // `component singleton {`, `component singleton serializable {`),
+        // which we let the metadata loop below pick up.
         let mut name = if matches!(self.peek(0), Token::Identifier(_))
-            && !matches!(self.peek(1), Token::Equal)
+            && matches!(self.peek(1), Token::Extends | Token::Implements)
             && !matches!(self.peek(0), Token::Extends | Token::Implements)
         {
             self.extract_identifier().unwrap_or_else(|_| "Anonymous".to_string())
