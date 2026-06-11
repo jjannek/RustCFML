@@ -7758,51 +7758,7 @@ impl CfmlVirtualMachine {
                             .map(|(_, v)| v.clone());
 
                         if let Some(func @ CfmlValue::Function(_)) = method_func {
-                            let call_args = if let CfmlValue::Struct(ref arg_map) = invoke_args {
-                                if arg_map.is_empty() {
-                                    Vec::new()
-                                } else if let CfmlValue::Function(ref f) = func {
-                                    // Get param names from bytecode function if CfmlFunction.params is empty
-                                    let param_names: Vec<String> = if f.params.is_empty() {
-                                        // Look up actual bytecode function params via func_idx
-                                        if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                            ref body,
-                                        ) = f.body
-                                        {
-                                            if let CfmlValue::Int(idx) = body.as_ref() {
-                                                // Resolve params by global_id via the registry.
-                                                self.resolve_fn(*idx)
-                                                    .map(|f| f.params.clone())
-                                                    .unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            }
-                                        } else {
-                                            Vec::new()
-                                        }
-                                    } else {
-                                        f.params.iter().map(|p| p.name.clone()).collect()
-                                    };
-
-                                    let mut positional = Vec::new();
-                                    for param_name in &param_names {
-                                        let param_lower = param_name.to_lowercase();
-                                        let val = arg_map
-                                            .iter()
-                                            .find(|(k, _)| k.to_lowercase() == param_lower)
-                                            .map(|(_, v)| v.clone())
-                                            .unwrap_or(CfmlValue::Null);
-                                        positional.push(val);
-                                    }
-                                    positional
-                                } else {
-                                    Vec::new()
-                                }
-                            } else if matches!(invoke_args, CfmlValue::Null) {
-                                Vec::new()
-                            } else {
-                                vec![invoke_args]
-                            };
+                            let call_args = self.build_invoke_call_args(&func, invoke_args);
 
                             let mut method_locals = IndexMap::new();
                             method_locals.insert("this".to_string(), component.clone());
@@ -7877,49 +7833,7 @@ impl CfmlVirtualMachine {
                             .map(|(_, v)| v.clone());
 
                         if let Some(func @ CfmlValue::Function(_)) = method_func {
-                            let call_args = if let CfmlValue::Struct(ref arg_map) = invoke_args {
-                                if arg_map.is_empty() {
-                                    Vec::new()
-                                } else if let CfmlValue::Function(ref f) = func {
-                                    let param_names: Vec<String> = if f.params.is_empty() {
-                                        if let cfml_common::dynamic::CfmlClosureBody::Expression(
-                                            ref body,
-                                        ) = f.body
-                                        {
-                                            if let CfmlValue::Int(idx) = body.as_ref() {
-                                                // Resolve params by global_id via the registry.
-                                                self.resolve_fn(*idx)
-                                                    .map(|f| f.params.clone())
-                                                    .unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            }
-                                        } else {
-                                            Vec::new()
-                                        }
-                                    } else {
-                                        f.params.iter().map(|p| p.name.clone()).collect()
-                                    };
-
-                                    let mut positional = Vec::new();
-                                    for param_name in &param_names {
-                                        let param_lower = param_name.to_lowercase();
-                                        let val = arg_map
-                                            .iter()
-                                            .find(|(k, _)| k.to_lowercase() == param_lower)
-                                            .map(|(_, v)| v.clone())
-                                            .unwrap_or(CfmlValue::Null);
-                                        positional.push(val);
-                                    }
-                                    positional
-                                } else {
-                                    Vec::new()
-                                }
-                            } else if matches!(invoke_args, CfmlValue::Null) {
-                                Vec::new()
-                            } else {
-                                vec![invoke_args]
-                            };
+                            let call_args = self.build_invoke_call_args(&func, invoke_args);
 
                             let mut method_locals = IndexMap::new();
                             method_locals.insert("this".to_string(), component.clone());
@@ -9864,6 +9778,87 @@ impl CfmlVirtualMachine {
             }
         }
         (positional, extras)
+    }
+
+    /// Bind an `invoke(o, m, argStruct)` arg struct to a target method's
+    /// declared params. Special-cases a top-level `argumentCollection` key —
+    /// its inner struct is spread into the callee's arguments scope, matching
+    /// Lucee/ACF/BoxLang. Keys that don't match a declared param are appended
+    /// as extras (via `pending_extra_named_args`) so they surface in
+    /// `arguments` by name even when the callee declares no params.
+    fn build_invoke_call_args(
+        &mut self,
+        func: &CfmlValue,
+        invoke_args: CfmlValue,
+    ) -> Vec<CfmlValue> {
+        let CfmlValue::Struct(arg_map) = invoke_args else {
+            return match invoke_args {
+                CfmlValue::Null => Vec::new(),
+                other => vec![other],
+            };
+        };
+        if arg_map.is_empty() {
+            return Vec::new();
+        }
+        let CfmlValue::Function(f) = func else {
+            return Vec::new();
+        };
+
+        let param_names: Vec<String> = if !f.params.is_empty() {
+            f.params.iter().map(|p| p.name.clone()).collect()
+        } else if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body {
+            if let CfmlValue::Int(idx) = body.as_ref() {
+                self.resolve_fn(*idx)
+                    .map(|bf| bf.params.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Expand a top-level `argumentCollection` struct key into its inner
+        // entries; the literal key itself never reaches the callee.
+        let mut flat: Vec<(String, CfmlValue)> = Vec::with_capacity(arg_map.len());
+        for (k, v) in arg_map.iter() {
+            if k.eq_ignore_ascii_case("argumentcollection") {
+                if let CfmlValue::Struct(inner) = v {
+                    for (ik, iv) in inner.iter() {
+                        flat.push((ik.clone(), iv.clone()));
+                    }
+                    continue;
+                }
+                // Non-struct argumentCollection: drop it (Lucee errors;
+                // dropping keeps the literal key from leaking through).
+                continue;
+            }
+            flat.push((k.clone(), v.clone()));
+        }
+
+        let mut positional: Vec<CfmlValue> = vec![CfmlValue::Null; param_names.len()];
+        let mut consumed = vec![false; flat.len()];
+        for (pi, pname) in param_names.iter().enumerate() {
+            for (fi, (fname, fval)) in flat.iter().enumerate() {
+                if !consumed[fi] && fname.eq_ignore_ascii_case(pname) {
+                    positional[pi] = fval.clone();
+                    consumed[fi] = true;
+                    break;
+                }
+            }
+        }
+        let mut extras: Vec<(usize, String)> = Vec::new();
+        for (fi, (fname, fval)) in flat.iter().enumerate() {
+            if !consumed[fi] {
+                let idx = positional.len();
+                positional.push(fval.clone());
+                extras.push((idx, fname.clone()));
+            }
+        }
+        if !extras.is_empty() {
+            self.pending_extra_named_args = Some(extras);
+        }
+        positional
     }
 
     fn call_member_function(

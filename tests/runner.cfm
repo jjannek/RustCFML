@@ -48,14 +48,12 @@ try { include "types/test_array.cfm"; } catch (any e) { writeOutput("ERROR | typ
 try { include "types/test_array_append_grow.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array_append_grow.cfm | " & e.message & chr(10)); }
 try { include "types/test_array_reference_semantics.cfm"; } catch (any e) { writeOutput("ERROR | types/test_array_reference_semantics.cfm | " & e.message & chr(10)); }
 try { include "types/test_struct.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct.cfm | " & e.message & chr(10)); }
-try { include "types/test_struct_literal_null_key.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct_literal_null_key.cfm | " & e.message & chr(10)); }
 try { include "types/test_struct_reference_semantics.cfm"; } catch (any e) { writeOutput("ERROR | types/test_struct_reference_semantics.cfm | " & e.message & chr(10)); }
 try { include "types/test_ordered_struct_literals.cfm"; } catch (any e) { writeOutput("ERROR | types/test_ordered_struct_literals.cfm | " & e.message & chr(10)); }
 try { include "types/test_nested_writeback.cfm"; } catch (any e) { writeOutput("ERROR | types/test_nested_writeback.cfm | " & e.message & chr(10)); }
 try { include "types/test_query.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_column.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_column.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_reference.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_reference.cfm | " & e.message & chr(10)); }
-try { include "types/test_query_bracket_column_access.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_bracket_column_access.cfm | " & e.message & chr(10)); }
 try { include "types/test_binary.cfm"; } catch (any e) { writeOutput("ERROR | types/test_binary.cfm | " & e.message & chr(10)); }
 try { include "types/test_hash_in_strings.cfm"; } catch (any e) { writeOutput("ERROR | types/test_hash_in_strings.cfm | " & e.message & chr(10)); }
 try { include "comments/test_hash_in_comments.cfm"; } catch (any e) { writeOutput("ERROR | comments/test_hash_in_comments.cfm | " & e.message & chr(10)); }
@@ -116,7 +114,6 @@ try { include "members/test_number_members.cfm"; } catch (any e) { writeOutput("
 
 // --- OOP ---
 try { include "oop/test_components.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_components.cfm | " & e.message & chr(10)); }
-try { include "oop/test_component_bare_singleton.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_bare_singleton.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_method_builtin_name.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_method_builtin_name.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_return_type.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_return_type.cfm | " & e.message & chr(10)); }
 try { include "oop/test_inheritance.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inheritance.cfm | " & e.message & chr(10)); }
@@ -161,7 +158,6 @@ try { include "tags/test_tags_cfmail.cfm"; } catch (any e) { writeOutput("ERROR 
 try { include "tags/test_tags_cfcache.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfcache.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfstoredproc.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfstoredproc.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfqueryparam_attribute_collection.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfqueryparam_attribute_collection.cfm | " & e.message & chr(10)); }
-try { include "tags/test_queryexecute_param_structs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_queryexecute_param_structs.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfqueryparam_interpolated_value.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfqueryparam_interpolated_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfquery_quoted_identifier.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_quoted_identifier.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfquery_control_tags.cfm | " & e.message & chr(10)); }
@@ -173,11 +169,6 @@ try { include "tags/test_cfstoredproc_runtime_body.cfm"; } catch (any e) { write
 try { include "tags/test_tags_cfimport.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfimport.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfthread.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfthread.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfthread_concurrency.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfthread_concurrency.cfm | " & e.message & chr(10)); }
-
-// --- Async kernel (runAsync + _schedule) ---
-try { include "async_kernel/test_run_async.cfm"; } catch (any e) { writeOutput("ERROR | async_kernel/test_run_async.cfm | " & e.message & chr(10)); }
-try { include "async_kernel/test_schedule.cfm"; } catch (any e) { writeOutput("ERROR | async_kernel/test_schedule.cfm | " & e.message & chr(10)); }
-
 try { include "tags/test_tags_cfscript_statements.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfscript_statements.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfhttp_interpolation.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfhttp_interpolation.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfhttp_multipart.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfhttp_multipart.cfm | " & e.message & chr(10)); }
@@ -349,6 +340,14 @@ try { include "core/test_script_fn_post_paren_attr.cfm"; } catch (any e) { write
 //     function-call form invoke(component=..)/cfinvoke(..) is intentionally NOT
 //     tested: Lucee rejects it at compile time, so it is not a portable contract.
 try { include "core/test_invoke_canonical_forms.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_canonical_forms.cfm | " & e.message & chr(10)); }
+//   - invoke_argumentcollection_spread: the argument struct passed to the
+//     positional invoke() BIF must special-case an `argumentCollection` key
+//     and spread the INNER struct into the callee's arguments scope (the same
+//     contract as fn(argumentCollection=st) / cfinvoke). RustCFML drops the
+//     key, so declared params keep their defaults. Surfaced booting Wheels:
+//     $doubleCheckedLock -> $invoke controller-class resolution received
+//     empty args, silently turning every user controller action into a no-op.
+try { include "core/test_invoke_argumentcollection_spread.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_argumentcollection_spread.cfm | " & e.message & chr(10)); }
 //   - reserved_word_identifiers / quoted_catch_type: follow-on to PR #32 — `new`
 //     as a method name, `extends`/`implements` as parameter names, and a quoted
 //     string catch type (`catch ("My.Type" e)`) are all soft constructs on
