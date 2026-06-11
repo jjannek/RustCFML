@@ -3761,18 +3761,37 @@ impl CfmlVirtualMachine {
                             {
                                 if let Ok(n) = key.parse::<i64>() {
                                     if n >= 1 {
-                                        if let Some(CfmlValue::Array(params)) =
+                                        let idx = (n - 1) as usize;
+                                        // First try the declared-param name at
+                                        // position N-1 (named call to a fn with
+                                        // declared params: value lives under the
+                                        // param name).
+                                        let by_param = if let Some(CfmlValue::Array(params)) =
                                             s.get("__arguments_params")
                                         {
-                                            let idx = (n - 1) as usize;
                                             params
                                                 .get(idx)
                                                 .map(|p| p.as_string())
                                                 .and_then(|name| s.get(&name))
-                                                .unwrap_or(CfmlValue::Null)
                                         } else {
-                                            CfmlValue::Null
-                                        }
+                                            None
+                                        };
+                                        // Fall through to the N-th non-marker entry's
+                                        // value in insertion order. Lucee/ACF: the
+                                        // arguments scope is array-addressable for
+                                        // named calls too — `arguments[1]` reads the
+                                        // first bound arg even when the callee declares
+                                        // no params (the Wheels $set() shape).
+                                        by_param.unwrap_or_else(|| {
+                                            s.iter()
+                                                .filter(|(k, _)| {
+                                                    k.as_str() != "__arguments_scope"
+                                                        && k.as_str() != "__arguments_params"
+                                                })
+                                                .nth(idx)
+                                                .map(|(_, v)| v)
+                                                .unwrap_or(CfmlValue::Null)
+                                        })
                                     } else {
                                         CfmlValue::Null
                                     }

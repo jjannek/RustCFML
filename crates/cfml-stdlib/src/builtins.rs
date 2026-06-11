@@ -1773,7 +1773,19 @@ fn fn_array_len(args: Vec<CfmlValue>) -> CfmlResult {
         ))),
         // Arguments scope is a struct but arrayLen should return count of positional entries
         Some(CfmlValue::Struct(s)) => {
-            // Count entries with numeric keys (1-based positional args)
+            // The arguments scope is a hybrid array/struct on Lucee/ACF: for both
+            // positional AND named calls, `arrayLen(arguments)` counts the bound
+            // args. Marker keys (`__arguments_scope`, `__arguments_params`) are
+            // excluded so they don't inflate the count.
+            if s.contains_key("__arguments_scope") {
+                let count = s
+                    .keys()
+                    .into_iter()
+                    .filter(|k| k.as_str() != "__arguments_scope" && k.as_str() != "__arguments_params")
+                    .count();
+                return Ok(CfmlValue::Int(count as i64));
+            }
+            // Plain struct: count entries with numeric keys (1-based positional args).
             let count = s.keys().into_iter().filter(|k| k.parse::<usize>().is_ok()).count();
             Ok(CfmlValue::Int(count as i64))
         }
