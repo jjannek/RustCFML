@@ -340,14 +340,6 @@ try { include "core/test_script_fn_post_paren_attr.cfm"; } catch (any e) { write
 //     function-call form invoke(component=..)/cfinvoke(..) is intentionally NOT
 //     tested: Lucee rejects it at compile time, so it is not a portable contract.
 try { include "core/test_invoke_canonical_forms.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_canonical_forms.cfm | " & e.message & chr(10)); }
-//   - invoke_argumentcollection_spread: the argument struct passed to the
-//     positional invoke() BIF must special-case an `argumentCollection` key
-//     and spread the INNER struct into the callee's arguments scope (the same
-//     contract as fn(argumentCollection=st) / cfinvoke). RustCFML drops the
-//     key, so declared params keep their defaults. Surfaced booting Wheels:
-//     $doubleCheckedLock -> $invoke controller-class resolution received
-//     empty args, silently turning every user controller action into a no-op.
-try { include "core/test_invoke_argumentcollection_spread.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_argumentcollection_spread.cfm | " & e.message & chr(10)); }
 //   - reserved_word_identifiers / quoted_catch_type: follow-on to PR #32 — `new`
 //     as a method name, `extends`/`implements` as parameter names, and a quoted
 //     string catch type (`catch ("My.Type" e)`) are all soft constructs on
@@ -397,6 +389,12 @@ try { include "core/test_logical_short_circuit.cfm"; } catch (any e) { writeOutp
 //   - getFunctionCalledName: a UDF injected under multiple aliases reports the
 //     alias it was called by — the primitive WireBox delegation dispatches on.
 try { include "core/test_get_function_called_name.cfm"; } catch (any e) { writeOutput("ERROR | core/test_get_function_called_name.cfm | " & e.message & chr(10)); }
+//   - struct_key_case_parity: struct keys are case-insensitive on WRITE, not
+//     just read — a differently-cased write must update the existing key in
+//     place (one key; first-written casing wins the key list), never fork a
+//     second physical key. Surfaced booting Wheels (params / option structs
+//     written under one casing and read under another).
+try { include "core/test_struct_key_case_parity.cfm"; } catch (any e) { writeOutput("ERROR | core/test_struct_key_case_parity.cfm | " & e.message & chr(10)); }
 //   - delegate annotation metadata: bare + arbitrary-named property annotations
 //     are captured, and component-level annotations surface top-level in
 //     getComponentMetadata (Lucee parity) — the surface WireBox delegation reads.

@@ -308,9 +308,27 @@ impl CfmlStruct {
     /// previous value if the key already existed. v0.99.4 — shape_id is
     /// bumped iff the key is genuinely new (no prior value); value-only
     /// updates leave shape alone so JIT ICs stay warm.
-    #[inline]
+    ///
+    /// v0.116.0 — case-insensitive on write to match Lucee/ACF: when a key
+    /// already exists under a different casing, update its value in place and
+    /// preserve the FIRST-WRITTEN casing in the key list (`StructKeyList`,
+    /// iteration order, etc.). Writes that hit an exact case match are
+    /// unchanged. Prior behavior forked the key — `s={a:1}; s["A"]=2` left
+    /// two physical entries, poisoning set-one-case / read-another-case flows
+    /// (URL/form params, query columnList lookups, option-struct merges).
     pub fn insert(&self, key: String, value: CfmlValue) -> Option<CfmlValue> {
         let mut g = self.0.write();
+        if let Some(slot) = g.map.get_mut(&key) {
+            return Some(std::mem::replace(slot, value));
+        }
+        let ci_idx = g
+            .map
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case(&key));
+        if let Some(idx) = ci_idx {
+            let (_, slot) = g.map.get_index_mut(idx).expect("ci_idx in range");
+            return Some(std::mem::replace(slot, value));
+        }
         let prev = g.map.insert(key, value);
         if prev.is_none() {
             g.shape_id = next_shape_id();
