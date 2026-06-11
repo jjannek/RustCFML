@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 pub mod application_store;
+pub mod async_kernel;
 mod java_shims;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
 /// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
@@ -812,6 +813,9 @@ pub struct ThreadResult {
     pub elapsed: i64,
     /// The body's `thread` scope (thread.x = ...), surfaced as cfthread.NAME.x.
     pub thread_vars: IndexMap<String, CfmlValue>,
+    /// The closure's return value (Ok-arm). Used by the async kernel
+    /// (`future.get()`) to surface the result; `cfthread` ignores it.
+    pub return_value: Option<CfmlValue>,
 }
 
 /// Everything a freshly-spawned child VM needs to run one `cfthread` body on a
@@ -1315,9 +1319,9 @@ impl CfmlVirtualMachine {
         let elapsed = start_time.elapsed().as_millis() as i64;
         let output = std::mem::take(&mut self.output_buffer);
         self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
-        let error = match &result {
-            Err(e) => format!("{}", e),
-            Ok(_) => String::new(),
+        let (error, return_value) = match &result {
+            Err(e) => (format!("{}", e), None),
+            Ok(v) => (String::new(), Some(v.clone())),
         };
         let thread_vars = match self.globals.shift_remove("thread") {
             Some(CfmlValue::Struct(ts)) => ts.snapshot(),
@@ -1334,6 +1338,7 @@ impl CfmlVirtualMachine {
             error,
             elapsed,
             thread_vars,
+            return_value,
         }
     }
 
@@ -5709,6 +5714,8 @@ impl CfmlVirtualMachine {
                 | "__cfthread_terminate"
                 | "threadjoin"
                 | "threadterminate"
+                | "runasync"
+                | "_schedule"
                 | "callstackget"
                 | "callstackdump"
                 | "precisionevaluate" => {
@@ -9059,6 +9066,161 @@ impl CfmlVirtualMachine {
                         }
                     }
                     return Ok(CfmlValue::Null);
+                }
+
+                // ---- async kernel: runAsync + _schedule ----
+                "runasync" => {
+                    let callback = match args.get(0) {
+                        Some(CfmlValue::Function(_)) => args[0].clone(),
+                        _ => {
+                            return Err(CfmlError::runtime(
+                                "runAsync requires a function/closure argument".to_string(),
+                            ));
+                        }
+                    };
+
+                    #[cfg(feature = "real-threads")]
+                    let spawn = self.thread_spawn_fn;
+                    #[cfg(not(feature = "real-threads"))]
+                    let spawn: Option<ThreadSpawnFn> = None;
+
+                    if let Some(spawn_fn) = spawn {
+                        let seed = self.build_thread_seed(callback, None);
+                        let handle = spawn_fn(seed);
+                        let fut = async_kernel::FutureNative::from_handle(handle);
+                        return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+                    }
+
+                    // Inline fallback (wasm / real-threads off): run now, store
+                    // a resolved Future. Output is captured inside run_thread_body.
+                    let r = self.run_thread_body(&callback, None, parent_locals);
+                    let fut = async_kernel::FutureNative::resolved(r);
+                    return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+                }
+                "_schedule" => {
+                    // _schedule(closure, delayMs [, everyMs] [, spacedMs])
+                    // OR _schedule(closure, optsStruct) where opts may have
+                    // delayMs / everyMs / spacedMs keys.
+                    let callback = match args.get(0) {
+                        Some(CfmlValue::Function(_)) => args[0].clone(),
+                        _ => {
+                            return Err(CfmlError::runtime(
+                                "_schedule requires a function/closure argument".to_string(),
+                            ));
+                        }
+                    };
+                    let (delay_ms, every_ms, spaced_ms) = match args.get(1) {
+                        Some(CfmlValue::Struct(s)) => {
+                            let snap = s.snapshot();
+                            (
+                                async_kernel::struct_get_i64(&snap, "delayMs").unwrap_or(0),
+                                async_kernel::struct_get_i64(&snap, "everyMs"),
+                                async_kernel::struct_get_i64(&snap, "spacedMs"),
+                            )
+                        }
+                        Some(v) => {
+                            let d = v.as_string().parse::<i64>().unwrap_or(0);
+                            let e = args.get(2).and_then(|v| v.as_string().parse::<i64>().ok());
+                            let sp = args.get(3).and_then(|v| v.as_string().parse::<i64>().ok());
+                            (d, e, sp)
+                        }
+                        None => (0, None, None),
+                    };
+
+                    #[cfg(feature = "real-threads")]
+                    let spawn = self.thread_spawn_fn;
+                    #[cfg(not(feature = "real-threads"))]
+                    let spawn: Option<ThreadSpawnFn> = None;
+
+                    // v1 supports ONE-SHOT scheduling (delayMs then run once).
+                    // Periodic `everyMs`/`spacedMs` is deferred to v2 — would
+                    // need a respawn driver that can't run a CFML closure
+                    // without VM access. v1 ignores those params with a doc'd
+                    // caveat; callers can compose via runAsync chains.
+                    let _ = (every_ms, spaced_ms);
+
+                    #[cfg(feature = "real-threads")]
+                    if let Some(spawn_fn) = spawn {
+                        let seed = self.build_thread_seed(callback, None);
+                        let outer_cancel = seed.cancel_flag.clone();
+
+                        if delay_ms <= 0 {
+                            let handle = spawn_fn(seed);
+                            let fut = async_kernel::FutureNative::from_handle(handle);
+                            return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+                        }
+
+                        // Relay thread: sleep `delayMs`, then spawn the real
+                        // cfthread worker via spawn_fn, then forward its
+                        // ThreadResult out our own channel. The Future holds
+                        // our channel's rx side so .get() blocks until the
+                        // relay forwards.
+                        let (tx, rx) = std::sync::mpsc::channel::<ThreadResult>();
+                        let cancel_for_relay = outer_cancel.clone();
+                        let join = std::thread::Builder::new()
+                            .name("rustcfml-schedule-relay".to_string())
+                            .spawn(move || {
+                                // Cooperative-cancellable sleep: poll every
+                                // 50ms so cancel() takes effect promptly.
+                                let start = std::time::Instant::now();
+                                let total =
+                                    std::time::Duration::from_millis(delay_ms as u64);
+                                let step = std::time::Duration::from_millis(50);
+                                loop {
+                                    if cancel_for_relay
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        let _ = tx.send(ThreadResult {
+                                            status: "TERMINATED".to_string(),
+                                            ..Default::default()
+                                        });
+                                        return;
+                                    }
+                                    let elapsed = start.elapsed();
+                                    if elapsed >= total {
+                                        break;
+                                    }
+                                    let remaining = total - elapsed;
+                                    std::thread::sleep(remaining.min(step));
+                                }
+                                let inner = spawn_fn(seed);
+                                // Wait for the inner cfthread to publish.
+                                if let Ok(res) = inner.rx.recv() {
+                                    let _ = tx.send(res);
+                                }
+                                if let Some(j) = {
+                                    let mut h = inner;
+                                    h.join.take()
+                                } {
+                                    let _ = j.join();
+                                }
+                            })
+                            .map_err(|e| {
+                                CfmlError::runtime(format!(
+                                    "_schedule: failed to spawn relay thread: {}",
+                                    e
+                                ))
+                            })?;
+
+                        let handle = ThreadHandle {
+                            name: String::new(),
+                            rx,
+                            cancel: outer_cancel,
+                            join: Some(join),
+                            result: None,
+                        };
+                        let fut = async_kernel::FutureNative::from_handle(handle);
+                        return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
+                    }
+
+                    // Inline fallback (wasm / real-threads off): no real
+                    // scheduling — run immediately and return a resolved
+                    // Future. delay/period args ignored (no thread to park).
+                    let _ = spawn;
+                    let _ = delay_ms;
+                    let r = self.run_thread_body(&callback, None, parent_locals);
+                    let fut = async_kernel::FutureNative::resolved(r);
+                    return Ok(CfmlValue::NativeObject(Arc::new(RwLock::new(fut))));
                 }
 
                 "getfunctioncalledname" => {

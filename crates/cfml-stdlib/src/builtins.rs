@@ -562,6 +562,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("threadjoin".into(), fn_cfthread_stub);
     f.insert("threadterminate".into(), fn_cfthread_stub);
 
+    // ---- async kernel: runAsync + _schedule (VM-intercepted) ----
+    f.insert("runAsync".into(), fn_async_stub);
+    f.insert("_schedule".into(), fn_async_stub);
+
     // ---- Cache functions (VM-intercepted) ----
     f.insert("cachePut".into(), fn_cache_stub);
     f.insert("cacheGet".into(), fn_cache_stub);
@@ -10570,6 +10574,11 @@ fn fn_session_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 /// Stub for cfthread functions — VM intercepts these
 fn fn_cfthread_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("cfthread function requires VM-level support and was not intercepted.".to_string()))
+}
+
+/// Stub for async-kernel functions (runAsync, _schedule) — VM intercepts these
+fn fn_async_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("Async function requires VM-level support and was not intercepted.".to_string()))
 }
 
 // ===============================================
