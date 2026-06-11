@@ -16,6 +16,7 @@ license.workspace = true
 cfml-common = { workspace = true }
 indexmap = { workspace = true }
 regex = "1"
+rustc-hash = { workspace = true }
 
 # Rayon parallelism is host-only: the wasm32 targets (cfml-worker, rustcfml-wasm)
 # transitively depend on this crate and must not pull in rayon.

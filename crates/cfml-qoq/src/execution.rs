@@ -377,6 +377,7 @@ impl<'a, I: Invoker> Engine<'a, I> {
         } else {
             &[]
         };
+
         let body = self.run_core(&stmt.body, body_order)?;
         let columns = body.columns;
         let mut data = body.data;
@@ -1316,8 +1317,40 @@ impl<'a, I: Invoker> Engine<'a, I> {
             .collect();
 
         let need_synth = col_alias.iter().any(|x| x.is_none());
-        // Pre-fill aliased keys in one column-major pass (no per-row synth):
-        // the key column IS the referenced output column.
+        // Pre-fill aliased keys: the key column IS the referenced output
+        // column. For wide output (~1M rows), parallelise the per-key clone
+        // across cores so each aliased key gets its own worker.
+        #[cfg(not(target_arch = "wasm32"))]
+        if row_count >= PARALLEL_ROW_THRESHOLD * 8 {
+            use rayon::prelude::*;
+            let built: Vec<(usize, Vec<CfmlValue>)> = col_alias
+                .par_iter()
+                .enumerate()
+                .filter_map(|(k, alias)| {
+                    alias.map(|idx| {
+                        let v = data
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| vec![CfmlValue::Null; row_count]);
+                        (k, v)
+                    })
+                })
+                .collect();
+            for (k, v) in built {
+                cols[k] = v;
+            }
+        } else {
+            for (k, alias) in col_alias.iter().enumerate() {
+                if let Some(idx) = alias {
+                    if let Some(src) = data.get(*idx) {
+                        cols[k] = src.clone();
+                    } else {
+                        cols[k] = vec![CfmlValue::Null; row_count];
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
         for (k, alias) in col_alias.iter().enumerate() {
             if let Some(idx) = alias {
                 if let Some(src) = data.get(*idx) {
@@ -2663,6 +2696,32 @@ fn dedup_values(values: &mut Vec<CfmlValue>) {
 /// type-tagged group key one cell at a time directly off the column data —
 /// no per-row `Vec<CfmlValue>` materialisation, no per-cell `Arc::clone`.
 fn dedup_keep_mask(data: &[Vec<CfmlValue>], row_count: usize) -> Vec<bool> {
+    // Above this many rows, build per-row group keys in parallel (pure column
+    // reads, no shared state) then dedup sequentially against an FxHashSet.
+    // Key building is the dominant cost on wide dedups (UNION DISTINCT over
+    // ~1M rows): on Q10 it's ~60% of total wall time before this fan-out.
+    #[cfg(not(target_arch = "wasm32"))]
+    if row_count >= 4_096 {
+        use rayon::prelude::*;
+        use rustc_hash::FxHashSet;
+        let keys: Vec<String> = (0..row_count)
+            .into_par_iter()
+            .map(|i| {
+                let mut s = String::new();
+                for col in data {
+                    append_group_key(&mut s, &col[i]);
+                }
+                s
+            })
+            .collect();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        seen.reserve(row_count);
+        let mut keep = Vec::with_capacity(row_count);
+        for k in keys {
+            keep.push(seen.insert(k));
+        }
+        return keep;
+    }
     let mut seen = HashSet::new();
     let mut keep = Vec::with_capacity(row_count);
     let mut key_buf = String::new();
