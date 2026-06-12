@@ -9950,6 +9950,17 @@ impl CfmlVirtualMachine {
     ) -> CfmlResult {
         let method_lower = method.to_lowercase();
 
+        // A method call on a null receiver is an error in CFML (Lucee throws);
+        // silently returning Null lets `<null>.save(...)` no-op and report fake
+        // success (the Wheels create() failure mode). Null-safe `?.` calls never
+        // reach here — codegen jumps over the CallMethod op on a null receiver.
+        if matches!(object, CfmlValue::Null) {
+            return Err(CfmlError::new(
+                format!("cannot call method [{}] on a null value", method),
+                CfmlErrorType::Expression,
+            ));
+        }
+
         // Native-object dispatch short-circuits the rest of the function.
         // Rust-backed objects implement their own method table via the
         // `CfmlNative` trait — none of the struct/component/java-shim

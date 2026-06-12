@@ -4168,8 +4168,19 @@ impl Parser {
                         arguments: args,
                         location: self.current_location(),
                     })))
+                } else if self.check(&Token::LParen) {
+                    // `new` is a SOFT keyword (Lucee/ACF/BoxLang): with no
+                    // component path after it, `new (argumentCollection = {...})`
+                    // is a plain call to a function named `new` — the Wheels
+                    // model-create shape — not the new-operator. Return the bare
+                    // identifier and let parse_call's postfix loop consume the
+                    // parens as a normal FunctionCall.
+                    Ok(Expression::Identifier(Identifier {
+                        name: "new".to_string(),
+                        location: self.current_location(),
+                    }))
                 } else {
-                    // Fallback for non-identifier new (e.g. new (expr)())
+                    // Fallback for non-identifier new (e.g. new "#path#"())
                     let class = Box::new(self.parse_call()?);
                     let args = if self.match_token(&Token::LParen) {
                         let a = self.parse_arguments()?;
