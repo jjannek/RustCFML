@@ -3,6 +3,8 @@
 pub mod builtins;
 pub mod db_driver;
 pub mod pg_sql;
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub mod dbinfo;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(feature = "s3")]

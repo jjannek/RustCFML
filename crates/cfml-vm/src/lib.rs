@@ -3473,7 +3473,12 @@ impl CfmlVirtualMachine {
                                 if name.is_empty() {
                                     continue;
                                 }
-                                if writeback_attr.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+                                if writeback_attr.iter().any(|a| a.eq_ignore_ascii_case(name))
+                                    && !matches!(
+                                        tag_builtin_name.as_deref(),
+                                        Some("cfdbinfo") | Some("dbinfo")
+                                    )
+                                {
                                     writeback_var = Some(value.as_string());
                                 }
                                 opts.insert(name.clone(), value);
@@ -3504,6 +3509,22 @@ impl CfmlVirtualMachine {
                                 }
                                 Err(e) => {
                                     self.pending_result_writeback = None;
+                                    if Self::is_control_flow_error(&e) {
+                                        return Err(e);
+                                    }
+                                    // Tag-call errors must be catchable —
+                                    // try { cfdbinfo(...) } catch is the
+                                    // standard feature-detection idiom.
+                                    if let Some(handler) = self.try_stack.pop() {
+                                        while stack.len() > handler.stack_depth {
+                                            stack.pop();
+                                        }
+                                        self.restore_capture_state(&handler);
+                                        let error_val = self.resolve_catch_error_val(&e);
+                                        stack.push(error_val);
+                                        ip = handler.catch_ip;
+                                        continue;
+                                    }
                                     return Err(self.wrap_error(e));
                                 }
                             }
@@ -5834,6 +5855,8 @@ impl CfmlVirtualMachine {
                 | "isdefined"
                 | "__cfparam"
                 | "queryexecute"
+                | "cfdbinfo"
+                | "dbinfo"
                 | "queryregisterfunction"
                 | "__cftransaction_start"
                 | "__cftransaction_commit"
@@ -8229,6 +8252,74 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(ret);
                 }
+                "cfdbinfo" | "dbinfo" => {
+                    // cfdbinfo — datasource metadata (issue #90 Gap B). The
+                    // attributes arrive as one struct (tag form and script
+                    // form both bundle); attributeCollection is the only
+                    // shape Wheels uses ($dbinfo in Global.cfc). The result
+                    // query is delivered to the (possibly dotted) `name`
+                    // variable via pending_result_writeback; the call itself
+                    // returns null, like Lucee's tag.
+                    let mut attrs: IndexMap<String, CfmlValue> = match args.first() {
+                        Some(CfmlValue::Struct(s)) => s.snapshot(),
+                        _ => IndexMap::new(),
+                    };
+                    // Expand attributeCollection (explicit keys win).
+                    let attr_coll = attrs
+                        .keys()
+                        .find(|k| k.eq_ignore_ascii_case("attributecollection"))
+                        .cloned();
+                    if let Some(coll_key) = attr_coll {
+                        if let Some(CfmlValue::Struct(inner)) = attrs.shift_remove(&coll_key) {
+                            for (ik, iv) in inner.snapshot().into_iter() {
+                                if !attrs.keys().any(|mk| mk.eq_ignore_ascii_case(&ik)) {
+                                    attrs.insert(ik, iv);
+                                }
+                            }
+                        }
+                    }
+                    let name_attr = attrs
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("name"))
+                        .map(|(_, v)| v.as_string())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            CfmlError::runtime("Missing attribute [name] on cfdbinfo".to_string())
+                        })?;
+                    // Per-application datasource resolution (this.datasources /
+                    // per-app cfconfig) — same routing queryExecute gets.
+                    if !self.app_datasources.is_empty() || self.app_default_datasource.is_some() {
+                        let current = attrs
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
+                            .map(|(_, v)| v.as_string());
+                        let new_url = match current {
+                            Some(ref n) => self.resolve_app_datasource(n),
+                            None => self.app_default_datasource.clone(),
+                        };
+                        if let Some(url) = new_url {
+                            let key = attrs
+                                .keys()
+                                .find(|k| k.eq_ignore_ascii_case("datasource"))
+                                .cloned()
+                                .unwrap_or_else(|| "datasource".to_string());
+                            attrs.insert(key, CfmlValue::string(url));
+                        }
+                    }
+                    let impl_fn = self
+                        .builtins
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("__dbinfo_impl"))
+                        .map(|(_, v)| *v)
+                        .ok_or_else(|| {
+                            CfmlError::runtime(
+                                "cfdbinfo: database features not enabled".to_string(),
+                            )
+                        })?;
+                    let result = impl_fn(vec![CfmlValue::strukt(attrs)])?;
+                    self.pending_result_writeback = Some(vec![(name_attr, result)]);
+                    return Ok(CfmlValue::Null);
+                }
                 "__cftransaction_start" => {
                     if self.transaction_conn.is_some() {
                         return Err(CfmlError::runtime(
@@ -10047,6 +10138,8 @@ impl CfmlVirtualMachine {
                 | "cfhttp"
                 | "cfmail"
                 | "__cfmail"
+                | "cfdbinfo"
+                | "dbinfo"
         )
     }
 

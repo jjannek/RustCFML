@@ -908,6 +908,17 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             }
             (format!("__cflocation({{ {} }});\n", parts.join(", ")), tag_end - start)
         }
+        "cfdbinfo" => {
+            // <cfdbinfo type="columns" name="cols" table="t" datasource="ds">
+            // → cfdbinfo({ type: "columns", name: "cols", ... });
+            // The VM intercept runs the metadata query and delivers it to the
+            // (possibly dotted) `name` variable — no compile-time assignment.
+            let mut parts = Vec::new();
+            for (k, v) in &attrs {
+                parts.push(format!("{}: {}", k, format_attr_value(v, quoted.contains(k.as_str()))));
+            }
+            (format!("cfdbinfo({{ {} }});\n", parts.join(", ")), tag_end - start)
+        }
         "cfdirectory" => {
             // <cfdirectory action="list" directory="." name="qDir" recurse="true">
             // → qDir = cfdirectory({action: "list", directory: ".", recurse: true});

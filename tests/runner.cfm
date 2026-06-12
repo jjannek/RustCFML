@@ -208,6 +208,7 @@ try { include "tags/test_cfqueryparam_interpolated_value.cfm"; } catch (any e) {
 try { include "tags/test_cfquery_quoted_identifier.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_quoted_identifier.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfquery_control_tags.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfquery_control_tags.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfquery_result_delivery.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfquery_result_delivery.cfm | " & e.message & chr(10)); }
+try { include "tags/test_cfdbinfo.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdbinfo.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_mapping_path.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_mapping_path.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfdirectory_function_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfdirectory_function_form.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfhttpparam_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfhttpparam_runtime_body.cfm | " & e.message & chr(10)); }

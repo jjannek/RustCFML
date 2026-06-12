@@ -150,6 +150,32 @@ Cross-engine tests live in `tests/qoq/test_qoq_{select,aggregates,joins,subqueri
 are executed once (uncorrelated); this matches typical QoQ usage. Errors loudly if a referenced
 table/column is missing.
 
+
+## 10. cfquery / queryExecute result metadata + cfdbinfo 🏗
+
+Shipped for issue #90 (Wheels ORM DB layer): `result=` delivery on cfquery (tag, script
+block, attributeCollection) and queryExecute, Lucee-faithful `name=` semantics (an INSERT
+leaves `name` untouched), and `<cfdbinfo>`/`cfdbinfo(...)`/`dbinfo(...)` across all four
+bundled drivers (SQLite, MySQL, PostgreSQL, SQL Server). Known divergences:
+
+| Behaviour | RustCFML | Lucee |
+|---|---|---|
+| `queryExecute("INSERT …")` return value | the result-metadata **struct** `{recordCount, cached, sql, executionTime[, generatedKey]}` | the JDBC generated-keys **resultset** (a query; driver-dependent shape) |
+| result struct extras | — | also carries `executionTimeNano`, `sqlparameters`, and a per-generated-key-column entry (e.g. `ID` on H2) |
+| `executionTime` in result structs | always `0` (not measured) | measured |
+| `generatedKey` on non-SQLite/MySQL INSERTs | absent on PostgreSQL/MSSQL (use `RETURNING` / `OUTPUT`) | driver-dependent |
+| dbinfo `DATA_TYPE`/`SQL_DATA_TYPE` columns | always `0` (no JDBC type codes) | JDBC `java.sql.Types` ints |
+| dbinfo statement syntax `dbinfo type="x" name="y";` | not parsed (use `cfdbinfo(...)` or the tag) | supported |
+| dbinfo `UPDATE_RULE`/`DELETE_RULE` (foreignkeys) | rule **names** (`CASCADE`, `NO ACTION`, …) | JDBC smallint codes |
+
+BoxLang notes (we follow Lucee, which Wheels tries first): Lucee renames `COLUMN_DEF` →
+`COLUMN_DEFAULT_VALUE` (BoxLang keeps `COLUMN_DEF`); Lucee `dbnames` uses `database_name`
+(BoxLang `DBNAME`); Lucee `IS_PRIMARYKEY`/`IS_FOREIGNKEY` are `YES`/`NO` strings (BoxLang
+booleans). Both engines throw on a missing table only after an empty result — so does
+RustCFML, with Lucee's message text. Live-server dbinfo tests are env-gated:
+`RUSTCFML_TEST_MYSQL_DS` / `RUSTCFML_TEST_PG_DS` / `RUSTCFML_TEST_MSSQL_DS` in
+`tests/tags/test_cfdbinfo.cfm`.
+
 ---
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit

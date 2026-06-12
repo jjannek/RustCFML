@@ -540,6 +540,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cftransaction_commit".into(), fn_cftransaction_commit_stub);
     f.insert("__cftransaction_rollback".into(), fn_cftransaction_rollback_stub);
     f.insert("cfdirectory".into(), fn_cfdirectory);
+    f.insert("cfdbinfo".into(), fn_cfdbinfo_stub);
+    f.insert("dbinfo".into(), fn_cfdbinfo_stub);
+    #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+    f.insert("__dbinfo_impl".into(), crate::dbinfo::fn_dbinfo_impl);
     f.insert("__cflog".into(), fn_cflog_stub);
     f.insert("__cfparam".into(), fn_cfparam_stub);
     f.insert("__cfsetting".into(), fn_cfsetting_stub);
@@ -6142,7 +6146,7 @@ fn parse_content_type(ct: &str) -> (String, String) {
 // ===============================================
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-enum DbDriver {
+pub(crate) enum DbDriver {
     Sqlite(String),
     Mysql(String),
     Postgres(String),
@@ -6150,7 +6154,7 @@ enum DbDriver {
 }
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn parse_datasource(ds: &str) -> DbDriver {
+pub(crate) fn parse_datasource(ds: &str) -> DbDriver {
     if ds.starts_with("mysql://") {
         DbDriver::Mysql(ds.to_string())
     } else if ds.starts_with("postgresql://") || ds.starts_with("postgres://") {
@@ -6283,7 +6287,7 @@ pub fn resolve_datasource(name: &str) -> String {
 /// Only called from `fn_query_execute`, which carries the same gate — without
 /// it, no-DB builds (e.g. wasm32 cfml-worker) flag this as dead code.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn default_datasource() -> Option<String> {
+pub(crate) fn default_datasource() -> Option<String> {
     DATASOURCE_REGISTRY
         .get()
         .and_then(|m| m.lock().unwrap().get("").cloned())
@@ -8063,6 +8067,10 @@ fn build_mutation_result(affected: i64, last_id: i64, sql: &str) -> CfmlResult {
 // -----------------------------------------------
 // HTTP/Tag infrastructure stubs (VM-intercepted)
 // -----------------------------------------------
+
+fn fn_cfdbinfo_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("cfdbinfo requires VM intercept".into()))
+}
 
 fn fn_cfheader_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfheader requires VM intercept".into()))
