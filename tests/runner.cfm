@@ -81,6 +81,7 @@ try { include "core/test_scopes.cfm"; } catch (any e) { writeOutput("ERROR | cor
 //     assertions, does NOT abort the run.
 try { include "core/test_this_dot_call_detaches_writes.cfm"; } catch (any e) { writeOutput("ERROR | core/test_this_dot_call_detaches_writes.cfm | " & e.message & chr(10)); }
 try { include "core/test_server_scope.cfm"; } catch (any e) { writeOutput("ERROR | core/test_server_scope.cfm | " & e.message & chr(10)); }
+try { include "core/test_pagecontext_request_response.cfm"; } catch (any e) { writeOutput("ERROR | core/test_pagecontext_request_response.cfm | " & e.message & chr(10)); }
 try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
 try { include "core/test_null_coalescing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_coalescing.cfm | " & e.message & chr(10)); }

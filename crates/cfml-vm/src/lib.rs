@@ -5904,6 +5904,7 @@ impl CfmlVirtualMachine {
                 | "_schedule"
                 | "callstackget"
                 | "callstackdump"
+                | "getpagecontext"
                 | "precisionevaluate" => {
                     // Will be handled at the end of this function (needs VM access)
                 }
@@ -9572,6 +9573,18 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::string(result));
                 }
 
+                "getpagecontext" => {
+                    // Build the servlet-bridge page context from the request's
+                    // CGI scope (serve mode) or Lucee's synthetic task-context
+                    // defaults (bare CLI). getRequest()/getResponse() resolve to
+                    // method-faithful shims dispatched in call_member_function.
+                    let cgi = match self.globals.get("cgi") {
+                        Some(CfmlValue::Struct(c)) => Some(c.snapshot()),
+                        _ => None,
+                    };
+                    return Ok(java_shims::build_page_context_shim(cgi.as_ref()));
+                }
+
                 "__cfcustomtag" => {
                     // Self-closing custom tag: __cfcustomtag(path_spec, attrs_struct)
                     let path_spec = args.get(0).map(|v| v.as_string()).unwrap_or_default();
@@ -10332,6 +10345,124 @@ impl CfmlVirtualMachine {
         out
     }
 
+    /// Dispatch a method on the getPageContext() shim. getRequest()/getResponse()
+    /// hand back the embedded servlet shims; the request-side accessors Lucee and
+    /// BoxLang expose directly on the page context (getRequestURL, getMethod, …)
+    /// are forwarded to the request shim so the surface is a superset of both.
+    fn dispatch_page_context(
+        &mut self,
+        object: &CfmlValue,
+        method_lower: &str,
+        extra_args: &mut Vec<CfmlValue>,
+    ) -> CfmlResult {
+        let pc = match object {
+            CfmlValue::Struct(s) => s,
+            _ => return Ok(CfmlValue::Null),
+        };
+        match method_lower {
+            "getrequest" | "gethttpservletrequest" => {
+                Ok(pc.get("__pc_request").unwrap_or(CfmlValue::Null))
+            }
+            "getresponse" | "gethttpservletresponse" => {
+                Ok(pc.get("__pc_response").unwrap_or(CfmlValue::Null))
+            }
+            // Response-side forwards (BoxLang exposes these on the page context).
+            "getstatus" | "setstatus" | "getcontenttype" | "setcontenttype"
+            | "addheader" | "setheader" | "containsheader" | "iscommitted"
+            | "getcharacterencoding" | "encodeurl" | "encoderedirecturl"
+            | "sendredirect" | "reset" | "resethtmlhead" => {
+                // Forward to the response handler; pass the page context itself
+                // as the receiver so a setter's write-back stays an identity
+                // store on `pc` rather than nulling it.
+                self.dispatch_servlet_response(object, method_lower, extra_args)
+            }
+            // Anything else (getRequestURL, getMethod, getQueryString, …) is a
+            // request-side accessor — forward to the request shim.
+            _ => {
+                let req = pc.get("__pc_request").unwrap_or(CfmlValue::Null);
+                let args = std::mem::take(extra_args);
+                java_shims::handle_servlet_request(method_lower, args, &req)
+            }
+        }
+    }
+
+    /// Dispatch a method on the HttpServletResponse shim. State lives on the VM
+    /// so setStatus()/setHeader() faithfully drive the real serve-mode response;
+    /// in CLI mode they update the same fields harmlessly (matching Lucee's
+    /// response dummy, which also doesn't reach a client).
+    ///
+    /// `receiver` is the shim the call was made on; the `set*` mutators return it
+    /// (not their void/null result) so the CallMethod write-back — which fires
+    /// for any `setXxx` method — stays a harmless identity store instead of
+    /// overwriting the receiver variable with null.
+    fn dispatch_servlet_response(
+        &mut self,
+        receiver: &CfmlValue,
+        method_lower: &str,
+        extra_args: &mut Vec<CfmlValue>,
+    ) -> CfmlResult {
+        let args = std::mem::take(extra_args);
+        let header_get = |name: &str| {
+            self.response_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        Ok(match method_lower {
+            "getstatus" => {
+                let code = self.response_status.as_ref().map(|(c, _)| *c).unwrap_or(200);
+                CfmlValue::Int(code as i64)
+            }
+            "setstatus" => {
+                let code = args.first().and_then(to_number).unwrap_or(200.0);
+                let text = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+                self.response_status = Some((code as u16, text));
+                receiver.clone()
+            }
+            "getcontenttype" => header_get("Content-Type")
+                .map(CfmlValue::string)
+                .unwrap_or_else(|| CfmlValue::string("text/html;charset=UTF-8".to_string())),
+            "setcontenttype" => {
+                let v = args.first().map(|a| a.as_string()).unwrap_or_default();
+                self.response_headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("Content-Type"));
+                self.response_headers.push(("Content-Type".to_string(), v));
+                receiver.clone()
+            }
+            "setheader" => {
+                let name = args.first().map(|a| a.as_string()).unwrap_or_default();
+                let val = args.get(1).map(|a| a.as_string()).unwrap_or_default();
+                self.response_headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+                self.response_headers.push((name, val));
+                receiver.clone()
+            }
+            "addheader" => {
+                let name = args.first().map(|a| a.as_string()).unwrap_or_default();
+                let val = args.get(1).map(|a| a.as_string()).unwrap_or_default();
+                self.response_headers.push((name, val));
+                CfmlValue::Null
+            }
+            "containsheader" => {
+                let name = args.first().map(|a| a.as_string()).unwrap_or_default();
+                CfmlValue::Bool(header_get(&name).is_some())
+            }
+            "sendredirect" => {
+                let url = args.first().map(|a| a.as_string()).unwrap_or_default();
+                self.response_headers.push(("Location".to_string(), url));
+                self.response_status = Some((302, "Found".to_string()));
+                CfmlValue::Null
+            }
+            "iscommitted" => CfmlValue::Bool(false),
+            "getcharacterencoding" => CfmlValue::string("UTF-8".to_string()),
+            "encodeurl" | "encoderedirecturl" => {
+                args.into_iter().next().unwrap_or(CfmlValue::Null)
+            }
+            "reset" | "resethtmlhead" => CfmlValue::Null,
+            _ => CfmlValue::Null,
+        })
+    }
+
     fn call_member_function(
         &mut self,
         object: &CfmlValue,
@@ -10374,6 +10505,24 @@ impl CfmlVirtualMachine {
                     .get("__java_class")
                     .map(|v| v.as_string().to_lowercase())
                     .unwrap_or_default();
+
+                // Servlet bridge: getPageContext() and its request/response
+                // objects. Dispatched here (not via the generic shim match) so
+                // the response side can read/write `self.response_status` /
+                // `self.response_headers` for faithful serve-mode behaviour.
+                match java_class.as_str() {
+                    java_shims::SERVLET_PAGE_CONTEXT_CLASS => {
+                        return self.dispatch_page_context(object, &method_lower, extra_args);
+                    }
+                    java_shims::SERVLET_REQUEST_CLASS => {
+                        let args = std::mem::take(extra_args);
+                        return java_shims::handle_servlet_request(&method_lower, args, object);
+                    }
+                    java_shims::SERVLET_RESPONSE_CLASS => {
+                        return self.dispatch_servlet_response(object, &method_lower, extra_args);
+                    }
+                    _ => {}
+                }
 
                 // Special: Queue.poll() returns the head and mutates in place.
                 // Set method_this_writeback so the bytecode CallMethod handler

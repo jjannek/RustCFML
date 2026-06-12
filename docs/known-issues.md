@@ -176,6 +176,28 @@ RustCFML, with Lucee's message text. Live-server dbinfo tests are env-gated:
 `RUSTCFML_TEST_MYSQL_DS` / `RUSTCFML_TEST_PG_DS` / `RUSTCFML_TEST_MSSQL_DS` in
 `tests/tags/test_cfdbinfo.cfm`.
 
+## 11. `getPageContext()` servlet bridge 🏗
+
+`getPageContext().getRequest()` / `.getResponse()` return method-faithful servlet shims
+in **every** context (serve and CLI), matching Lucee — which synthesizes them even under a
+CommandBox task. Request accessors (`getRequestURL`, `getRequestURI`, `getQueryString`,
+`getMethod`, `getScheme`, `getServerName`, `getServerPort`, `getServletPath`,
+`getContextPath`, `getRemoteAddr`, `getProtocol`, `isSecure`, `getPathInfo`, `getHeader`,
+`getContentType`, `getCharacterEncoding`) are synthesized from the request's CGI scope in
+serve mode, and from Lucee's task-context defaults in bare CLI. Response mutators
+(`setStatus`, `setHeader`, `addHeader`, `setContentType`, `sendRedirect`) drive the **real**
+`response_status`/`response_headers` in serve mode; in CLI they update the same fields
+harmlessly (as Lucee's response dummy does). We model Lucee (real servlet objects); the page
+context also forwards the request/response accessors BoxLang exposes directly, so the surface
+is a superset of both.
+
+| Behaviour | RustCFML | Lucee |
+|---|---|---|
+| `getRemoteAddr()` in bare CLI | `127.0.0.1` | host LAN IP |
+| `getPathInfo()` for a plain script request | `null` | `null` |
+| Unknown servlet method (e.g. `getLocale`) | returns `null` (non-null receiver keeps chains alive) | full servlet API |
+| `getMetaData(getRequest()).getName()` | a struct (no real Java class) | `...HTTPServletRequestWrap` |
+
 ---
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit

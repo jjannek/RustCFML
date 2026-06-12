@@ -1185,3 +1185,162 @@ pub fn java_matcher_step(
     }
     Ok((matched, CfmlValue::strukt(ns)))
 }
+
+// ===============================================================
+// Servlet bridge: getPageContext().getRequest() / .getResponse()
+// ===============================================================
+//
+// On Lucee and Adobe CF the page context exposes live servlet request/
+// response objects in EVERY execution context — even CLI/task contexts,
+// where Lucee synthesizes them (getRequestURL() returns
+// "http://localhost/index.cfm" with no real HTTP request in sight).
+// Wheels builds request URLs through this exact chain
+// (`GetPageContext().getRequest().getRequestURL()`), so the bridge must be
+// non-null and method-faithful in both serve and CLI mode.
+//
+// We model Lucee's behaviour (real servlet objects with the full
+// HttpServletRequest/Response surface) rather than BoxLang's narrower
+// FakePageContext (whose getRequest()/getResponse() return the page context
+// itself). For broad compatibility the page-context shim also forwards the
+// request-side accessors BoxLang exposes directly (getRequestURL et al.),
+// making the surface a superset of both engines.
+//
+// Request values are synthesized from the request's CGI scope when present
+// (serve mode); absent in bare CLI, we fall back to Lucee's task-context
+// defaults (localhost:80, /index.cfm, GET, http). The response side is
+// dispatched in `lib.rs` (it mutates `self.response_status` /
+// `self.response_headers` so setStatus()/setHeader() are faithful in serve
+// mode, not no-ops).
+
+pub const SERVLET_PAGE_CONTEXT_CLASS: &str = "lucee.runtime.pagecontextimpl";
+pub const SERVLET_REQUEST_CLASS: &str = "lucee.runtime.net.http.httpservletrequestwrap";
+pub const SERVLET_RESPONSE_CLASS: &str = "lucee.runtime.net.http.httpservletresponsedummy";
+
+/// Build the `HttpServletRequest` shim returned by getPageContext().getRequest().
+/// `cgi` is the request's CGI scope (serve mode) or `None` in bare CLI.
+pub fn build_servlet_request_shim(cgi: Option<&IndexMap<String, CfmlValue>>) -> CfmlValue {
+    let nonempty = |k: &str| {
+        cgi.and_then(|c| c.get(k))
+            .map(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+    };
+    let server_name = nonempty("server_name").unwrap_or_else(|| "localhost".to_string());
+    let port: i64 = nonempty("server_port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
+    let method = nonempty("request_method").unwrap_or_else(|| "GET".to_string());
+    let script = nonempty("script_name").unwrap_or_else(|| "/index.cfm".to_string());
+    let query = cgi
+        .and_then(|c| c.get("query_string"))
+        .map(|v| v.as_string())
+        .unwrap_or_default();
+    let remote = nonempty("remote_addr").unwrap_or_else(|| "127.0.0.1".to_string());
+    let secure = cgi
+        .and_then(|c| c.get("https"))
+        .map(|v| v.as_string().eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
+    let scheme = if secure { "https" } else { "http" };
+    // Lucee omits the port from getRequestURL() when it is the scheme default.
+    let port_part = if (!secure && port == 80) || (secure && port == 443) {
+        String::new()
+    } else {
+        format!(":{}", port)
+    };
+    let request_url = format!("{}://{}{}{}", scheme, server_name, port_part, script);
+    let content_type = nonempty("content_type");
+
+    let mut s = IndexMap::new();
+    s.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    s.insert(
+        "__java_class".to_string(),
+        CfmlValue::string(SERVLET_REQUEST_CLASS.to_string()),
+    );
+    s.insert("__req_url".to_string(), CfmlValue::string(request_url));
+    s.insert("__req_uri".to_string(), CfmlValue::string(script.clone()));
+    s.insert("__req_query".to_string(), CfmlValue::string(query));
+    s.insert("__req_method".to_string(), CfmlValue::string(method));
+    s.insert("__req_scheme".to_string(), CfmlValue::string(scheme.to_string()));
+    s.insert("__req_server_name".to_string(), CfmlValue::string(server_name));
+    s.insert("__req_server_port".to_string(), CfmlValue::Int(port));
+    s.insert("__req_servlet_path".to_string(), CfmlValue::string(script));
+    s.insert("__req_remote_addr".to_string(), CfmlValue::string(remote));
+    s.insert("__req_secure".to_string(), CfmlValue::Bool(secure));
+    s.insert(
+        "__req_content_type".to_string(),
+        content_type.map(CfmlValue::string).unwrap_or(CfmlValue::Null),
+    );
+    // Retain the CGI snapshot so getHeader(name) can resolve http_* keys.
+    if let Some(c) = cgi {
+        s.insert("__req_cgi".to_string(), CfmlValue::strukt(c.clone()));
+    }
+    CfmlValue::strukt(s)
+}
+
+/// Build the `HttpServletResponse` shim. State lives on the VM
+/// (`response_status`/`response_headers`); the shim itself is just a marker
+/// dispatched in `lib.rs`.
+pub fn build_servlet_response_shim() -> CfmlValue {
+    let mut s = IndexMap::new();
+    s.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    s.insert(
+        "__java_class".to_string(),
+        CfmlValue::string(SERVLET_RESPONSE_CLASS.to_string()),
+    );
+    CfmlValue::strukt(s)
+}
+
+/// Build the page-context shim returned by getPageContext().
+pub fn build_page_context_shim(cgi: Option<&IndexMap<String, CfmlValue>>) -> CfmlValue {
+    let mut s = IndexMap::new();
+    s.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    s.insert(
+        "__java_class".to_string(),
+        CfmlValue::string(SERVLET_PAGE_CONTEXT_CLASS.to_string()),
+    );
+    s.insert("__pc_request".to_string(), build_servlet_request_shim(cgi));
+    s.insert("__pc_response".to_string(), build_servlet_response_shim());
+    CfmlValue::strukt(s)
+}
+
+/// Dispatch a method call on the `HttpServletRequest` shim. Read-only: every
+/// value was synthesized at construction time, so this needs no VM access.
+pub fn handle_servlet_request(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    let s = match object {
+        CfmlValue::Struct(s) => s,
+        _ => return Ok(CfmlValue::Null),
+    };
+    let get = |k: &str| s.get(k).unwrap_or(CfmlValue::Null);
+    Ok(match method {
+        "getrequesturl" => get("__req_url"),
+        "getrequesturi" => get("__req_uri"),
+        "getquerystring" => get("__req_query"),
+        "getmethod" => get("__req_method"),
+        "getscheme" => get("__req_scheme"),
+        "getservername" => get("__req_server_name"),
+        "getserverport" => get("__req_server_port"),
+        "getservletpath" => get("__req_servlet_path"),
+        "getremoteaddr" | "getremotehost" => get("__req_remote_addr"),
+        "getcontenttype" => get("__req_content_type"),
+        "issecure" => get("__req_secure"),
+        "getprotocol" => CfmlValue::string("HTTP/1.1".to_string()),
+        // Lucee serves apps at the context root, so contextPath is empty and
+        // pathInfo is null for a plain script request.
+        "getcontextpath" => CfmlValue::string(String::new()),
+        "getpathinfo" => CfmlValue::Null,
+        "getcharacterencoding" => CfmlValue::string("UTF-8".to_string()),
+        "getlocaladdr" => get("__req_remote_addr"),
+        "getlocalport" => get("__req_server_port"),
+        "getheader" => {
+            let name = args.first().map(|v| v.as_string()).unwrap_or_default();
+            let key = format!("http_{}", name.to_lowercase().replace('-', "_"));
+            match s.get("__req_cgi") {
+                Some(CfmlValue::Struct(cgi)) => cgi.get(&key).unwrap_or(CfmlValue::Null),
+                _ => CfmlValue::Null,
+            }
+        }
+        // Unknown method: a non-null receiver is enough to keep call chains
+        // alive; return null rather than throwing (matches a servlet getter
+        // with no value).
+        _ => CfmlValue::Null,
+    })
+}

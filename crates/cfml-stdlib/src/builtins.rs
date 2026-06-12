@@ -3791,8 +3791,12 @@ fn fn_get_context_root(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_get_page_context(_args: Vec<CfmlValue>) -> CfmlResult {
-    // Stub: getPageContext() returns a Java PageContext in ACF/Lucee.
-    // We return a struct with common methods as stubs.
+    // Fallback only. The real getPageContext() is VM-intercepted in
+    // `cfml-vm` (`call_function` → `build_page_context_shim`) so it can read
+    // the request's CGI scope and return a servlet bridge whose getRequest()/
+    // getResponse() are method-faithful (getRequestURL, getMethod, setStatus,
+    // …). This stub keeps the name registered as a builtin for resolution; it
+    // is never reached when running on the VM.
     let mut ctx = IndexMap::new();
     ctx.insert("getRequest".to_string(), CfmlValue::Null);
     ctx.insert("getResponse".to_string(), CfmlValue::Null);

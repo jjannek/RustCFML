@@ -105,6 +105,7 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 | **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
 | **[Testing](docs/testing.md)** | Running the test suites and writing tests |
 | **[Status](docs/status.md)** | Implementation status and remaining work |
+| **[Known Issues](docs/known-issues.md)** | Documented gaps, silent no-ops, and Lucee/BoxLang divergences |
 
 ## Deployment
 
@@ -140,6 +141,8 @@ See **[Compatibility & Status](docs/status.md)** for implementation status.
 
 - Image functions, Spreadsheet functions, ORM, SOAP/WSDL, Flash/Flex, PDF, LDAP, Registry
 - `cfschedule`, `cfwddx`
+
+For documented gaps, silent no-ops, and Lucee/BoxLang divergences, see **[Known Issues](docs/known-issues.md)**.
 
 ## Threading
 
