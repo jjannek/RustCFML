@@ -8244,6 +8244,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                 filter: &str,
                 recurse: bool,
                 rows: &mut Vec<IndexMap<String, CfmlValue>>,
+                visited: &mut std::collections::HashSet<std::path::PathBuf>,
             ) -> Result<(), CfmlError> {
                 let entries = fs::read_dir(dir).map_err(|e| {
                     CfmlError::runtime(format!("cfdirectory: cannot read directory: {}", e))
@@ -8254,24 +8255,16 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
-                    let metadata = match entry.metadata() {
+                    // Follow symlinks when classifying entries (Lucee parity): a
+                    // symlink pointing at a directory must be treated as a directory
+                    // so recurse descends into it. fs::metadata traverses links;
+                    // DirEntry::metadata does not.
+                    let metadata = match fs::metadata(entry.path()) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
                     let name = entry.file_name().to_string_lossy().to_string();
                     let is_dir = metadata.is_dir();
-
-                    if !is_dir && !matches_glob(&name, filter) {
-                        if recurse && is_dir {
-                            // still recurse into non-matching dirs
-                        } else if !is_dir {
-                            // skip non-matching files
-                            if recurse && metadata.is_dir() {
-                                // unreachable but safe
-                            }
-                            // actually skip
-                        }
-                    }
 
                     let file_type = if is_dir { "Dir" } else { "File" };
                     let size = if is_dir { 0i64 } else { metadata.len() as i64 };
@@ -8300,13 +8293,27 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                     }
 
                     if recurse && is_dir {
-                        list_dir(&entry.path(), filter, recurse, rows)?;
+                        // Cycle protection: following directory symlinks can form
+                        // loops. `visited` holds the canonical paths of the current
+                        // ancestor chain only — a symlink pointing back at an
+                        // ancestor is skipped, but a symlink to a sibling is still
+                        // followed (Lucee lists such targets again).
+                        let canon = fs::canonicalize(entry.path())
+                            .unwrap_or_else(|_| entry.path());
+                        if visited.insert(canon.clone()) {
+                            list_dir(&entry.path(), filter, recurse, rows, visited)?;
+                            visited.remove(&canon);
+                        }
                     }
                 }
                 Ok(())
             }
 
-            list_dir(Path::new(&directory), &filter, recurse, &mut rows)?;
+            let mut visited = std::collections::HashSet::new();
+            if let Ok(canon) = fs::canonicalize(&directory) {
+                visited.insert(canon);
+            }
+            list_dir(Path::new(&directory), &filter, recurse, &mut rows, &mut visited)?;
 
             Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)))
         }

@@ -65,8 +65,11 @@ impl Vfs for RealFs {
         let mut result = Vec::new();
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                // Use metadata() (not file_type()) to follow symlinks
-                let (is_file, is_dir) = entry.metadata()
+                // Classify by following symlinks (Lucee parity): a symlink to a
+                // directory must report is_dir=true so recursive listings descend
+                // into it. DirEntry::metadata() returns the link's own metadata
+                // (like symlink_metadata) — fs::metadata() traverses the link.
+                let (is_file, is_dir) = std::fs::metadata(entry.path())
                     .map(|md| (md.is_file(), md.is_dir()))
                     .unwrap_or((false, false));
                 result.push(VfsDirEntry {

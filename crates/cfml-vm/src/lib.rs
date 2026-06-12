@@ -13302,7 +13302,11 @@ impl CfmlVirtualMachine {
     /// Sandbox directoryList: list entries from the VFS.
     fn sandbox_directory_list(&self, path: &str, recurse: bool, list_info: &str) -> CfmlResult {
         let mut entries = Vec::new();
-        self.sandbox_collect_entries(path, recurse, &mut entries)?;
+        let mut visited = std::collections::HashSet::new();
+        if let Ok(canon) = self.vfs.canonicalize(path) {
+            visited.insert(canon);
+        }
+        self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
 
         if list_info == "name" {
             Ok(CfmlValue::array(
@@ -13348,7 +13352,11 @@ impl CfmlVirtualMachine {
 
     fn sandbox_cfdirectory_list(&self, path: &str, recurse: bool, filter: &str) -> CfmlResult {
         let mut entries = Vec::new();
-        self.sandbox_collect_entries(path, recurse, &mut entries)?;
+        let mut visited = std::collections::HashSet::new();
+        if let Ok(canon) = self.vfs.canonicalize(path) {
+            visited.insert(canon);
+        }
+        self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
         entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
         Ok(Self::build_directory_query(&entries, path))
     }
@@ -13438,6 +13446,7 @@ impl CfmlVirtualMachine {
         path: &str,
         recurse: bool,
         out: &mut Vec<(String, String, bool)>,
+        visited: &mut std::collections::HashSet<String>,
     ) -> Result<(), CfmlError> {
         let entries = self
             .vfs
@@ -13451,7 +13460,19 @@ impl CfmlVirtualMachine {
             };
             out.push((entry.name.clone(), full_path.clone(), entry.is_dir));
             if recurse && entry.is_dir {
-                self.sandbox_collect_entries(&full_path, true, out)?;
+                // Cycle protection: following directory symlinks can form loops.
+                // `visited` holds the canonical paths of the current ancestor
+                // chain only — so a symlink pointing back at an ancestor is
+                // skipped, but a symlink to a sibling/already-listed directory is
+                // still followed (Lucee lists such targets again).
+                let canon = self
+                    .vfs
+                    .canonicalize(&full_path)
+                    .unwrap_or_else(|_| full_path.clone());
+                if visited.insert(canon.clone()) {
+                    self.sandbox_collect_entries(&full_path, true, out, visited)?;
+                    visited.remove(&canon);
+                }
             }
         }
         Ok(())
