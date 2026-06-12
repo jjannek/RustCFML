@@ -18,6 +18,16 @@ try { include "core/test_function_scope_capture.cfm"; } catch (any e) { writeOut
 try { include "core/test_closure_env_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_closure_env_leak.cfm | " & e.message & chr(10)); }
 try { include "core/test_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_compound_assignment.cfm | " & e.message & chr(10)); }
 try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutput("ERROR | core/test_undeclared_named_args.cfm | " & e.message & chr(10)); }
+//   - invoke_undeclared_keys: the argument struct of the positional BIF
+//     invoke(obj, method, argStruct) is a named-argument collection — EVERY
+//     key must reach the callee's arguments scope, declared param or not,
+//     paramless targets included. RustCFML bound only declared names and
+//     silently dropped the rest (direct obj.m(argumentCollection=st) and
+//     in-context this[name](argumentCollection=st) already deliver all keys;
+//     only the invoke() marshaling path filtered). Surfaced while booting
+//     Wheels: $simpleLock()'s "$locked" re-entry guard key never arrived, so
+//     $readFlash recursed to depth 256 and 500'd every request.
+try { include "core/test_invoke_undeclared_keys.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_undeclared_keys.cfm | " & e.message & chr(10)); }
 try { include "core/test_struct_method_sequential.cfm"; } catch (any e) { writeOutput("ERROR | core/test_struct_method_sequential.cfm | " & e.message & chr(10)); }
 try { include "core/test_include_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_include_scope_capture.cfm | " & e.message & chr(10)); }
 try { include "core/test_operators.cfm"; } catch (any e) { writeOutput("ERROR | core/test_operators.cfm | " & e.message & chr(10)); }
