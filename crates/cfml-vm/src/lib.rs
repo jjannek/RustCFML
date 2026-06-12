@@ -2415,8 +2415,13 @@ impl CfmlVirtualMachine {
                             }
                             // Bidirectional sync: when a function param is stored,
                             // also update arguments[param] so `arguments.x` sees
-                            // the latest value (and vice versa, handled above for arguments)
+                            // the latest value (and vice versa, handled above for arguments).
+                            // PR #96: NOT for `var X` / `local.X` declarations — those
+                            // create a separate local-scope slot; `arguments.X` must keep
+                            // resolving to the passed value / declared default.
                             if is_inside_function
+                                && !declared_locals.contains(name.as_str())
+                                && !declared_locals.contains(&name_lower)
                                 && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                                 && matches!(
                                     val,
@@ -2530,6 +2535,8 @@ impl CfmlVirtualMachine {
                     } else {
                         locals.insert(name.clone(), val.clone());
                         if is_inside_function
+                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(name_lower)
                             && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                         {
                             if let Some(args) =
