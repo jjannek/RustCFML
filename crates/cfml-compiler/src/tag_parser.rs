@@ -774,10 +774,6 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             )
         }
         "cfquery" => {
-            let name = attrs.get("name").cloned().unwrap_or("queryResult".to_string());
-            let datasource = attrs.get("datasource").cloned();
-            let return_type = attrs.get("returntype").cloned();
-
             // Everything between <cfquery> and </cfquery> is the SQL
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfquery") {
                 let sql_raw: String = chars[tag_end..end_tag_pos].iter().collect();
@@ -789,25 +785,38 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // Process remaining hash expressions in SQL for string interpolation
                 let sql = process_sql_hashes(&cleaned_sql);
 
+                // All attributes ride in queryExecute's options struct. The
+                // VM intercept expands attributeCollection and delivers
+                // `name`/`result` (possibly dotted, e.g. "local.wheels.result")
+                // into the calling scope at runtime — `name` only when a
+                // resultset came back, matching Lucee (an INSERT leaves the
+                // name variable untouched and `result` gets the metadata).
                 let mut opts_parts = Vec::new();
-                if let Some(ds) = &datasource {
-                    let ds_val = strip_hashes(ds);
-                    if ds != &ds_val {
-                        // Dynamic datasource — emit as variable reference
-                        opts_parts.push(format!("datasource: {}", ds_val));
-                    } else {
-                        opts_parts.push(format!("datasource: \"{}\"", ds));
+                for (key, target) in [
+                    ("datasource", "datasource"),
+                    ("name", "name"),
+                    ("result", "result"),
+                    ("returntype", "returnType"),
+                    ("dbtype", "dbtype"),
+                    ("attributecollection", "attributeCollection"),
+                ] {
+                    if let Some(raw) = attrs.get(key) {
+                        let val = strip_hashes(raw);
+                        if raw != &val {
+                            // Dynamic #expr# value — emit as expression
+                            opts_parts.push(format!("{}: {}", target, val));
+                        } else {
+                            opts_parts.push(format!("{}: \"{}\"", target, raw));
+                        }
                     }
                 }
-                if let Some(rt) = return_type {
-                    opts_parts.push(format!("returnType: \"{}\"", rt));
+                if !attrs.contains_key("name") && !attrs.contains_key("attributecollection") {
+                    // Pre-#90 leniency: nameless cfquery still populates
+                    // queryResult.
+                    opts_parts.push("name: \"queryResult\"".to_string());
                 }
-
-                let opts_str = if opts_parts.is_empty() {
-                    "{}".to_string()
-                } else {
-                    format!("{{ {} }}", opts_parts.join(", "))
-                };
+                opts_parts.push("__cfquery_tag: true".to_string());
+                let opts_str = format!("{{ {} }}", opts_parts.join(", "));
 
                 let params_str = if query_params.is_empty() {
                     "[]".to_string()
@@ -827,13 +836,13 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 if body_has_control_flow(&sql_raw) {
                     let body_script = tags_to_script_inner(&sql_raw, imports, true);
                     let code = format!(
-                        "__cfquery_params = [];\n__cfsavecontent_start();\n{}{} = queryExecute(__cfsavecontent_end(), __cfquery_params, {});\n",
-                        body_script, name, opts_str
+                        "__cfquery_params = [];\n__cfsavecontent_start();\n{}queryExecute(__cfsavecontent_end(), __cfquery_params, {});\n",
+                        body_script, opts_str
                     );
                     return (code, close_end - start);
                 }
 
-                (format!("{} = queryExecute({}, {}, {});\n", name, sql, params_str, opts_str), close_end - start)
+                (format!("queryExecute({}, {}, {});\n", sql, params_str, opts_str), close_end - start)
             } else {
                 (String::new(), tag_end - start)
             }

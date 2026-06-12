@@ -6853,7 +6853,7 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
             .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
 
         let last_id = conn.last_insert_rowid();
-        build_mutation_result(affected as i64, last_id)
+        build_mutation_result(affected as i64, last_id, sql)
     }
 }
 
@@ -6994,7 +6994,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
 
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
-        build_mutation_result(affected, last_id)
+        build_mutation_result(affected, last_id, sql)
     }
 }
 
@@ -7111,7 +7111,7 @@ fn run_postgres_statements(
                 .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL error: {}", e)))?;
             total += affected as i64;
         }
-        build_mutation_result(total, 0) // PG uses RETURNING, not last_insert_id
+        build_mutation_result(total, 0, sql) // PG uses RETURNING, not last_insert_id
     }
 }
 
@@ -7562,7 +7562,7 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
                 .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL error: {}", e)))?;
             let rows = result.into_first_result().await
                 .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL result error: {}", e)))?;
-            build_mutation_result(rows.len() as i64, 0)
+            build_mutation_result(rows.len() as i64, 0, sql)
         }
     })
 }
@@ -7926,7 +7926,7 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
         let affected = conn.execute(sql, rusqlite::params_from_iter(bound_params.iter()))
             .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
         let last_id = conn.last_insert_rowid();
-        build_mutation_result(affected as i64, last_id)
+        build_mutation_result(affected as i64, last_id, sql)
     }
 }
 
@@ -7977,7 +7977,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
             .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL error: {}", e)))?;
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
-        build_mutation_result(affected, last_id)
+        build_mutation_result(affected, last_id, sql)
     }
 }
 
@@ -8031,11 +8031,32 @@ fn build_query_result(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue
     }
 }
 
+/// True when the statement's first keyword is INSERT (the only statement
+/// kind that carries a generated key — Lucee omits `generatedKey` for
+/// UPDATE/DELETE/DDL, and drivers report a stale id from the previous
+/// INSERT for those).
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn build_mutation_result(affected: i64, last_id: i64) -> CfmlResult {
+fn sql_is_insert(sql: &str) -> bool {
+    sql.trim_start()
+        .get(..6)
+        .map(|kw| kw.eq_ignore_ascii_case("insert"))
+        .unwrap_or(false)
+}
+
+/// Metadata struct for a non-SELECT statement. Shape matches what Lucee
+/// exposes through cfquery's `result=` attribute / queryExecute's `result`
+/// option: {recordCount, cached, sql, executionTime [, generatedKey]} —
+/// `generatedKey` only on an INSERT that actually inserted rows.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn build_mutation_result(affected: i64, last_id: i64, sql: &str) -> CfmlResult {
     let mut result = IndexMap::new();
     result.insert("recordCount".to_string(), CfmlValue::Int(affected));
-    result.insert("generatedKey".to_string(), CfmlValue::Int(last_id));
+    result.insert("cached".to_string(), CfmlValue::Bool(false));
+    result.insert("sql".to_string(), CfmlValue::string(sql.to_string()));
+    result.insert("executionTime".to_string(), CfmlValue::Int(0));
+    if sql_is_insert(sql) && affected > 0 && last_id != 0 {
+        result.insert("generatedKey".to_string(), CfmlValue::Int(last_id));
+    }
     Ok(CfmlValue::strukt(result))
 }
 

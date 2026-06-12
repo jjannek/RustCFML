@@ -710,6 +710,16 @@ pub struct CfmlVirtualMachine {
     /// After a function call, holds modified complex-type argument values for
     /// pass-by-reference writeback. Maps param name → final value.
     arg_ref_writeback: Option<Vec<(String, CfmlValue)>>,
+    /// Caller-scope variable deliveries requested by a VM-intercepted call —
+    /// queryExecute's `result` option and cfquery's `name`/`result`
+    /// attributes (which arrive at runtime, e.g. inside Wheels'
+    /// attributeCollection, so no compile-time assignment can see them).
+    /// Each entry is a (possibly dotted, scope-prefixed) variable path plus
+    /// the value. The intercept runs inside `call_function`, which cannot
+    /// reach the calling frame's locals, so the Call/CallNamed op handlers
+    /// apply these right after the call returns (same pattern as
+    /// `arg_ref_writeback`).
+    pending_result_writeback: Option<Vec<(String, CfmlValue)>>,
     /// Named arguments supplied at a callsite that do not match any declared
     /// param on the callee. Each entry is `(positional_index, name)`. Drained
     /// by the next `execute_function_with_args` so the callee's `arguments`
@@ -992,6 +1002,7 @@ impl CfmlVirtualMachine {
             enable_cfoutput_only: 0,
             sandbox: false,
             arg_ref_writeback: None,
+            pending_result_writeback: None,
             pending_extra_named_args: None,
             pending_called_name: None,
             native_classes: HashMap::new(),
@@ -2478,29 +2489,7 @@ impl CfmlVirtualMachine {
                         .pop()
                         .map(|v| v.as_string())
                         .unwrap_or_default();
-                    let parts: Vec<&str> = path.split('.').collect();
-                    if parts.len() >= 2 {
-                        let scope = parts[0];
-                        let root = self
-                            .scope_aware_load(scope, &locals)
-                            .unwrap_or_else(|| CfmlValue::strukt(IndexMap::new()));
-                        if let CfmlValue::Struct(ref s) = root {
-                            // Walk/auto-vivify intermediate structs, set the leaf.
-                            let mut cur = s.clone();
-                            for key in &parts[1..parts.len() - 1] {
-                                cur = cur.get_or_insert_struct(key);
-                            }
-                            cur.insert(parts[parts.len() - 1].to_string(), value.clone());
-                        }
-                        // Write the (possibly copied) scope container back. For
-                        // reference-typed scopes (a CFC's __variables) the leaf is
-                        // already mutated in place; for page scope this commits the
-                        // new key into locals.
-                        self.scope_aware_store(scope, root, &mut locals);
-                    } else {
-                        // Bare name (no scope prefix) — single-variable store.
-                        self.scope_aware_store(&path, value.clone(), &mut locals);
-                    }
+                    self.store_runtime_path(&path, value.clone(), &mut locals);
                     stack.push(value);
                 }
                 BytecodeOp::ArrayAppendLocal(name) => {
@@ -3318,6 +3307,7 @@ impl CfmlVirtualMachine {
                     if let Some(func_ref) = stack.pop() {
                         self.closure_parent_writeback = None;
                         self.arg_ref_writeback = None;
+                        self.pending_result_writeback = None;
                         // For closures with captured scope, merge defining scope + caller locals.
                         // For CFC method calls (this in locals), caller locals take priority.
                         // For plain UDF calls, pass caller locals by reference (no clone).
@@ -3394,12 +3384,15 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                 }
+                                // queryExecute result=/cfquery name= delivery
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys);
                                 stack.push(result);
                             }
                             Err(e) => {
                                 if Self::is_control_flow_error(&e) {
                                     return Err(e);
                                 }
+                                self.pending_result_writeback = None;
                                 // Route error through try-catch mechanism
                                 if let Some(handler) = self.try_stack.pop() {
                                     while stack.len() > handler.stack_depth {
@@ -3487,6 +3480,7 @@ impl CfmlVirtualMachine {
                             }
                             self.closure_parent_writeback = None;
                             self.arg_ref_writeback = None;
+                            self.pending_result_writeback = None;
                             let saved_try_stack = if self.try_stack.is_empty() {
                                 None
                             } else {
@@ -3505,9 +3499,13 @@ impl CfmlVirtualMachine {
                                     if let Some(var) = writeback_var {
                                         locals.insert(var, result.clone());
                                     }
+                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys);
                                     stack.push(result);
                                 }
-                                Err(e) => return Err(self.wrap_error(e)),
+                                Err(e) => {
+                                    self.pending_result_writeback = None;
+                                    return Err(self.wrap_error(e));
+                                }
                             }
                             continue;
                         }
@@ -3561,6 +3559,7 @@ impl CfmlVirtualMachine {
 
                         self.closure_parent_writeback = None;
                         self.arg_ref_writeback = None;
+                        self.pending_result_writeback = None;
                         let merged_scope;
                         let effective_locals = if let CfmlValue::Function(ref f) = func_ref {
                             if let Some(ref shared_env) = f.captured_scope {
@@ -3647,12 +3646,15 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                 }
+                                // queryExecute result=/cfquery name= delivery
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys);
                                 stack.push(result);
                             }
                             Err(e) => {
                                 if Self::is_control_flow_error(&e) {
                                     return Err(e);
                                 }
+                                self.pending_result_writeback = None;
                                 if let Some(handler) = self.try_stack.pop() {
                                     while stack.len() > handler.stack_depth {
                                         stack.pop();
@@ -8041,6 +8043,60 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "queryexecute" => {
+                    let mut args = args;
+                    // cfquery routes its name=/result= attributes through the
+                    // options struct — they can only be known at runtime
+                    // (Wheels passes everything via attributeCollection), so
+                    // no compile-time assignment can deliver them. Expand
+                    // attributeCollection into the options (explicit keys
+                    // win, like Lucee), record the delivery directives, and
+                    // strip the internal cfquery marker.
+                    let sql_text = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    let mut result_name: Option<String> = None;
+                    let mut name_attr: Option<String> = None;
+                    let mut from_cfquery_tag = false;
+                    let mut return_type_opt: Option<String> = None;
+                    if let Some(CfmlValue::Struct(opts)) = args.get(2) {
+                        let snap = opts.snapshot();
+                        let mut attr_coll: Option<IndexMap<String, CfmlValue>> = None;
+                        let mut merged: IndexMap<String, CfmlValue> = IndexMap::new();
+                        for (k, v) in snap.into_iter() {
+                            if k.eq_ignore_ascii_case("attributecollection") {
+                                if let CfmlValue::Struct(inner) = &v {
+                                    attr_coll = Some(inner.snapshot());
+                                    continue;
+                                }
+                            }
+                            if k.eq_ignore_ascii_case("__cfquery_tag") {
+                                from_cfquery_tag = true;
+                                continue;
+                            }
+                            merged.insert(k, v);
+                        }
+                        if let Some(coll) = attr_coll {
+                            for (ik, iv) in coll.into_iter() {
+                                if !merged.keys().any(|mk| mk.eq_ignore_ascii_case(&ik)) {
+                                    merged.insert(ik, iv);
+                                }
+                            }
+                        }
+                        result_name = merged
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("result"))
+                            .map(|(_, v)| v.as_string())
+                            .filter(|s| !s.is_empty());
+                        name_attr = merged
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("name"))
+                            .map(|(_, v)| v.as_string())
+                            .filter(|s| !s.is_empty());
+                        return_type_opt = merged
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("returntype"))
+                            .map(|(_, v)| v.as_string().to_lowercase());
+                        args[2] = CfmlValue::strukt(merged);
+                    }
+
                     // Query of Queries: dbtype="query" runs against in-memory
                     // query variables instead of a datasource.
                     let is_qoq = match args.get(2) {
@@ -8050,7 +8106,7 @@ impl CfmlVirtualMachine {
                             .unwrap_or(false),
                         _ => false,
                     };
-                    if is_qoq {
+                    let ret = if is_qoq {
                         let sql = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                         let params_arg = args.get(1).cloned().unwrap_or(CfmlValue::Null);
                         let (return_type, column_key) = match args.get(2) {
@@ -8064,52 +8120,114 @@ impl CfmlVirtualMachine {
                             }
                             _ => ("query".to_string(), None),
                         };
-                        return self.execute_qoq(
+                        self.execute_qoq(
                             &sql,
                             &params_arg,
                             &return_type,
                             column_key,
                             parent_locals,
-                        );
-                    }
-                    // Resolve a per-application datasource (this.datasources /
-                    // per-app cfconfig) to its connection URL before any path
-                    // below sees the args. No-op when this request has none.
-                    let args = self.rewrite_query_datasource(args);
-                    // VM intercept for queryExecute — routes through transaction conn if active
-                    if self.transaction_conn.is_some() {
-                        if let Some(txn_execute) = self.txn_execute {
+                        )?
+                    } else {
+                        // Resolve a per-application datasource (this.datasources /
+                        // per-app cfconfig) to its connection URL before any path
+                        // below sees the args. No-op when this request has none.
+                        let args = self.rewrite_query_datasource(args);
+                        // Route through the transaction conn if one is active.
+                        if self.transaction_conn.is_some() && self.txn_execute.is_some() {
+                            let txn_execute = self.txn_execute.unwrap();
                             let sql = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                             let params_arg = args.get(1).cloned().unwrap_or(CfmlValue::Null);
-                            let options_arg = args.get(2).cloned().unwrap_or(CfmlValue::Null);
-                            let return_type = match &options_arg {
-                                CfmlValue::Struct(opts) => opts
-                                    .iter()
-                                    .find(|(k, _)| k.eq_ignore_ascii_case("returntype"))
-                                    .map(|(_, v)| v.as_string().to_lowercase())
-                                    .unwrap_or_else(|| "query".to_string()),
-                                _ => "query".to_string(),
-                            };
+                            let return_type =
+                                return_type_opt.clone().unwrap_or_else(|| "query".to_string());
                             let txn_conn = self.transaction_conn.as_mut().unwrap();
-                            return txn_execute(txn_conn, &sql, &params_arg, &return_type);
+                            txn_execute(txn_conn, &sql, &params_arg, &return_type)?
+                        } else if let Some(qe_fn) = self.query_execute_fn {
+                            // No active transaction — delegate to the normal
+                            // builtin (via fn pointer or registered builtin).
+                            qe_fn(args)?
+                        } else if let Some(builtin) = self
+                            .builtins
+                            .iter()
+                            .find(|(k, _)| k.to_lowercase() == "queryexecute")
+                            .map(|(_, v)| *v)
+                        {
+                            builtin(args)?
+                        } else {
+                            return Err(CfmlError::runtime(
+                                "queryExecute: database features not enabled".to_string(),
+                            ));
+                        }
+                    };
+
+                    // Deliver `result` (queryExecute option + cfquery attr) and
+                    // `name` (cfquery attr only — direct queryExecute ignores
+                    // it, matching Lucee) into the caller's scope. The names
+                    // may be dotted ("local.wheels.result"); the Call op
+                    // handler applies the writeback in the caller's frame.
+                    let mut deliveries: Vec<(String, CfmlValue)> = Vec::new();
+                    if let Some(rn) = result_name {
+                        let result_struct = match &ret {
+                            CfmlValue::Query(q) => {
+                                let mut m = IndexMap::new();
+                                m.insert(
+                                    "recordCount".to_string(),
+                                    CfmlValue::Int(q.row_count() as i64),
+                                );
+                                m.insert("cached".to_string(), CfmlValue::Bool(false));
+                                m.insert(
+                                    "columnList".to_string(),
+                                    CfmlValue::string(q.column_list()),
+                                );
+                                m.insert(
+                                    "sql".to_string(),
+                                    CfmlValue::string(
+                                        q.sql().unwrap_or_else(|| sql_text.clone()),
+                                    ),
+                                );
+                                m.insert("executionTime".to_string(), CfmlValue::Int(0));
+                                CfmlValue::strukt(m)
+                            }
+                            // Mutation metadata struct from the driver — it IS
+                            // the result shape. Snapshot so the delivered
+                            // struct is independent of the returned one.
+                            CfmlValue::Struct(s) => CfmlValue::strukt(s.snapshot()),
+                            other => {
+                                let mut m = IndexMap::new();
+                                if let CfmlValue::Array(a) = other {
+                                    m.insert(
+                                        "recordCount".to_string(),
+                                        CfmlValue::Int(a.len() as i64),
+                                    );
+                                }
+                                m.insert("cached".to_string(), CfmlValue::Bool(false));
+                                m.insert("sql".to_string(), CfmlValue::string(sql_text.clone()));
+                                m.insert("executionTime".to_string(), CfmlValue::Int(0));
+                                CfmlValue::strukt(m)
+                            }
+                        };
+                        deliveries.push((rn, result_struct));
+                    }
+                    if from_cfquery_tag {
+                        if let Some(n) = name_attr {
+                            // Lucee: `name` is only set when the statement
+                            // produced a resultset (SELECT / returning) — it
+                            // stays untouched for INSERT/UPDATE/DDL.
+                            let rt = return_type_opt.as_deref().unwrap_or("query");
+                            let deliver = match &ret {
+                                CfmlValue::Query(_) => true,
+                                CfmlValue::Array(_) => rt == "array",
+                                CfmlValue::Struct(_) => rt.starts_with("struct"),
+                                _ => false,
+                            };
+                            if deliver {
+                                deliveries.push((n, ret.clone()));
+                            }
                         }
                     }
-                    // No active transaction — delegate to normal builtin (via fn pointer or registered builtin)
-                    if let Some(qe_fn) = self.query_execute_fn {
-                        return qe_fn(args);
+                    if !deliveries.is_empty() {
+                        self.pending_result_writeback = Some(deliveries);
                     }
-                    // Fall through to normal builtin dispatch
-                    let builtin_match = self
-                        .builtins
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == "queryexecute")
-                        .map(|(_, v)| *v);
-                    if let Some(builtin) = builtin_match {
-                        return builtin(args);
-                    }
-                    return Err(CfmlError::runtime(
-                        "queryExecute: database features not enabled".to_string(),
-                    ));
+                    return Ok(ret);
                 }
                 "__cftransaction_start" => {
                     if self.transaction_conn.is_some() {
@@ -9812,6 +9930,75 @@ impl CfmlVirtualMachine {
             self.globals.insert(name.to_string(), val);
         } else {
             locals.insert(name.to_string(), val);
+        }
+    }
+
+    /// Assign a value to a runtime-resolved, possibly dotted variable path
+    /// ("rr", "local.wheels.result", "variables.x.y", "request.foo", …),
+    /// auto-vivifying intermediate structs. Shared by `SetDynamicVar`
+    /// (dynamic quoted-LHS assignment) and the pending-result writeback
+    /// (queryExecute `result` / cfquery `name`/`result` delivery).
+    fn store_runtime_path(
+        &mut self,
+        path: &str,
+        value: CfmlValue,
+        locals: &mut IndexMap<String, CfmlValue>,
+    ) {
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.len() >= 2 {
+            let scope = parts[0];
+            let root = self
+                .scope_aware_load(scope, locals)
+                .unwrap_or_else(|| CfmlValue::strukt(IndexMap::new()));
+            let root = if matches!(root, CfmlValue::Struct(_)) {
+                root
+            } else {
+                // Leading segment exists but isn't a struct — replace it,
+                // matching auto-vivification on a normal dotted assignment.
+                CfmlValue::strukt(IndexMap::new())
+            };
+            if let CfmlValue::Struct(ref s) = root {
+                // Walk/auto-vivify intermediate structs, set the leaf.
+                let mut cur = s.clone();
+                for key in &parts[1..parts.len() - 1] {
+                    cur = cur.get_or_insert_struct(key);
+                }
+                cur.insert(parts[parts.len() - 1].to_string(), value);
+            }
+            // Write the (possibly copied) scope container back. For
+            // reference-typed scopes (a CFC's __variables) the leaf is
+            // already mutated in place; for page scope this commits the
+            // new key into locals.
+            self.scope_aware_store(scope, root, locals);
+        } else {
+            // Bare name (no scope prefix) — single-variable store.
+            self.scope_aware_store(path, value, locals);
+        }
+    }
+
+    /// Apply (and clear) any caller-scope deliveries requested by the call
+    /// that just returned — see `pending_result_writeback`.
+    ///
+    /// A delivery that lands in the frame's locals must also RECLAIM the key
+    /// into this frame's `local` view (PR #93 tracking) — exactly like a
+    /// `local.x = ...` assignment — otherwise a same-named key inherited from
+    /// the caller/captured scope keeps the delivered variable invisible to
+    /// `local.x` reads.
+    fn apply_pending_result_writeback(
+        &mut self,
+        locals: &mut IndexMap<String, CfmlValue>,
+        inherited_or_param_keys: &mut std::collections::HashSet<String>,
+    ) {
+        if let Some(sets) = self.pending_result_writeback.take() {
+            for (path, value) in sets {
+                self.store_runtime_path(&path, value, locals);
+                let parts: Vec<&str> = path.split('.').collect();
+                if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("local") {
+                    inherited_or_param_keys.remove(parts[1]);
+                } else if parts.len() == 1 && locals.contains_key(parts[0]) {
+                    inherited_or_param_keys.remove(parts[0]);
+                }
+            }
         }
     }
 

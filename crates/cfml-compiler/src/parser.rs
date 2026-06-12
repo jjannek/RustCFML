@@ -1949,27 +1949,69 @@ impl Parser {
                 // any cfqueryparam appends to __cfquery_params, then queryExecute
                 // runs the captured SQL. Without this, the trailing `{ ... }` was
                 // mis-parsed as a struct literal (issue #68).
-                let query_name = attrs.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("name"))
-                    .and_then(|(_, v)| match v {
-                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
-                        Expression::Identifier(id) => Some(id.name.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "queryResult".to_string());
-                // Options struct: every attribute except `name` (datasource,
-                // returntype, …) — queryExecute's third argument.
-                let opts_struct = Expression::Struct(Struct {
-                    pairs: attrs.iter()
-                        .filter(|(k, _)| !k.eq_ignore_ascii_case("name"))
-                        .map(|(k, v)| (
+                // Options struct: EVERY attribute (name, result, datasource,
+                // attributeCollection, …) — queryExecute's third argument.
+                // The VM intercept expands attributeCollection and delivers
+                // `name`/`result` into the caller's scope at runtime (they
+                // can be dotted, e.g. Wheels' name="local.query" +
+                // result="local.wheels.result", and may only be known at
+                // runtime inside an attributeCollection). The __cfquery_tag
+                // marker tells the intercept this call came from cfquery, so
+                // `name` is honored (direct queryExecute ignores it, like
+                // Lucee) and only set when a resultset came back (Lucee
+                // leaves `name` untouched for INSERT/UPDATE/DDL).
+                let mut pairs: Vec<(Expression, Expression)> = attrs.iter()
+                    .map(|(k, v)| {
+                        // A bare identifier as the name attr (name=q1) targets
+                        // the variable called q1 — normalize to its string.
+                        let value = if k.eq_ignore_ascii_case("name") {
+                            match v {
+                                Expression::Identifier(id) => Expression::Literal(Literal {
+                                    value: LiteralValue::String(id.name.clone()),
+                                    location: loc,
+                                }),
+                                other => other.clone(),
+                            }
+                        } else {
+                            v.clone()
+                        };
+                        (
                             Expression::Literal(Literal {
                                 value: LiteralValue::String(k.clone()),
                                 location: loc,
                             }),
-                            v.clone(),
-                        ))
-                        .collect(),
+                            value,
+                        )
+                    })
+                    .collect();
+                if !attrs.iter().any(|(k, _)| {
+                    k.eq_ignore_ascii_case("name") || k.eq_ignore_ascii_case("attributecollection")
+                }) {
+                    // Pre-#90 leniency: a nameless script cfquery still
+                    // populates `queryResult` (Lucee would require name).
+                    pairs.push((
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String("name".to_string()),
+                            location: loc,
+                        }),
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String("queryResult".to_string()),
+                            location: loc,
+                        }),
+                    ));
+                }
+                pairs.push((
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String("__cfquery_tag".to_string()),
+                        location: loc,
+                    }),
+                    Expression::Literal(Literal {
+                        value: LiteralValue::Bool(true),
+                        location: loc,
+                    }),
+                ));
+                let opts_struct = Expression::Struct(Struct {
+                    pairs,
                     ordered: false,
                     location: loc,
                 });
@@ -1993,15 +2035,14 @@ impl Parser {
                     }),
                 ];
                 stmts.extend(body);
-                // NAME = queryExecute(__cfsavecontent_end(), __cfquery_params, OPTS);
-                stmts.push(Statement::Assignment(Assignment {
-                    target: self.assign_target_from_dotted(&query_name, loc),
-                    value: call("queryExecute", vec![
+                // queryExecute(__cfsavecontent_end(), __cfquery_params, OPTS);
+                // — the VM intercept delivers name=/result= from OPTS.
+                stmts.push(Statement::Expression(ExpressionStatement {
+                    expr: call("queryExecute", vec![
                         call("__cfsavecontent_end", vec![]),
                         Expression::Identifier(Identifier { name: "__cfquery_params".to_string(), location: loc }),
                         opts_struct,
                     ]),
-                    operator: AssignOp::Equal,
                     location: loc,
                 }));
                 CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
