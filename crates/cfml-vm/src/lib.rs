@@ -4874,9 +4874,23 @@ impl CfmlVirtualMachine {
                                         (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap))
                                             if cur.contains_key("__variables") && !cur.ptr_eq(snap)
                                     );
+                                // Same-instance guard: when the snapshot IS the receiver
+                                // (same Arc), every `this.x =` in the callee already
+                                // mutated the shared struct in place — there is nothing
+                                // to write back. Rebuilding via snapshot() would DETACH
+                                // the binding onto a fresh Arc; for `this.method()` inside
+                                // a CFC method that detaches the frame's own `this`, so
+                                // all later this-writes in the frame are silently
+                                // discarded on return (PR #100, broke Wheels create()/
+                                // update() persistence).
+                                let same_instance = matches!(
+                                    (&existing, &modified_this),
+                                    (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap))
+                                        if cur.ptr_eq(snap)
+                                );
                                 if skip_for_identity {
                                     self.method_variables_writeback = None;
-                                } else {
+                                } else if !same_instance {
                                 let merged = if is_cfc {
                                     match (existing, modified_this) {
                                         (Some(CfmlValue::Struct(cur)), CfmlValue::Struct(snap)) => {
