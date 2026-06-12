@@ -281,7 +281,7 @@ fn select_without_from() {
 #[test]
 fn parallel_filter_and_order_preserves_results() {
     // 15k rows: id = 1..=15000, name = "n{id}".
-    let mut q = CfmlQuery::new(vec!["id".to_string(), "name".to_string()]);
+    let q = CfmlQuery::new(vec!["id".to_string(), "name".to_string()]);
     for n in 1..=15000i64 {
         let mut m = IndexMap::new();
         m.insert("id".to_string(), CfmlValue::Int(n));
@@ -307,7 +307,7 @@ fn parallel_filter_and_order_preserves_results() {
 /// when parallel filtering feeds it.
 #[test]
 fn parallel_filter_into_aggregate() {
-    let mut q = CfmlQuery::new(vec!["id".to_string(), "bucket".to_string()]);
+    let q = CfmlQuery::new(vec!["id".to_string(), "bucket".to_string()]);
     for n in 1..=12000i64 {
         let mut m = IndexMap::new();
         m.insert("id".to_string(), CfmlValue::Int(n));

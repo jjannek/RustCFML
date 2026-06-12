@@ -19,10 +19,11 @@ fn compile(src: &str) -> BytecodeProgram {
 }
 
 fn run(src: &str) -> (String, usize) {
-    // Compile the native body on the 2nd invocation of a hot function.
-    std::env::set_var("RUSTCFML_JIT_THRESHOLD", "1");
-    std::env::remove_var("RUSTCFML_JIT"); // ensure not force-disabled
     let mut vm = CfmlVirtualMachine::new(compile(src));
+    // Compile the native body on the 2nd invocation of a hot function.
+    // Set via API, not env vars: parallel test threads share the process
+    // environment, so env mutation makes JIT engagement nondeterministic.
+    vm.jit_set_threshold(1);
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }
@@ -33,11 +34,11 @@ fn run(src: &str) -> (String, usize) {
     (vm.get_output().trim().to_string(), vm.jit_compiled_count())
 }
 
-/// Run `src` with the JIT force-disabled (`RUSTCFML_JIT=0`) — the interpreter
-/// oracle. Returns the trimmed output.
+/// Run `src` with the JIT force-disabled — the interpreter oracle. Returns
+/// the trimmed output.
 fn run_interpreter(src: &str) -> String {
-    std::env::set_var("RUSTCFML_JIT", "0");
     let mut vm = CfmlVirtualMachine::new(compile(src));
+    vm.jit_disable();
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }
@@ -45,7 +46,6 @@ fn run_interpreter(src: &str) -> String {
         vm.builtins.insert(name, func);
     }
     vm.execute().expect("execute");
-    std::env::remove_var("RUSTCFML_JIT");
     vm.get_output().trim().to_string()
 }
 
@@ -178,9 +178,8 @@ fn builtin_calls_jit_and_match_interpreter() {
 /// Same setup as `run` but also returns the count of OSR-compiled loop bodies
 /// — used to confirm OSR specifically fired (not just whole-fn JIT).
 fn run_with_osr(src: &str) -> (String, usize, usize) {
-    std::env::set_var("RUSTCFML_JIT_THRESHOLD", "1");
-    std::env::remove_var("RUSTCFML_JIT");
     let mut vm = CfmlVirtualMachine::new(compile(src));
+    vm.jit_set_threshold(1);
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }

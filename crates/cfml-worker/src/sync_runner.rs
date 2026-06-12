@@ -62,7 +62,7 @@ pub fn stash_context(ctx: RunContext) {
     CTX.with(|c| *c.borrow_mut() = Some(ctx));
 }
 
-pub fn take_result() -> Option<Result<ResponseData, String>> {
+pub(crate) fn take_result() -> Option<Result<ResponseData, String>> {
     RESULT.with(|r| r.borrow_mut().take())
 }
 

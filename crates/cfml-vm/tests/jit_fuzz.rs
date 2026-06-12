@@ -53,13 +53,13 @@ fn compile(src: &str) -> BytecodeProgram {
 }
 
 fn run(src: &str, jit_on: bool) -> String {
-    if jit_on {
-        std::env::set_var("RUSTCFML_JIT_THRESHOLD", "1");
-        std::env::remove_var("RUSTCFML_JIT");
-    } else {
-        std::env::set_var("RUSTCFML_JIT", "0");
-    }
     let mut vm = CfmlVirtualMachine::new(compile(src));
+    // API, not env vars: parallel test threads share the process environment.
+    if jit_on {
+        vm.jit_set_threshold(1);
+    } else {
+        vm.jit_disable();
+    }
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }
@@ -67,9 +67,7 @@ fn run(src: &str, jit_on: bool) -> String {
         vm.builtins.insert(name, func);
     }
     vm.execute().expect("execute");
-    let out = vm.get_output().trim().to_string();
-    std::env::remove_var("RUSTCFML_JIT");
-    out
+    vm.get_output().trim().to_string()
 }
 
 /// Build a CFML program with `nfuncs` functions, each calling one other at

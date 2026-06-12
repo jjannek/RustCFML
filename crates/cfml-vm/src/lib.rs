@@ -1037,6 +1037,22 @@ impl CfmlVirtualMachine {
     pub fn osr_compiled_count(&self) -> usize {
         self.jit.as_ref().map_or(0, |j| j.osr_compiled_count())
     }
+
+    /// Replace this VM's JIT engine with one at an explicit hotness threshold,
+    /// ignoring `RUSTCFML_JIT` / `RUSTCFML_JIT_THRESHOLD`. Tests use this for
+    /// deterministic JIT engagement: mutating the process environment instead
+    /// races when the test runner executes other tests on parallel threads.
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    pub fn jit_set_threshold(&mut self, threshold: u32) {
+        self.jit = jit::JitEngine::new_with_threshold(threshold);
+    }
+
+    /// Force-disable the JIT for this VM regardless of environment — the
+    /// deterministic equivalent of `RUSTCFML_JIT=0` (interpreter oracle).
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    pub fn jit_disable(&mut self) {
+        self.jit = None;
+    }
 }
 
 /// Shared OSR/JIT shadow-guard predicate: `true` when calling the canonical

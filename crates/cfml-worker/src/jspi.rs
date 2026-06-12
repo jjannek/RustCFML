@@ -166,6 +166,10 @@ pub(crate) fn hyperdrive_query_sync(request_json: &str) -> Result<String, CfmlEr
 /// Sync-from-wasm Durable Object fetch. `request_json` is shaped as
 /// `{binding, instance, path?, method?, body?}`; the returned String is
 /// the JSON the JS shim wrote (`{success, status, body, error?}`).
+///
+/// Not wired up yet: this is the transport for the planned DO-backed
+/// application scope (see do_application_store.rs), kept ahead of that work.
+#[allow(dead_code)]
 pub(crate) fn do_fetch_sync(request_json: &str) -> Result<String, CfmlError> {
     let req_bytes = request_json.as_bytes();
     let mut buf: Vec<u8> = vec![0u8; INITIAL_RESPONSE_CAP];

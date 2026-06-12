@@ -25,6 +25,8 @@ fn compile(src: &str) -> BytecodeProgram {
 
 fn fresh_vm(program: BytecodeProgram) -> CfmlVirtualMachine {
     let mut vm = CfmlVirtualMachine::new(program);
+    // API, not env vars: parallel test threads share the process environment.
+    vm.jit_set_threshold(1);
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }
@@ -48,8 +50,6 @@ fn soak_iterations() -> usize {
 /// the per-iteration compile count is stable (it is bounded by the program's
 /// distinct JIT-eligible functions, not by the iteration index).
 fn soak(label: &str, src: &str) {
-    std::env::set_var("RUSTCFML_JIT_THRESHOLD", "1");
-    std::env::remove_var("RUSTCFML_JIT");
     let program = compile(src);
     let iters = soak_iterations();
     let mut first_out: Option<String> = None;

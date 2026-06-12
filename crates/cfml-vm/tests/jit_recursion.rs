@@ -22,9 +22,9 @@ fn compile(src: &str) -> BytecodeProgram {
 /// Run `src` with the JIT forced on (threshold=1 so any hot function
 /// compiles on its second call). Returns `(stdout, fn_compiled_count)`.
 fn run_jit(src: &str) -> (String, usize) {
-    std::env::set_var("RUSTCFML_JIT_THRESHOLD", "1");
-    std::env::remove_var("RUSTCFML_JIT");
     let mut vm = CfmlVirtualMachine::new(compile(src));
+    // API, not env vars: parallel test threads share the process environment.
+    vm.jit_set_threshold(1);
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }
@@ -37,8 +37,8 @@ fn run_jit(src: &str) -> (String, usize) {
 
 /// Same program, JIT off — the trusted oracle.
 fn run_interp(src: &str) -> String {
-    std::env::set_var("RUSTCFML_JIT", "0");
     let mut vm = CfmlVirtualMachine::new(compile(src));
+    vm.jit_disable();
     for (name, value) in get_builtins() {
         vm.globals.insert(name, value);
     }
@@ -46,7 +46,6 @@ fn run_interp(src: &str) -> String {
         vm.builtins.insert(name, func);
     }
     vm.execute().expect("execute");
-    std::env::remove_var("RUSTCFML_JIT");
     vm.get_output().trim().to_string()
 }
 

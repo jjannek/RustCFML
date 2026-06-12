@@ -1098,9 +1098,9 @@ impl<'a, I: Invoker> Engine<'a, I> {
         //    so we avoid the row-major→col-major transpose at the end of the
         //    pipeline.
         if !needs_eval.is_empty() {
-            let n_e = needs_eval.len();
             #[cfg(not(target_arch = "wasm32"))]
             {
+                let n_e = needs_eval.len();
                 if self.parallel && n_surv >= PARALLEL_ROW_THRESHOLD {
                     use rayon::prelude::*;
                     let pure = PureInvoker;

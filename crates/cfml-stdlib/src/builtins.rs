@@ -6280,6 +6280,9 @@ pub fn resolve_datasource(name: &str) -> String {
 }
 
 /// Resolve the default datasource registered via `set_default_datasource`.
+/// Only called from `fn_query_execute`, which carries the same gate — without
+/// it, no-DB builds (e.g. wasm32 cfml-worker) flag this as dead code.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn default_datasource() -> Option<String> {
     DATASOURCE_REGISTRY
         .get()
@@ -10358,6 +10361,10 @@ fn fn_cfexecute_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfexecute requires VM intercept".into()))
 }
 
+// Without `smtp`, the early `return Err` makes the rest of the body
+// unreachable by design — the code must still compile so the smtp build
+// stays warning-free, so allow the lint rather than cfg-ing out the tail.
+#[cfg_attr(not(feature = "smtp"), allow(unreachable_code))]
 fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
     let opts = match args.into_iter().next() {
         Some(CfmlValue::Struct(s)) => s,

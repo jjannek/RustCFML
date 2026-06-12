@@ -408,6 +408,15 @@ impl JitEngine {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(50);
+        Self::new_with_threshold(threshold)
+    }
+
+    /// Construct the engine with an explicit hotness threshold, ignoring the
+    /// `RUSTCFML_JIT` / `RUSTCFML_JIT_THRESHOLD` environment entirely.
+    /// Deterministic regardless of the process environment — tests use this
+    /// (via `CfmlVirtualMachine::jit_set_threshold`) instead of `env::set_var`,
+    /// which races when parallel test threads mutate the shared environment.
+    pub fn new_with_threshold(threshold: u32) -> Option<Self> {
         let backend = translate::Backend::new().ok()?;
         Some(Self {
             cache: FxHashMap::default(),
