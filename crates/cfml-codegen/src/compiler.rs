@@ -190,6 +190,14 @@ pub enum BytecodeOp {
     /// Vec). Emitted only for a 2-arg call with a simple, non-scope identifier.
     ArrayAppendLocal(String),
     LoadGlobal(String),
+    /// Page-scope `variables.foo` read peephole. Same locals-then-globals
+    /// resolution chain as LoadGlobal, but READ position: a plain data value
+    /// is always returned as-is. LoadGlobal is otherwise emitted only in
+    /// call position, where data inherited from an ancestor frame (and data
+    /// under a builtin name) must stay invisible to function-name
+    /// resolution (PR #97) — semantics that would corrupt reads of
+    /// variables named like builtins (`variables.log`, `variables.len`).
+    LoadVariablesKey(String),
     StoreGlobal(String),
 
     // Stack
@@ -2677,7 +2685,8 @@ impl CfmlCompiler {
                 if !access.null_safe && self.function_depth == 0 {
                     if let Expression::Identifier(ref ident) = *access.object {
                         if ident.name.eq_ignore_ascii_case("variables") {
-                            instructions.push(BytecodeOp::LoadGlobal(access.member.clone()));
+                            instructions
+                                .push(BytecodeOp::LoadVariablesKey(access.member.clone()));
                             return;
                         }
                     }

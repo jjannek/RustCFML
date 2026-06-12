@@ -2569,17 +2569,49 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
-                BytecodeOp::LoadGlobal(name) => {
+                BytecodeOp::LoadGlobal(name) | BytecodeOp::LoadVariablesKey(name) => {
                     let name_lower = name.to_lowercase();
+                    // Resolve from this frame's locals (exact, then CI), keeping the
+                    // matched key so we can ask whether it was inherited.
+                    let local_hit = locals
+                        .get_key_value(name.as_str())
+                        .or_else(|| locals.iter().find(|(k, _)| k.to_lowercase() == name_lower))
+                        .map(|(k, v)| (k.clone(), v.clone()));
+                    // PR #97: CFML is lexically scoped — a non-Function value that
+                    // leaked in from an ANCESTOR frame (the parent-scope copy above)
+                    // must stay invisible to bare-name call resolution; only data
+                    // established in THIS frame (params, `var`s, bare writes) may
+                    // shadow a same-named function. Builtin names are immune to
+                    // data shadowing entirely (Lucee binds BIFs at compile time:
+                    // `function f(struct lcase={}) { lcase("X") }` calls the BIF).
+                    // When the hit is skipped here and nothing else resolves, the
+                    // final else pushes the data back so plain reads keep working.
+                    //
+                    // LoadVariablesKey is the page-scope `variables.foo` READ
+                    // peephole: same resolution chain, but a data hit is always
+                    // visible (`variables.log` must return the variable, not the
+                    // log() builtin).
+                    let is_read_position = matches!(op, BytecodeOp::LoadVariablesKey(_));
+                    let local_hit_visible = match &local_hit {
+                        None => false,
+                        _ if is_read_position => true,
+                        Some((_, CfmlValue::Function(_))) => true,
+                        Some((k, _)) => {
+                            let is_own_param =
+                                func.params.iter().any(|p| p.eq_ignore_ascii_case(k));
+                            let inherited_data =
+                                inherited_or_param_keys.contains(k.as_str()) && !is_own_param;
+                            let is_builtin_name = self.builtins.contains_key(name.as_str())
+                                || self
+                                    .builtins
+                                    .keys()
+                                    .any(|b| b.eq_ignore_ascii_case(&name_lower));
+                            !inherited_data && !is_builtin_name
+                        }
+                    };
                     // 1. Check locals (exact, then CI)
-                    if let Some(val) = locals.get(name.as_str()) {
-                        stack.push(val.clone());
-                    } else if let Some(val) = locals
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == name_lower)
-                        .map(|(_, v)| v.clone())
-                    {
-                        stack.push(val);
+                    if local_hit_visible {
+                        stack.push(local_hit.as_ref().map(|(_, v)| v.clone()).unwrap());
                     // 1b. Check __variables scope for CFC methods
                     } else if let Some(val) = locals.get("__variables").and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
@@ -2753,6 +2785,12 @@ impl CfmlVirtualMachine {
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: None,
                         })));
+                    } else if let Some((_, val)) = local_hit {
+                        // The locals hit was skipped above (inherited data /
+                        // builtin-named data) but no function resolved either:
+                        // restore the data so plain reads behave as before and
+                        // a call on it reports "Variable is not a function".
+                        stack.push(val);
                     } else {
                         return Err(self.wrap_error(CfmlError::runtime(format!(
                             "Variable '{}' is undefined",
@@ -14496,9 +14534,10 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         | BytecodeOp::Double(_)
         | BytecodeOp::String(_) => (1, 0),
         // Variable loads: push 1, pop 0
-        BytecodeOp::LoadLocal(_) | BytecodeOp::LoadGlobal(_) | BytecodeOp::TryLoadLocal(_) => {
-            (1, 0)
-        }
+        BytecodeOp::LoadLocal(_)
+        | BytecodeOp::LoadGlobal(_)
+        | BytecodeOp::LoadVariablesKey(_)
+        | BytecodeOp::TryLoadLocal(_) => (1, 0),
         // Variable stores: push 0, pop 1
         BytecodeOp::StoreLocal(_) | BytecodeOp::StoreGlobal(_) => (0, 1),
         // Fused in-place append: pops the value, pushes nothing
@@ -14608,7 +14647,8 @@ fn find_arg_sources(ops: &[BytecodeOp], call_ip: usize, arg_count: usize) -> Vec
                 arg_idx -= 1;
                 if let BytecodeOp::LoadLocal(name)
                 | BytecodeOp::TryLoadLocal(name)
-                | BytecodeOp::LoadGlobal(name) = op
+                | BytecodeOp::LoadGlobal(name)
+                | BytecodeOp::LoadVariablesKey(name) = op
                 {
                     sources[arg_idx] = Some(name.clone());
                 }
