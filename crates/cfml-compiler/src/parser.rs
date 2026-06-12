@@ -863,20 +863,28 @@ impl Parser {
         if matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "savecontent") {
             self.advance(); // consume 'savecontent'
             // Parse attributes: variable = "name"
-            let mut var_name = "__savecontent_result".to_string();
+            let mut var_target =
+                AssignTarget::Variable("__savecontent_result".to_string());
             while !self.check(&Token::LBrace) && !self.is_at_end() {
                 if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
                     let attr_name = self.extract_identifier()?;
                     self.advance(); // consume =
                     let attr_value = self.parse_expression()?;
                     if attr_name.to_lowercase() == "variable" {
-                        if let Expression::Literal(ref lit) = attr_value {
-                            if let LiteralValue::String(ref s) = lit.value {
-                                var_name = s.clone();
+                        // The variable= target may be unqualified ("cap"), scope-
+                        // qualified ("local.cap" → a MemberAccess expr), or a string
+                        // literal ("variables.cap"). Lower each to a proper
+                        // AssignTarget so the capture lands in the right scope.
+                        var_target = match attr_value {
+                            Expression::Literal(ref lit) => {
+                                if let LiteralValue::String(ref s) = lit.value {
+                                    self.assign_target_from_dotted(s, stmt_loc.clone())
+                                } else {
+                                    self.expression_to_assign_target(&attr_value)?
+                                }
                             }
-                        } else if let Expression::Identifier(ref id) = attr_value {
-                            var_name = id.name.clone();
-                        }
+                            _ => self.expression_to_assign_target(&attr_value)?,
+                        };
                     }
                 } else {
                     break;
@@ -899,7 +907,7 @@ impl Parser {
             }));
             stmts.extend(body);
             stmts.push(Statement::Assignment(Assignment {
-                target: AssignTarget::Variable(var_name),
+                target: var_target,
                 value: Expression::FunctionCall(Box::new(FunctionCall {
                     name: Box::new(Expression::Identifier(Identifier {
                         name: "__cfsavecontent_end".to_string(),
@@ -1907,14 +1915,19 @@ impl Parser {
     ) -> CfmlNode {
         match tag {
             "cfsavecontent" => {
-                let var_name = attrs.iter()
+                // The variable= target may be unqualified ("cap") or scope-qualified
+                // ("local.cap"); lower it to a proper AssignTarget so the capture
+                // lands in the right scope rather than being silently discarded.
+                let var_target = attrs.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("variable"))
-                    .and_then(|(_, v)| match v {
-                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.clone()),
-                        Expression::Identifier(id) => Some(id.name.clone()),
-                        _ => None,
+                    .map(|(_, v)| match v {
+                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => {
+                            self.assign_target_from_dotted(s, loc)
+                        }
+                        other => self.expression_to_assign_target(other)
+                            .unwrap_or_else(|_| AssignTarget::Variable("__savecontent_result".to_string())),
                     })
-                    .unwrap_or_else(|| "__savecontent_result".to_string());
+                    .unwrap_or_else(|| AssignTarget::Variable("__savecontent_result".to_string()));
                 let mut stmts = vec![Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
@@ -1928,7 +1941,7 @@ impl Parser {
                 })];
                 stmts.extend(body);
                 stmts.push(Statement::Assignment(Assignment {
-                    target: AssignTarget::Variable(var_name),
+                    target: var_target,
                     value: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
                             name: "__cfsavecontent_end".to_string(),
