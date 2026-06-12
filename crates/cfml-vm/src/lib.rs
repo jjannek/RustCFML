@@ -5048,12 +5048,20 @@ impl CfmlVirtualMachine {
                                 stack.push(CfmlValue::array(keys));
                             }
                             CfmlValue::String(s) => {
-                                // Iterating over a string: convert to array of chars
-                                let chars: Vec<CfmlValue> = s
-                                    .chars()
-                                    .map(|c| CfmlValue::string(c.to_string()))
-                                    .collect();
-                                stack.push(CfmlValue::array(chars));
+                                // Lucee parity: for-in over a string iterates it
+                                // as a comma-delimited LIST, not characters.
+                                // Comma is the only delimiter, items are not
+                                // trimmed, and empty items are KEPT ("a,,b" is
+                                // 3 items) — unlike ListToArray's default. An
+                                // empty string never enters the loop.
+                                let items: Vec<CfmlValue> = if s.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    s.split(',')
+                                        .map(|item| CfmlValue::string(item.to_string()))
+                                        .collect()
+                                };
+                                stack.push(CfmlValue::array(items));
                             }
                             CfmlValue::Query(q) => {
                                 // Iterating over a query: convert to array of row structs
