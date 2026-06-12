@@ -305,6 +305,14 @@ try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOu
 try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
 try { include "core/test_forin_member_loop_var.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_member_loop_var.cfm | " & e.message & chr(10)); }
 try { include "core/test_forin_keyword_member_access.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_keyword_member_access.cfm | " & e.message & chr(10)); }
+//   - forin_string_list: for-in over a comma-delimited STRING must iterate
+//     the LIST ITEMS ("id","title","body"), not the CHARACTERS. RustCFML
+//     iterates character-by-character (commas included), so Wheels'
+//     $queryRowToStruct -- for (local.column in query.columnList) -- gave
+//     every finder-hydrated model object junk single-character property
+//     keys instead of its real columns. Runtime gap: wrong values, no
+//     parse error.
+try { include "core/test_forin_string_list.cfm"; } catch (any e) { writeOutput("ERROR | core/test_forin_string_list.cfm | " & e.message & chr(10)); }
 
 // --- v0.34.3 round: Wheels now parses, constructs, and boots its full app
 //     lifecycle + DI on RustCFML. This is the remaining language gap found
