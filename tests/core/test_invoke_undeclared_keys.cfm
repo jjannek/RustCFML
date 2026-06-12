@@ -78,6 +78,22 @@ assert("CONTROL: obj.m(argumentCollection = st) delivers undeclared keys",
 assert("CONTROL: this[name](argumentCollection = st) delivers undeclared keys",
 	fixture.callViaThisBracket("paramless", args),
 	"hasX=true|hasLocked=true");
+</cfscript>
+
+<!--- --- the gap, tag form: <cfinvoke> extra attributes are the same
+	named-argument collection, so undeclared ones must arrive too
+	(surfaced independently by PR 106, credit Blute). Plain attribute
+	names only: Lucee parse-rejects `$` inside a tag attribute name. --- --->
+<cfinvoke component="#fixture#" method="declaredPlain" returnvariable="tagDeclared"
+	x="hello" extra="1" />
+<cfinvoke component="#fixture#" method="paramlessPlain" returnvariable="tagParamless"
+	x="1" extra="1" />
+
+<cfscript>
+assert("cfinvoke tag delivers an undeclared attribute alongside a declared param",
+	tagDeclared, "x=hello|hasExtra=true");
+assert("cfinvoke tag delivers every attribute to a paramless target",
+	tagParamless, "hasX=true|hasExtra=true");
 
 suiteEnd();
 </cfscript>

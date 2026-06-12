@@ -22,6 +22,18 @@ component {
 		return "LOCKED-OK";
 	}
 
+	// Tag-form probes: <cfinvoke> attribute names cannot contain `$` (Lucee
+	// parse-rejects it), so these report a plain undeclared key `extra`.
+	public string function declaredPlain(string x = "(default)") {
+		return "x=" & arguments.x
+			& "|hasExtra=" & StructKeyExists(arguments, "extra");
+	}
+
+	public string function paramlessPlain() {
+		return "hasX=" & StructKeyExists(arguments, "x")
+			& "|hasExtra=" & StructKeyExists(arguments, "extra");
+	}
+
 	// In-context dynamic dispatch control: this[name](argumentCollection = st).
 	public string function callViaThisBracket(required string m, required struct a) {
 		return this[arguments.m](argumentCollection = arguments.a);
