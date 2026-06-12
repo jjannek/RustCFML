@@ -198,6 +198,76 @@ is a superset of both.
 | Unknown servlet method (e.g. `getLocale`) | returns `null` (non-null receiver keeps chains alive) | full servlet API |
 | `getMetaData(getRequest()).getName()` | a struct (no real Java class) | `...HTTPServletRequestWrap` |
 
+## 12. Session storage — datasource store, lazy default, data-only rule 🏗/🌟
+
+Three deliberate changes from issue #88, two of them conscious divergences from Lucee.
+
+### 12a. Datasource (SQL) session store — *new, additive*
+
+`sessionStorage` may now resolve to a SQL datasource, a fourth backend alongside
+`memory`, `memcached`, and `cluster`. Two config forms:
+
+```jsonc
+// (a) cache entry with provider="datasource"
+{ "sessionStorage": "sess_db",
+  "caches": { "sess_db": { "provider": "datasource", "storage": true,
+    "properties": { "datasource": "appdb", "table": "cf_session_data" } } },
+  "datasources": { "appdb": { "driver": "sqlite", "database": "/var/app/sessions.db" } } }
+
+// (b) Lucee-compat: sessionStorage names a defined datasource directly
+{ "sessionStorage": "appdb",
+  "datasources": { "appdb": { "driver": "postgresql", "host": "...", "database": "..." } } }
+```
+
+The table (`cf_session_data` by default, configurable) is auto-created with
+`CREATE TABLE IF NOT EXISTS` on first use. The session blob is the same
+`serde_json` shape the memcached store writes, so the `data` column is portable
+between the two stores.
+
+| Behaviour | RustCFML | Notes |
+|---|---|---|
+| Concurrency | last-write-wins (whole-blob) | same model as the memcached store; optimistic versioning is a possible v2 |
+| Upsert | portable `UPDATE`-then-`INSERT` | avoids dialect-specific `ON CONFLICT`/`ON DUPLICATE KEY`/`MERGE` |
+| `onSessionEnd` sweep | portable `SELECT` + per-row `DELETE` claim (no `RETURNING`) | the delete is the cross-node claim, so multi-node does not double-fire — **best-effort, no delivery guarantee** |
+| Expiry touch | throttled (skips the write until ~25% of the timeout elapses with no data change) | kills per-request write amplification; semantically invisible |
+| App partition | single logical `app_name` per store | multi-app isolation via distinct datasources/tables in v1 |
+| DDL denied by grants | clear error telling you to pre-create the documented schema | the store then just uses it |
+| Verified driver | SQLite (bundled) end-to-end; MySQL/PostgreSQL/MSSQL portable-by-construction | MSSQL may need a manual schema (`TEXT` is deprecated there) |
+| `client` scope storage | not implemented (explicit non-goal for v1) | the schema extends with a scope discriminator if ever wanted |
+
+### 12b. Lazy session creation is the engine-wide default 🌟 *(divergence)*
+
+No session record, no `CFID` cookie, and no `onSessionStart` fire until code
+**writes** to the `session` scope. A request that only reads session (or never
+touches it) mints nothing — so crawlers and `curl` hits no longer persist empty
+sessions or receive a tracking cookie.
+
+This is **stricter than Lucee 7**, which still mints the cookie when a session
+is created by a mere read/check. Deferring the cookie until a write is a
+conscious, privacy-friendly divergence. `onSessionStart` timing also shifts for
+existing apps: first write, not first hit. Opt back into the historical eager
+behaviour with `this.lazySessionCreation = false` (alias `this.lazySessions`).
+
+### 12c. Session scope is data-only 🛑 *(divergence — was a silent null)*
+
+The `session` scope persists **data values only** — no components, closures /
+functions, or native objects — enforced on **every store, memory included**.
+A violation throws and names the offending key path:
+
+```
+session.cart.items[3].product is a component; the session scope only persists
+data values (no components, closures, functions, or native objects)
+```
+
+The status quo this replaces was worse than a breaking change: on the external
+stores a component in session serialised to a **silent `null`** and vanished on
+the next request. Making that loud is a fix. Two layers enforce it: a shallow
+check at the `session.x = ...` write site (fails fast at the call), and a
+persist-time deep walk (the airtight gate — also catches values smuggled in via
+reference mutation, e.g. `local.x = {}; session.box = local.x; local.x.p = new C()`).
+Dates are strings and binary/query have JSON round-trip forms, so the allowed
+set covers everything that round-trips.
+
 ---
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit

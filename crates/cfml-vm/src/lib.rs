@@ -95,6 +95,67 @@ pub struct SessionData {
     pub timeout_secs: u64,
 }
 
+/// Data-only session rule (issue #88): the session scope persists data values
+/// only — no components, closures/functions, or native objects. Returns the
+/// offending key-path on the first violation so the error names exactly what
+/// to remove. Enforced across every store (memory included) so the rule is a
+/// session-scope semantic, not a deployment surprise that only bites once an
+/// external store silently drops the value to null.
+fn validate_session_value(path: &str, v: &CfmlValue) -> Result<(), String> {
+    match v {
+        CfmlValue::Closure(_) => Err(format!("{} is a closure", path)),
+        CfmlValue::Function(_) => Err(format!("{} is a function", path)),
+        CfmlValue::Component(_) => Err(format!("{} is a component", path)),
+        CfmlValue::NativeObject(_) => Err(format!("{} is a native object", path)),
+        CfmlValue::Array(a) => {
+            for (i, item) in a.snapshot().iter().enumerate() {
+                validate_session_value(&format!("{}[{}]", path, i + 1), item)?;
+            }
+            Ok(())
+        }
+        CfmlValue::Struct(m) => {
+            let snap = m.snapshot();
+            // A struct carrying CFC instance markers is a component instance
+            // (this engine materialises CFCs as marker-bearing structs as well
+            // as the `Component` variant).
+            let looks_like_cfc = snap.keys().any(|k| k.eq_ignore_ascii_case("__variables"))
+                && snap.keys().any(|k| {
+                    k.eq_ignore_ascii_case("this") || k.eq_ignore_ascii_case("__name")
+                });
+            if looks_like_cfc {
+                return Err(format!("{} is a component", path));
+            }
+            for (k, val) in snap.iter() {
+                // Skip internal markers; user-visible keys only.
+                if k.starts_with("__") {
+                    continue;
+                }
+                validate_session_value(&format!("{}.{}", path, k), val)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Validate a whole session variable map against the data-only rule, turning a
+/// violation into a `CfmlError` whose message names the offending key path.
+fn validate_session_data_only(vars: &IndexMap<String, CfmlValue>) -> Result<(), CfmlError> {
+    for (k, v) in vars.iter() {
+        if k.starts_with("__") {
+            continue;
+        }
+        validate_session_value(&format!("session.{}", k), v).map_err(|p| {
+            CfmlError::runtime(format!(
+                "{}; the session scope only persists data values \
+                 (no components, closures, functions, or native objects)",
+                p
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Returns current Unix epoch seconds.
 #[inline]
 fn now_epoch_secs() -> u64 {
@@ -2380,7 +2441,7 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "session" {
                             if let CfmlValue::Struct(s) = &val {
-                                self.set_session_scope(s.snapshot());
+                                self.set_session_scope(s.snapshot())?;
                             }
                         } else if name_lower == "thread" && self.globals.contains_key("thread") {
                             self.globals.insert("thread".to_string(), val);
@@ -7508,7 +7569,7 @@ impl CfmlVirtualMachine {
                             self.request_scope.insert(key.to_string(), default_val);
                         }
                         "session" => {
-                            self.set_session_variable(key, default_val);
+                            self.set_session_variable(key, default_val)?;
                         }
                         "application" => {
                             if let Some(ref app_scope) = self.application_scope {
@@ -8801,7 +8862,7 @@ impl CfmlVirtualMachine {
                     // Flush any pending live-scope writes to the old record first
                     // so rotate migrates the current data, then migrate + re-attach
                     // the live scope from the new id.
-                    self.sync_session_scope_to_store();
+                    self.sync_session_scope_to_store()?;
                     if let (Some(ref state), Some(ref old_sid)) =
                         (&self.server_state, &self.session_id)
                     {
@@ -9005,7 +9066,7 @@ impl CfmlVirtualMachine {
                         self.request_scope.insert(key, value.clone());
                     } else if var_lower.starts_with("session.") {
                         let key = var_name[8..].to_string();
-                        self.set_session_variable(&key, value.clone());
+                        self.set_session_variable(&key, value.clone())?;
                     } else if var_lower.starts_with("application.") {
                         let key = var_name[12..].to_string();
                         if let Some(ref app_scope) = self.application_scope {
@@ -12194,11 +12255,15 @@ impl CfmlVirtualMachine {
     /// Persist the live session scope back to the session store. Called at the
     /// end of the request (after user code) so scope-pointer writes that bypass
     /// `set_session_*` (e.g. `var p = session; p[k]=v`) are committed.
-    fn sync_session_scope_to_store(&mut self) {
+    fn sync_session_scope_to_store(&mut self) -> Result<(), CfmlError> {
         let snap = match &self.session_scope {
             Some(ss) => ss.snapshot(),
-            None => return,
+            None => return Ok(()),
         };
+        // Airtight data-only gate: catches values smuggled in via reference
+        // mutation (`local.x = {}; session.cart = local.x; local.x.p = new C()`),
+        // which no assignment-time check can see.
+        validate_session_data_only(&snap)?;
         if let (Some(state), Some(sid)) = (self.server_state.clone(), self.session_id.clone()) {
             let now = now_epoch_secs();
             // Create the record if missing so a write after sessionInvalidate
@@ -12215,6 +12280,7 @@ impl CfmlVirtualMachine {
             session.last_accessed_secs = now;
             state.sessions.set(&sid, session);
         }
+        Ok(())
     }
 
     /// Get the session scope for the current request — a LIVE handle clone when
@@ -12233,7 +12299,11 @@ impl CfmlVirtualMachine {
     }
 
     /// Set the session scope for the current request (mutates the live scope).
-    fn set_session_scope(&mut self, vars: IndexMap<String, CfmlValue>) {
+    fn set_session_scope(&mut self, vars: IndexMap<String, CfmlValue>) -> Result<(), CfmlError> {
+        // Data-only gate at the write site (ergonomics): the common direct
+        // case `session.x = new C()` fails here rather than at request end.
+        // Validate BEFORE lazy-init so a rejected write mints no session.
+        validate_session_data_only(&vars)?;
         // If lazy-init fires here, `onSessionStart` ran AFTER the user
         // code loaded the (then-empty) session scope. Their `vars`
         // snapshot doesn't contain any keys onSessionStart set, so we
@@ -12253,16 +12323,25 @@ impl CfmlVirtualMachine {
                 ss.with_write(|m| *m = vars);
             }
         }
+        Ok(())
     }
 
     /// Update a single key in the session scope (mutates the live scope).
-    #[allow(dead_code)]
-    fn set_session_variable(&mut self, key: &str, value: CfmlValue) {
+    fn set_session_variable(&mut self, key: &str, value: CfmlValue) -> Result<(), CfmlError> {
+        // Data-only gate at the write site (ergonomics).
+        validate_session_value(&format!("session.{}", key), &value).map_err(|p| {
+            CfmlError::runtime(format!(
+                "{}; the session scope only persists data values \
+                 (no components, closures, functions, or native objects)",
+                p
+            ))
+        })?;
         self.lazy_init_session_if_pending();
         self.attach_session_scope();
         if let Some(ref ss) = self.session_scope {
             ss.insert(key.to_string(), value);
         }
+        Ok(())
     }
 
     /// Resolve a component template by name: tries locals, globals (exact + CI),
@@ -14452,10 +14531,16 @@ impl CfmlVirtualMachine {
             app_caches,
         ) = Self::extract_app_config(&template);
 
-        // `this.lazySessionCreation = true` (alias `this.lazySessions`):
-        // Preside-style deferred session creation. When set, no session
-        // record is inserted at request start; instead a record + cookie
-        // + onSessionStart fire on the first write to `session`.
+        // Lazy session creation is the engine-wide DEFAULT (issue #88):
+        // no session record, no CFID cookie, and no `onSessionStart` until
+        // code actually writes to the `session` scope. A page that only reads
+        // session (or never touches it) mints nothing — privacy-friendly, and
+        // it stops every crawler/`curl` hit from persisting an empty session.
+        //
+        // This is a deliberate divergence from Lucee 7 (which still mints the
+        // cookie on a read/check) — see docs/known-issues.md. Apps that need
+        // the historical eager behaviour opt back in with
+        // `this.lazySessionCreation = false` (alias `this.lazySessions`).
         let lazy_session_creation = config
             .get("lazysessioncreation")
             .or_else(|| config.get("lazysessions"))
@@ -14463,11 +14548,11 @@ impl CfmlVirtualMachine {
                 CfmlValue::Bool(b) => *b,
                 CfmlValue::String(s) => {
                     let l = s.trim().to_ascii_lowercase();
-                    l == "true" || l == "yes" || l == "1"
+                    !(l == "false" || l == "no" || l == "0")
                 }
-                _ => false,
+                _ => true,
             })
-            .unwrap_or(false);
+            .unwrap_or(true);
         self.lazy_session_creation = lazy_session_creation;
 
         // 3.0 Layer .cfconfig.json global mappings + customTagPaths underneath
@@ -14761,7 +14846,20 @@ impl CfmlVirtualMachine {
         // reads/writes during the request mutate a cached live CfmlStruct (so
         // the scope-pointer pattern works); commit it now before expiry runs.
         if session_management {
-            self.sync_session_scope_to_store();
+            // A data-only violation smuggled in via reference mutation surfaces
+            // here (the airtight persist gate). The bad value is never written;
+            // route the error through onError like other lifecycle failures.
+            if let Err(e) = self.sync_session_scope_to_store() {
+                let _ = self.call_lifecycle_method(
+                    &mut template,
+                    "onError",
+                    vec![
+                        CfmlValue::string(e.message.clone()),
+                        CfmlValue::string("onRequestEnd".to_string()),
+                    ],
+                );
+                return Err(e);
+            }
         }
 
         // 8b. Session expiry — scan and expire timed-out sessions

@@ -21,14 +21,15 @@ use std::sync::Arc;
 const VROOT: &str = "/app";
 
 fn run_request(app_cfc: &str, page_cfm: &str, lazy: bool, sid: Option<&str>) -> Arc<MemoryStore> {
-    let app_with_flag = if lazy {
-        app_cfc.replace(
-            "this.sessionManagement = true;",
-            "this.sessionManagement = true; this.lazySessionCreation = true;",
-        )
+    // Lazy is now the engine-wide default (issue #88), so eager mode must
+    // opt out explicitly. Always inject the flag so the test pins the mode
+    // it intends regardless of the engine default.
+    let flag = if lazy {
+        "this.sessionManagement = true; this.lazySessionCreation = true;"
     } else {
-        app_cfc.to_string()
+        "this.sessionManagement = true; this.lazySessionCreation = false;"
     };
+    let app_with_flag = app_cfc.replace("this.sessionManagement = true;", flag);
 
     // EmbeddedFs keys are relative to base_dir.
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();

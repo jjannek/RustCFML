@@ -205,6 +205,11 @@ struct CfmlResponse {
     response_body: Option<CfmlValue>,
     redirect_url: Option<String>,
     session_id: Option<String>,
+    /// True when a session record was actually created/minted this request
+    /// (eager start, or the first session write under the lazy default). Drives
+    /// whether a `CFID` cookie is emitted — under lazy sessions, a request that
+    /// only reads session mints nothing and gets no cookie.
+    session_record_created: bool,
 }
 
 /// Error from CFML execution, carrying any output generated before the error.
@@ -731,6 +736,7 @@ fn compile_and_run(
                 response_body: vm.response_body,
                 redirect_url: vm.redirect_url,
                 session_id: vm.session_id,
+                session_record_created: vm.session_record_created,
             })
         }
         Err(e) => {
@@ -941,6 +947,25 @@ async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::sess
     let cache_cfg = match cfconfig.caches.get(storage_name) {
         Some(c) => c,
         None => {
+            // Lucee compat: `sessionStorage` may name a defined datasource
+            // directly (no cache entry). That's the form Lucee `.cfconfig.json`
+            // exports use for DB session storage.
+            if cfconfig
+                .datasources
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case(storage_name))
+            {
+                println!(
+                    "[session] Using datasource session store (datasource={}, table={})",
+                    storage_name,
+                    session::datasource::DEFAULT_TABLE
+                );
+                return Arc::new(session::datasource::DatasourceStore::new(
+                    storage_name,
+                    session::datasource::DEFAULT_TABLE,
+                    storage_name,
+                ));
+            }
             eprintln!(
                 "[session] sessionStorage cache '{}' not found in caches — using in-process memory store",
                 storage_name
@@ -963,6 +988,38 @@ async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::sess
 
     match provider.as_str() {
         "memory" | "" => Arc::new(cfml_vm::session_store::MemoryStore::new()),
+
+        "datasource" => {
+            // `properties.datasource` names the backing datasource; fall back
+            // to the cache name itself if omitted (a cache literally named
+            // after the datasource). `properties.table` overrides the default.
+            let ds = if !cache_cfg.properties.datasource.is_empty() {
+                cache_cfg.properties.datasource.clone()
+            } else {
+                storage_name.to_string()
+            };
+            let table = if !cache_cfg.properties.table.is_empty() {
+                cache_cfg.properties.table.clone()
+            } else {
+                session::datasource::DEFAULT_TABLE.to_string()
+            };
+            if !cfconfig
+                .datasources
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case(&ds))
+            {
+                eprintln!(
+                    "[session] datasource provider references datasource '{}' which is not defined in cfconfig.datasources — using memory store",
+                    ds
+                );
+                return Arc::new(cfml_vm::session_store::MemoryStore::new());
+            }
+            println!(
+                "[session] Using datasource session store (datasource={}, table={})",
+                ds, table
+            );
+            Arc::new(session::datasource::DatasourceStore::new(&ds, &table, &ds))
+        }
 
         #[cfg(feature = "memcached")]
         "memcached" => {
@@ -1330,13 +1387,16 @@ async fn handle_request(
             let vfs = state.vfs.clone();
             let sandbox = state.sandbox;
 
-            // Extract or generate session ID from cookies
-            let session_id = {
+            // Extract the session ID from the incoming CFID cookie, if any.
+            // Under the lazy-session default we do NOT pre-mint an id here:
+            // the VM mints one only when code actually writes to session, so a
+            // read-only/never-touched request hands out no cookie.
+            let existing_sid: Option<String> = {
                 let cookie_header = headers.iter()
                     .find(|(n, _)| n.to_lowercase() == "cookie")
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default();
-                let existing_sid = cookie_header.split(';')
+                cookie_header.split(';')
                     .find_map(|c| {
                         let c = c.trim();
                         if c.starts_with("CFID=") {
@@ -1344,10 +1404,9 @@ async fn handle_request(
                         } else {
                             None
                         }
-                    });
-                existing_sid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                    })
             };
-            let session_id_clone = session_id.clone();
+            let session_id_clone = existing_sid.clone();
 
             let result = tokio::task::spawn_blocking(move || {
                 compile_and_run_with_session(
@@ -1357,7 +1416,7 @@ async fn handle_request(
                     extra_globals,
                     Some(&server_state),
                     Some(http_request_data),
-                    Some(session_id_clone),
+                    session_id_clone,
                     vfs,
                     sandbox,
                 )
@@ -1377,6 +1436,17 @@ async fn handle_request(
                         for (name, value) in &response.response_headers {
                             if name.to_lowercase() != "location" {
                                 builder = builder.header(name.as_str(), value.as_str());
+                            }
+                        }
+                        // Carry the session cookie through a redirect too, so a
+                        // write-then-cflocation (the POST/redirect/GET pattern)
+                        // hands the new CFID to the browser.
+                        if let Some(ref sid) = response.session_id {
+                            if response.session_record_created || Some(sid) != existing_sid.as_ref() {
+                                builder = builder.header(
+                                    "Set-Cookie",
+                                    format!("CFID={}; Path=/; HttpOnly", sid),
+                                );
                             }
                         }
                         return builder.body(axum::body::Body::empty()).unwrap();
@@ -1408,9 +1478,13 @@ async fn handle_request(
                         builder = builder.header(name.as_str(), value.as_str());
                     }
 
-                    // Set session cookie
+                    // Set session cookie only when a record was minted this
+                    // request (lazy default: a read-only request writes nothing
+                    // and gets no cookie) or the id changed (sessionRotate).
                     if let Some(ref sid) = response.session_id {
-                        builder = builder.header("Set-Cookie", format!("CFID={}; Path=/; HttpOnly", sid));
+                        if response.session_record_created || Some(sid) != existing_sid.as_ref() {
+                            builder = builder.header("Set-Cookie", format!("CFID={}; Path=/; HttpOnly", sid));
+                        }
                     }
 
                     builder.body(axum::body::Body::from(body)).unwrap()

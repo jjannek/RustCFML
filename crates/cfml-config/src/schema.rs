@@ -292,6 +292,16 @@ pub struct CacheProperties {
     #[serde(rename = "keyPrefix")]
     pub key_prefix: String,
 
+    // datasource provider (SQL-backed session storage)
+    /// Name of a configured datasource (see top-level `datasources`) that backs
+    /// session storage. Resolved through the same registry cfquery/queryExecute
+    /// use. When `sessionStorage` names a datasource directly (no cache entry),
+    /// this is filled in automatically.
+    pub datasource: String,
+    /// Table name for the datasource provider. Defaults to "cf_session_data".
+    /// Auto-created (`CREATE TABLE IF NOT EXISTS`) on first use.
+    pub table: String,
+
     // cluster provider (memberlist + CRDT)
     /// UDP/QUIC address this node binds for cluster gossip. Default "0.0.0.0:7946".
     #[serde(rename = "listenAddr")]
@@ -364,6 +374,8 @@ impl Default for CacheProperties {
             eviction_policy: "LRU".into(),
             servers: Vec::new(),
             key_prefix: "rustcfml:sess:".into(),
+            datasource: String::new(),
+            table: String::new(),
             listen_addr: "0.0.0.0:7946".into(),
             advertise_addr: String::new(),
             seeds: Vec::new(),
