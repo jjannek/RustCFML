@@ -2264,11 +2264,14 @@ impl CfmlVirtualMachine {
                             );
                             exception
                                 .insert("detail".to_string(), CfmlValue::string(String::new()));
+                            exception.insert("tagcontext".to_string(), self.build_tag_context());
                             stack.truncate(handler.stack_depth);
                             self.restore_capture_state(&handler);
                             let exc = CfmlValue::strukt(exception);
                             self.last_exception = Some(exc.clone());
-                            locals.insert("cfcatch".to_string(), exc);
+                            // The catch handler begins with StoreLocal(catch_var),
+                            // which pops the in-flight error from the stack.
+                            stack.push(exc);
                             ip = handler.catch_ip;
                             continue;
                         }
@@ -2792,6 +2795,31 @@ impl CfmlVirtualMachine {
                         // a call on it reports "Variable is not a function".
                         stack.push(val);
                     } else {
+                        // Unresolved name in call/global position. Route through
+                        // the active try handler if there is one: calling an
+                        // undefined function must be catchable (the standard
+                        // CFML feature-detection idiom relies on it).
+                        if let Some(handler) = self.try_stack.pop() {
+                            let mut exception = IndexMap::new();
+                            exception.insert(
+                                "message".to_string(),
+                                CfmlValue::string(format!("Variable '{}' is undefined", name)),
+                            );
+                            exception.insert(
+                                "type".to_string(),
+                                CfmlValue::string("expression".to_string()),
+                            );
+                            exception
+                                .insert("detail".to_string(), CfmlValue::string(String::new()));
+                            exception.insert("tagcontext".to_string(), self.build_tag_context());
+                            stack.truncate(handler.stack_depth);
+                            self.restore_capture_state(&handler);
+                            let exc = CfmlValue::strukt(exception);
+                            self.last_exception = Some(exc.clone());
+                            stack.push(exc);
+                            ip = handler.catch_ip;
+                            continue;
+                        }
                         return Err(self.wrap_error(CfmlError::runtime(format!(
                             "Variable '{}' is undefined",
                             name

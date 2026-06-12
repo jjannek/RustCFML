@@ -39,6 +39,7 @@ try { include "core/test_cfloop_negative_step.cfm"; } catch (any e) { writeOutpu
 try { include "core/test_cfloop_array_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_array_item_index.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_collection_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_collection_item_index.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_handling.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_handling.cfm | " & e.message & chr(10)); }
+try { include "core/test_catchable_undefined.cfm"; } catch (any e) { writeOutput("ERROR | core/test_catchable_undefined.cfm | " & e.message & chr(10)); }
 try { include "core/test_builtin_shadowing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_builtin_shadowing.cfm | " & e.message & chr(10)); }
 //   - builtin_data_shadow: a plain DATA variable named like a builtin
 //     (val = "29") must not make the builtin uncallable in call position —
