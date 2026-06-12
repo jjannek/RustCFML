@@ -1926,10 +1926,21 @@ impl CfmlVirtualMachine {
         // Copy parent scope variables (closures and nested functions see parent vars).
         // Skip Function values — they're immutable and already available via
         // user_functions, so cloning them (and their captured scopes) is pure waste.
+        //
+        // PR #93: track which keys were *inherited* from the parent so the
+        // per-call `local` scope view (LoadLocal "local" etc.) can exclude
+        // them. The caller's vars must NOT be visible through this frame's
+        // `local` — `local` is strictly per-call. Anything in `locals` that
+        // isn't an inherited key (and isn't a function parameter — those
+        // belong to `arguments`, not `local`) was established in this frame
+        // and is part of `local`.
+        let mut inherited_or_param_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if let Some(parent) = parent_scope {
             for (k, v) in parent {
                 if !matches!(v, CfmlValue::Function(_)) {
                     locals.insert(k.clone(), v.clone());
+                    inherited_or_param_keys.insert(k.clone());
                 }
             }
         }
@@ -1950,6 +1961,7 @@ impl CfmlVirtualMachine {
         // extras beyond declared params with no matching name) DO get numeric
         // keys — that's the only handle they have.
         for (i, param_name) in func.params.iter().enumerate() {
+            inherited_or_param_keys.insert(param_name.clone());
             let has_default = func.has_default.get(i).copied().unwrap_or(false);
             // A Null arg value counts as "not supplied": CFML has no way to pass
             // an explicit null, and the named-argument rebinder pads omitted
@@ -2072,14 +2084,14 @@ impl CfmlVirtualMachine {
                         name.as_str()
                     };
                     let val = if name_lower == "local" {
-                        // `local` is the function-local scope inside functions; at
-                        // template scope CFML engines (Lucee/ACF/BoxLang) treat it
-                        // as an auto-vivifying struct on first subscript write.
-                        // Return the locals struct view either way — StoreLocal
-                        // merges the result back.
-                        let mut scope = locals.clone();
-                        scope.shift_remove("__variables");
-                        CfmlValue::strukt(scope)
+                        // `local` is strictly per-call (PR #93): only keys
+                        // established in THIS frame are visible — inherited
+                        // parent vars (page `variables`, CFC bridge keys) and
+                        // function params are excluded.
+                        CfmlValue::strukt(Self::build_local_scope_view(
+                            &locals,
+                            &inherited_or_param_keys,
+                        ))
                     } else if name_lower == "variables"
                     {
                         // Return a struct representing the variables scope
@@ -2254,7 +2266,13 @@ impl CfmlVirtualMachine {
                 BytecodeOp::TryLoadLocal(name) => {
                     // Safe load: returns Null for undefined vars (used by Elvis, null-safe, isNull)
                     let name_lower = name.to_lowercase();
-                    let val = if name_lower == "variables" || name_lower == "local" {
+                    let val = if name_lower == "local" {
+                        // PR #93: per-frame `local` — only keys established here.
+                        CfmlValue::strukt(Self::build_local_scope_view(
+                            &locals,
+                            &inherited_or_param_keys,
+                        ))
+                    } else if name_lower == "variables" {
                         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
                             CfmlValue::Struct(vars.clone())
                         } else {
@@ -2280,6 +2298,12 @@ impl CfmlVirtualMachine {
                 BytecodeOp::DeclareLocal(name) => {
                     // Mark this variable as function-local (var keyword)
                     declared_locals.insert(name.clone());
+                    // PR #93: a `var x` / `local.x` declaration RECLAIMS the
+                    // name into THIS frame's `local` scope, shadowing any
+                    // same-named key inherited from the caller. Removing it
+                    // from `inherited_or_param_keys` makes the subsequent
+                    // `local.x` reads return this frame's value.
+                    inherited_or_param_keys.remove(name);
                 }
                 BytecodeOp::StoreLocal(name) => {
                     if let Some(val) = stack.pop() {
@@ -2382,6 +2406,13 @@ impl CfmlVirtualMachine {
                             }
                         } else {
                             locals.insert(name.clone(), val.clone());
+                            // PR #93: in modern localmode, a bare assignment IS a
+                            // local-scope assignment — it claims the key for this
+                            // frame's `local` view, shadowing any inherited
+                            // same-named key from the caller / closure parent.
+                            if effective_local_mode_modern {
+                                inherited_or_param_keys.remove(name);
+                            }
                             // Bidirectional sync: when a function param is stored,
                             // also update arguments[param] so `arguments.x` sees
                             // the latest value (and vice versa, handled above for arguments)
@@ -9878,6 +9909,36 @@ impl CfmlVirtualMachine {
             self.pending_extra_named_args = Some(extras);
         }
         positional
+    }
+
+    /// Build the `local` scope view for the current call frame. CFML
+    /// defines `local` as strictly per-call: even when the caller's locals
+    /// are propagated into the callee's frame (so the callee can read the
+    /// page-scope `variables` and CFC bridge keys), the `local` scope
+    /// itself must contain only keys established in THIS frame.
+    ///
+    /// PR #93: a callee that never declares `local.rv` must see
+    /// `StructKeyExists(local, "rv") == false` even when the caller has a
+    /// same-named `local.rv`. Filter `locals` to keys that aren't inherited
+    /// from the parent and aren't function parameters (params live in
+    /// `arguments`, not `local`). The CFC bridge keys (`this`, `super`,
+    /// `__variables`, `__*` internals) and the `arguments` scope are also
+    /// excluded.
+    fn build_local_scope_view(
+        locals: &IndexMap<String, CfmlValue>,
+        inherited_or_param_keys: &std::collections::HashSet<String>,
+    ) -> IndexMap<String, CfmlValue> {
+        let mut out = IndexMap::new();
+        for (k, v) in locals {
+            if inherited_or_param_keys.contains(k) {
+                continue;
+            }
+            if k == "this" || k == "super" || k == "arguments" || k.starts_with("__") {
+                continue;
+            }
+            out.insert(k.clone(), v.clone());
+        }
+        out
     }
 
     fn call_member_function(
