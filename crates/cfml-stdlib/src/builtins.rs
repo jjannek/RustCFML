@@ -7074,6 +7074,25 @@ fn execute_postgres(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &
 /// accepts a single command per call, so multi-statement framework mutations
 /// would otherwise fail. See docs/compatibility-notes/postgres-multi-statement-mutations.md.
 #[cfg(feature = "postgres_db")]
+/// Format a `postgres::Error` so the server's underlying cause survives into
+/// `cfcatch.message`. The top-level `Display` is a bare "db error"; the real
+/// SQLSTATE message (e.g. `ERROR: function zz_x() does not exist`) and any
+/// further detail live on the `source()` chain, which Lucee surfaces. Walk the
+/// chain and append each cause so failures are diagnosable from CFML and logs.
+#[cfg(feature = "postgres_db")]
+fn format_pg_error(context: &str, e: &postgres::Error) -> String {
+    use std::error::Error;
+    let mut msg = format!("{}: {}", context, e);
+    let mut src: Option<&(dyn Error + 'static)> = e.source();
+    while let Some(s) = src {
+        msg.push_str(" — ");
+        msg.push_str(&s.to_string());
+        src = s.source();
+    }
+    msg
+}
+
+#[cfg(feature = "postgres_db")]
 fn run_postgres_statements(
     client: &mut postgres::Client,
     sql: &str,
@@ -7091,7 +7110,7 @@ fn run_postgres_statements(
             .map(|v| v as &(dyn postgres::types::ToSql + Sync))
             .collect();
         let rows = client.query(stmt.sql.as_str(), &param_refs)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL query error: {}", e)))?;
+            .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL query error", &e)))?;
 
         let columns: Vec<String> = if let Some(first_row) = rows.first() {
             first_row.columns().iter().map(|c| c.name().to_string()).collect()
@@ -7116,7 +7135,7 @@ fn run_postgres_statements(
                 .map(|v| v as &(dyn postgres::types::ToSql + Sync))
                 .collect();
             let affected = client.execute(stmt.sql.as_str(), &param_refs)
-                .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL error: {}", e)))?;
+                .map_err(|e| CfmlError::runtime(format_pg_error("queryExecute: PostgreSQL error", &e)))?;
             total += affected as i64;
         }
         build_mutation_result(total, 0, sql) // PG uses RETURNING, not last_insert_id
@@ -7168,6 +7187,58 @@ type PgToSqlResult = Result<postgres::types::IsNull, Box<dyn std::error::Error +
 #[cfg(feature = "postgres_db")]
 fn bind_parse_err(s: &str, ty: &postgres::types::Type, e: impl std::fmt::Display) -> Box<dyn std::error::Error + Sync + Send> {
     format!("queryExecute: cannot bind \"{}\" as PostgreSQL {}: {}", s, ty.name(), e).into()
+}
+
+/// Parse a CFML time string ("HH:MM:SS", "HH:MM", with optional fractional
+/// seconds) to a `NaiveTime` for binding to a PostgreSQL `time` column. Falls
+/// back to the time component of a full date/time string.
+#[cfg(feature = "postgres_db")]
+fn parse_cfml_time(s: &str) -> Option<NaiveTime> {
+    let t = s.trim();
+    for fmt in &["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"] {
+        if let Ok(nt) = NaiveTime::parse_from_str(t, fmt) {
+            return Some(nt);
+        }
+    }
+    // "2024-03-15 10:30:45" → 10:30:45
+    parse_cfml_date(t).map(|dt| dt.time())
+}
+
+/// Encode a CFML vector-literal string ("[1,0,0]") into pgvector's binary wire
+/// format: `u16` dimension count, `u16` flags (always 0), then one big-endian
+/// IEEE-754 `f32` per element. pgvector extension types carry no static OID, so
+/// the `to_sql` dispatch reaches this by matching the type name "vector".
+#[cfg(feature = "postgres_db")]
+fn encode_pg_vector(
+    s: &str,
+    ty: &postgres::types::Type,
+    out: &mut postgres::types::private::BytesMut,
+) -> PgToSqlResult {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .ok_or_else(|| bind_parse_err(s, ty, "expected a \"[..]\" vector literal"))?;
+    let mut vals: Vec<f32> = Vec::new();
+    for part in inner.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        vals.push(
+            p.parse::<f32>()
+                .map_err(|e| bind_parse_err(s, ty, format!("bad vector element \"{}\": {}", p, e)))?,
+        );
+    }
+    if vals.len() > u16::MAX as usize {
+        return Err(bind_parse_err(s, ty, "vector has too many dimensions"));
+    }
+    out.extend_from_slice(&(vals.len() as u16).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // unused flags word
+    for v in vals {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    Ok(postgres::types::IsNull::No)
 }
 
 #[cfg(feature = "postgres_db")]
@@ -7223,7 +7294,14 @@ impl postgres::types::ToSql for PgParam {
             // numeric arms fix the common "string id -> int column" pattern.
             // TEXT-family / UNKNOWN / other fall through to raw utf-8 bytes
             // (`String::to_sql` writes the bytes regardless of `ty`).
-            PgParam::Text(s) => match *ty {
+            PgParam::Text(s) => {
+                // pgvector and other extension types have no static OID, so they
+                // must be matched by type NAME, not against the `Type::*` consts.
+                // pgvector wire format: u16 dim, u16 flags(0), big-endian f32 each.
+                if ty.name() == "vector" {
+                    return encode_pg_vector(s, ty, out);
+                }
+                match *ty {
                 Type::UUID => uuid::Uuid::parse_str(s.trim())
                     .map_err(|e| bind_parse_err(s, ty, e))?
                     .to_sql(ty, out),
@@ -7242,7 +7320,38 @@ impl postgres::types::ToSql for PgParam {
                         || t.eq_ignore_ascii_case("yes") || t == "1";
                     b.to_sql(ty, out)
                 }
+                // Temporal columns expect binary wire bytes (int64/int32), not
+                // text — Lucee binds CFML date/time strings here. Parse the CFML
+                // value and let chrono's ToSql impls write the binary form.
+                Type::TIMESTAMP => parse_cfml_date(s)
+                    .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date/time"))?
+                    .to_sql(ty, out),
+                Type::TIMESTAMPTZ => {
+                    // A naive CFML datetime carries no zone; interpret the
+                    // wall-clock as UTC (Lucee binds the server-tz instant — for
+                    // a UTC server, identical). The server then renders it back
+                    // in its session TimeZone.
+                    let ndt = parse_cfml_date(s)
+                        .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date/time"))?;
+                    Utc.from_utc_datetime(&ndt).to_sql(ty, out)
+                }
+                Type::DATE => parse_cfml_date(s)
+                    .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date"))?
+                    .date()
+                    .to_sql(ty, out),
+                Type::TIME => parse_cfml_time(s)
+                    .ok_or_else(|| bind_parse_err(s, ty, "not a recognised time"))?
+                    .to_sql(ty, out),
+                // json/jsonb want the JSON text parsed to a value; serde_json's
+                // ToSql writes jsonb's required 0x01 version prefix for us (raw
+                // text fails with "unsupported jsonb version number").
+                Type::JSON | Type::JSONB => {
+                    let v: serde_json::Value = serde_json::from_str(s.trim())
+                        .map_err(|e| bind_parse_err(s, ty, e))?;
+                    v.to_sql(ty, out)
+                }
                 _ => s.to_sql(ty, out),
+                }
             },
 
             PgParam::Bytes(b) => b.to_sql(ty, out),
@@ -7251,6 +7360,42 @@ impl postgres::types::ToSql for PgParam {
 
     fn accepts(_ty: &postgres::types::Type) -> bool {
         true
+    }
+
+    // rust-postgres sends every parameter in BINARY wire format by default,
+    // whereas Lucee/pgjdbc send parameters as TEXT and let the server parse
+    // them. We binary-encode the common scalar types above; for everything
+    // else (arrays, inet/cidr/macaddr, interval, timetz, ranges, hstore, …)
+    // `to_sql` writes the value's text form, so it MUST go out as Text format
+    // for the server to parse it — otherwise the server reads the text bytes as
+    // a binary payload and rejects them ("incorrect binary data format").
+    // This mirrors `to_sql`'s per-(variant, type) decision exactly.
+    fn encode_format(&self, ty: &postgres::types::Type) -> postgres::types::Format {
+        use postgres::types::{Format, Type};
+        // pgvector is binary-encoded (matched by name; no static OID).
+        if ty.name() == "vector" {
+            return match self {
+                PgParam::Text(_) => Format::Binary,
+                _ => Format::Text,
+            };
+        }
+        let binary = match self {
+            // No bytes emitted for NULL; raw bytes for bytea.
+            PgParam::Null | PgParam::Bytes(_) => true,
+            PgParam::Int(_) | PgParam::Double(_) | PgParam::Bool(_) => matches!(
+                *ty,
+                Type::INT2 | Type::INT4 | Type::INT8 | Type::OID
+                    | Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC | Type::BOOL
+            ),
+            PgParam::Text(_) => matches!(
+                *ty,
+                Type::UUID | Type::INT2 | Type::INT4 | Type::INT8 | Type::OID
+                    | Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC | Type::BOOL
+                    | Type::TIMESTAMP | Type::TIMESTAMPTZ | Type::DATE | Type::TIME
+                    | Type::JSON | Type::JSONB | Type::BYTEA
+            ),
+        };
+        if binary { Format::Binary } else { Format::Text }
     }
 
     postgres::types::to_sql_checked!();

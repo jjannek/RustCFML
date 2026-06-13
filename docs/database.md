@@ -79,7 +79,7 @@ cftransaction {
 
 ## Working with PostgreSQL
 
-PostgreSQL is well supported, but it is stricter on the wire than the other engines — it uses `$1`/`$2` positional placeholders and binds parameters in **binary** format. RustCFML handles the translation so ordinary CFML works, but a few behaviours are worth knowing.
+PostgreSQL is well supported, but it is stricter on the wire than the other engines — it uses `$1`/`$2` positional placeholders. RustCFML binds common scalar types in **binary** format (encoded at the column's exact type) and sends the rest (arrays, network/temporal-zone, extension types) in **text** format for the server to parse, matching the JDBC engines. RustCFML handles the translation so ordinary CFML works, but a few behaviours are worth knowing.
 
 ### Placeholders are translated automatically
 
@@ -88,6 +88,40 @@ You write CFML-style `?` (or `:name`) placeholders; RustCFML rewrites them to Po
 ### Untyped CFML strings are coerced to the column type
 
 CFML values are frequently strings (form and URL values are untyped). Because PostgreSQL binds parameters in binary, RustCFML encodes each parameter at the **target column's type** — so a string `"251"` binds correctly to an `int4` column, `"3.14"` to `numeric`, `"true"` to `boolean`, and so on. Integers and floats are likewise encoded at the column's exact width (e.g. `int2`/`int4`/`int8`), avoiding "incorrect binary data format" errors.
+
+### Date/time, JSON, and `vector` parameters
+
+CFML date/time values (and ISO-ish date strings) bind to `timestamp`, `timestamptz`,
+`date`, and `time` columns; a `timestamptz` value with no zone is interpreted as
+UTC. JSON text (e.g. the output of `serializeJSON`) binds to `json` and `jsonb`
+columns — the `jsonb` version prefix is written for you. Vector-literal strings
+(`"[1,0,0]"`) bind to pgvector `vector` columns (INSERT and `<->` nearest-neighbour
+queries), encoded in pgvector's binary wire format.
+
+```cfml
+queryExecute("update events set at = ? where id = ?",
+    [ createDateTime(2024,3,15,10,30,45), 1 ], { datasource = "app" }); // -> timestamptz
+queryExecute("insert into docs (id, body) values (?, ?)",
+    [ 1, serializeJSON({ name = "alpha" }) ], { datasource = "app" });  // -> jsonb
+queryExecute("select id from items order by embedding <-> ? limit 5",
+    [ "[0.9,0.1,0]" ], { datasource = "app" });                        // -> vector
+```
+
+### Arrays and other non-scalar types (sent as text — Lucee/BoxLang parity)
+
+RustCFML binary-encodes the common scalar types above. For everything else —
+arrays (`int[]`, `text[]`, …), `interval`, `inet`/`cidr`, `macaddr`, `timetz`,
+ranges, `hstore`, and so on — the parameter is sent in PostgreSQL's **text**
+format and parsed by the server, exactly as Lucee and BoxLang do (both use the
+JDBC driver, which sends parameters as text). So a CFML array literal binds to
+an array column, and the long tail of extension/specialised types works without
+a bespoke binary encoder:
+
+```cfml
+queryExecute("update t set tags = ? where id = ?", [ "{red,green,blue}", 1 ], { datasource = "app" }); // -> text[]
+queryExecute("update t set window = ? where id = ?", [ "2 days 03:00:00", 1 ], { datasource = "app" }); // -> interval
+queryExecute("update t set client = ? where id = ?", [ "10.0.0.5", 1 ], { datasource = "app" });        // -> inet
+```
 
 ### UUID string parameters
 
@@ -104,6 +138,14 @@ queryExecute(
 ### `UNKNOWN`-typed parameters
 
 When PostgreSQL can't pin a concrete parameter type early (for example a bare `select ?`), RustCFML encodes the value as text and lets the server coerce it — so framework-generated statements that don't force a type still work.
+
+### Server error messages surface the cause
+
+When a query fails server-side, `cfcatch.message` carries the server's own
+message (e.g. `ERROR: function zz_x() does not exist`, `ERROR: duplicate key
+value violates unique constraint …`), not a bare `db error`. The driver's
+error-`source()` chain is walked and appended, so failures are diagnosable from
+CFML and the server log — matching what Lucee surfaces.
 
 ### Multi-statement mutations
 
