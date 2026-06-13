@@ -2602,6 +2602,26 @@ impl CfmlVirtualMachine {
                     self.store_runtime_path(&path, value.clone(), &mut locals);
                     stack.push(value);
                 }
+                BytecodeOp::UnsetPath(path) => {
+                    // CFML null-assignment: `x = voidFn()` (Null RHS) must DELETE
+                    // the target rather than materialize a null-valued key. The
+                    // value (Null) was already popped by the guard's `Pop`.
+                    self.delete_scope_path(path, &mut locals);
+                    // Drop any closure-env copy so sibling closures see the
+                    // deletion too (mirrors StoreLocal's env sync).
+                    if let Some(ref env) = closure_env {
+                        let mut m = env.write().unwrap();
+                        let found = m.keys().find(|k| k.eq_ignore_ascii_case(path)).cloned();
+                        if let Some(k) = found {
+                            m.shift_remove(&k);
+                        }
+                    }
+                    // A `var x` / `local.x` that resolved to Null leaves no key,
+                    // but the name was still claimed for this frame's `local`
+                    // view — keep it shadowing any inherited caller key.
+                    let leaf = path.rsplit('.').next().unwrap_or(path.as_str());
+                    inherited_or_param_keys.remove(leaf);
+                }
                 BytecodeOp::ArrayAppendLocal(name) => {
                     // Fused arrayAppend(<ident>, value). The value is on top of
                     // the stack; the array lives in the named variable. With
@@ -10345,6 +10365,13 @@ impl CfmlVirtualMachine {
         value: CfmlValue,
         locals: &mut IndexMap<String, CfmlValue>,
     ) {
+        // CFML null-assignment: storing Null through a scope path (a dynamic
+        // `"variables.x" = voidFn()` LHS, or a null result-writeback delivery)
+        // DELETES the target rather than materializing a null-valued key.
+        if matches!(value, CfmlValue::Null) {
+            self.delete_scope_path(path, locals);
+            return;
+        }
         let parts: Vec<&str> = path.split('.').collect();
         if parts.len() >= 2 {
             let scope = parts[0];
@@ -10374,6 +10401,93 @@ impl CfmlVirtualMachine {
         } else {
             // Bare name (no scope prefix) — single-variable store.
             self.scope_aware_store(path, value, locals);
+        }
+    }
+
+    /// Delete a scope-qualified / nested variable path, the deletion half of
+    /// CFML null-assignment semantics (`variables.x = voidFn()` removes the key
+    /// rather than materializing a null one). The bare-name case is handled
+    /// inline in the `UnsetPath` opcode (it also clears globals + closure env);
+    /// this covers `<scope>.leaf` and deeper `<scope>.a.b…leaf` paths.
+    fn delete_scope_path(&mut self, path: &str, locals: &mut IndexMap<String, CfmlValue>) {
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.len() < 2 {
+            imap_remove_ci(locals, path);
+            if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
+                vars.remove_ci(path);
+            }
+            imap_remove_ci(&mut self.globals, path);
+            return;
+        }
+        let scope = parts[0];
+        let leaf = parts[parts.len() - 1];
+
+        // Single-level scoped target: <scope>.<leaf>.
+        if parts.len() == 2 {
+            match scope.to_lowercase().as_str() {
+                "local" => {
+                    imap_remove_ci(locals, leaf);
+                }
+                "variables" => {
+                    if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
+                        // CFC method: the component scope is a live handle.
+                        vars.remove_ci(leaf);
+                    } else {
+                        // Page scope: `variables` is the frame's locals (+globals spill).
+                        imap_remove_ci(locals, leaf);
+                        let found = self
+                            .globals
+                            .keys()
+                            .find(|k| k.eq_ignore_ascii_case(leaf))
+                            .cloned();
+                        if let Some(k) = found {
+                            self.globals.shift_remove(&k);
+                        }
+                    }
+                }
+                "request" => {
+                    self.request_scope.remove_ci(leaf);
+                }
+                "application" => {
+                    if let Some(ref app) = self.application_scope {
+                        app.remove_ci(leaf);
+                    }
+                }
+                "session" => {
+                    if let CfmlValue::Struct(s) = self.get_session_scope() {
+                        let mut m = s.snapshot();
+                        imap_remove_ci(&mut m, leaf);
+                        let _ = self.set_session_scope(m);
+                    }
+                }
+                _ => {
+                    // Plain struct variable: `obj.member`. Reference-typed structs
+                    // mutate in place; store back covers a value-typed page scope.
+                    if let Some(obj) = self.scope_aware_load(scope, locals) {
+                        if let Some(s) = obj.as_cfml_struct() {
+                            s.remove_ci(leaf);
+                        }
+                        self.scope_aware_store(scope, obj, locals);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Nested target: `<scope>.a.b…leaf`. Walk to the parent container — every
+        // intermediate is a reference-typed struct, so removing the leaf in place
+        // is visible through the scope. A missing link means nothing to delete.
+        if let Some(root) = self.scope_aware_load(scope, locals) {
+            let mut cur = root;
+            for key in &parts[1..parts.len() - 1] {
+                match cur.as_cfml_struct().and_then(|s| s.get_ci(key)) {
+                    Some(next) => cur = next,
+                    None => return,
+                }
+            }
+            if let Some(s) = cur.as_cfml_struct() {
+                s.remove_ci(leaf);
+            }
         }
     }
 
@@ -15235,6 +15349,22 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == plen
 }
 
+/// Case-insensitively remove a key from a scope `IndexMap`, returning whether
+/// anything was removed. Direct-case first (the common path), then a scan —
+/// mirrors `CfmlStruct::remove_ci` for the plain-`IndexMap` scopes (locals/
+/// globals) used by CFML null-assignment deletion.
+fn imap_remove_ci(m: &mut IndexMap<String, CfmlValue>, key: &str) -> bool {
+    if m.shift_remove(key).is_some() {
+        return true;
+    }
+    let found = m.keys().find(|k| k.eq_ignore_ascii_case(key)).cloned();
+    if let Some(k) = found {
+        m.shift_remove(&k);
+        return true;
+    }
+    false
+}
+
 fn binary_op<F>(stack: &mut Vec<CfmlValue>, op: F)
 where
     F: FnOnce(CfmlValue, CfmlValue) -> CfmlValue,
@@ -15437,6 +15567,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::StoreLocalProperty(_, _) => (0, 1), // pops 1 (value), pushes 0
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value
+        BytecodeOp::UnsetPath(_) => (0, 0),   // value already popped by the guard
         BytecodeOp::GetKeys => (1, 1),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object

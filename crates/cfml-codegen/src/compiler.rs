@@ -274,6 +274,15 @@ pub enum BytecodeOp {
     /// the assigned value on the stack. Lucee/ACF semantics; WireBox's
     /// MixerUtil.injectPropertyMixin relies on this.
     SetDynamicVar,
+    /// Delete a variable / scope path (CFML null-assignment semantics). Assigning
+    /// the result of a function that returns null/void (`x = voidFn()`) must NOT
+    /// create the target key, and must DELETE a pre-existing one — the assigned
+    /// name stays undefined (StructKeyExists / isDefined both false) in every
+    /// scope. Emitted by `=` assignments, guarded by `JumpIfNotNull` so it only
+    /// fires when the RHS evaluated to Null. The string is the dotted target path
+    /// ("rv", "local.rv", "variables.x", "obj.member", "a.b.c"). Pops/pushes
+    /// nothing — the guard's `Pop` already cleared the Null. Lucee semantics.
+    UnsetPath(String),
 
     // Object
     NewObject(usize),  // arg_count for constructor
@@ -613,6 +622,72 @@ impl CfmlCompiler {
         None
     }
 
+    /// For a plain `=` assignment, return the dotted path string that names the
+    /// target, so a Null RHS can DELETE it (CFML null-assignment semantics —
+    /// `x = voidFn()` must leave the name undefined, not materialize a null key).
+    /// Mirrors the store-side target dispatch in `compile_statement`. Returns
+    /// `None` for targets we don't guard (array-element writes, exotic bases) —
+    /// those keep their plain store behaviour.
+    fn assign_unset_path(target: &AssignTarget) -> Option<String> {
+        match target {
+            AssignTarget::Variable(name) => Some(name.clone()),
+            AssignTarget::StructAccess(obj, member) => {
+                if let Some(path) = Self::scope_rooted_nested_path(obj, member) {
+                    Some(path)
+                } else if let Expression::Identifier(ref ident) = **obj {
+                    Some(format!("{}.{}", ident.name, member))
+                } else {
+                    None
+                }
+            }
+            AssignTarget::ArrayAccess(_, _) => None,
+        }
+    }
+
+    /// Same as [`assign_unset_path`] but for a script `=` assignment, whose LHS
+    /// is an `Expression` (assignment-as-expression: `x = voidFn()` parses to a
+    /// `BinaryOp{Assign}`). Returns the dotted target path for the
+    /// value-CONSUMING store paths (`StoreLocal` / `StoreLocalProperty` /
+    /// `SetProperty`). Returns `None` for scope-rooted-nested targets — those
+    /// store via `SetDynamicVar`, whose `store_runtime_path` already deletes on
+    /// a Null value — and for exotic bases (array element, computed object).
+    fn expr_assign_unset_path(left: &Expression) -> Option<String> {
+        match left {
+            Expression::Identifier(id) => Some(id.name.clone()),
+            Expression::MemberAccess(access) => {
+                if Self::scope_rooted_nested_path(&access.object, &access.member).is_some() {
+                    None
+                } else if let Expression::Identifier(ref ident) = *access.object {
+                    Some(format!("{}.{}", ident.name, access.member))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether an expression could evaluate to Null at runtime. Used to decide
+    /// if a plain `=` assignment needs the null-delete guard (a non-null RHS —
+    /// literals, struct/array/closure/`new`, arithmetic/logical ops — can skip it,
+    /// keeping the hot path of `x = 5` / `x = a + b` exactly as before). Anything
+    /// that reads a variable or calls a function MAY be null and is guarded.
+    fn expr_may_be_null(expr: &Expression) -> bool {
+        match expr {
+            Expression::Literal(lit) => matches!(lit.value, LiteralValue::Null),
+            Expression::Array(_)
+            | Expression::Struct(_)
+            | Expression::Closure(_)
+            | Expression::ArrowFunction(_)
+            | Expression::New(_)
+            | Expression::StringInterpolation(_)
+            | Expression::UnaryOp(_)
+            | Expression::BinaryOp(_)
+            | Expression::PostfixOp(_) => false,
+            _ => true,
+        }
+    }
+
     /// Compile the base collection of an index-assignment target (`base[idx] = v`).
     /// A bare, non-scope identifier is loaded with TryLoadLocal so an undefined
     /// variable yields Null — which SetIndex then auto-vivifies into a struct or
@@ -856,10 +931,25 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::DeclareLocal(var.name.clone()));
                 if let Some(value) = &var.value {
                     self.compile_expression(value, instructions);
+                    // `var x = voidFn()` — a Null initialiser must NOT create the
+                    // key (CFML null-assignment semantics), same as `local.x =`.
+                    if Self::expr_may_be_null(value) {
+                        instructions.push(BytecodeOp::JumpIfNotNull(0)); // -> store (patched)
+                        let guard_idx = instructions.len() - 1;
+                        instructions.push(BytecodeOp::Pop); // drop the Null
+                        instructions.push(BytecodeOp::UnsetPath(var.name.clone()));
+                        instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
+                        let end_idx = instructions.len() - 1;
+                        instructions[guard_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
+                        instructions.push(BytecodeOp::StoreLocal(var.name.clone()));
+                        instructions[end_idx] = BytecodeOp::Jump(instructions.len());
+                    } else {
+                        instructions.push(BytecodeOp::StoreLocal(var.name.clone()));
+                    }
                 } else {
                     instructions.push(BytecodeOp::Null);
+                    instructions.push(BytecodeOp::StoreLocal(var.name.clone()));
                 }
-                instructions.push(BytecodeOp::StoreLocal(var.name.clone()));
             }
             Statement::Assignment(assign) => {
                 // Hot-path: x += <int>, x -= <int>, x *= <int> compile to a single
@@ -923,6 +1013,31 @@ impl CfmlCompiler {
                     AssignOp::Equal => {} // Value already on stack
                 }
 
+                // CFML null-assignment semantics: `x = voidFn()` (a function
+                // returning null/void, or an explicit `x = null`) must NOT create
+                // the target key and must DELETE a pre-existing one — the name
+                // stays undefined in every scope. Guard the store with the
+                // existing JumpIfNotNull (peeks, doesn't pop): on a non-null RHS
+                // it jumps straight to the normal store; on Null it falls through
+                // to Pop + UnsetPath. Only plain `=` with a derivable target path
+                // AND a possibly-null RHS pays for the guard — literal/arithmetic
+                // assignments keep their original single-store bytecode.
+                let mut unset_end_jump = None;
+                if matches!(assign.operator, AssignOp::Equal)
+                    && Self::expr_may_be_null(&assign.value)
+                {
+                    if let Some(path) = Self::assign_unset_path(&assign.target) {
+                        instructions.push(BytecodeOp::JumpIfNotNull(0)); // -> store (patched)
+                        let guard_idx = instructions.len() - 1;
+                        instructions.push(BytecodeOp::Pop); // drop the Null
+                        instructions.push(BytecodeOp::UnsetPath(path));
+                        instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
+                        unset_end_jump = Some(instructions.len() - 1);
+                        // The store ops emitted next are the JumpIfNotNull target.
+                        instructions[guard_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
+                    }
+                }
+
                 match &assign.target {
                     AssignTarget::Variable(name) => {
                         instructions.push(BytecodeOp::StoreLocal(name.clone()));
@@ -976,6 +1091,12 @@ impl CfmlCompiler {
                             Self::emit_nested_writeback(obj, instructions);
                         }
                     }
+                }
+
+                // Close the null-delete guard: the store branch jumps here, past
+                // the Pop+UnsetPath sequence emitted before it.
+                if let Some(idx) = unset_end_jump {
+                    instructions[idx] = BytecodeOp::Jump(instructions.len());
                 }
             }
             Statement::Return(ret) => {
@@ -2543,6 +2664,28 @@ impl CfmlCompiler {
 
                     self.compile_expression(&binop.right, instructions);
 
+                    // CFML null-assignment semantics: `x = voidFn()` (a Null RHS)
+                    // must DELETE the target, not materialize a null-valued key.
+                    // Guard the value-CONSUMING store paths with JumpIfNotNull
+                    // (peeks, doesn't pop): a non-null RHS jumps straight to the
+                    // store; a Null falls through to Pop + UnsetPath, leaving the
+                    // stack empty like the store branch. Scope-rooted-nested
+                    // targets aren't guarded here — they store via SetDynamicVar,
+                    // whose store_runtime_path already deletes on Null. Only a
+                    // possibly-null RHS pays for the guard.
+                    let mut unset_end_jump = None;
+                    if Self::expr_may_be_null(&binop.right) {
+                        if let Some(path) = Self::expr_assign_unset_path(&binop.left) {
+                            instructions.push(BytecodeOp::JumpIfNotNull(0)); // -> store (patched)
+                            let guard_idx = instructions.len() - 1;
+                            instructions.push(BytecodeOp::Pop); // drop the Null
+                            instructions.push(BytecodeOp::UnsetPath(path));
+                            instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
+                            unset_end_jump = Some(instructions.len() - 1);
+                            instructions[guard_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
+                        }
+                    }
+
                     match &*binop.left {
                         Expression::Identifier(ident) => {
                             instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
@@ -2561,38 +2704,41 @@ impl CfmlCompiler {
                                 instructions.push(BytecodeOp::String(path));
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetDynamicVar);
-                                return;
-                            }
-                            // Stack has [value]. When the object is a bare,
-                            // non-scope identifier, use the fused StoreLocalProperty
-                            // op, which auto-vivifies the local as a struct if it
-                            // does not yet exist (Lucee/ACF/BoxLang semantics).
-                            // Loading the object directly would throw "Variable
-                            // 'x' is undefined" for an undeclared base.
-                            if let Expression::Identifier(ref ident) = *access.object {
+                            } else if let Expression::Identifier(ref ident) = *access.object {
+                                // Stack has [value]. When the object is a bare,
+                                // non-scope identifier, use the fused
+                                // StoreLocalProperty op, which auto-vivifies the
+                                // local as a struct if it does not yet exist
+                                // (Lucee/ACF/BoxLang semantics). Loading the object
+                                // directly would throw "Variable 'x' is undefined"
+                                // for an undeclared base.
                                 if !is_reserved_scope_name(&ident.name) {
                                     instructions.push(BytecodeOp::StoreLocalProperty(
                                         ident.name.clone(),
                                         access.member.clone(),
                                     ));
-                                    return;
-                                }
-                                if ident.name.eq_ignore_ascii_case("local") {
+                                } else if ident.name.eq_ignore_ascii_case("local") {
                                     // `local.X = v` is identical to `var X = v` —
                                     // function-frame scope, must NOT propagate to
                                     // caller at return. Same fix as the
                                     // Statement::Assignment path above.
                                     instructions.push(BytecodeOp::DeclareLocal(access.member.clone()));
                                     instructions.push(BytecodeOp::StoreLocal(access.member.clone()));
-                                    return;
+                                } else {
+                                    // SetProperty needs [obj, value].
+                                    self.compile_expression(&access.object, instructions);
+                                    instructions.push(BytecodeOp::Swap);
+                                    instructions.push(BytecodeOp::SetProperty(access.member.clone()));
+                                    Self::emit_nested_writeback(&access.object, instructions);
                                 }
+                            } else {
+                                // SetProperty needs [obj, value].
+                                self.compile_expression(&access.object, instructions);
+                                instructions.push(BytecodeOp::Swap);
+                                instructions.push(BytecodeOp::SetProperty(access.member.clone()));
+                                // Write back through nested chain
+                                Self::emit_nested_writeback(&access.object, instructions);
                             }
-                            // SetProperty needs [obj, value].
-                            self.compile_expression(&access.object, instructions);
-                            instructions.push(BytecodeOp::Swap);
-                            instructions.push(BytecodeOp::SetProperty(access.member.clone()));
-                            // Write back through nested chain
-                            Self::emit_nested_writeback(&access.object, instructions);
                         }
                         Expression::ArrayAccess(access) => {
                             self.compile_index_assign_base(&access.array, instructions);
@@ -2602,6 +2748,12 @@ impl CfmlCompiler {
                             Self::emit_nested_writeback(&access.array, instructions);
                         }
                         _ => {}
+                    }
+
+                    // Close the null-delete guard: the store branch jumps here,
+                    // past the Pop+UnsetPath sequence emitted before it.
+                    if let Some(idx) = unset_end_jump {
+                        instructions[idx] = BytecodeOp::Jump(instructions.len());
                     }
                     return;
                 }

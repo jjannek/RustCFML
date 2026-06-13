@@ -23,8 +23,10 @@ cachePut("myKey", "myValue");
 assert("cacheGet basic", cacheGet("myKey"), "myValue");
 
 // --- cacheGet missing key returns null ---
-result = cacheGet("nonExistent");
-assertNull("cacheGet missing key", result);
+// NB: assert on the call directly — assigning a null return to `result` would
+// (correctly, per CFML null-assignment semantics) leave `result` undefined,
+// so a subsequent `result` read would throw rather than read null.
+assertNull("cacheGet missing key", cacheGet("nonExistent"));
 
 // --- cachePut overwrites ---
 cachePut("myKey", "newValue");

@@ -16,6 +16,7 @@ try { include "core/test_variables.cfm"; } catch (any e) { writeOutput("ERROR | 
 try { include "core/test_access_identifiers.cfm"; } catch (any e) { writeOutput("ERROR | core/test_access_identifiers.cfm | " & e.message & chr(10)); }
 try { include "core/test_function_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_function_scope_capture.cfm | " & e.message & chr(10)); }
 try { include "core/test_bare_call_caller_stack_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_bare_call_caller_stack_leak.cfm | " & e.message & chr(10)); }
+try { include "core/test_null_return_no_key.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_return_no_key.cfm | " & e.message & chr(10)); }
 try { include "core/test_bare_call_shadowing_semantics.cfm"; } catch (any e) { writeOutput("ERROR | core/test_bare_call_shadowing_semantics.cfm | " & e.message & chr(10)); }
 try { include "core/test_closure_env_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_closure_env_leak.cfm | " & e.message & chr(10)); }
 try { include "core/test_compound_assignment.cfm"; } catch (any e) { writeOutput("ERROR | core/test_compound_assignment.cfm | " & e.message & chr(10)); }
