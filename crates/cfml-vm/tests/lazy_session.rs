@@ -78,6 +78,10 @@ fn run_request(app_cfc: &str, page_cfm: &str, lazy: bool, sid: Option<&str>) -> 
     store
 }
 
+/// The fixture's `this.name` — sessions are keyed by `(app, id)`, so store
+/// assertions must query under this same partition.
+const APP_NAME: &str = "lazy-session-test";
+
 const APP_BASE: &str = r##"
 component {
     this.name              = "lazy-session-test";
@@ -100,7 +104,7 @@ component {
 fn eager_mode_creates_record_for_every_visit() {
     // Default: even a page that never touches session creates a record.
     let store = run_request(APP_BASE, "<cfoutput>hello</cfoutput>", false, Some("sid-A"));
-    assert!(store.contains("sid-A"), "eager mode must create the record");
+    assert!(store.contains(APP_NAME, "sid-A"), "eager mode must create the record");
 }
 
 #[test]
@@ -112,7 +116,7 @@ fn lazy_mode_skips_record_when_page_never_writes_session() {
         Some("sid-B"),
     );
     assert!(
-        !store.contains("sid-B"),
+        !store.contains(APP_NAME, "sid-B"),
         "lazy mode must NOT create a record when the page doesn't write session.X"
     );
 }
@@ -126,10 +130,10 @@ fn lazy_mode_creates_record_on_first_session_write() {
         Some("sid-C"),
     );
     assert!(
-        store.contains("sid-C"),
+        store.contains(APP_NAME, "sid-C"),
         "lazy mode must create the record on first session write"
     );
-    let data = store.get("sid-C").unwrap();
+    let data = store.get(APP_NAME, "sid-C").unwrap();
     assert!(
         data.variables.keys().any(|k| k.eq_ignore_ascii_case("cart")),
         "the user write should be persisted alongside the lazy-created record"
@@ -152,7 +156,7 @@ fn lazy_mode_does_not_create_record_on_session_read_only() {
         Some("sid-D"),
     );
     assert!(
-        !store.contains("sid-D"),
+        !store.contains(APP_NAME, "sid-D"),
         "lazy mode must NOT create a record on read-only session access"
     );
 }

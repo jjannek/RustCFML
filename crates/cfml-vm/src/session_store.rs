@@ -9,20 +9,29 @@ use crate::SessionData;
 
 /// Trait for session storage backends.
 ///
-/// All methods receive a session ID string. Implementations must be
-/// `Send + Sync` so they can be shared across Tokio worker threads.
+/// Session identity is the composite **(application name, session id)** —
+/// matching Lucee, where `Application.cfc`'s `this.name` selects the
+/// application and one process can host several apps that each have an
+/// isolated session scope. The same `CFID` presented under two different
+/// `this.name` values must resolve to two independent sessions. Every keyed
+/// method therefore takes the application name alongside the id, so a lookup
+/// cannot be performed without an application context. Application names are
+/// case-insensitive (CFML semantics); implementations normalise as needed.
+///
+/// Implementations must be `Send + Sync` so they can be shared across Tokio
+/// worker threads.
 pub trait SessionStore: Send + Sync + 'static {
-    /// Retrieve a session by ID. Returns `None` if the session does not exist.
-    fn get(&self, id: &str) -> Option<SessionData>;
-    /// Insert or overwrite a session.
-    fn set(&self, id: &str, data: SessionData);
-    /// Remove a session.
-    fn remove(&self, id: &str);
-    /// Atomically move session data from `old_id` to `new_id`.
-    fn rotate(&self, old_id: &str, new_id: &str);
-    /// Returns `true` if the session exists.
-    fn contains(&self, id: &str) -> bool {
-        self.get(id).is_some()
+    /// Retrieve a session by `(app, id)`. Returns `None` if it does not exist.
+    fn get(&self, app: &str, id: &str) -> Option<SessionData>;
+    /// Insert or overwrite a session under `(app, id)`.
+    fn set(&self, app: &str, id: &str, data: SessionData);
+    /// Remove a session under `(app, id)`.
+    fn remove(&self, app: &str, id: &str);
+    /// Atomically move session data from `(app, old_id)` to `(app, new_id)`.
+    fn rotate(&self, app: &str, old_id: &str, new_id: &str);
+    /// Returns `true` if the session exists under `(app, id)`.
+    fn contains(&self, app: &str, id: &str) -> bool {
+        self.get(app, id).is_some()
     }
     /// Drain all sessions whose `last_accessed_secs` age exceeds their
     /// `timeout_secs`, returning `(app_name, id, variables)` per drained
@@ -46,11 +55,27 @@ pub trait SessionStore: Send + Sync + 'static {
 // MemoryStore — in-process default
 // ─────────────────────────────────────────────
 
-/// In-process session store backed by a `Mutex<HashMap>`.
-/// Identical behaviour to the original `ServerState.sessions` field.
+/// In-process session store backed by a `Mutex<HashMap>`, keyed by the
+/// composite `(application name, session id)` so two applications sharing a
+/// CFID never collide. The map key is `"{app_lower}\u{1f}{id}"`; the unit
+/// separator cannot appear in a UUID session id, so the bare id is always
+/// recoverable for `take_expired`.
 #[derive(Clone)]
 pub struct MemoryStore {
     inner: Arc<Mutex<HashMap<String, SessionData>>>,
+}
+
+/// Build the composite map key. App names are case-insensitive in CFML, so
+/// lowercase the app portion for consistent lookups.
+fn composite_key(app: &str, id: &str) -> String {
+    format!("{}\u{1f}{}", app.to_lowercase(), id)
+}
+
+/// Recover the bare session id from a composite key (everything after the
+/// last unit separator). Falls back to the whole key if no separator is
+/// present (defensive — never happens for keys we mint).
+fn id_from_key(key: &str) -> &str {
+    key.rsplit('\u{1f}').next().unwrap_or(key)
 }
 
 impl MemoryStore {
@@ -68,15 +93,16 @@ impl Default for MemoryStore {
 }
 
 impl SessionStore for MemoryStore {
-    fn get(&self, id: &str) -> Option<SessionData> {
+    fn get(&self, app: &str, id: &str) -> Option<SessionData> {
         // Read-path exactness (G1): a session is invisible the instant it is
         // past `last_accessed + timeout`, independent of any sweep. Remove the
         // dead record opportunistically while we hold the lock.
         let now = crate::now_epoch_secs();
+        let key = composite_key(app, id);
         let mut m = self.inner.lock().ok()?;
-        match m.get(id) {
+        match m.get(&key) {
             Some(s) if now.saturating_sub(s.last_accessed_secs) > s.timeout_secs => {
-                m.remove(id);
+                m.remove(&key);
                 None
             }
             Some(s) => Some(s.clone()),
@@ -84,29 +110,29 @@ impl SessionStore for MemoryStore {
         }
     }
 
-    fn set(&self, id: &str, data: SessionData) {
+    fn set(&self, app: &str, id: &str, data: SessionData) {
         if let Ok(mut m) = self.inner.lock() {
-            m.insert(id.to_string(), data);
+            m.insert(composite_key(app, id), data);
         }
     }
 
-    fn remove(&self, id: &str) {
+    fn remove(&self, app: &str, id: &str) {
         if let Ok(mut m) = self.inner.lock() {
-            m.remove(id);
+            m.remove(&composite_key(app, id));
         }
     }
 
-    fn rotate(&self, old_id: &str, new_id: &str) {
+    fn rotate(&self, app: &str, old_id: &str, new_id: &str) {
         if let Ok(mut m) = self.inner.lock() {
-            if let Some(data) = m.remove(old_id) {
-                m.insert(new_id.to_string(), data);
+            if let Some(data) = m.remove(&composite_key(app, old_id)) {
+                m.insert(composite_key(app, new_id), data);
             }
         }
     }
 
-    fn contains(&self, id: &str) -> bool {
+    fn contains(&self, app: &str, id: &str) -> bool {
         // Route through the expiry-aware get so an expired record reads absent.
-        self.get(id).is_some()
+        self.get(app, id).is_some()
     }
 
     fn take_expired(&self, now_secs: u64) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
@@ -118,7 +144,10 @@ impl SessionStore for MemoryStore {
                 .collect();
             expired
                 .into_iter()
-                .filter_map(|id| m.remove(&id).map(|s| (s.app_name.clone(), id, s.variables)))
+                .filter_map(|key| {
+                    m.remove(&key)
+                        .map(|s| (s.app_name.clone(), id_from_key(&key).to_string(), s.variables))
+                })
                 .collect()
         } else {
             Vec::new()
@@ -155,9 +184,9 @@ mod tests {
         let store = MemoryStore::new();
         let now = now_epoch_secs();
         // last accessed 10_000s ago, 5s timeout → already expired.
-        store.set("dead", session("appA", now - 10_000, 5));
-        assert!(store.get("dead").is_none(), "expired session must read as absent");
-        assert!(!store.contains("dead"), "contains must agree with get");
+        store.set("appA", "dead", session("appA", now - 10_000, 5));
+        assert!(store.get("appA", "dead").is_none(), "expired session must read as absent");
+        assert!(!store.contains("appA", "dead"), "contains must agree with get");
         // It was opportunistically removed, so take_expired finds nothing left.
         assert!(store.take_expired(now).is_empty(), "get should have evicted it");
     }
@@ -166,33 +195,63 @@ mod tests {
     fn get_returns_live_record() {
         let store = MemoryStore::new();
         let now = now_epoch_secs();
-        store.set("live", session("appA", now, 1800));
-        assert!(store.get("live").is_some());
-        assert!(store.contains("live"));
+        store.set("appA", "live", session("appA", now, 1800));
+        assert!(store.get("appA", "live").is_some());
+        assert!(store.contains("appA", "live"));
+    }
+
+    #[test]
+    fn same_id_in_two_apps_is_two_sessions() {
+        // The core namespacing guarantee: one CFID under two `this.name`
+        // values resolves to independent sessions — neither leaks into the
+        // other, and the app name is case-insensitive.
+        let store = MemoryStore::new();
+        let now = now_epoch_secs();
+        let mut a = session("appA", now, 1800);
+        a.variables.insert("x".into(), CfmlValue::string("alpha"));
+        let mut b = session("appB", now, 1800);
+        b.variables.insert("x".into(), CfmlValue::string("beta"));
+        store.set("appA", "shared-cfid", a);
+        store.set("appB", "shared-cfid", b);
+
+        assert_eq!(
+            store.get("appA", "shared-cfid").unwrap().variables.get("x").unwrap().as_string(),
+            "alpha",
+            "app A keeps its own value"
+        );
+        assert_eq!(
+            store.get("AppB", "shared-cfid").unwrap().variables.get("x").unwrap().as_string(),
+            "beta",
+            "app B is independent and app name is case-insensitive"
+        );
+        // Removing A's session does not touch B's.
+        store.remove("appA", "shared-cfid");
+        assert!(store.get("appA", "shared-cfid").is_none());
+        assert!(store.get("appB", "shared-cfid").is_some());
     }
 
     #[test]
     fn take_expired_reports_owning_app_name() {
         let store = MemoryStore::new();
         let now = now_epoch_secs();
-        store.set("a", session("shop", now - 10_000, 5));
-        store.set("b", session("blog", now, 1800));
+        store.set("shop", "a", session("shop", now - 10_000, 5));
+        store.set("blog", "b", session("blog", now, 1800));
         let mut drained = store.take_expired(now);
         assert_eq!(drained.len(), 1, "only the timed-out session is drained");
         let (app, id, _vars) = drained.pop().unwrap();
         assert_eq!(app, "shop");
         assert_eq!(id, "a");
         // The live session survives and its app is untouched.
-        assert!(store.get("b").is_some());
+        assert!(store.get("blog", "b").is_some());
     }
 
     #[test]
     fn next_expiry_is_earliest_absolute_instant() {
         let store = MemoryStore::new();
         let base = 1_000_000;
-        store.set("a", session("x", base, 100)); // expires at base+100
-        store.set("b", session("x", base, 30)); // expires at base+30  (earliest)
-        store.set("c", session("x", base, 900)); // expires at base+900
+        store.set("x", "a", session("x", base, 100)); // expires at base+100
+        store.set("x", "b", session("x", base, 30)); // expires at base+30  (earliest)
+        store.set("x", "c", session("x", base, 900)); // expires at base+900
         assert_eq!(store.next_expiry(base), Some(base + 30));
     }
 }

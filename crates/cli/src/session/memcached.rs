@@ -1,8 +1,15 @@
 //! Memcached-backed session store.
 //!
 //! Enabled by the `memcached` Cargo feature. Each session is serialised to
-//! JSON and stored under the key `{key_prefix}{session_id}` with a TTL equal
-//! to the session's `timeout_secs`.
+//! JSON and stored under the key `{key_prefix}{app_name}\u{1f}{session_id}`
+//! with a TTL equal to the session's `timeout_secs`. The application name is
+//! part of the key so two applications sharing a CFID never collide.
+//!
+//! **Migration note:** keys gained the `{app_name}\u{1f}` segment, so session
+//! keys written by an earlier build (`{key_prefix}{session_id}`) are no longer
+//! found — existing memcached sessions are effectively invalidated on upgrade
+//! (users re-authenticate / start fresh sessions). Memcached enforces TTL
+//! natively, so the stale keys expire on their own.
 
 #[cfg(feature = "memcached")]
 mod inner {
@@ -39,32 +46,35 @@ mod inner {
             })
         }
 
-        fn key(&self, id: &str) -> String {
-            format!("{}{}", self.key_prefix, id)
+        /// Namespace the storage key by application: `{prefix}{app}\u{1f}{id}`.
+        /// App names are case-insensitive in CFML, so lowercase the app
+        /// segment for consistent lookups across `this.name` casings.
+        fn key(&self, app: &str, id: &str) -> String {
+            format!("{}{}\u{1f}{}", self.key_prefix, app.to_lowercase(), id)
         }
     }
 
     impl SessionStore for MemcachedStore {
-        fn get(&self, id: &str) -> Option<SessionData> {
-            let raw: Option<String> = self.client.get(&self.key(id)).ok().flatten();
+        fn get(&self, app: &str, id: &str) -> Option<SessionData> {
+            let raw: Option<String> = self.client.get(&self.key(app, id)).ok().flatten();
             raw.and_then(|s| serde_json::from_str(&s).ok())
         }
 
-        fn set(&self, id: &str, data: SessionData) {
+        fn set(&self, app: &str, id: &str, data: SessionData) {
             if let Ok(json) = serde_json::to_string(&data) {
                 let ttl = data.timeout_secs as u32;
-                let _ = self.client.set(&self.key(id), json, ttl);
+                let _ = self.client.set(&self.key(app, id), json, ttl);
             }
         }
 
-        fn remove(&self, id: &str) {
-            let _ = self.client.delete(&self.key(id));
+        fn remove(&self, app: &str, id: &str) {
+            let _ = self.client.delete(&self.key(app, id));
         }
 
-        fn rotate(&self, old_id: &str, new_id: &str) {
-            if let Some(data) = self.get(old_id) {
-                self.set(new_id, data);
-                self.remove(old_id);
+        fn rotate(&self, app: &str, old_id: &str, new_id: &str) {
+            if let Some(data) = self.get(app, old_id) {
+                self.set(app, new_id, data);
+                self.remove(app, old_id);
             }
         }
 

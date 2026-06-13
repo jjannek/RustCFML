@@ -52,6 +52,21 @@ mod inner {
     const TOMBSTONE_TTL: Duration = Duration::from_secs(60);
     const OUTBOUND_QUEUE_CAP: usize = 1024;
 
+    /// Per-session doc keys (and the opaque `id` on the wire) are the composite
+    /// `(application name, session id)` so two apps sharing a CFID map to two
+    /// distinct Automerge docs across the whole cluster. Every node computes
+    /// the same key, so deltas/tombstones stay consistent. App names are
+    /// case-insensitive in CFML — lowercase the app segment.
+    fn composite_key(app: &str, id: &str) -> String {
+        format!("{}\u{1f}{}", app.to_lowercase(), id)
+    }
+
+    /// Recover the bare session id from a composite doc key (everything after
+    /// the last unit separator).
+    fn id_from_key(key: &str) -> &str {
+        key.rsplit('\u{1f}').next().unwrap_or(key)
+    }
+
     // ─────────────────────────────────────────────
     // Wire frames
     // ─────────────────────────────────────────────
@@ -565,9 +580,10 @@ mod inner {
     }
 
     impl SessionStore for ClusterStore {
-        fn get(&self, id: &str) -> Option<SessionData> {
+        fn get(&self, app: &str, id: &str) -> Option<SessionData> {
+            let key = composite_key(app, id);
             let docs = self.shared.docs.lock().ok()?;
-            let doc = docs.get(id)?;
+            let doc = docs.get(&key)?;
             let s = read_session(doc)?;
             // Read-path exactness (G1): an expired session reads as absent the
             // instant it times out, independent of the reaper sweep. We don't
@@ -580,42 +596,44 @@ mod inner {
             Some(s)
         }
 
-        fn set(&self, id: &str, data: SessionData) {
+        fn set(&self, app: &str, id: &str, data: SessionData) {
+            let key = composite_key(app, id);
             let mut docs = match self.shared.docs.lock() {
                 Ok(d) => d,
                 Err(_) => return,
             };
             let doc = docs
-                .entry(id.to_string())
+                .entry(key.clone())
                 .or_insert_with(automerge::AutoCommit::new);
             if let Err(e) = write_session(doc, &data) {
                 eprintln!("[session/cluster] write_session failed: {}", e);
                 return;
             }
-            self.broadcast_delta(id, doc);
+            self.broadcast_delta(&key, doc);
         }
 
-        fn remove(&self, id: &str) {
+        fn remove(&self, app: &str, id: &str) {
+            let key = composite_key(app, id);
             if let Ok(mut docs) = self.shared.docs.lock() {
-                docs.remove(id);
+                docs.remove(&key);
             }
             if let Ok(mut t) = self.shared.tombstones.lock() {
-                t.insert(id.to_string(), Instant::now());
+                t.insert(key.clone(), Instant::now());
             }
-            self.broadcast_tombstone(id);
+            self.broadcast_tombstone(&key);
         }
 
-        fn rotate(&self, old_id: &str, new_id: &str) {
+        fn rotate(&self, app: &str, old_id: &str, new_id: &str) {
             let existing = {
                 let docs = match self.shared.docs.lock() {
                     Ok(d) => d,
                     Err(_) => return,
                 };
-                docs.get(old_id).and_then(read_session)
+                docs.get(&composite_key(app, old_id)).and_then(read_session)
             };
             if let Some(data) = existing {
-                self.set(new_id, data);
-                self.remove(old_id);
+                self.set(app, new_id, data);
+                self.remove(app, old_id);
             }
         }
 
@@ -623,13 +641,14 @@ mod inner {
             &self,
             now_secs: u64,
         ) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
-            let expired_ids: Vec<String> = match self.shared.docs.lock() {
+            // Doc keys are composite `(app, id)`; collect the expired keys.
+            let expired_keys: Vec<String> = match self.shared.docs.lock() {
                 Ok(docs) => docs
                     .iter()
-                    .filter_map(|(id, doc)| {
+                    .filter_map(|(key, doc)| {
                         let s = read_session(doc)?;
                         if now_secs.saturating_sub(s.last_accessed_secs) > s.timeout_secs {
-                            Some(id.clone())
+                            Some(key.clone())
                         } else {
                             None
                         }
@@ -637,20 +656,28 @@ mod inner {
                     .collect(),
                 Err(_) => return Vec::new(),
             };
-            let mut out = Vec::with_capacity(expired_ids.len());
-            for id in expired_ids {
+            let mut out = Vec::with_capacity(expired_keys.len());
+            for key in expired_keys {
                 let drained = {
                     let docs = match self.shared.docs.lock() {
                         Ok(d) => d,
                         Err(_) => continue,
                     };
-                    docs.get(&id)
+                    docs.get(&key)
                         .and_then(read_session)
                         .map(|s| (s.app_name, s.variables))
                 };
                 if let Some((app_name, vars)) = drained {
-                    out.push((app_name, id.clone(), vars));
-                    self.remove(&id);
+                    // Report the bare id (the reaper routes onSessionEnd by
+                    // app_name), but evict + tombstone by the composite key.
+                    out.push((app_name, id_from_key(&key).to_string(), vars));
+                    if let Ok(mut docs) = self.shared.docs.lock() {
+                        docs.remove(&key);
+                    }
+                    if let Ok(mut t) = self.shared.tombstones.lock() {
+                        t.insert(key.clone(), Instant::now());
+                    }
+                    self.broadcast_tombstone(&key);
                 }
             }
             out

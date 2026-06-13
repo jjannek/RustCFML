@@ -28,6 +28,13 @@ use worker::kv::KvStore;
 // Sessions
 // ─────────────────────────────────────────────
 
+/// Fixed application partition for the in-isolate `MemoryStore`. The worker
+/// keys sessions by bare id (see the impl note below); using one constant
+/// partition keeps every internal access — `prime`, `flush`, `sweep_expired`,
+/// and the `SessionStore` methods — consistent regardless of the per-request
+/// app name the VM supplies.
+const MEM_APP: &str = "";
+
 #[derive(Clone)]
 pub struct KvBackedSessionStore {
     memory: Arc<MemoryStore>,
@@ -47,12 +54,12 @@ impl KvBackedSessionStore {
     /// Pull `session_id` from KV into the in-isolate cache if not already
     /// present. Called once per request before the VM runs.
     pub async fn prime(&self, session_id: &str) -> worker::Result<()> {
-        if session_id.is_empty() || self.memory.contains(session_id) {
+        if session_id.is_empty() || self.memory.contains(MEM_APP, session_id) {
             return Ok(());
         }
         if let Some(bytes) = self.kv.get(session_id).bytes().await? {
             if let Ok(data) = serde_json::from_slice::<SessionData>(&bytes) {
-                self.memory.set(session_id, data);
+                self.memory.set(MEM_APP, session_id, data);
             }
         }
         Ok(())
@@ -88,7 +95,7 @@ impl KvBackedSessionStore {
                 if age > data.timeout_secs {
                     // Delete first so concurrent sweeps don't double-fire.
                     if self.kv.delete(&key.name).await.is_ok() {
-                        self.memory.remove(&key.name);
+                        self.memory.remove(MEM_APP, &key.name);
                         expired.push((key.name, data));
                     }
                 }
@@ -124,7 +131,7 @@ impl KvBackedSessionStore {
             g.drain().collect()
         };
         for id in dirty {
-            let Some(data) = self.memory.get(&id) else { continue };
+            let Some(data) = self.memory.get(MEM_APP, &id) else { continue };
             let bytes = serde_json::to_vec(&data)
                 .map_err(|e| worker::Error::RustError(format!("session {id} serialize: {e}")))?;
             // KV rejects an `expiration_ttl` below 60s. Defend against a
@@ -143,18 +150,28 @@ impl KvBackedSessionStore {
     }
 }
 
+// NOTE on application namespacing: the `SessionStore` trait keys sessions by
+// `(app_name, id)` so a multi-application process isolates sessions per app.
+// A Workers isolate, however, runs a single application per script and `prime`
+// pulls a session from KV by bare id *before* `Application.cfc` resolves the
+// app name — so the app name is not yet known at the KV key boundary. This
+// store therefore keys by bare id (app-agnostic), matching its prime/flush/KV
+// layout. The trait's `app` argument is accepted and ignored; for the one-app-
+// per-worker deployment model there is nothing to disambiguate. The native
+// multi-app stores (memory/datasource/cluster/memcached) do the real
+// namespacing.
 impl SessionStore for KvBackedSessionStore {
-    fn get(&self, id: &str) -> Option<SessionData> {
-        self.memory.get(id)
+    fn get(&self, _app: &str, id: &str) -> Option<SessionData> {
+        self.memory.get(MEM_APP, id)
     }
 
-    fn set(&self, id: &str, data: SessionData) {
-        self.memory.set(id, data);
+    fn set(&self, _app: &str, id: &str, data: SessionData) {
+        self.memory.set(MEM_APP, id, data);
         self.dirty.lock().unwrap().insert(id.to_string());
     }
 
-    fn remove(&self, id: &str) {
-        self.memory.remove(id);
+    fn remove(&self, _app: &str, id: &str) {
+        self.memory.remove(MEM_APP, id);
         // Schedule the KV delete on the next flush; cheaper to track as a
         // separate set, but for v1 piggyback on `dirty` and let flush detect
         // missing memory entries → delete. Actually simpler: do nothing here
@@ -162,13 +179,13 @@ impl SessionStore for KvBackedSessionStore {
         let _ = id;
     }
 
-    fn rotate(&self, old_id: &str, new_id: &str) {
-        self.memory.rotate(old_id, new_id);
+    fn rotate(&self, _app: &str, old_id: &str, new_id: &str) {
+        self.memory.rotate(MEM_APP, old_id, new_id);
         self.dirty.lock().unwrap().insert(new_id.to_string());
     }
 
-    fn contains(&self, id: &str) -> bool {
-        self.memory.contains(id)
+    fn contains(&self, _app: &str, id: &str) -> bool {
+        self.memory.contains(MEM_APP, id)
     }
 
     fn take_expired(&self, now_secs: u64) -> Vec<(String, String, indexmap::IndexMap<String, cfml_common::dynamic::CfmlValue>)> {

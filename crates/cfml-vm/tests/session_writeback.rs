@@ -66,21 +66,21 @@ impl SpyStore {
 }
 
 impl SessionStore for SpyStore {
-    fn get(&self, id: &str) -> Option<SessionData> {
-        self.inner.get(id)
+    fn get(&self, app: &str, id: &str) -> Option<SessionData> {
+        self.inner.get(app, id)
     }
-    fn set(&self, id: &str, data: SessionData) {
+    fn set(&self, app: &str, id: &str, data: SessionData) {
         self.sets.lock().unwrap().push((id.to_string(), data.clone()));
-        self.inner.set(id, data);
+        self.inner.set(app, id, data);
     }
-    fn remove(&self, id: &str) {
-        self.inner.remove(id);
+    fn remove(&self, app: &str, id: &str) {
+        self.inner.remove(app, id);
     }
-    fn rotate(&self, old_id: &str, new_id: &str) {
-        self.inner.rotate(old_id, new_id);
+    fn rotate(&self, app: &str, old_id: &str, new_id: &str) {
+        self.inner.rotate(app, old_id, new_id);
     }
-    fn contains(&self, id: &str) -> bool {
-        self.inner.contains(id)
+    fn contains(&self, app: &str, id: &str) -> bool {
+        self.inner.contains(app, id)
     }
     fn take_expired(
         &self,
@@ -89,6 +89,10 @@ impl SessionStore for SpyStore {
         self.inner.take_expired(now_secs)
     }
 }
+
+/// The fixture application's `this.name` — sessions are keyed by
+/// `(app, id)`, so spy assertions must query under this same partition.
+const APP_NAME: &str = "session-writeback-test";
 
 const APP: &str = r##"
 component {
@@ -165,14 +169,14 @@ fn existing_session_mutation_persists_on_second_request() {
 
     // Request 1: creates the session, sets visits = 1.
     run_request(spy.clone() as Arc<dyn SessionStore>, sid);
-    let after_first = spy.get(sid).expect("record created on first request");
+    let after_first = spy.get(APP_NAME, sid).expect("record created on first request");
     assert_eq!(visits(&after_first), 1, "first visit should persist visits=1");
 
     // Request 2: the record already exists. The mutation must commit.
     let sets_before = spy.set_count(sid);
     run_request(spy.clone() as Arc<dyn SessionStore>, sid);
 
-    let after_second = spy.get(sid).expect("record still present");
+    let after_second = spy.get(APP_NAME, sid).expect("record still present");
     assert_eq!(
         visits(&after_second),
         2,
@@ -199,7 +203,7 @@ fn createtimespan_session_timeout_is_seconds_not_zero() {
     let sid = "sid-timeout";
     run_request(spy.clone() as Arc<dyn SessionStore>, sid);
 
-    let data = spy.get(sid).expect("record created");
+    let data = spy.get(APP_NAME, sid).expect("record created");
     assert_eq!(
         data.timeout_secs, 3600,
         "createTimeSpan(0,1,0,0) must resolve to 3600s, not a day-fraction truncated to 0"
@@ -212,7 +216,7 @@ fn existing_session_refreshes_last_accessed() {
     let sid = "sid-sliding";
 
     run_request(spy.clone() as Arc<dyn SessionStore>, sid);
-    let created = spy.get(sid).expect("record created").created_secs;
+    let created = spy.get(APP_NAME, sid).expect("record created").created_secs;
 
     run_request(spy.clone() as Arc<dyn SessionStore>, sid);
     let last = spy.last_set(sid).expect("a set() was recorded on the 2nd request");
