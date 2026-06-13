@@ -140,6 +140,9 @@ pub struct Backend {
     pub(super) box_int_id: FuncId,
     pub(super) box_float_id: FuncId,
     pub(super) concat_boxed_id: FuncId,
+    /// v0.141.0 — `cfml_jit_is_null(tagged) -> i64`, the null test for the
+    /// PR #112 null-delete assignment guard (deopt-on-null).
+    pub(super) is_null_id: FuncId,
     pub(super) add_boxed_id: FuncId,
     /// v0.99.7 — Sub/Mul Boxed slow shims (mirror `add_boxed_id`).
     pub(super) sub_boxed_id: FuncId,
@@ -197,6 +200,7 @@ impl Backend {
         builder.symbol("cfml_jit_box_int", cfml_jit_box_int as *const u8);
         builder.symbol("cfml_jit_box_float", cfml_jit_box_float as *const u8);
         builder.symbol("cfml_jit_concat_boxed", cfml_jit_concat_boxed as *const u8);
+        builder.symbol("cfml_jit_is_null", super::shims::cfml_jit_is_null as *const u8);
         builder.symbol("cfml_jit_add_boxed", cfml_jit_add_boxed as *const u8);
         builder.symbol("cfml_jit_sub_boxed", cfml_jit_sub_boxed as *const u8);
         builder.symbol("cfml_jit_mul_boxed", cfml_jit_mul_boxed as *const u8);
@@ -309,6 +313,14 @@ impl Backend {
                 .declare_function("cfml_jit_concat_boxed", Linkage::Import, &sig)
                 .map_err(|e| e.to_string())?
         };
+        let is_null_id = {
+            let mut sig = Signature::new(module.target_config().default_call_conv);
+            sig.params.push(AbiParam::new(I64)); // tagged value
+            sig.returns.push(AbiParam::new(I64)); // 1 if Null, else 0
+            module
+                .declare_function("cfml_jit_is_null", Linkage::Import, &sig)
+                .map_err(|e| e.to_string())?
+        };
         let declare_arith_boxed =
             |module: &mut JITModule, sym: &str| -> Result<FuncId, String> {
                 let mut sig = Signature::new(module.target_config().default_call_conv);
@@ -376,6 +388,7 @@ impl Backend {
             box_int_id,
             box_float_id,
             concat_boxed_id,
+            is_null_id,
             add_boxed_id,
             sub_boxed_id,
             mul_boxed_id,
@@ -485,6 +498,9 @@ impl Backend {
         let concat_boxed_ref = self
             .module
             .declare_func_in_func(self.concat_boxed_id, &mut ctx.func);
+        let is_null_ref = self
+            .module
+            .declare_func_in_func(self.is_null_id, &mut ctx.func);
         let add_boxed_ref = self
             .module
             .declare_func_in_func(self.add_boxed_id, &mut ctx.func);
@@ -520,6 +536,10 @@ impl Backend {
         // v0.100.0 — IC slots for member-write sites (SetProperty,
         // StoreLocalProperty). Same slot layout as the read IC.
         let mut member_set_at: HashMap<usize, (*mut u64, *const u8, i64)> = HashMap::new();
+        // v0.141.0 — null-delete assignment guards (PR #112). The `Pop`/
+        // `UnsetPath` pair is skipped; the `JumpIfNotNull` becomes a
+        // deopt-if-null check on the guarded RHS (see the op loop below).
+        let null_guards = super::analysis::null_guard_sites(&func.instructions);
         for blk in &plan.blocks {
             for ip in blk.start..blk.end {
                 match &func.instructions[ip] {
@@ -647,6 +667,31 @@ impl Backend {
                 let fallthrough = target_block(blk.end);
 
                 for ip in blk.start..blk.end {
+                    // Null-delete guard (PR #112): skip the `Pop`/`UnsetPath`
+                    // pair — they are the deopt-on-null path, never run in
+                    // native code (the guarded value flows straight to the
+                    // store at ip+3).
+                    if null_guards.skip.contains(&ip) {
+                        continue;
+                    }
+                    // The guard's `JumpIfNotNull` becomes a deopt-if-null
+                    // check: peek the RHS (it stays on the stack for the
+                    // store). An Int/Float can never be Null, so no check is
+                    // needed; a Boxed value is tested by `cfml_jit_is_null` and
+                    // bails to the interpreter (which deletes the target /
+                    // throws on a later undefined read) when Null.
+                    if null_guards.jump.contains(&ip) {
+                        let &(v, k) = stack.last().ok_or("jit: guard on empty stack")?;
+                        if k == Kind::Boxed {
+                            let call = b.ins().call(is_null_ref, &[v]);
+                            let is_null = b.inst_results(call)[0];
+                            let null_set = b.ins().icmp_imm(IntCC::NotEqual, is_null, 0);
+                            let cont = b.create_block();
+                            b.ins().brif(null_set, bail_block, &[], cont, &[]);
+                            b.switch_to_block(cont);
+                        }
+                        continue;
+                    }
                     match &func.instructions[ip] {
                         BytecodeOp::Integer(n) => stack.push((b.ins().iconst(I64, *n), Kind::Int)),
                         BytecodeOp::Double(d) => stack.push((b.ins().f64const(*d), Kind::Float)),

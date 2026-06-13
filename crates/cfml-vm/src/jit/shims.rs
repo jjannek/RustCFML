@@ -343,6 +343,25 @@ fn encode_into_arena(v: CfmlValue) -> i64 {
     arena::box_into_active(v) as i64
 }
 
+/// True (`1`) iff the tagged JIT value represents `CfmlValue::Null`.
+///
+/// Implements the native side of the null-delete assignment guard (PR #112):
+/// a `=` / `var` assignment whose RHS may be Null is compiled as "evaluate the
+/// RHS; if it is Null, **deopt** to the interpreter (which deletes the target /
+/// throws on a later undefined read); else store". An inline SMI Int can never
+/// be Null; a heap box is inspected without taking ownership.
+///
+/// # Safety
+/// `tagged` must be a live JIT value (heap box from `box_value`, or an SMI tag).
+#[no_mangle]
+pub extern "C" fn cfml_jit_is_null(tagged: i64) -> i64 {
+    if boxed::is_smi_int(tagged) {
+        return 0;
+    }
+    let v = unsafe { boxed::borrow_tagged(tagged as usize) };
+    matches!(v, CfmlValue::Null) as i64
+}
+
 /// `a & b` where one or both operands cross as Boxed. Always produces a
 /// String box (per CFML `&` semantics — both sides are stringified).
 ///

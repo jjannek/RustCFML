@@ -12,11 +12,29 @@ cargo build --release                # Release build
 cargo run -- tests/runner.cfm        # Run all tests (~1181 assertions, 89 suites)
 cargo run --release -- file.cfm      # Run a CFML file
 cargo run --release -- --serve       # Start web server on port 8500
-cargo test                           # Rust unit tests (tag_parser, etc.)
+cargo test --workspace               # ALL Rust tests — incl. the JIT integration
+                                     # suite crates/cfml-vm/tests/jit_numeric.rs
+                                     # (76 tests). Run serial if a parallel run is
+                                     # ever flaky: `-- --test-threads=1`.
 
 # Wasm-target members — NOT built by the commands above (see warning below):
 cargo build -p cfml-worker -p rustcfml-wasm --target wasm32-unknown-unknown
 ```
+
+> 🚨 **Verification gate — a red OR skipped test in ANY suite is a release
+> blocker, never a shrug.** A green `cargo build` + `tests/runner.cfm` is NOT
+> sufficient. Before tagging you MUST have all of these green: `cargo test
+> --workspace` (Rust + JIT integration tests), `cargo run -- tests/runner.cfm`
+> (CFML, CLI **and** serve-mode cold+warm — see "Validate in serve mode"), and the
+> wasm build above. If a test fails or is `#[ignore]`d, do NOT dismiss it as
+> "flaky" or "unrelated" — `git bisect` to the commit that broke it and fix the
+> root cause (or open a tracked issue). **This bit us hard:** a v0.137.0 codegen
+> change (the PR #112 null-delete guard) silently disqualified every hot
+> assignment-bearing function from JIT compilation, turning 11 of 76 JIT tests
+> red — and it went unnoticed for ~20 releases (v0.137→v0.140) because the JIT
+> suite wasn't being run at tag time and a green `tests/runner.cfm` masked it
+> (fixed in v0.142.0). The CFML suite cannot see JIT/codegen-admission
+> regressions; only `cargo test --workspace` can.
 
 > ⚠️ **A plain `cargo build` does NOT compile the wasm32-only workspace members
 > (`cfml-worker`, `rustcfml-wasm`).** They only target `wasm32-unknown-unknown`,

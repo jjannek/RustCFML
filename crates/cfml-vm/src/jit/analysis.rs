@@ -220,6 +220,59 @@ fn lower(s: &str) -> String {
     s.to_ascii_lowercase()
 }
 
+/// The instruction indices making up each **null-delete guard** the codegen
+/// emits around a `=` / `var` assignment whose RHS may be Null (v0.137.0,
+/// PR #112). The exact, only shape that produces an `UnsetPath` is:
+///
+/// ```text
+///   ip   : JumpIfNotNull(ip+4)   // PEEK the RHS; non-null → jump to the store
+///   ip+1 : Pop                   // drop the Null
+///   ip+2 : UnsetPath(path)       // delete the target key (undefined afterwards)
+///   ip+3 : Jump(END)             // null path: skip the store
+///   ip+4 : <store op…>           // the JumpIfNotNull target
+///   …
+///   END  :                       // (the Jump target)
+/// ```
+///
+/// The native code compiles this as *"evaluate the RHS; if it is Null, **deopt**
+/// to the interpreter (which performs the delete / undefined-read throw); else
+/// store"* — so the guarded value flows straight into the store and the
+/// `Pop`/`UnsetPath`/`Jump` trio never executes in native code. Recognising the
+/// idiom here (and in the translator) lets a hot function containing such an
+/// assignment JIT again instead of being silently rejected by the op-subset
+/// check. `JumpIfNotNull`/`UnsetPath` outside this exact shape (e.g. Elvis /
+/// null-coalescing, which place the default expression between the jump and its
+/// target) are NOT matched and still disqualify the function.
+pub(super) struct NullGuards {
+    /// ips holding a guard's `JumpIfNotNull` (a peek → deopt-if-null).
+    pub jump: std::collections::HashSet<usize>,
+    /// ips holding a guard's `Pop`, `UnsetPath`, and skip-`Jump` (the
+    /// deopt-on-null path — never executed in native code). Also suppressed
+    /// from leader detection so the guarded value flows straight from the RHS
+    /// into the store within a single basic block.
+    pub skip: std::collections::HashSet<usize>,
+}
+
+pub(super) fn null_guard_sites(code: &[BytecodeOp]) -> NullGuards {
+    let mut jump = std::collections::HashSet::new();
+    let mut skip = std::collections::HashSet::new();
+    for ip in 0..code.len() {
+        if let BytecodeOp::JumpIfNotNull(t) = code[ip] {
+            if t == ip + 4
+                && matches!(code.get(ip + 1), Some(BytecodeOp::Pop))
+                && matches!(code.get(ip + 2), Some(BytecodeOp::UnsetPath(_)))
+                && matches!(code.get(ip + 3), Some(BytecodeOp::Jump(_)))
+            {
+                jump.insert(ip);
+                skip.insert(ip + 1);
+                skip.insert(ip + 2);
+                skip.insert(ip + 3);
+            }
+        }
+    }
+    NullGuards { jump, skip }
+}
+
 fn is_reserved_scope(name: &str) -> bool {
     matches!(
         lower(name).as_str(),
@@ -296,10 +349,21 @@ pub fn analyze(
         return None;
     }
 
+    // Null-delete assignment guards (PR #112). Computed up front: the guard's
+    // skip-`Jump` must NOT create a basic-block leader (else the store would
+    // start a block with the guarded value already live on the operand stack,
+    // breaking the empty-stack-at-boundary invariant). See [`null_guard_sites`].
+    let null_guards = null_guard_sites(code);
+
     // ── 1. Leaders & basic blocks ───────────────────────────────────────────
     let mut leader_set: BTreeSet<usize> = BTreeSet::new();
     leader_set.insert(0);
     for (ip, op) in code.iter().enumerate() {
+        // A guard's internal `Pop`/`UnsetPath`/`Jump` are elided in native
+        // code — they must not split blocks.
+        if null_guards.skip.contains(&ip) {
+            continue;
+        }
         match op {
             BytecodeOp::Jump(t)
             | BytecodeOp::JumpIfFalse(t)
@@ -432,7 +496,16 @@ pub fn analyze(
     for (bidx, blk) in plan_blocks.iter().enumerate() {
         let events = &mut block_events[bidx];
         for ip in blk.start..blk.end {
+            // A null-delete guard's `Pop`/`UnsetPath` carry no dataflow on the
+            // native success path (the guarded value flows straight to the
+            // store; a Null deopts) — admit them as no-ops.
+            if null_guards.skip.contains(&ip) {
+                continue;
+            }
             match &code[ip] {
+                // A guard's `JumpIfNotNull` peeks the RHS for the deopt-if-null
+                // check; no local dataflow event.
+                BytecodeOp::JumpIfNotNull(_) if null_guards.jump.contains(&ip) => {}
                 // value-producing / value-consuming ops with no local event
                 BytecodeOp::Integer(_)
                 | BytecodeOp::Double(_)
@@ -595,6 +668,7 @@ pub fn analyze(
                 &udf_names,
                 udf_resolver,
                 &mut _scratch,
+                &null_guards,
                 Mode::Infer { changed: &mut changed },
             )?;
         }
@@ -626,6 +700,7 @@ pub fn analyze(
             &udf_names,
             udf_resolver,
             &mut udf_call_at,
+            &null_guards,
             Mode::Check { ret_kind: &mut ret_kind },
         )?;
     }
@@ -754,6 +829,7 @@ fn simulate_block(
     udf_names: &[String],
     udf_resolver: &UdfResolver<'_>,
     udf_bindings: &mut HashMap<usize, UdfRefBinding>,
+    null_guards: &NullGuards,
     mut mode: Mode,
 ) -> Option<()> {
     let slot_index = |name: &str| -> Option<usize> { local_slot.get(&lower(name)).copied() };
@@ -796,7 +872,16 @@ fn simulate_block(
     }
 
     for ip in blk.start..blk.end {
+        // Null-delete guard: the `Pop`/`UnsetPath` pair is the deopt-on-null
+        // path, never taken in native code — skip it so the guarded value
+        // stays on the operand stack and flows into the store at `ip+3`.
+        if null_guards.skip.contains(&ip) {
+            continue;
+        }
         match &code[ip] {
+            // A guard's `JumpIfNotNull` is a peek (deopt-if-null at translate
+            // time); the value remains on the stack, kind unchanged.
+            BytecodeOp::JumpIfNotNull(_) if null_guards.jump.contains(&ip) => {}
             BytecodeOp::Integer(_) => stack.push(Kind::Int),
             BytecodeOp::Double(_) => stack.push(Kind::Float),
             BytecodeOp::True | BytecodeOp::False => stack.push(Kind::Bool),

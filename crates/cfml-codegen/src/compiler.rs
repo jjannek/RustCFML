@@ -669,9 +669,18 @@ impl CfmlCompiler {
 
     /// Whether an expression could evaluate to Null at runtime. Used to decide
     /// if a plain `=` assignment needs the null-delete guard (a non-null RHS —
-    /// literals, struct/array/closure/`new`, arithmetic/logical ops — can skip it,
-    /// keeping the hot path of `x = 5` / `x = a + b` exactly as before). Anything
-    /// that reads a variable or calls a function MAY be null and is guarded.
+    /// literals, struct/array/closure/`new`, arithmetic/logical ops, and bare
+    /// identifier reads — can skip it, keeping the hot path of `x = 5` /
+    /// `x = a + b` / `var t = s` exactly as before). Only a function/method
+    /// CALL return (void/null) or an explicit `null` is guarded.
+    ///
+    /// A bare `Identifier` read is non-null by CFML semantics: a defined
+    /// variable holds a non-null value, and reading an *undefined* one THROWS
+    /// rather than yielding Null — so `x = someVar` never assigns Null. Keeping
+    /// identifier RHS unguarded matters beyond the hot path: the extra
+    /// `JumpIfNotNull`/`UnsetPath` ops are outside the JIT's admitted op-subset,
+    /// so guarding `var t = s` would silently disqualify the whole function
+    /// from native compilation (regressed in v0.137.0, restored here).
     fn expr_may_be_null(expr: &Expression) -> bool {
         match expr {
             Expression::Literal(lit) => matches!(lit.value, LiteralValue::Null),
@@ -683,7 +692,8 @@ impl CfmlCompiler {
             | Expression::StringInterpolation(_)
             | Expression::UnaryOp(_)
             | Expression::BinaryOp(_)
-            | Expression::PostfixOp(_) => false,
+            | Expression::PostfixOp(_)
+            | Expression::Identifier(_) => false,
             _ => true,
         }
     }
