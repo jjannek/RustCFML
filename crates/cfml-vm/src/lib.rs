@@ -3541,6 +3541,157 @@ impl CfmlVirtualMachine {
                     named_values.reverse();
 
                     if let Some(func_ref) = stack.pop() {
+                        // The parenthesized `cfinvoke(...)` CALL form (Lucee
+                        // accepts every tag as a script call; Wheels' Global.cfc
+                        // $invoke() rides it). It reaches here as a CallNamed on
+                        // the __cfinvoke stub, but unlike the tag/statement forms
+                        // its attributes arrive as NAMED args — and may be wrapped
+                        // in `attributeCollection`. Marshal them by hand: pull out
+                        // component/method/returnVariable/argumentCollection,
+                        // dispatch, and deliver returnVariable scope-aware into the
+                        // caller's frame. (The generic reorder path below would
+                        // bundle every named arg as an `arguments` overflow and the
+                        // positional __cfinvoke intercept would see method="".)
+                        if matches!(&func_ref, CfmlValue::Function(f)
+                            if f.name.eq_ignore_ascii_case("__cfinvoke"))
+                        {
+                            let mut comp_val: Option<CfmlValue> = None;
+                            let mut method_str: Option<String> = None;
+                            let mut return_var: Option<String> = None;
+                            let mut arg_collection: Option<CfmlValue> = None;
+                            let mut extra_args: IndexMap<String, CfmlValue> = IndexMap::new();
+                            let mut positional: Vec<CfmlValue> = Vec::new();
+
+                            // attributeCollection supplies the base attributes;
+                            // explicit named args override (Lucee precedence).
+                            let apply_attr = |key: &str, v: CfmlValue,
+                                comp_val: &mut Option<CfmlValue>,
+                                method_str: &mut Option<String>,
+                                return_var: &mut Option<String>,
+                                arg_collection: &mut Option<CfmlValue>,
+                                extra_args: &mut IndexMap<String, CfmlValue>| {
+                                match key.to_lowercase().as_str() {
+                                    "component" => *comp_val = Some(v),
+                                    "method" => *method_str = Some(v.as_string()),
+                                    "returnvariable" => *return_var = Some(v.as_string()),
+                                    "argumentcollection" => *arg_collection = Some(v),
+                                    _ => {
+                                        extra_args.insert(key.to_string(), v);
+                                    }
+                                }
+                            };
+
+                            // Pass 1: attributeCollection (base).
+                            for (i, name) in names.iter().enumerate() {
+                                if name.eq_ignore_ascii_case("attributecollection") {
+                                    if let Some(CfmlValue::Struct(s)) = named_values.get(i) {
+                                        for (k, v) in s.iter() {
+                                            apply_attr(&k, v, &mut comp_val, &mut method_str,
+                                                &mut return_var, &mut arg_collection, &mut extra_args);
+                                        }
+                                    }
+                                }
+                            }
+                            // Pass 2: explicit named args (override the base).
+                            for (i, name) in names.iter().enumerate() {
+                                let val = named_values.get(i).cloned().unwrap_or(CfmlValue::Null);
+                                if name.is_empty() {
+                                    positional.push(val);
+                                    continue;
+                                }
+                                if name.eq_ignore_ascii_case("attributecollection") {
+                                    continue;
+                                }
+                                apply_attr(name, val, &mut comp_val, &mut method_str,
+                                    &mut return_var, &mut arg_collection, &mut extra_args);
+                            }
+                            // Bare positionals (rare): component, then method.
+                            let mut positional = positional.into_iter();
+                            if comp_val.is_none() {
+                                comp_val = positional.next();
+                            }
+                            if method_str.is_none() {
+                                if let Some(m) = positional.next() {
+                                    method_str = Some(m.as_string());
+                                }
+                            }
+
+                            let method_str = method_str.unwrap_or_default();
+                            let invoke_args = arg_collection
+                                .unwrap_or_else(|| CfmlValue::strukt(extra_args));
+
+                            // Resolve the component. No component (or an empty one)
+                            // inside a CFC method means a SIBLING call — dispatch
+                            // the method on the current component (this + its
+                            // private functions), NOT as a component path.
+                            let have_component = matches!(&comp_val, Some(v)
+                                if !matches!(v, CfmlValue::Null)
+                                    && !matches!(v, CfmlValue::String(s) if s.is_empty()));
+                            let component = if have_component {
+                                comp_val.unwrap()
+                            } else if let Some(CfmlValue::Struct(this_s)) = locals.get("this") {
+                                let mut merged = this_s.snapshot();
+                                if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
+                                    for (k, v) in vars.snapshot() {
+                                        if matches!(v, CfmlValue::Function(_))
+                                            && !merged.keys()
+                                                .any(|mk| mk.eq_ignore_ascii_case(&k))
+                                        {
+                                            merged.insert(k, v);
+                                        }
+                                    }
+                                }
+                                CfmlValue::strukt(merged)
+                            } else {
+                                comp_val.unwrap_or(CfmlValue::Null)
+                            };
+
+                            let saved_try_stack = if self.try_stack.is_empty() {
+                                None
+                            } else {
+                                Some(std::mem::take(&mut self.try_stack))
+                            };
+                            let call_result = self.call_function(
+                                &func_ref,
+                                vec![component, CfmlValue::string(method_str), invoke_args],
+                                &locals,
+                            );
+                            if let Some(saved) = saved_try_stack {
+                                self.try_stack = saved;
+                            }
+                            match call_result {
+                                Ok(result) => {
+                                    if let Some(rv) = return_var {
+                                        if !rv.is_empty() {
+                                            self.pending_result_writeback =
+                                                Some(vec![(rv, result.clone())]);
+                                            self.apply_pending_result_writeback(
+                                                &mut locals,
+                                                &mut inherited_or_param_keys,
+                                            );
+                                        }
+                                    }
+                                    stack.push(result);
+                                }
+                                Err(e) => {
+                                    if Self::is_control_flow_error(&e) {
+                                        return Err(e);
+                                    }
+                                    if let Some(handler) = self.try_stack.pop() {
+                                        while stack.len() > handler.stack_depth {
+                                            stack.pop();
+                                        }
+                                        self.restore_capture_state(&handler);
+                                        let error_val = self.resolve_catch_error_val(&e);
+                                        stack.push(error_val);
+                                        ip = handler.catch_ip;
+                                        continue;
+                                    }
+                                    return Err(self.wrap_error(e));
+                                }
+                            }
+                            continue;
+                        }
                         // Expand argumentCollection: unpack struct keys as named args
                         let mut expanded_names = Vec::new();
                         let mut expanded_values = Vec::new();

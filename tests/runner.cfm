@@ -374,6 +374,14 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
+//   - cfinvoke_call_form_marshaling: the cf-PREFIXED parenthesized CALL form
+//     cfinvoke(...) — the spelling Lucee accepts and Wheels' Global.cfc
+//     $invoke() uses — must marshal attributeCollection, deliver
+//     returnVariable scope-aware (plain/dotted, page/function level), and
+//     dispatch the componentless form as a SIBLING method on the current
+//     component. cfquery(attributeCollection) honors the same spelling
+//     (in-suite control).
+try { include "tags/test_cfinvoke_tag_marshaling.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_tag_marshaling.cfm | " & e.message & chr(10)); }
 //   - script_transaction_attrs: cfscript `transaction action="begin" { ... }`
 //     (the attribute form of the transaction tag, with a body).
 try { include "tags/test_script_transaction_attrs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_script_transaction_attrs.cfm | " & e.message & chr(10)); }
