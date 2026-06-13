@@ -10561,7 +10561,10 @@ impl CfmlVirtualMachine {
         // intermediate is a reference-typed struct, so removing the leaf in place
         // is visible through the scope. A missing link means nothing to delete.
         if let Some(root) = self.scope_aware_load(scope, locals) {
-            let mut cur = root;
+            // `root.clone()` shares the Arc backing (CfmlValue::Struct is
+            // reference-typed), so the in-place `remove_ci` below is reflected
+            // in `root` — which we commit back at the end.
+            let mut cur = root.clone();
             for key in &parts[1..parts.len() - 1] {
                 match cur.as_cfml_struct().and_then(|s| s.get_ci(key)) {
                     Some(next) => cur = next,
@@ -10571,6 +10574,12 @@ impl CfmlVirtualMachine {
             if let Some(s) = cur.as_cfml_struct() {
                 s.remove_ci(leaf);
             }
+            // Commit the scope container back so the deletion persists for scopes
+            // whose load returns a snapshot copy rather than a live handle — e.g.
+            // `session` before it is attached, or a value-typed page scope.
+            // Mirrors the set path in store_runtime_path; for already-reference-typed
+            // scopes the leaf is removed in place and this re-commit is a no-op.
+            self.scope_aware_store(scope, root, locals);
         }
     }
 
