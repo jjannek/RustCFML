@@ -216,6 +216,7 @@ try { include "tags/test_tags_cfmail.cfm"; } catch (any e) { writeOutput("ERROR 
 try { include "tags/test_tags_cfcache.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfcache.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfstoredproc.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfstoredproc.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfqueryparam_attribute_collection.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfqueryparam_attribute_collection.cfm | " & e.message & chr(10)); }
+try { include "tags/test_cfhttp_multiparam_url.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfhttp_multiparam_url.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfqueryparam_interpolated_value.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfqueryparam_interpolated_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_temporal_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_temporal_param_binds.cfm | " & e.message & chr(10)); }
 try { include "tags/test_pg_jsonb_param_binds.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_pg_jsonb_param_binds.cfm | " & e.message & chr(10)); }

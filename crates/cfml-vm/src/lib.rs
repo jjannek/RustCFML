@@ -3747,10 +3747,10 @@ impl CfmlVirtualMachine {
                                 if Self::is_tag_call_builtin(&f.name) => Some(f.name.to_lowercase()),
                             _ => None,
                         };
-                        if let Some(_) = tag_builtin_name {
+                        if let Some(ref tag_name) = tag_builtin_name {
                             let mut opts: IndexMap<String, CfmlValue> = IndexMap::new();
                             let mut writeback_var: Option<String> = None;
-                            let writeback_attr = Self::tag_call_writeback_attr();
+                            let writeback_attr = Self::tag_call_writeback_attr(tag_name);
                             let is_dbinfo = matches!(
                                 tag_builtin_name.as_deref(),
                                 Some("cfdbinfo") | Some("dbinfo")
@@ -3802,6 +3802,11 @@ impl CfmlVirtualMachine {
                                     CfmlValue::Null
                                 };
                                 apply_attr(name, value, &mut opts, &mut writeback_var);
+                            }
+                            // cfhttp with no explicit result= writes its return
+                            // struct into a variable named `cfhttp` (tag-form parity).
+                            if writeback_var.is_none() && tag_name.eq_ignore_ascii_case("cfhttp") {
+                                writeback_var = Some("cfhttp".to_string());
                             }
                             self.closure_parent_writeback = None;
                             self.arg_ref_writeback = None;
@@ -10585,9 +10590,17 @@ impl CfmlVirtualMachine {
 
     /// Attribute names whose value (a string) is the caller-scope variable
     /// the tag-call writes its return value back to (e.g. `name="dirQ"` on
-    /// `cfdirectory(...)` populates `dirQ` with the listing query).
-    fn tag_call_writeback_attr() -> &'static [&'static str] {
-        &["name", "variable"]
+    /// `cfdirectory(...)` populates `dirQ` with the listing query). `cfhttp`
+    /// uses `result` instead — without it the bare statement form
+    /// `cfhttp(url=…, result="r")` silently dropped its return struct (the
+    /// block form `cfhttp(…){…}` is rewritten to an explicit assignment in the
+    /// parser, so only the no-block call form was affected).
+    fn tag_call_writeback_attr(tag: &str) -> &'static [&'static str] {
+        if tag.eq_ignore_ascii_case("cfhttp") {
+            &["result"]
+        } else {
+            &["name", "variable"]
+        }
     }
 
     /// Reorder named args to declared-param positions and surface the named
