@@ -38,6 +38,16 @@ pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 /// immediately.
 const MIN_SESSION_TIMEOUT_SECS: u64 = 60;
 
+/// Reserved `locals` key under which a frame's `arguments` scope is stored.
+/// CFML keeps `local` and `arguments` as fully independent scopes (Lucee and
+/// BoxLang both back them with separate scope objects), so the scope must NOT
+/// occupy the literal `"arguments"` key — that key is reserved for a user's own
+/// `local.arguments = …` variable. The `__` prefix means every introspection
+/// filter that already skips `__`-prefixed keys hides this automatically. All
+/// bare-`arguments` reads/writes route here via `scope_aware_load` /
+/// `scope_aware_store` / `lookup_name_in_scopes`.
+const ARGUMENTS_SCOPE_KEY: &str = "__arguments__";
+
 /// A stored `CfmlValue::Function` body is `CfmlClosureBody::Expression(Int(n))`
 /// where `n` is the target function's process-stable `BytecodeFunction.global_id`
 /// (see `cfml_codegen::compiler::next_global_fn_id`). `DefineFunction` ops carry
@@ -2169,7 +2179,10 @@ impl CfmlVirtualMachine {
             "__arguments_params".to_string(),
             CfmlValue::array(params_array),
         );
-        locals.insert("arguments".to_string(), CfmlValue::strukt(arguments_map));
+        locals.insert(
+            ARGUMENTS_SCOPE_KEY.to_string(),
+            CfmlValue::strukt(arguments_map),
+        );
 
         // The name this call was dispatched under (a member-call alias, if any).
         // Always drained so it can't leak into a later call; falls back to the
@@ -2500,7 +2513,18 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "thread" && self.globals.contains_key("thread") {
                             self.globals.insert("thread".to_string(), val);
-                        } else if name_lower == "arguments" && is_inside_function {
+                        } else if name_lower == "arguments"
+                            && is_inside_function
+                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(&name_lower)
+                        {
+                            // Storing the `arguments` SCOPE (bare `arguments = …`
+                            // or an `arguments.x = …` round-trip). A user
+                            // `local.arguments = …` emits DeclareLocal first, so
+                            // it lands in `declared_locals` and falls through to
+                            // the plain locals-insert branch (literal "arguments"
+                            // key) instead — keeping the two scopes independent.
+                            //
                             // When the arguments scope is stored, sync complex-type
                             // params back to their named locals so that modifications
                             // via `arguments.param.prop = val` are visible to the
@@ -2532,7 +2556,9 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                            locals.insert(name.clone(), val);
+                            // The arguments scope lives under the reserved key, not
+                            // the literal "arguments" (which is a user local var).
+                            locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
                         } else if locals.contains_key("__variables")
                             && !declared_locals.contains(name)
                             && !declared_locals.contains(&name_lower)
@@ -2578,7 +2604,7 @@ impl CfmlVirtualMachine {
                                 )
                             {
                                 if let Some(args) =
-                                    locals.get_mut("arguments").and_then(|v| v.as_cfml_struct())
+                                    locals.get_mut(ARGUMENTS_SCOPE_KEY).and_then(|v| v.as_cfml_struct())
                                 {
                                     args.insert(name.clone(), val.clone());
                                 }
@@ -2684,7 +2710,7 @@ impl CfmlVirtualMachine {
                             && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
                         {
                             if let Some(args) =
-                                locals.get_mut("arguments").and_then(|v| v.as_cfml_struct())
+                                locals.get_mut(ARGUMENTS_SCOPE_KEY).and_then(|v| v.as_cfml_struct())
                             {
                                 args.insert(name.clone(), val.clone());
                             }
@@ -4093,6 +4119,7 @@ impl CfmlVirtualMachine {
                             for (k, v) in &locals {
                                 if k == "arguments"
                                     || k == "this"
+                                    || k.starts_with("__")
                                     || func.params.contains(k)
                                     || declared_locals.contains(k.as_str())
                                 {
@@ -5563,7 +5590,7 @@ impl CfmlVirtualMachine {
                             // inject captured_scope that triggers spurious write-backs.
                             if let Some(inc_locals) = self.captured_locals.take() {
                                 for (k, v) in inc_locals {
-                                    if k == "arguments" {
+                                    if k == "arguments" || k.starts_with("__") {
                                         continue;
                                     }
                                     // Only merge NEW variables that are not functions and
@@ -5671,7 +5698,7 @@ impl CfmlVirtualMachine {
                             // Merge new non-function variables from the include
                             if let Some(inc_locals) = self.captured_locals.take() {
                                 for (k, v) in inc_locals {
-                                    if k == "arguments" {
+                                    if k == "arguments" || k.starts_with("__") {
                                         continue;
                                     }
                                     if !pre_include_keys.contains(&k)
@@ -5890,7 +5917,7 @@ impl CfmlVirtualMachine {
                     // locals, and __variables (handled by method_variables_writeback)
                     if k == "arguments"
                         || k == "this"
-                        || k == "__variables"
+                        || k.starts_with("__")
                         || func.params.contains(k)
                         || declared_locals.contains(k.as_str())
                     {
@@ -10228,10 +10255,19 @@ impl CfmlVirtualMachine {
     ) -> Option<CfmlValue> {
         let name_lower = name.to_lowercase();
         if name_lower == "local" {
-            // `local` is always the function-local scope.
+            // `local` is always the function-local scope. Strip the internal
+            // bridge keys (`__variables`, the `arguments` scope under
+            // ARGUMENTS_SCOPE_KEY, …) — they are not local variables.
             let mut scope = locals.clone();
-            scope.shift_remove("__variables");
+            scope.retain(|k, _| !k.starts_with("__"));
             return Some(CfmlValue::strukt(scope));
+        }
+        if name_lower == "arguments" {
+            // The arguments scope lives under the reserved key; a literal
+            // "arguments" key (if any) is a user local var, handled below.
+            if let Some(v) = locals.get(ARGUMENTS_SCOPE_KEY) {
+                return Some(v.clone());
+            }
         }
         if name_lower == "variables" {
             if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
@@ -10288,6 +10324,13 @@ impl CfmlVirtualMachine {
         name_lower: &str,
         locals: &IndexMap<String, CfmlValue>,
     ) -> Option<CfmlValue> {
+        // Bare `arguments` resolves to the scope stored under the reserved key
+        // (independent of any user `local.arguments` var at the literal key).
+        if name_lower == "arguments" {
+            if let Some(v) = locals.get(ARGUMENTS_SCOPE_KEY) {
+                return Some(v.clone());
+            }
+        }
         if let Some(v) = locals.get(name) {
             return Some(v.clone());
         }
@@ -10365,6 +10408,11 @@ impl CfmlVirtualMachine {
             if let CfmlValue::Struct(s) = &val {
                 self.request_scope.with_write(|m| *m = s.snapshot());
             }
+        } else if name_lower == "arguments" && locals.contains_key(ARGUMENTS_SCOPE_KEY) {
+            // Write back the arguments scope under its reserved key (so an
+            // `arguments.x = …` round-trip doesn't fork a literal "arguments"
+            // key, which belongs to a user `local.arguments` var).
+            locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
         } else if locals.contains_key(name) {
             locals.insert(name.to_string(), val);
         } else if self.globals.contains_key(name) {
@@ -10777,7 +10825,11 @@ impl CfmlVirtualMachine {
             if inherited_or_param_keys.contains(k) {
                 continue;
             }
-            if k == "this" || k == "super" || k == "arguments" || k.starts_with("__") {
+            // `this`/`super`/the `arguments` scope (ARGUMENTS_SCOPE_KEY) and
+            // every other internal bridge key are `__`-prefixed or filtered
+            // here. A literal "arguments" key is now a genuine user
+            // `local.arguments` var and stays visible.
+            if k == "this" || k == "super" || k.starts_with("__") {
                 continue;
             }
             out.insert(k.clone(), v.clone());

@@ -337,6 +337,7 @@ try { include "core/test_local_at_template_scope.cfm"; } catch (any e) { writeOu
 //     before its INSERT, silently. Runtime-level (wrong values, no parse
 //     error), so registration is safe.
 try { include "core/test_local_scope_absence_leak.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_scope_absence_leak.cfm | " & e.message & chr(10)); }
+try { include "core/test_local_arguments_scope_independence.cfm"; } catch (any e) { writeOutput("ERROR | core/test_local_arguments_scope_independence.cfm | " & e.message & chr(10)); }
 try { include "oop/test_metadata_name_value.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_metadata_name_value.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_script_syntax_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_script_syntax_body.cfm | " & e.message & chr(10)); }
 try { include "functions/test_expandpath_trailing_slash.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_expandpath_trailing_slash.cfm | " & e.message & chr(10)); }
