@@ -320,7 +320,7 @@ impl SessionStore for DatasourceStore {
         self.get(id).is_some()
     }
 
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, IndexMap<String, CfmlValue>)> {
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
         self.ensure_schema();
         // 1. Find candidates.
         let sel = format!(
@@ -376,7 +376,7 @@ impl SessionStore for DatasourceStore {
                 let vars = serde_json::from_str::<SessionData>(&data)
                     .map(|s| s.variables)
                     .unwrap_or_default();
-                out.push((cfid, vars));
+                out.push((self.app_name.clone(), cfid, vars));
             }
         }
         out
@@ -419,6 +419,7 @@ mod tests {
             auth_user: None,
             auth_roles: Vec::new(),
             timeout_secs: timeout,
+            app_name: "appA".to_string(),
         }
     }
 
@@ -483,8 +484,9 @@ mod tests {
 
         let expired = store.take_expired(now);
         assert_eq!(expired.len(), 1, "only the timed-out session should be swept");
-        assert_eq!(expired[0].0, "dead");
-        assert_eq!(expired[0].1.get("b").unwrap().as_string(), "2");
+        assert_eq!(expired[0].0, "appA", "app_name should be the store's partition");
+        assert_eq!(expired[0].1, "dead");
+        assert_eq!(expired[0].2.get("b").unwrap().as_string(), "2");
 
         // The claim is the delete — a second sweep returns nothing.
         assert!(store.take_expired(now).is_empty());

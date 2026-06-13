@@ -31,6 +31,7 @@ pub struct RustCfmlConfig {
     pub caches: IndexMap<String, CacheCfg>,
     #[serde(rename = "sessionStorage")]
     pub session_storage: String,
+    pub session: SessionCfg,
     pub logging: LoggingCfg,
     pub debugging: DebuggingCfg,
     pub security: SecurityCfg,
@@ -165,6 +166,45 @@ impl RuntimeCfg {
         let m = parts.next()?.ok()?;
         let s = parts.next()?.ok()?;
         Some(d * 86_400 + h * 3_600 + m * 60 + s)
+    }
+}
+
+// ─────────────────────────────────────────────
+// Session reaper
+// ─────────────────────────────────────────────
+
+/// Background session-expiry reaper settings (serve mode only). The reaper
+/// drains expired sessions off the request path on a timer, so a normal
+/// request pays ~zero expiry cost and idle servers still evict expired data.
+/// `onSessionEnd` itself fires opportunistically on the next request for the
+/// owning application (cleanup-only delivery — see docs/known-issues.md).
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct SessionCfg {
+    /// Reaper tick in seconds. `0` disables the background reaper entirely
+    /// (read-path exactness + native store TTL still apply).
+    #[serde(rename = "reapIntervalSecs")]
+    pub reap_interval_secs: u64,
+    /// When true, sleep until the next session's expiry instant (capped at
+    /// `reapIntervalSecs`) instead of waking on the fixed interval. Only stores
+    /// that can compute the next expiry cheaply benefit; others fall back to
+    /// the fixed tick.
+    #[serde(rename = "reapAdaptive")]
+    pub reap_adaptive: bool,
+    /// Maximum number of pending `onSessionEnd` deliveries buffered per
+    /// application between requests. Beyond this the oldest are dropped (with a
+    /// log line) so a never-revisited application cannot leak memory.
+    #[serde(rename = "reapBatchMax")]
+    pub reap_batch_max: usize,
+}
+
+impl Default for SessionCfg {
+    fn default() -> Self {
+        Self {
+            reap_interval_secs: 60,
+            reap_adaptive: false,
+            reap_batch_max: 1000,
+        }
     }
 }
 

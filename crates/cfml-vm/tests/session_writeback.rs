@@ -85,7 +85,7 @@ impl SessionStore for SpyStore {
     fn take_expired(
         &self,
         now_secs: u64,
-    ) -> Vec<(String, IndexMap<String, CfmlValue>)> {
+    ) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
         self.inner.take_expired(now_secs)
     }
 }

@@ -1104,6 +1104,96 @@ async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::sess
     }
 }
 
+/// Spawn the background session-expiry reaper. The reaper wakes on a timer,
+/// drains every expired session out of the store (off the request path), and
+/// queues an `onSessionEnd` delivery per drained session against its owning
+/// application. The hook fires on the next request for that application
+/// (cleanup-only delivery). A `reapIntervalSecs` of 0 disables the reaper
+/// entirely — read-path exactness and native store TTL still apply.
+fn spawn_session_reaper(server_state: cfml_vm::ServerState, cfconfig: &RustCfmlConfig) {
+    let cfg = cfconfig.session.clone();
+    if cfg.reap_interval_secs == 0 {
+        println!("[session] background reaper disabled (reapIntervalSecs = 0)");
+        return;
+    }
+    let interval = std::time::Duration::from_secs(cfg.reap_interval_secs);
+    let batch_max = cfg.reap_batch_max;
+    let adaptive = cfg.reap_adaptive;
+    println!(
+        "[session] background reaper enabled (interval={}s, adaptive={}, batchMax={})",
+        cfg.reap_interval_secs, adaptive, batch_max
+    );
+    let sessions = server_state.sessions.clone();
+    let pending_owner = server_state;
+
+    tokio::spawn(async move {
+        // First tick is a full interval away — don't reap immediately on boot.
+        loop {
+            // Decide how long to sleep. Adaptive: until the earliest known
+            // expiry, capped at the configured tick (and floored at 1s so a
+            // burst of already-expired sessions can't spin). Stores that can't
+            // compute the next expiry return None and fall back to the tick.
+            let delay = if adaptive {
+                let now = now_unix_secs();
+                match sessions.next_expiry(now) {
+                    Some(next) => {
+                        let secs = next.saturating_sub(now).clamp(1, cfg.reap_interval_secs);
+                        std::time::Duration::from_secs(secs)
+                    }
+                    None => interval,
+                }
+            } else {
+                interval
+            };
+            tokio::time::sleep(delay).await;
+
+            let now = now_unix_secs();
+            // `take_expired` may run blocking SQL (datasource store) — keep it
+            // off the async worker threads.
+            let sessions_for_blocking = sessions.clone();
+            let drained =
+                tokio::task::spawn_blocking(move || sessions_for_blocking.take_expired(now))
+                    .await
+                    .unwrap_or_default();
+
+            if drained.is_empty() {
+                continue;
+            }
+            let count = drained.len();
+            let mut dropped_any = false;
+            for (app_name, _id, vars) in drained {
+                // app_name is "" for stores that don't record it (memcached /
+                // KV); those never reach here because their take_expired is a
+                // no-op, but guard anyway — an unkeyed hook can never be
+                // delivered, so skip queuing it rather than stranding memory.
+                if app_name.is_empty() {
+                    continue;
+                }
+                if pending_owner.queue_session_end(&app_name, vars, batch_max) {
+                    dropped_any = true;
+                }
+            }
+            if dropped_any {
+                log::warn!(
+                    "[session] reaper dropped the oldest pending onSessionEnd for at least one \
+                     application (reapBatchMax = {} reached — that application has not been \
+                     requested recently)",
+                    batch_max
+                );
+            }
+            log::debug!("[session] reaper drained {} expired session(s)", count);
+        }
+    });
+}
+
+/// Current unix epoch seconds (wall clock).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 async fn async_run_server(
     doc_root: &Path,
     port: u16,
@@ -1164,6 +1254,12 @@ async fn async_run_server(
     println!("RustCFML server running on http://127.0.0.1:{} ({})", port, mode);
     println!("Document root: {}", fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()).display());
     println!("Press Ctrl+C to stop\n");
+
+    // Spawn the background session reaper (serve mode only). It drains expired
+    // session data off the request path on a timer and queues `onSessionEnd`
+    // deliveries per application; the hooks themselves fire on the next request
+    // for the owning application. Disabled when reapIntervalSecs = 0.
+    spawn_session_reaper(server_state.clone(), &cfconfig);
 
     let app_state = Arc::new(AppState {
         doc_root: doc_root.to_path_buf(),

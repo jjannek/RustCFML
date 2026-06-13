@@ -274,6 +274,14 @@ mod inner {
 
     const SESSION_FIELD: &str = "data";
 
+    /// Current unix epoch seconds (wall clock), for read-path expiry checks.
+    fn now_unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     fn write_session(doc: &mut automerge::AutoCommit, data: &SessionData) -> Result<(), String> {
         use automerge::{ObjType, ReadDoc, ROOT, transaction::Transactable};
         let json = serde_json::to_vec(data).map_err(|e| e.to_string())?;
@@ -560,7 +568,16 @@ mod inner {
         fn get(&self, id: &str) -> Option<SessionData> {
             let docs = self.shared.docs.lock().ok()?;
             let doc = docs.get(id)?;
-            read_session(doc)
+            let s = read_session(doc)?;
+            // Read-path exactness (G1): an expired session reads as absent the
+            // instant it times out, independent of the reaper sweep. We don't
+            // remove here (would need a write lock + tombstone broadcast);
+            // `take_expired` reclaims it on the next reaper tick.
+            let now = now_unix_secs();
+            if now.saturating_sub(s.last_accessed_secs) > s.timeout_secs {
+                return None;
+            }
+            Some(s)
         }
 
         fn set(&self, id: &str, data: SessionData) {
@@ -602,7 +619,10 @@ mod inner {
             }
         }
 
-        fn take_expired(&self, now_secs: u64) -> Vec<(String, IndexMap<String, CfmlValue>)> {
+        fn take_expired(
+            &self,
+            now_secs: u64,
+        ) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
             let expired_ids: Vec<String> = match self.shared.docs.lock() {
                 Ok(docs) => docs
                     .iter()
@@ -619,19 +639,29 @@ mod inner {
             };
             let mut out = Vec::with_capacity(expired_ids.len());
             for id in expired_ids {
-                let vars = {
+                let drained = {
                     let docs = match self.shared.docs.lock() {
                         Ok(d) => d,
                         Err(_) => continue,
                     };
-                    docs.get(&id).and_then(read_session).map(|s| s.variables)
+                    docs.get(&id)
+                        .and_then(read_session)
+                        .map(|s| (s.app_name, s.variables))
                 };
-                if let Some(vars) = vars {
-                    out.push((id.clone(), vars));
+                if let Some((app_name, vars)) = drained {
+                    out.push((app_name, id.clone(), vars));
                     self.remove(&id);
                 }
             }
             out
+        }
+
+        fn next_expiry(&self, _now_secs: u64) -> Option<u64> {
+            let docs = self.shared.docs.lock().ok()?;
+            docs.values()
+                .filter_map(read_session)
+                .map(|s| s.last_accessed_secs.saturating_add(s.timeout_secs))
+                .min()
         }
     }
 }

@@ -25,9 +25,21 @@ pub trait SessionStore: Send + Sync + 'static {
         self.get(id).is_some()
     }
     /// Drain all sessions whose `last_accessed_secs` age exceeds their
-    /// `timeout_secs`, returning their IDs and variable maps so callers can
-    /// invoke `onSessionEnd`.
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, IndexMap<String, CfmlValue>)>;
+    /// `timeout_secs`, returning `(app_name, id, variables)` per drained
+    /// session so callers can route `onSessionEnd` to the owning application.
+    /// `app_name` is `""` for stores that do not record it (memcached / KV),
+    /// which also never deliver `onSessionEnd`.
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, IndexMap<String, CfmlValue>)>;
+
+    /// Earliest absolute expiry instant (unix epoch seconds) across all live
+    /// sessions, if the store can compute it cheaply. Drives adaptive reaper
+    /// scheduling: when `Some(t)`, the reaper may sleep until `t` (capped at
+    /// the configured tick) instead of waking on a fixed interval. The default
+    /// returns `None`, so a store opts out simply by not overriding it and the
+    /// reaper falls back to its fixed tick.
+    fn next_expiry(&self, _now_secs: u64) -> Option<u64> {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -57,7 +69,19 @@ impl Default for MemoryStore {
 
 impl SessionStore for MemoryStore {
     fn get(&self, id: &str) -> Option<SessionData> {
-        self.inner.lock().ok()?.get(id).cloned()
+        // Read-path exactness (G1): a session is invisible the instant it is
+        // past `last_accessed + timeout`, independent of any sweep. Remove the
+        // dead record opportunistically while we hold the lock.
+        let now = crate::now_epoch_secs();
+        let mut m = self.inner.lock().ok()?;
+        match m.get(id) {
+            Some(s) if now.saturating_sub(s.last_accessed_secs) > s.timeout_secs => {
+                m.remove(id);
+                None
+            }
+            Some(s) => Some(s.clone()),
+            None => None,
+        }
     }
 
     fn set(&self, id: &str, data: SessionData) {
@@ -81,10 +105,11 @@ impl SessionStore for MemoryStore {
     }
 
     fn contains(&self, id: &str) -> bool {
-        self.inner.lock().ok().map_or(false, |m| m.contains_key(id))
+        // Route through the expiry-aware get so an expired record reads absent.
+        self.get(id).is_some()
     }
 
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, IndexMap<String, CfmlValue>)> {
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
         if let Ok(mut m) = self.inner.lock() {
             let expired: Vec<String> = m
                 .iter()
@@ -93,10 +118,81 @@ impl SessionStore for MemoryStore {
                 .collect();
             expired
                 .into_iter()
-                .filter_map(|id| m.remove(&id).map(|s| (id, s.variables)))
+                .filter_map(|id| m.remove(&id).map(|s| (s.app_name.clone(), id, s.variables)))
                 .collect()
         } else {
             Vec::new()
         }
+    }
+
+    fn next_expiry(&self, _now_secs: u64) -> Option<u64> {
+        let m = self.inner.lock().ok()?;
+        m.values()
+            .map(|s| s.last_accessed_secs.saturating_add(s.timeout_secs))
+            .min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::now_epoch_secs;
+
+    fn session(app: &str, last_accessed: u64, timeout: u64) -> SessionData {
+        SessionData {
+            variables: IndexMap::new(),
+            created_secs: last_accessed,
+            last_accessed_secs: last_accessed,
+            auth_user: None,
+            auth_roles: Vec::new(),
+            timeout_secs: timeout,
+            app_name: app.to_string(),
+        }
+    }
+
+    #[test]
+    fn get_hides_and_removes_expired_record() {
+        let store = MemoryStore::new();
+        let now = now_epoch_secs();
+        // last accessed 10_000s ago, 5s timeout → already expired.
+        store.set("dead", session("appA", now - 10_000, 5));
+        assert!(store.get("dead").is_none(), "expired session must read as absent");
+        assert!(!store.contains("dead"), "contains must agree with get");
+        // It was opportunistically removed, so take_expired finds nothing left.
+        assert!(store.take_expired(now).is_empty(), "get should have evicted it");
+    }
+
+    #[test]
+    fn get_returns_live_record() {
+        let store = MemoryStore::new();
+        let now = now_epoch_secs();
+        store.set("live", session("appA", now, 1800));
+        assert!(store.get("live").is_some());
+        assert!(store.contains("live"));
+    }
+
+    #[test]
+    fn take_expired_reports_owning_app_name() {
+        let store = MemoryStore::new();
+        let now = now_epoch_secs();
+        store.set("a", session("shop", now - 10_000, 5));
+        store.set("b", session("blog", now, 1800));
+        let mut drained = store.take_expired(now);
+        assert_eq!(drained.len(), 1, "only the timed-out session is drained");
+        let (app, id, _vars) = drained.pop().unwrap();
+        assert_eq!(app, "shop");
+        assert_eq!(id, "a");
+        // The live session survives and its app is untouched.
+        assert!(store.get("b").is_some());
+    }
+
+    #[test]
+    fn next_expiry_is_earliest_absolute_instant() {
+        let store = MemoryStore::new();
+        let base = 1_000_000;
+        store.set("a", session("x", base, 100)); // expires at base+100
+        store.set("b", session("x", base, 30)); // expires at base+30  (earliest)
+        store.set("c", session("x", base, 900)); // expires at base+900
+        assert_eq!(store.next_expiry(base), Some(base + 30));
     }
 }

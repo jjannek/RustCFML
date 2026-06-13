@@ -93,6 +93,12 @@ pub struct SessionData {
     pub auth_roles: Vec<String>,
     /// Session timeout in seconds (default 1800 = 30 minutes)
     pub timeout_secs: u64,
+    /// Name of the CFML application that owns this session. Recorded at create
+    /// time so the background reaper can route `onSessionEnd` to the owning
+    /// application's live context. Backward-compatible: older serialised
+    /// records (datasource/cluster stores) deserialise with `""`.
+    #[serde(default)]
+    pub app_name: String,
 }
 
 /// Data-only session rule (issue #88): the session scope persists data values
@@ -551,6 +557,14 @@ pub struct ServerState {
     /// Resolved `.cfconfig.json` (or defaults if no file). Wraps in `Arc` so
     /// every cloned ServerState shares the same struct without re-parsing.
     pub cfconfig: Arc<cfml_config::RustCfmlConfig>,
+    /// `onSessionEnd` deliveries queued by the background reaper, keyed by the
+    /// owning application name. The reaper drains expired session *data* off
+    /// the request path (cleanup); the hook itself needs a live per-app VM
+    /// context, so each request for an application drains its queue here and
+    /// fires `onSessionEnd` with that context. Bounded per app by
+    /// `session.reapBatchMax` (oldest dropped beyond the cap).
+    pub pending_session_ends:
+        Arc<Mutex<HashMap<String, std::collections::VecDeque<IndexMap<String, CfmlValue>>>>>,
 }
 
 impl ServerState {
@@ -576,7 +590,42 @@ impl ServerState {
             app_cfc_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             app_cfconfig_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
+            pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Queue an expired session's variables for an opportunistic `onSessionEnd`
+    /// on the next request for `app_name`. Bounded: once a per-app queue reaches
+    /// `batch_max`, the oldest entry is dropped (and counted) so an application
+    /// that is never revisited cannot grow the queue without limit.
+    pub fn queue_session_end(
+        &self,
+        app_name: &str,
+        vars: IndexMap<String, CfmlValue>,
+        batch_max: usize,
+    ) -> bool {
+        if let Ok(mut q) = self.pending_session_ends.lock() {
+            let dq = q.entry(app_name.to_string()).or_default();
+            let mut dropped = false;
+            while batch_max > 0 && dq.len() >= batch_max {
+                dq.pop_front();
+                dropped = true;
+            }
+            dq.push_back(vars);
+            return dropped;
+        }
+        false
+    }
+
+    /// Drain all queued `onSessionEnd` deliveries for `app_name`, returning
+    /// their variable maps in arrival order. Empty when nothing is pending.
+    pub fn drain_session_ends(&self, app_name: &str) -> Vec<IndexMap<String, CfmlValue>> {
+        if let Ok(mut q) = self.pending_session_ends.lock() {
+            if let Some(dq) = q.get_mut(app_name) {
+                return dq.drain(..).collect();
+            }
+        }
+        Vec::new()
     }
 }
 
@@ -8953,6 +9002,7 @@ impl CfmlVirtualMachine {
                             auth_user: None,
                             auth_roles: Vec::new(),
                             timeout_secs: 1800,
+                            app_name: self.current_application_name.clone().unwrap_or_default(),
                         });
                         session.auth_user = Some(name);
                         session.auth_roles = roles;
@@ -12216,6 +12266,7 @@ impl CfmlVirtualMachine {
                     auth_user: None,
                     auth_roles: Vec::new(),
                     timeout_secs: self.session_timeout_secs,
+                    app_name: self.current_application_name.clone().unwrap_or_default(),
                 },
             );
         }
@@ -12275,6 +12326,7 @@ impl CfmlVirtualMachine {
                 auth_user: None,
                 auth_roles: Vec::new(),
                 timeout_secs: self.session_timeout_secs,
+                app_name: self.current_application_name.clone().unwrap_or_default(),
             });
             session.variables = snap;
             session.last_accessed_secs = now;
@@ -14776,6 +14828,7 @@ impl CfmlVirtualMachine {
                             auth_user: None,
                             auth_roles: Vec::new(),
                             timeout_secs: session_timeout,
+                            app_name: app_name.clone(),
                         },
                     );
                     self.session_record_created = true;
@@ -14862,25 +14915,29 @@ impl CfmlVirtualMachine {
             }
         }
 
-        // 8b. Session expiry — scan and expire timed-out sessions
+        // 8b. Session expiry — deliver any `onSessionEnd` hooks queued by the
+        // background reaper for THIS application. The reaper evicts expired
+        // session data off the request path (so a normal request pays ~zero
+        // expiry cost); the hook itself needs the owning application's live
+        // context, which only exists on a request, so it fires opportunistically
+        // here. Keyed by app name, so a request only ever runs hooks for its own
+        // application's expired sessions. (Cleanup-only delivery — onSessionEnd
+        // is bounded by traffic to the application; see docs/known-issues.md.)
         if session_management {
             if let Some(ref server_state) = self.server_state.clone() {
-                let expired = server_state.sessions.take_expired(now_epoch_secs());
-                if !expired.is_empty() {
+                let pending = server_state.drain_session_ends(&app_name);
+                if !pending.is_empty() {
                     let app_scope_val = self
                         .application_scope
                         .as_ref()
                         .map(|a| CfmlValue::strukt(a.snapshot()))
                         .unwrap_or(CfmlValue::strukt(IndexMap::new()));
-                    for (_, session_vars) in &expired {
+                    for session_vars in pending {
                         // Call onSessionEnd(sessionScope, applicationScope)
                         let _ = self.call_lifecycle_method(
                             &mut template,
                             "onSessionEnd",
-                            vec![
-                                CfmlValue::strukt(session_vars.clone()),
-                                app_scope_val.clone(),
-                            ],
+                            vec![CfmlValue::strukt(session_vars), app_scope_val.clone()],
                         );
                     }
                 }

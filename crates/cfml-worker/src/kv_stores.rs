@@ -171,7 +171,7 @@ impl SessionStore for KvBackedSessionStore {
         self.memory.contains(id)
     }
 
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, indexmap::IndexMap<String, cfml_common::dynamic::CfmlValue>)> {
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, indexmap::IndexMap<String, cfml_common::dynamic::CfmlValue>)> {
         // Worker isolates don't run a background sweeper — expiry is handled
         // by KV TTL. Always return empty so the VM doesn't try to fire
         // onSessionEnd for sessions it can't observe.

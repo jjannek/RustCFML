@@ -140,6 +140,23 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 | `sessionTimeout` | `"d,h,m,s"` | `"0,0,30,0"` | Session scope timeout |
 | `clientTimeout` | `"d,h,m,s"` | `"7,0,0,0"` | Client scope timeout |
 
+### `session`
+
+Background session-expiry reaper (serve mode only). The reaper drains expired
+session data off the request path on a timer, so a normal request pays ~zero
+expiry cost and an idle server still evicts expired sessions. `onSessionEnd`
+fires opportunistically on the next request for the owning application
+(cleanup-only delivery — see `docs/known-issues.md` §12d).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `reapIntervalSecs` | int | `60` | Reaper tick in seconds. `0` disables the reaper entirely (read-path exactness + native store TTL still apply) |
+| `reapAdaptive` | bool | `false` | Sleep until the next session's expiry (capped at `reapIntervalSecs`). Only memory/cluster stores benefit; others use the fixed tick |
+| `reapBatchMax` | int | `1000` | Max pending `onSessionEnd` deliveries buffered per application between requests; beyond it the oldest is dropped (logged) |
+
+> Note: `sessionTimeout` (under `runtime`, or `this.sessionTimeout`) is clamped
+> to a 60-second floor — sub-minute session timeouts are raised to 60s.
+
 ### `datasources`
 
 Map of name → driver config. The name becomes the value used in

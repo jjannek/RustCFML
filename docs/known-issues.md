@@ -228,7 +228,7 @@ between the two stores.
 |---|---|---|
 | Concurrency | last-write-wins (whole-blob) | same model as the memcached store; optimistic versioning is a possible v2 |
 | Upsert | portable `UPDATE`-then-`INSERT` | avoids dialect-specific `ON CONFLICT`/`ON DUPLICATE KEY`/`MERGE` |
-| `onSessionEnd` sweep | portable `SELECT` + per-row `DELETE` claim (no `RETURNING`) | the delete is the cross-node claim, so multi-node does not double-fire — **best-effort, no delivery guarantee** |
+| Expiry sweep | portable `SELECT` + per-row `DELETE` claim (no `RETURNING`), now driven by the background reaper (§12d) not the request path | the delete is the cross-node claim, so multi-node does not double-fire — `onSessionEnd` is **best-effort, no delivery guarantee** (cleanup-only; see §12d) |
 | Expiry touch | throttled (skips the write until ~25% of the timeout elapses with no data change) | kills per-request write amplification; semantically invisible |
 | App partition | single logical `app_name` per store | multi-app isolation via distinct datasources/tables in v1 |
 | DDL denied by grants | clear error telling you to pre-create the documented schema | the store then just uses it |
@@ -267,6 +267,58 @@ persist-time deep walk (the airtight gate — also catches values smuggled in vi
 reference mutation, e.g. `local.x = {}; session.box = local.x; local.x.p = new C()`).
 Dates are strings and binary/query have JSON round-trip forms, so the allowed
 set covers everything that round-trips.
+
+### 12d. Session expiry — background reaper + read-path exactness — *new*
+
+Expiry no longer rides on request handling. Two independent mechanisms:
+
+**Read-path exactness (hard guarantee).** Every store's `get()` treats a record
+past `last_accessed + timeout` as absent the instant it expires, independent of
+any sweep — so application code never sees a session that should have died. The
+memory store removes the dead record opportunistically on read; the datasource
+store filters `expires_at > now` in its `SELECT`; memcached/KV rely on native
+TTL; the cluster store checks expiry in `get()`.
+
+**Background reaper (serve mode only).** A `tokio` task drains expired session
+*data* out of the store on a timer — off the request path, so a normal request
+pays ~zero expiry cost, and an **idle server still evicts** expired data (the old
+request-driven sweep could leave a dead session lingering with unbounded lateness
+until the next hit). Config under `session`:
+
+```jsonc
+{ "session": {
+    "reapIntervalSecs": 60,   // tick; 0 disables the reaper entirely
+    "reapAdaptive": false,    // sleep until the next expiry (capped at the tick)
+    "reapBatchMax": 1000      // max pending onSessionEnd per app between requests
+} }
+```
+
+🛑 **`onSessionEnd` is cleanup-only (delivery bounded by traffic).** The hook is
+per-application CFML that needs the owning app's `Application.cfc`, `application`
+scope, and mappings — all of which exist only inside a live request. The reaper
+has no request context, so it **cannot fire `onSessionEnd` itself**. Instead it
+queues the expired session's scope per application, and the hook fires on the
+**next request for that application**. Consequences, documented rather than
+hidden:
+
+- An application that is **never requested again** drains its data on schedule
+  but its `onSessionEnd` hooks never run. The per-app queue is bounded by
+  `reapBatchMax`; beyond it the oldest pending hook is dropped (logged).
+- **memcached / KV stores never deliver `onSessionEnd`** at all — expiry there is
+  native TTL with no drain hook, so there is nothing to queue.
+- **Server shutdown drops pending `onSessionEnd`** (matches Lucee's hard-stop
+  semantics). A graceful-drain-on-shutdown is *not* offered: under cleanup-only
+  delivery it could only evict data (no request context exists on shutdown to run
+  the hook), so it would add no hook-delivery value.
+- `reapAdaptive` only helps stores that can cheaply report their next expiry
+  (memory, cluster); the datasource store falls back to the fixed tick rather
+  than issue a `SELECT MIN(expires_at)` every wake-up.
+
+`onSessionEnd` was already **best-effort with no delivery guarantee** before this
+change (the datasource store's delete-as-claim row in §12a says as much); the
+reaper keeps that contract and additionally fixes the idle-server data-eviction
+gap. CLI (single-shot) mode spawns no reaper — expiry is irrelevant for a
+one-request process.
 
 ---
 
