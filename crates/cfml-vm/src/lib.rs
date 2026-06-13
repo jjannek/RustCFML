@@ -10284,6 +10284,13 @@ impl CfmlVirtualMachine {
         if name_lower == "request" {
             return Some(CfmlValue::strukt(self.request_scope.snapshot()));
         }
+        if name_lower == "session" {
+            // Session must resolve to the live/persisted scope, not a stray
+            // `session` local — otherwise a nested write (`session.a.b = v`,
+            // routed here via store_runtime_path) loads an empty struct and
+            // its mutation never reaches the persisted SessionData.
+            return Some(self.get_session_scope());
+        }
         if let Some(v) = locals.get(name) {
             return Some(v.clone());
         }
@@ -10407,6 +10414,14 @@ impl CfmlVirtualMachine {
         } else if name_lower == "request" {
             if let CfmlValue::Struct(s) = &val {
                 self.request_scope.with_write(|m| *m = s.snapshot());
+            }
+        } else if name_lower == "session" {
+            // Commit the (whole) session scope back so nested writes routed
+            // through store_runtime_path persist into the SessionData. `val`
+            // is the full session struct loaded via get_session_scope above,
+            // walked + leaf-inserted, so a full snapshot replace is correct.
+            if let CfmlValue::Struct(s) = &val {
+                let _ = self.set_session_scope(s.snapshot());
             }
         } else if name_lower == "arguments" && locals.contains_key(ARGUMENTS_SCOPE_KEY) {
             // Write back the arguments scope under its reserved key (so an
