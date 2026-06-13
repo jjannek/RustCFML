@@ -40,6 +40,10 @@ try { include "core/test_include_scope_capture.cfm"; } catch (any e) { writeOutp
 try { include "core/test_savecontent_scoped_target.cfm"; } catch (any e) { writeOutput("ERROR | core/test_savecontent_scoped_target.cfm | " & e.message & chr(10)); }
 try { include "core/test_operators.cfm"; } catch (any e) { writeOutput("ERROR | core/test_operators.cfm | " & e.message & chr(10)); }
 try { include "core/test_subscript_autovivify.cfm"; } catch (any e) { writeOutput("ERROR | core/test_subscript_autovivify.cfm | " & e.message & chr(10)); }
+// Scope-qualified nested auto-vivification (variables.$class.name = ...): the residual
+// auto-viv gap that blocked Wheels $initControllerClass. Fixed in the compiler by routing
+// multi-level scope-rooted nested writes through the runtime scope-path store.
+try { include "core/test_scoped_nested_autoviv.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scoped_nested_autoviv.cfm | " & e.message & chr(10)); }
 try { include "core/test_control_flow.cfm"; } catch (any e) { writeOutput("ERROR | core/test_control_flow.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_negative_step.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_negative_step.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_array_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_array_item_index.cfm | " & e.message & chr(10)); }

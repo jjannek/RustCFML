@@ -568,6 +568,51 @@ impl CfmlCompiler {
         )
     }
 
+    /// Scope roots whose nested member writes are routed through the runtime
+    /// scope-path store (`SetDynamicVar` → `store_runtime_path`), which
+    /// auto-vivifies missing intermediate structs scope-aware. Excludes
+    /// `this`/`super`/`arguments`/`thread`, whose member chains keep their
+    /// established struct-receiver writeback semantics.
+    fn is_autoviv_scope_root(name: &str) -> bool {
+        matches!(name.to_lowercase().as_str(),
+            "local" | "variables" | "request" | "application" | "session" |
+            "server" | "cgi" | "url" | "form" | "cookie" | "client"
+        )
+    }
+
+    /// Flatten a pure member-access chain rooted at an auto-viv scope name into
+    /// a dotted path string (e.g. `variables.zzc.name` → `"variables.zzc.name"`).
+    /// Returns `None` unless the root is an auto-viv scope identifier and every
+    /// level is a plain (non null-safe) member access — array indices, calls or
+    /// dynamic members fall back to the generic assignment path.
+    fn flatten_scope_path(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::Identifier(id) if Self::is_autoviv_scope_root(&id.name) => {
+                Some(id.name.clone())
+            }
+            Expression::MemberAccess(access) if !access.null_safe => {
+                let base = Self::flatten_scope_path(&access.object)?;
+                Some(format!("{}.{}", base, access.member))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a `<scope>.a.b…leaf = v` assignment target, return the full dotted
+    /// path string IF the base is a multi-level member chain rooted at an
+    /// auto-viv scope (i.e. ≥2 levels below the scope). Single-level writes
+    /// like `variables.x = v` return `None` so they keep their existing,
+    /// well-exercised compilation. This is the case that otherwise throws
+    /// "Variable 'X' is undefined" or silently drops the write because the
+    /// intermediate container was never declared.
+    fn scope_rooted_nested_path(obj: &Expression, member: &str) -> Option<String> {
+        if matches!(obj, Expression::MemberAccess(_)) {
+            let base = Self::flatten_scope_path(obj)?;
+            return Some(format!("{}.{}", base, member));
+        }
+        None
+    }
+
     /// Compile the base collection of an index-assignment target (`base[idx] = v`).
     /// A bare, non-scope identifier is loaded with TryLoadLocal so an undefined
     /// variable yields Null — which SetIndex then auto-vivifies into a struct or
@@ -890,7 +935,22 @@ impl CfmlCompiler {
                         Self::emit_nested_writeback(arr, instructions);
                     }
                     AssignTarget::StructAccess(obj, member) => {
-                        if let Expression::Identifier(ref ident) = **obj {
+                        // Nested write to an undeclared scope-qualified container
+                        // (`variables.zzc.name = v`): route through the runtime
+                        // scope-path store, which auto-vivifies every missing
+                        // intermediate struct scope-aware. Reading the base first
+                        // (the generic path below) would throw "Variable 'zzc' is
+                        // undefined" at page scope or silently drop the write
+                        // elsewhere. Stack on entry is [value]; SetDynamicVar wants
+                        // [path, value], so push the path and Swap.
+                        if let Some(path) = Self::scope_rooted_nested_path(obj, member) {
+                            instructions.push(BytecodeOp::String(path));
+                            instructions.push(BytecodeOp::Swap);
+                            instructions.push(BytecodeOp::SetDynamicVar);
+                            // SetDynamicVar pushes the value back; this is a
+                            // statement, so discard it.
+                            instructions.push(BytecodeOp::Pop);
+                        } else if let Expression::Identifier(ref ident) = **obj {
                             if !is_reserved_scope_name(&ident.name) {
                                 instructions.push(BytecodeOp::StoreLocalProperty(
                                     ident.name.clone(),
@@ -2488,6 +2548,21 @@ impl CfmlCompiler {
                             instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
                         }
                         Expression::MemberAccess(access) => {
+                            // Nested write to an undeclared scope-qualified
+                            // container used as an expression value
+                            // (`x = (variables.a.b = v)`): route through the
+                            // runtime scope-path store so missing intermediates
+                            // auto-vivify. Stack on entry is [value]; SetDynamicVar
+                            // wants [path, value] and pushes the value back (the
+                            // expression's result), so no trailing Pop here.
+                            if let Some(path) =
+                                Self::scope_rooted_nested_path(&access.object, &access.member)
+                            {
+                                instructions.push(BytecodeOp::String(path));
+                                instructions.push(BytecodeOp::Swap);
+                                instructions.push(BytecodeOp::SetDynamicVar);
+                                return;
+                            }
                             // Stack has [value]. When the object is a bare,
                             // non-scope identifier, use the fused StoreLocalProperty
                             // op, which auto-vivifies the local as a struct if it
