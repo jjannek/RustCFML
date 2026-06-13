@@ -540,6 +540,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cftransaction_commit".into(), fn_cftransaction_commit_stub);
     f.insert("__cftransaction_rollback".into(), fn_cftransaction_rollback_stub);
     f.insert("cfdirectory".into(), fn_cfdirectory);
+    f.insert("cffile".into(), fn_cffile);
     f.insert("cfdbinfo".into(), fn_cfdbinfo_stub);
     f.insert("dbinfo".into(), fn_cfdbinfo_stub);
     #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
@@ -8498,6 +8499,74 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
 #[cfg(target_arch = "wasm32")]
 fn fn_cfdirectory(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("cfdirectory is not supported in wasm".into()))
+}
+
+// -----------------------------------------------
+// cffile - script-call form (`cffile(action=..., ...)`)
+// -----------------------------------------------
+// The <cffile> tag lowers to specific file BIFs, but CFML also exposes every
+// built-in tag as a script-callable function. This bundles the single
+// struct-of-attributes (built by the tag-call-builtin path in the VM, which
+// also folds attributeCollection) and dispatches on `action`, returning the
+// content for read/readBinary so the VM can deliver it to `variable="..."`.
+#[cfg(not(target_arch = "wasm32"))]
+fn fn_cffile(args: Vec<CfmlValue>) -> CfmlResult {
+    let opts = match args.first() {
+        Some(CfmlValue::Struct(s)) => s,
+        _ => return Err(CfmlError::runtime("cffile requires a struct argument".into())),
+    };
+    let get_ci = |key: &str| opts.get_ci(key);
+    let str_attr = |key: &str| get_ci(key).map(|v| v.as_string()).unwrap_or_default();
+    // CFML booleanness for attribute strings ("yes"/"no"/"true"/"false").
+    let bool_attr = |key: &str| match get_ci(key) {
+        Some(CfmlValue::Bool(b)) => b,
+        Some(v) => {
+            let l = v.as_string().to_lowercase();
+            l == "true" || l == "yes" || l == "1"
+        }
+        None => false,
+    };
+
+    let action = get_ci("action")
+        .map(|v| v.as_string().to_lowercase())
+        .unwrap_or_else(|| "read".into());
+
+    match action.as_str() {
+        "read" => fn_file_read(vec![CfmlValue::string(str_attr("file"))]),
+        "readbinary" => fn_file_read_binary(vec![CfmlValue::string(str_attr("file"))]),
+        "write" => fn_file_write(vec![
+            CfmlValue::string(str_attr("file")),
+            CfmlValue::string(str_attr("output")),
+        ]),
+        "append" => {
+            let mut data = str_attr("output");
+            // addNewLine appends a trailing newline; defaults off to match the
+            // fileAppend() BIF. The tag form is delivery-equivalent.
+            if bool_attr("addnewline") {
+                data.push('\n');
+            }
+            fn_file_append(vec![CfmlValue::string(str_attr("file")), CfmlValue::string(data)])
+        }
+        "copy" => fn_file_copy(vec![
+            CfmlValue::string(str_attr("source")),
+            CfmlValue::string(str_attr("destination")),
+        ]),
+        "move" | "rename" => fn_file_move(vec![
+            CfmlValue::string(str_attr("source")),
+            CfmlValue::string(str_attr("destination")),
+        ]),
+        "delete" => fn_file_delete(vec![CfmlValue::string(str_attr("file"))]),
+        "upload" | "uploadall" => fn_cffile_upload(args),
+        _ => Err(CfmlError::runtime(format!(
+            "cffile action='{}' is not implemented.",
+            action
+        ))),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fn_cffile(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("cffile is not supported in wasm".into()))
 }
 
 // ==== ENCODING HELPERS ====

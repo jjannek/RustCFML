@@ -3822,7 +3822,16 @@ impl CfmlVirtualMachine {
                             match call_result {
                                 Ok(result) => {
                                     if let Some(var) = writeback_var {
-                                        locals.insert(var, result.clone());
+                                        // Scope-qualified targets (e.g.
+                                        // `variable="local.content"` on
+                                        // cffile(action="read")) must route
+                                        // through the scope-aware store, not a
+                                        // literal dotted key in `locals`.
+                                        if var.contains('.') {
+                                            self.store_runtime_path(&var, result.clone(), &mut locals);
+                                        } else {
+                                            locals.insert(var, result.clone());
+                                        }
                                     }
                                     self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys);
                                     stack.push(result);
@@ -10565,6 +10574,7 @@ impl CfmlVirtualMachine {
             name.to_lowercase().as_str(),
             "cfdirectory"
                 | "__cfdirectory"
+                | "cffile"
                 | "cfhttp"
                 | "cfmail"
                 | "__cfmail"
