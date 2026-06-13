@@ -3725,24 +3725,57 @@ impl CfmlVirtualMachine {
                             let mut opts: IndexMap<String, CfmlValue> = IndexMap::new();
                             let mut writeback_var: Option<String> = None;
                             let writeback_attr = Self::tag_call_writeback_attr();
+                            let is_dbinfo = matches!(
+                                tag_builtin_name.as_deref(),
+                                Some("cfdbinfo") | Some("dbinfo")
+                            );
+                            // Fold one attribute into `opts`, tracking the
+                            // `name`/`variable` write-back target as we go.
+                            let apply_attr =
+                                |key: &str, value: CfmlValue,
+                                 opts: &mut IndexMap<String, CfmlValue>,
+                                 writeback_var: &mut Option<String>| {
+                                    if key.is_empty() {
+                                        return;
+                                    }
+                                    if !is_dbinfo
+                                        && writeback_attr
+                                            .iter()
+                                            .any(|a| a.eq_ignore_ascii_case(key))
+                                    {
+                                        *writeback_var = Some(value.as_string());
+                                    }
+                                    opts.insert(key.to_string(), value);
+                                };
+                            // Pass 1: attributeCollection supplies the base attrs.
+                            // (cfdirectory/cfmail/cfhttp accept the tag's
+                            // attributeCollection just like cfinvoke/cfquery —
+                            // Wheels' Global.cfc::$directory rides this exact
+                            // shape. Without this the struct lands as a literal
+                            // `attributecollection` key and the real attrs —
+                            // directory/action/name — never reach the intercept.)
                             for (i, name) in expanded_names.iter().enumerate() {
+                                if name.eq_ignore_ascii_case("attributecollection") {
+                                    if let Some(CfmlValue::Struct(s)) = expanded_values.get(i) {
+                                        for (k, v) in s.iter() {
+                                            apply_attr(&k, v, &mut opts, &mut writeback_var);
+                                        }
+                                    }
+                                }
+                            }
+                            // Pass 2: explicit named args override the base.
+                            for (i, name) in expanded_names.iter().enumerate() {
+                                if name.is_empty()
+                                    || name.eq_ignore_ascii_case("attributecollection")
+                                {
+                                    continue;
+                                }
                                 let value = if i < expanded_values.len() {
                                     std::mem::replace(&mut expanded_values[i], CfmlValue::Null)
                                 } else {
                                     CfmlValue::Null
                                 };
-                                if name.is_empty() {
-                                    continue;
-                                }
-                                if writeback_attr.iter().any(|a| a.eq_ignore_ascii_case(name))
-                                    && !matches!(
-                                        tag_builtin_name.as_deref(),
-                                        Some("cfdbinfo") | Some("dbinfo")
-                                    )
-                                {
-                                    writeback_var = Some(value.as_string());
-                                }
-                                opts.insert(name.clone(), value);
+                                apply_attr(name, value, &mut opts, &mut writeback_var);
                             }
                             self.closure_parent_writeback = None;
                             self.arg_ref_writeback = None;
