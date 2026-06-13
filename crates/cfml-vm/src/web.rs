@@ -127,6 +127,9 @@ pub fn build_web_scopes(
 
     let mut content_type = String::new();
     let mut server_name = "127.0.0.1".to_string();
+    // The CLI server is HTTP-only and sits behind a TLS-terminating proxy, so
+    // the only honest "is this request secure" signal is `X-Forwarded-Proto`.
+    let mut is_https = false;
     for (name, value) in headers {
         let lower = name.to_lowercase();
         if lower == "content-type" {
@@ -136,10 +139,19 @@ pub fn build_web_scopes(
         if lower == "host" {
             server_name = value.split(':').next().unwrap_or(value).to_string();
         }
+        if lower == "x-forwarded-proto" && value.eq_ignore_ascii_case("https") {
+            is_https = true;
+        }
         let cgi_key = format!("http_{}", lower.replace('-', "_"));
         cgi.insert(cgi_key, CfmlValue::string(value.clone()));
     }
     cgi.insert("server_name".to_string(), CfmlValue::string(server_name));
+    // Mirror the secure-transport view into the standard CGI variable
+    // (`on`/`off`), matching CFML convention. Previously absent entirely.
+    cgi.insert(
+        "https".to_string(),
+        CfmlValue::string(if is_https { "on" } else { "off" }.to_string()),
+    );
 
     globals.insert("cgi".to_string(), CfmlValue::strukt(cgi));
 

@@ -8,5 +8,6 @@ pub mod dynamic;
 pub mod encodings;
 pub mod introspection;
 pub mod position;
+pub mod session_cookie;
 pub mod vfs;
 pub mod vm;

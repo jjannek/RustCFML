@@ -737,6 +737,11 @@ pub struct CfmlVirtualMachine {
     pub query_execute_fn: Option<fn(Vec<CfmlValue>) -> CfmlResult>,
     /// Session ID for current request
     pub session_id: Option<String>,
+    /// Resolved `this.sessioncookie` attributes for the current application.
+    /// Embedders (the `--serve` HTTP layer, the Workers fetch handler) read
+    /// this to render the session `Set-Cookie`. Defaults until an
+    /// Application.cfc is loaded by `extract_app_config`.
+    pub session_cookie_policy: cfml_common::session_cookie::SessionCookiePolicy,
     /// Per-request flag: Application.cfc set `this.lazySessionCreation =
     /// true`. When true, no session record is created at request start;
     /// instead the record + `onSessionStart` fire on the first write to
@@ -1092,6 +1097,7 @@ impl CfmlVirtualMachine {
             txn_rollback: None,
             txn_execute: None,
             session_id: None,
+            session_cookie_policy: cfml_common::session_cookie::SessionCookiePolicy::default(),
             lazy_session_creation: false,
             session_lazy_pending: false,
             session_record_created: false,
@@ -14911,6 +14917,12 @@ impl CfmlVirtualMachine {
             })
             .unwrap_or(true);
         self.lazy_session_creation = lazy_session_creation;
+
+        // Resolve this.sessioncookie attribute overrides (secure / httponly /
+        // samesite / domain / path). The embedder consults the resolved policy
+        // when rendering the session Set-Cookie.
+        self.session_cookie_policy =
+            cfml_common::session_cookie::SessionCookiePolicy::from_app_config(&config);
 
         // 3.0 Layer .cfconfig.json global mappings + customTagPaths underneath
         // the per-application ones, so Application.cfc wins on any conflict.

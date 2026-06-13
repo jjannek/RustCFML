@@ -69,5 +69,12 @@ function readRequest() {
 }
 assert("request scope persists into function", readRequest(), 42);
 
+// --- cgi.https is exposed over HTTP (secure-transport signal) ---
+// In serve mode RustCFML derives this from X-Forwarded-Proto and reports
+// "on"/"off". The CLI runner has no HTTP request, so the key is absent there;
+// guard for it so this stays green on the CLI and on Lucee-over-HTTP alike.
+httpsSignal = structKeyExists(cgi, "https") ? cgi.https : "off";
+assertTrue("cgi.https is a readable simple value", isSimpleValue(httpsSignal));
+
 suiteEnd();
 </cfscript>

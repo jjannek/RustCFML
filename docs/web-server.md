@@ -33,7 +33,13 @@ If an `Application.cfc` file exists in the document root (or any parent director
 
 Application state (`application` scope) persists across requests in serve mode. Component mappings defined via `this.mappings` in `Application.cfc` are supported for virtual path resolution.
 
-## Distributed sessions
+## Sessions
+
+For the full picture — the `session` scope, the lazy-creation default, the
+`CFID` cookie and `this.sessioncookie` hardening, storage backends, and expiry —
+see **[Sessions](sessions.md)**. The distributed backends are summarised below.
+
+### Distributed sessions
 
 RustCFML supports two pluggable session backends beyond the in-process default, both built into the stock binary and selected via `.cfconfig.json`:
 

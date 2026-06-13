@@ -210,6 +210,9 @@ struct CfmlResponse {
     /// whether a `CFID` cookie is emitted — under lazy sessions, a request that
     /// only reads session mints nothing and gets no cookie.
     session_record_created: bool,
+    /// Resolved `this.sessioncookie` attributes, used to render the session
+    /// `Set-Cookie` header (Secure/HttpOnly/SameSite/Domain/Path).
+    session_cookie_policy: cfml_common::session_cookie::SessionCookiePolicy,
 }
 
 /// Error from CFML execution, carrying any output generated before the error.
@@ -737,6 +740,7 @@ fn compile_and_run(
                 redirect_url: vm.redirect_url,
                 session_id: vm.session_id,
                 session_record_created: vm.session_record_created,
+                session_cookie_policy: vm.session_cookie_policy,
             })
         }
         Err(e) => {
@@ -1504,6 +1508,13 @@ async fn handle_request(
             };
             let session_id_clone = existing_sid.clone();
 
+            // The server is HTTP-only and meant to sit behind a TLS-terminating
+            // proxy, so a request is "secure" iff the proxy told us so via
+            // `X-Forwarded-Proto: https`. Drives the auto-`Secure` cookie default.
+            let conn_is_secure = headers.iter().any(|(n, v)| {
+                n.eq_ignore_ascii_case("x-forwarded-proto") && v.eq_ignore_ascii_case("https")
+            });
+
             let result = tokio::task::spawn_blocking(move || {
                 compile_and_run_with_session(
                     &source,
@@ -1541,7 +1552,11 @@ async fn handle_request(
                             if response.session_record_created || Some(sid) != existing_sid.as_ref() {
                                 builder = builder.header(
                                     "Set-Cookie",
-                                    format!("CFID={}; Path=/; HttpOnly", sid),
+                                    response.session_cookie_policy.render(
+                                        "CFID",
+                                        sid,
+                                        conn_is_secure,
+                                    ),
                                 );
                             }
                         }
@@ -1579,7 +1594,10 @@ async fn handle_request(
                     // and gets no cookie) or the id changed (sessionRotate).
                     if let Some(ref sid) = response.session_id {
                         if response.session_record_created || Some(sid) != existing_sid.as_ref() {
-                            builder = builder.header("Set-Cookie", format!("CFID={}; Path=/; HttpOnly", sid));
+                            builder = builder.header(
+                                "Set-Cookie",
+                                response.session_cookie_policy.render("CFID", sid, conn_is_secure),
+                            );
                         }
                     }
 

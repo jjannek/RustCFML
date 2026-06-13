@@ -25,7 +25,8 @@ marked *by design*.
 
 Read today: `this.name`, `this.mappings`, `this.sessionManagement`, `this.sessionTimeout`,
 `this.customTagPaths`, `this.localMode`, `this.sessionStorage`, `this.cache`,
-`this.lazySessionCreation`, `this.datasources`, `this.datasource`.
+`this.lazySessionCreation`, `this.datasources`, `this.datasource`,
+`this.sessioncookie` (secure/httponly/samesite/domain/path — see §12e).
 
 Accepted but **ignored** (no error, no effect):
 
@@ -320,7 +321,41 @@ reaper keeps that contract and additionally fixes the idle-server data-eviction
 gap. CLI (single-shot) mode spawns no reaper — expiry is irrelevant for a
 one-request process.
 
----
+### 12e. Session cookie attributes — `this.sessioncookie` + auto-`Secure` 🌟 *(divergence)*
+
+The session `Set-Cookie` is rendered by a single shared builder
+(`cfml-common::session_cookie`) used by **both** the `--serve` HTTP layer and the
+Cloudflare Worker handler — previously each hand-rolled the header inline and they
+had drifted (Worker emitted `SameSite=Lax`, CLI emitted neither `SameSite` nor
+`Secure`). Per-application overrides via `this.sessioncookie` are now honoured on
+both runtimes:
+
+```cfc
+this.sessioncookie = {
+    secure   = true,        // see Secure default below
+    httponly = true,        // default true
+    samesite = "Strict",    // Lax (default) | Strict | None | "" (omit)
+    domain   = ".example.com",
+    path     = "/"          // default /
+};
+```
+
+**`Secure` default — "secure if the connection is secure" (divergence from Lucee).**
+When the app does **not** set `secure`, `Secure` is emitted iff the request arrived
+over a secure transport:
+
+- **Worker** — always HTTPS end-to-end → `Secure` on by default (also makes
+  `__Secure-`/`__Host-` prefixes possible later).
+- **CLI** — HTTP-only by design, behind a TLS-terminating proxy, so the signal is
+  `X-Forwarded-Proto: https`. A bare `http://` dev box (LAN IP, custom hostname)
+  gets no `Secure` and the session survives; a deployment behind nginx/Caddy gets
+  `Secure` automatically. The same header now also populates `cgi.https`
+  (`on`/`off`), which was previously absent.
+
+Lucee's spec default is `secure:false` everywhere, so the Worker-on default is a
+**deliberate divergence** — but confined to the *unspecified* case: an explicit
+`this.sessioncookie.secure = false` is honoured verbatim on both runtimes.
+`SameSite=None` forces `Secure` on (browsers reject it otherwise).
 
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /

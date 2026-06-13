@@ -201,9 +201,13 @@ pub async fn handle_fetch(
     // round-trip overhead.
     if response_data.session_record_created && cookie_session_id.is_none() {
         if let Some(sid) = &response_data.session_id {
-            let cookie = format!(
-                "{}={}; Path=/; HttpOnly; SameSite=Lax",
-                config.session_cookie_name, sid
+            // Workers are HTTPS end-to-end, so the connection is always secure:
+            // the auto-`Secure` default resolves to on unless the app set
+            // `this.sessioncookie.secure = false` explicitly.
+            let cookie = response_data.session_cookie_policy.render(
+                &config.session_cookie_name,
+                sid,
+                true,
             );
             headers.append("Set-Cookie", &cookie)?;
         }
@@ -267,6 +271,9 @@ pub(crate) struct ResponseData {
     /// Set if the VM actually inserted a session record this request.
     /// The handler uses this to decide whether to emit `Set-Cookie`.
     pub(crate) session_record_created: bool,
+    /// Resolved `this.sessioncookie` attributes for rendering the session
+    /// `Set-Cookie` header.
+    pub(crate) session_cookie_policy: cfml_common::session_cookie::SessionCookiePolicy,
 }
 
 pub(crate) fn run_cfml(
@@ -348,6 +355,7 @@ pub(crate) fn run_cfml(
     let redirect_url = vm.redirect_url.clone();
     let session_id = vm.session_id.clone();
     let session_record_created = vm.session_record_created;
+    let session_cookie_policy = vm.session_cookie_policy.clone();
 
     match result {
         Ok(_) => Ok(ResponseData {
@@ -358,6 +366,7 @@ pub(crate) fn run_cfml(
             redirect_url,
             session_id,
             session_record_created,
+            session_cookie_policy,
         }),
         Err(e) => Err(format!("{}\n\nOutput so far:\n{}", e, output)),
     }

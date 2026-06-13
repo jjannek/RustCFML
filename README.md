@@ -92,6 +92,7 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 |---|---|
 | **[Getting Started](docs/getting-started.md)** | Prebuilt binaries, running files, REPL, shebang scripts, building from source |
 | **[Web Server](docs/web-server.md)** | Serve mode, Application.cfc lifecycle, URL rewriting, distributed sessions |
+| **[Sessions](docs/sessions.md)** | The `session` scope, lazy default, the `CFID` cookie & `this.sessioncookie`, storage backends, expiry |
 | **[Configuration](docs/configuration.md)** | `.cfconfig.json` — datasources, mappings, mail, security, caches, env vars |
 | **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
 | **[Database](docs/database.md)** | `queryExecute`, datasources, `cfqueryparam`, engine specifics |
@@ -129,7 +130,7 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 
 - **Complete CFML language** — CFScript and tag syntax (a preprocessor converts 50+ tags to CFScript), components with inheritance and interfaces, closures, member functions, and higher-order functions across arrays, structs, queries, and lists.
 - **400+ built-in functions** — strings, arrays, structs, dates, math, lists, queries, JSON, XML, regex, encoding, hashing, and modern password hashing (bcrypt/scrypt/argon2).
-- **Batteries-included web server** — `Application.cfc` lifecycle, sessions (in-process, Memcached, or clustered), cookies, authentication, URL rewriting, and file uploads.
+- **Batteries-included web server** — `Application.cfc` lifecycle, [sessions](docs/sessions.md) (in-process, Memcached, or clustered), cookies, authentication, URL rewriting, and file uploads.
 - **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; in-memory **Query-of-Queries** (`dbtype="query"`) on a pure-Rust SQL engine — see the perf table below; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
 - **Real concurrency** — `cfthread` runs bodies on real OS threads with shared `application`/`request`/`session` scopes and `cflock`. See **[Threading](docs/threads.md)**.
 - **Run anywhere** — native binaries, self-contained single-file apps, and a WebAssembly target that runs on Cloudflare Workers.
