@@ -204,6 +204,9 @@ try { include "oop/test_chained_writeback_clobber.cfm"; } catch (any e) { writeO
 // `new Sibling()` spelling is uncatchable on a miss, so only the runner-safe
 // createObject form is asserted. Credit bpamiri (PR #132).
 try { include "oop/test_relative_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_relative_component_resolution.cfm | " & e.message & chr(10)); }
+// Inherited-method sibling of #132: a bare CreateObject inside an inherited method must
+// resolve against the PARENT (defining) component's package, not the concrete subclass's dir.
+try { include "oop/test_inherited_bare_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_bare_component_resolution.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }

@@ -11905,18 +11905,46 @@ impl CfmlVirtualMachine {
             let mut method_locals = IndexMap::new();
             // While a CFC method runs, relative component resolution (bare
             // `createObject("component","Sibling")` / `new Sibling()`) must
-            // search the OWNING component's package first, not the caller's
-            // file. Swap source_file to the instance's __source_file for the
-            // duration — mirrors resolve_inheritance's sibling-parent swap.
-            let saved_source_file_method: Option<Option<String>> = if receiver_is_cfc {
-                if let CfmlValue::Struct(ref s) = object {
-                    if let Some(CfmlValue::String(src)) = s.get("__source_file") {
-                        let prev = self.source_file.clone();
-                        self.source_file = Some(src.to_string());
-                        Some(prev)
+            // search the package of the component that LEXICALLY DEFINES the
+            // method, not the caller's file. For an INHERITED method that is
+            // the parent's directory, not the concrete subclass instance's —
+            // so prefer the method's own BytecodeFunction.source_file (stamped
+            // per-CFC at compile time) and only fall back to the instance's
+            // __source_file when the function carries no source (e.g. a
+            // dynamically-built closure). Mirrors resolve_inheritance's
+            // sibling-parent swap; without the defining-source preference,
+            // `InhChild` (oop/inhsub/) inheriting `InhParent.viaCreate()`
+            // (oop/inh/) wrongly searched oop/inhsub/ for the bare sibling.
+            let defining_source: Option<String> =
+                if let CfmlValue::Function(ref f) = prop {
+                    if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) = f.body {
+                        if let CfmlValue::Int(idx) = body.as_ref() {
+                            self.resolve_fn(*idx).and_then(|bf| bf.source_file.clone())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
+                } else {
+                    None
+                };
+            let swap_source: Option<String> = defining_source.or_else(|| {
+                if let CfmlValue::Struct(ref s) = object {
+                    if let Some(CfmlValue::String(src)) = s.get("__source_file") {
+                        Some(src.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            let saved_source_file_method: Option<Option<String>> = if receiver_is_cfc {
+                if let Some(src) = swap_source {
+                    let prev = self.source_file.clone();
+                    self.source_file = Some(src);
+                    Some(prev)
                 } else {
                     None
                 }
