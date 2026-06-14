@@ -31,6 +31,10 @@ try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutp
 //     Wheels: $simpleLock()'s "$locked" re-entry guard key never arrived, so
 //     $readFlash recursed to depth 256 and 500'd every request.
 try { include "core/test_invoke_undeclared_keys.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_undeclared_keys.cfm | " & e.message & chr(10)); }
+// onMissingMethod must key missingMethodArguments by NAME for named-arg calls
+// (Lucee/ACF parity). NOT #126/#95/#82 — those are invoke()/cfinvoke marshaling
+// and declared-param frames; this is the onMissingMethod fallthrough path.
+try { include "core/test_onmissingmethod_named_keys.cfm"; } catch (any e) { writeOutput("ERROR | core/test_onmissingmethod_named_keys.cfm | " & e.message & chr(10)); }
 try { include "core/test_struct_method_sequential.cfm"; } catch (any e) { writeOutput("ERROR | core/test_struct_method_sequential.cfm | " & e.message & chr(10)); }
 try { include "core/test_include_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_include_scope_capture.cfm | " & e.message & chr(10)); }
 // savecontent's variable= must deliver the capture to SCOPE-QUALIFIED targets

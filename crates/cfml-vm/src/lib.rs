@@ -11992,9 +11992,32 @@ impl CfmlVirtualMachine {
                 .map(|(_, v)| v.clone());
             if let Some(handler @ CfmlValue::Function(_)) = missing_handler {
                 let args_array: Vec<CfmlValue> = extra_args.drain(..).collect();
-                let mut missing_args = IndexMap::new();
-                for (i, a) in args_array.iter().enumerate() {
-                    missing_args.insert((i + 1).to_string(), a.clone());
+                // Key missingMethodArguments by the call-site argument NAME when
+                // the call used named args (obj.probe(label="x") -> key "label"),
+                // falling back to 1-based numeric keys for positional args. Lucee/
+                // ACF/BoxLang all preserve names here; Wheels' dynamic query scopes
+                // read them by name (arguments.status) via onMissingMethod.
+                let names = arg_names.unwrap_or(&[]);
+                let mut missing_args: IndexMap<String, CfmlValue> = IndexMap::new();
+                let mut positional = 0usize;
+                for (i, a) in args_array.into_iter().enumerate() {
+                    let name = names.get(i).map(String::as_str).unwrap_or("");
+                    if name.eq_ignore_ascii_case("argumentcollection") {
+                        // Spread an argumentCollection struct into named entries,
+                        // mirroring reorder_named_args_with_extras.
+                        if let CfmlValue::Struct(ref s) = a {
+                            for (k, v) in s.iter() {
+                                missing_args.insert(k.clone(), v.clone());
+                            }
+                            continue;
+                        }
+                    }
+                    if name.is_empty() {
+                        positional += 1;
+                        missing_args.insert(positional.to_string(), a);
+                    } else {
+                        missing_args.insert(name.to_string(), a);
+                    }
                 }
                 let mut method_locals = IndexMap::new();
                 if let CfmlValue::Struct(ref s2) = object {
