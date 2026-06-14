@@ -6664,11 +6664,57 @@ fn coerce_by_sqltype_value(val: &CfmlValue, sqltype: &str) -> CfmlValue {
     }
 }
 
+/// Strip leading whitespace and SQL comments (`-- line` and `/* block */`)
+/// so the first *significant* keyword can be classified. Returns the
+/// remainder starting at the first non-comment, non-whitespace byte.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn strip_leading_sql_noise(sql: &str) -> &str {
+    let mut s = sql.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            // line comment: skip to end of line
+            s = match rest.find('\n') {
+                Some(i) => rest[i + 1..].trim_start(),
+                None => return "",
+            };
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            // block comment: skip to closing */
+            s = match rest.find("*/") {
+                Some(i) => rest[i + 2..].trim_start(),
+                None => return "",
+            };
+        } else {
+            return s;
+        }
+    }
+}
+
+/// Decide whether a SQL statement returns rows (and so must be run via the
+/// query path rather than the execute path). A statement is row-returning
+/// when its first significant keyword is one of:
+///   - `SELECT`            — ordinary query
+///   - `WITH`              — CTE that resolves to a `SELECT` (Lucee parity)
+///   - `CALL` / `EXEC` / `EXECUTE` — stored-procedure invocation that may
+///                            return a result set (CALL: MySQL/standard,
+///                            EXEC[UTE]: SQL Server)
+///   - `VALUES`            — row constructor (Postgres/SQLite)
+///   - `SHOW` / `PRAGMA` / `EXPLAIN` / `DESCRIBE` / `DESC` — metadata queries
+/// Leading whitespace and SQL comments are stripped first.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn is_select_query(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("SELECT"))
-        || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("CALL"))
+    let trimmed = strip_leading_sql_noise(sql);
+    // First keyword = leading run of ASCII-alphabetic bytes.
+    let kw_len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    let kw = &trimmed[..kw_len];
+    matches!(
+        kw.to_ascii_uppercase().as_str(),
+        "SELECT" | "WITH" | "CALL" | "EXEC" | "EXECUTE" | "VALUES" | "SHOW" | "PRAGMA"
+            | "EXPLAIN" | "DESCRIBE" | "DESC"
+    )
 }
 
 /// Dynamic-driver-only `queryExecute` for builds that don't enable any
