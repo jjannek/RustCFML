@@ -10880,6 +10880,25 @@ impl CfmlVirtualMachine {
 
         let mut positional: Vec<CfmlValue> = vec![CfmlValue::Null; param_names.len()];
         let mut consumed = vec![false; flat.len()];
+        // Pass 1: a NUMERIC string key ("1", "2", ...) forwards as the Nth
+        // POSITIONAL argument (1-based), matching Lucee/ACF/BoxLang. This is
+        // the shape Wheels' Global.cfc $invoke() builds when it rebuilds a
+        // dynamic call's positional args into a numeric-keyed
+        // argumentCollection; without this they were dropped as unmatched
+        // named extras and the callee's positional param kept its default.
+        for (fi, (fname, fval)) in flat.iter().enumerate() {
+            if let Ok(n) = fname.trim().parse::<usize>() {
+                if n >= 1 {
+                    let pi = n - 1;
+                    if pi >= positional.len() {
+                        positional.resize(pi + 1, CfmlValue::Null);
+                    }
+                    positional[pi] = fval.clone();
+                    consumed[fi] = true;
+                }
+            }
+        }
+        // Pass 2: named keys bind to declared params by (case-insensitive) name.
         for (pi, pname) in param_names.iter().enumerate() {
             for (fi, (fname, fval)) in flat.iter().enumerate() {
                 if !consumed[fi] && fname.eq_ignore_ascii_case(pname) {
