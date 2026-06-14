@@ -836,18 +836,17 @@ fn xorshift64(state: u64) -> u64 {
 
 fn cfml_random() -> f64 {
     PRNG_SEEDED.with(|seeded| {
-        if seeded.get() {
-            PRNG_STATE.with(|state| {
-                let next = xorshift64(state.get());
-                state.set(next);
-                (next >> 11) as f64 / (1u64 << 53) as f64
-            })
-        } else {
-            // Fallback: time-based pseudo-random (non-deterministic)
-            let seed = cfml_common::clock::now_unix_nanos();
-            let x = (seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) as u64;
-            (x >> 11) as f64 / (1u64 << 53) as f64
-        }
+        PRNG_STATE.with(|state| {
+            let current = state.get();
+            let next = if current == 0 {
+                // Lazy initialization: seed from nanosecond clock on first use
+                cfml_common::clock::now_unix_nanos() as u64
+            } else {
+                xorshift64(current)
+            };
+            state.set(next);
+            (next >> 11) as f64 / (1u64 << 53) as f64
+        })
     })
 }
 
