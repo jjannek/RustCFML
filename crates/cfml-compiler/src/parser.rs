@@ -977,8 +977,61 @@ impl Parser {
                     let body = self.parse_block()?;
                     return Ok(self.lower_script_body_tag("cftransaction", attrs, body, stmt_loc));
                 }
-                // No `{` body (e.g. a bare `transaction action="commit";` statement
-                // form we don't special-case) — restore and fall through.
+                // Body-less statement form (no `{`):
+                //   transaction action="commit";   → __cftransaction_commit()
+                //   transaction action="rollback";  → __cftransaction_rollback()
+                //   transaction action="begin";     → __cftransaction_start("begin"[, isolation][, datasource])
+                // Mirrors the angle-bracket <cftransaction action="..."> tag lowering
+                // (tag_parser.rs). Wheels migration templates emit the commit/rollback
+                // forms, so without this they failed with `transaction is undefined`.
+                if !attrs.is_empty() {
+                    self.match_token(&Token::Semicolon); // optional trailing ;
+                    let action = attrs
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("action"))
+                        .and_then(|(_, v)| match v {
+                            Expression::Literal(l) => match &l.value {
+                                LiteralValue::String(s) => Some(s.to_lowercase()),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "begin".to_string());
+                    let fn_name = match action.as_str() {
+                        "commit" => "__cftransaction_commit",
+                        "rollback" => "__cftransaction_rollback",
+                        _ => "__cftransaction_start",
+                    };
+                    let mut arguments: Vec<Expression> = Vec::new();
+                    if fn_name == "__cftransaction_start" {
+                        arguments.push(Expression::Literal(Literal {
+                            value: LiteralValue::String("begin".to_string()),
+                            location: stmt_loc,
+                        }));
+                        if let Some((_, iso)) =
+                            attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("isolation"))
+                        {
+                            arguments.push(iso.clone());
+                        }
+                        if let Some((_, ds)) =
+                            attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
+                        {
+                            arguments.push(ds.clone());
+                        }
+                    }
+                    return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+                        expr: Expression::FunctionCall(Box::new(FunctionCall {
+                            name: Box::new(Expression::Identifier(Identifier {
+                                name: fn_name.to_string(),
+                                location: stmt_loc,
+                            })),
+                            arguments,
+                            location: stmt_loc,
+                        })),
+                        location: stmt_loc,
+                    })));
+                }
+                // No attributes and no body — restore and fall through.
                 self.current = saved;
             }
             // cfhttpparam(name=…, value=…, type=…) statement → appends to the

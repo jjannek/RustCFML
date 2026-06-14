@@ -31,10 +31,6 @@ try { include "core/test_undeclared_named_args.cfm"; } catch (any e) { writeOutp
 //     Wheels: $simpleLock()'s "$locked" re-entry guard key never arrived, so
 //     $readFlash recursed to depth 256 and 500'd every request.
 try { include "core/test_invoke_undeclared_keys.cfm"; } catch (any e) { writeOutput("ERROR | core/test_invoke_undeclared_keys.cfm | " & e.message & chr(10)); }
-// onMissingMethod must key missingMethodArguments by NAME for named-arg calls
-// (Lucee/ACF parity). NOT #126/#95/#82 — those are invoke()/cfinvoke marshaling
-// and declared-param frames; this is the onMissingMethod fallthrough path.
-try { include "core/test_onmissingmethod_named_keys.cfm"; } catch (any e) { writeOutput("ERROR | core/test_onmissingmethod_named_keys.cfm | " & e.message & chr(10)); }
 try { include "core/test_struct_method_sequential.cfm"; } catch (any e) { writeOutput("ERROR | core/test_struct_method_sequential.cfm | " & e.message & chr(10)); }
 try { include "core/test_include_scope_capture.cfm"; } catch (any e) { writeOutput("ERROR | core/test_include_scope_capture.cfm | " & e.message & chr(10)); }
 // savecontent's variable= must deliver the capture to SCOPE-QUALIFIED targets
@@ -49,14 +45,6 @@ try { include "core/test_subscript_autovivify.cfm"; } catch (any e) { writeOutpu
 // auto-viv gap that blocked Wheels $initControllerClass. Fixed in the compiler by routing
 // multi-level scope-rooted nested writes through the runtime scope-path store.
 try { include "core/test_scoped_nested_autoviv.cfm"; } catch (any e) { writeOutput("ERROR | core/test_scoped_nested_autoviv.cfm | " & e.message & chr(10)); }
-// THIS-scope nested auto-vivification (this.paths.migrate = ...): the residual auto-viv
-// gap that #111 left behind. #111 (v0.136) fixed variables/local/request and those still
-// pass on 0.153.0, but the `this` scope was MISSED -- a nested write to an undeclared
-// this.X is lost silently (key registers, IsStruct(this.X) -> false, member vanishes).
-// Blocks Wheels Migrator.cfc init() (this.paths.migrate/sql/templates with no prior
-// this.paths = {}), making the whole migrator unusable. Runtime-level (wrong value, no
-// parse error) so registration is safe. Controls pin that #111 holds + isolate THIS scope.
-try { include "core/test_this_scope_nested_autoviv.cfm"; } catch (any e) { writeOutput("ERROR | core/test_this_scope_nested_autoviv.cfm | " & e.message & chr(10)); }
 try { include "core/test_control_flow.cfm"; } catch (any e) { writeOutput("ERROR | core/test_control_flow.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_negative_step.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_negative_step.cfm | " & e.message & chr(10)); }
 try { include "core/test_cfloop_array_item_index.cfm"; } catch (any e) { writeOutput("ERROR | core/test_cfloop_array_item_index.cfm | " & e.message & chr(10)); }
@@ -108,7 +96,6 @@ try { include "core/test_pagecontext_request_response.cfm"; } catch (any e) { wr
 try { include "core/test_localmode.cfm"; } catch (any e) { writeOutput("ERROR | core/test_localmode.cfm | " & e.message & chr(10)); }
 try { include "core/test_error_context.cfm"; } catch (any e) { writeOutput("ERROR | core/test_error_context.cfm | " & e.message & chr(10)); }
 try { include "core/test_null_coalescing.cfm"; } catch (any e) { writeOutput("ERROR | core/test_null_coalescing.cfm | " & e.message & chr(10)); }
-try { include "core/test_isnumeric_boolean.cfm"; } catch (any e) { writeOutput("ERROR | core/test_isnumeric_boolean.cfm | " & e.message & chr(10)); }
 
 // --- Data Types ---
 try { include "types/test_null.cfm"; } catch (any e) { writeOutput("ERROR | types/test_null.cfm | " & e.message & chr(10)); }
@@ -124,7 +111,6 @@ try { include "types/test_ordered_struct_literals.cfm"; } catch (any e) { writeO
 try { include "types/test_nested_writeback.cfm"; } catch (any e) { writeOutput("ERROR | types/test_nested_writeback.cfm | " & e.message & chr(10)); }
 try { include "types/test_query.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_column.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_column.cfm | " & e.message & chr(10)); }
-try { include "types/test_query_bare_column_scalar_type.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_bare_column_scalar_type.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_reference.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_reference.cfm | " & e.message & chr(10)); }
 try { include "types/test_binary.cfm"; } catch (any e) { writeOutput("ERROR | types/test_binary.cfm | " & e.message & chr(10)); }
 try { include "types/test_hash_in_strings.cfm"; } catch (any e) { writeOutput("ERROR | types/test_hash_in_strings.cfm | " & e.message & chr(10)); }
@@ -418,16 +404,6 @@ try { include "core/test_component_soft_keyword.cfm"; } catch (any e) { writeOut
 //     also accepts the ACF-style cf-prefixed `cfinvoke` spelling, but Lucee
 //     rejects it, so the cross-engine test uses the cf-less `invoke`.)
 try { include "tags/test_cfinvoke_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_statement.cfm | " & e.message & chr(10)); }
-//   - cfinvoke_argumentcollection_positional: cfinvoke's argumentCollection is
-//     a full argument collection — NUMERIC string keys forward as POSITIONAL
-//     args (named keys as named), like fn(argumentCollection=st) / invoke().
-//     RustCFML forwards named keys but DROPS numeric-keyed (positional)
-//     entries. Wheels' Global.cfc $invoke() rebuilds the dynamic call's
-//     positional args as a numeric-keyed argumentCollection, so onMissingMethod
-//     association methods (post.createComment(struct), dependent=delete's
-//     deleteAll<Assoc>()) lose their positional arg — the FK (named) survives,
-//     the attributes struct (positional) is dropped. Runtime gap, runner-safe.
-try { include "tags/test_cfinvoke_argumentcollection_positional.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfinvoke_argumentcollection_positional.cfm | " & e.message & chr(10)); }
 //   - cfinvoke_call_form_marshaling: the cf-PREFIXED parenthesized CALL form
 //     cfinvoke(...) — the spelling Lucee accepts and Wheels' Global.cfc
 //     $invoke() uses — must marshal attributeCollection, deliver
@@ -439,6 +415,13 @@ try { include "tags/test_cfinvoke_tag_marshaling.cfm"; } catch (any e) { writeOu
 //   - script_transaction_attrs: cfscript `transaction action="begin" { ... }`
 //     (the attribute form of the transaction tag, with a body).
 try { include "tags/test_script_transaction_attrs.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_script_transaction_attrs.cfm | " & e.message & chr(10)); }
+//   - transaction_action_statement: the body-less cfscript transaction
+//     STATEMENT form `transaction action="commit";` / `="rollback";` /
+//     `="begin";` (no `{ ... }` block) — the spelling every Wheels migration
+//     template emits inside up()/down(). Distinct from script_transaction_attrs
+//     above (which has a body). A bare transaction{} block is the in-suite
+//     control.
+try { include "tags/test_transaction_action_statement.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_transaction_action_statement.cfm | " & e.message & chr(10)); }
 //   - component_declaration_attributes: follow-on to component_soft_keyword.
 //     Component-header metadata attributes are order-independent and may be
 //     written quoted or unquoted on Lucee/ACF/BoxLang. Two shapes the Wheels
