@@ -11903,6 +11903,26 @@ impl CfmlVirtualMachine {
                 CfmlValue::Struct(ref s) if s.contains_key("__variables") || s.contains_key("__name")
             );
             let mut method_locals = IndexMap::new();
+            // While a CFC method runs, relative component resolution (bare
+            // `createObject("component","Sibling")` / `new Sibling()`) must
+            // search the OWNING component's package first, not the caller's
+            // file. Swap source_file to the instance's __source_file for the
+            // duration — mirrors resolve_inheritance's sibling-parent swap.
+            let saved_source_file_method: Option<Option<String>> = if receiver_is_cfc {
+                if let CfmlValue::Struct(ref s) = object {
+                    if let Some(CfmlValue::String(src)) = s.get("__source_file") {
+                        let prev = self.source_file.clone();
+                        self.source_file = Some(src.to_string());
+                        Some(prev)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if receiver_is_cfc {
                 if let CfmlValue::Struct(ref s) = object {
                     if let Some(vars) = s.get("__variables") {
@@ -11920,7 +11940,13 @@ impl CfmlVirtualMachine {
             // getFunctionCalledName() reports the alias (WireBox delegation
             // injects one UDF under many method names and dispatches by it).
             self.pending_called_name = Some(method.to_string());
-            let result = self.call_function(&func_ref, args, &method_locals)?;
+            let result = self.call_function(&func_ref, args, &method_locals);
+            // Restore the caller's source_file before propagating any error or
+            // result, so relative resolution outside the method is unaffected.
+            if let Some(prev) = saved_source_file_method {
+                self.source_file = prev;
+            }
+            let result = result?;
             if let Some(ref wb) = self.closure_parent_writeback {
                 Self::write_back_to_captured_scope(&func_ref, wb);
             }

@@ -196,6 +196,14 @@ try { include "oop/test_dynamic_lhs_assign.cfm"; } catch (any e) { writeOutput("
 try { include "oop/test_getmetadata_properties.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_getmetadata_properties.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_bool_attr.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_bool_attr.cfm | " & e.message & chr(10)); }
 try { include "oop/test_chained_writeback_clobber.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_chained_writeback_clobber.cfm | " & e.message & chr(10)); }
+// Bare component name resolves relative to the CALLING CFC's package. From
+// inside oop.relcomp.Maker, createObject("component","Sibling") must find
+// oop.relcomp.Sibling. Was the deepest blocker for the Wheels migrator
+// TableDefinition DSL (createTable/t.string/t.integer/changeTable all route
+// through relative createObject of sibling migrator components). The
+// `new Sibling()` spelling is uncatchable on a miss, so only the runner-safe
+// createObject form is asserted. Credit bpamiri (PR #132).
+try { include "oop/test_relative_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_relative_component_resolution.cfm | " & e.message & chr(10)); }
 
 // --- Tags ---
 try { include "tags/test_tags_basic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_basic.cfm | " & e.message & chr(10)); }
