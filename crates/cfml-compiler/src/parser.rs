@@ -1903,6 +1903,171 @@ impl Parser {
         }
     }
 
+    /// If `expr` is a call to `cfqueryparam(...)` (script-statement form),
+    /// return the param-struct expression to bind. The attributeCollection
+    /// form (`cfqueryparam(attributeCollection = qp)`) yields the struct
+    /// itself (it already carries value/cfsqltype/null/list/…); otherwise a
+    /// struct is built from the args — named args keep their name, and a bare
+    /// positional maps to `value` then `cfsqltype` (cfqueryparam's attribute
+    /// order). Returns None for any other expression.
+    fn cfqueryparam_call_struct(&self, expr: &Expression) -> Option<Expression> {
+        let Expression::FunctionCall(fc) = expr else { return None; };
+        let Expression::Identifier(id) = fc.name.as_ref() else { return None; };
+        if !id.name.eq_ignore_ascii_case("cfqueryparam") {
+            return None;
+        }
+        let loc = fc.location;
+        if fc.arguments.len() == 1 {
+            if let Expression::NamedArgument(na) = &fc.arguments[0] {
+                if na.name.eq_ignore_ascii_case("attributecollection") {
+                    return Some((*na.value).clone());
+                }
+            }
+        }
+        let mut pairs: Vec<(Expression, Expression)> = Vec::with_capacity(fc.arguments.len());
+        let mut positional = 0;
+        for arg in &fc.arguments {
+            let (key, value) = match arg {
+                Expression::NamedArgument(na) => (na.name.clone(), (*na.value).clone()),
+                other => {
+                    let k = if positional == 0 { "value" } else { "cfsqltype" };
+                    positional += 1;
+                    (k.to_string(), other.clone())
+                }
+            };
+            pairs.push((
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(key),
+                    location: loc,
+                }),
+                value,
+            ));
+        }
+        Some(Expression::Struct(Struct {
+            pairs,
+            ordered: false,
+            location: loc,
+        }))
+    }
+
+    /// Rewrite `cfqueryparam(...)` script statements appearing anywhere in a
+    /// script `cfquery(){}` body into the same
+    /// `writeOutput("?"); arrayAppend(__cfquery_params, <param-struct>);`
+    /// shape the `<cfqueryparam>` TAG lowers to (see tag_parser.rs). Recurses
+    /// through control flow so a cfqueryparam inside a loop/if — the Wheels
+    /// databaseAdapters/Base.cfc bind-loop shape — is lowered too. Without
+    /// this the call site was an undefined identifier and threw
+    /// `Variable 'cfqueryparam' is undefined`.
+    fn rewrite_cfqueryparam_stmts(&self, stmts: Vec<Statement>) -> Vec<Statement> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            match stmt {
+                Statement::Expression(es) => {
+                    if let Some(param_expr) = self.cfqueryparam_call_struct(&es.expr) {
+                        let loc = es.location;
+                        let call = |name: &str, arguments: Vec<Expression>| {
+                            Expression::FunctionCall(Box::new(FunctionCall {
+                                name: Box::new(Expression::Identifier(Identifier {
+                                    name: name.to_string(),
+                                    location: loc,
+                                })),
+                                arguments,
+                                location: loc,
+                            }))
+                        };
+                        out.push(Statement::Expression(ExpressionStatement {
+                            expr: call(
+                                "writeOutput",
+                                vec![Expression::Literal(Literal {
+                                    value: LiteralValue::String("?".to_string()),
+                                    location: loc,
+                                })],
+                            ),
+                            location: loc,
+                        }));
+                        out.push(Statement::Expression(ExpressionStatement {
+                            expr: call(
+                                "arrayAppend",
+                                vec![
+                                    Expression::Identifier(Identifier {
+                                        name: "__cfquery_params".to_string(),
+                                        location: loc,
+                                    }),
+                                    param_expr,
+                                ],
+                            ),
+                            location: loc,
+                        }));
+                    } else {
+                        out.push(Statement::Expression(es));
+                    }
+                }
+                Statement::If(mut i) => {
+                    i.then_branch = self.rewrite_cfqueryparam_stmts(i.then_branch);
+                    i.else_if = i
+                        .else_if
+                        .into_iter()
+                        .map(|mut e| {
+                            e.body = self.rewrite_cfqueryparam_stmts(e.body);
+                            e
+                        })
+                        .collect();
+                    i.else_branch = i.else_branch.map(|b| self.rewrite_cfqueryparam_stmts(b));
+                    out.push(Statement::If(i));
+                }
+                Statement::For(mut f) => {
+                    f.body = self.rewrite_cfqueryparam_stmts(f.body);
+                    out.push(Statement::For(f));
+                }
+                Statement::ForIn(mut f) => {
+                    f.body = self.rewrite_cfqueryparam_stmts(f.body);
+                    out.push(Statement::ForIn(f));
+                }
+                Statement::While(mut w) => {
+                    w.body = self.rewrite_cfqueryparam_stmts(w.body);
+                    out.push(Statement::While(w));
+                }
+                Statement::Do(mut d) => {
+                    d.body = self.rewrite_cfqueryparam_stmts(d.body);
+                    out.push(Statement::Do(d));
+                }
+                Statement::Switch(mut s) => {
+                    s.cases = s
+                        .cases
+                        .into_iter()
+                        .map(|mut c| {
+                            c.body = self.rewrite_cfqueryparam_stmts(c.body);
+                            c
+                        })
+                        .collect();
+                    s.default_case =
+                        s.default_case.map(|b| self.rewrite_cfqueryparam_stmts(b));
+                    out.push(Statement::Switch(s));
+                }
+                Statement::Try(mut t) => {
+                    t.body = self.rewrite_cfqueryparam_stmts(t.body);
+                    t.catches = t
+                        .catches
+                        .into_iter()
+                        .map(|mut c| {
+                            c.body = self.rewrite_cfqueryparam_stmts(c.body);
+                            c
+                        })
+                        .collect();
+                    t.finally_body =
+                        t.finally_body.map(|b| self.rewrite_cfqueryparam_stmts(b));
+                    out.push(Statement::Try(t));
+                }
+                Statement::Output(mut o) => {
+                    o.body = self.rewrite_cfqueryparam_stmts(o.body);
+                    out.push(Statement::Output(o));
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
     /// Lower a script-call-with-body form (`cfsavecontent(...) { ... }`,
     /// `cflock(...) { ... }`, `cftransaction(...) { ... }`, `cfmail(...) { ... }`)
     /// into the same AST shape the angle-bracket tag forms produce.
@@ -2047,7 +2212,10 @@ impl Parser {
                         location: loc,
                     }),
                 ];
-                stmts.extend(body);
+                // Lower any script-statement cfqueryparam(...) in the body to
+                // writeOutput("?") + arrayAppend(__cfquery_params, …), matching
+                // the <cfqueryparam> tag path (recurses through control flow).
+                stmts.extend(self.rewrite_cfqueryparam_stmts(body));
                 // queryExecute(__cfsavecontent_end(), __cfquery_params, OPTS);
                 // — the VM intercept delivers name=/result= from OPTS.
                 stmts.push(Statement::Expression(ExpressionStatement {
