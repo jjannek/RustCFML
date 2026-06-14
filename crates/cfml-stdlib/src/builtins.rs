@@ -6527,8 +6527,14 @@ impl r2d2::ManageConnection for PostgresConnectionManager {
         conn.simple_query("SELECT 1").map(|_| ()).map_err(Into::into)
     }
 
-    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        false
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        // The pool does NOT validate on checkout (Lucee parity — see
+        // get_postgres_pool), so detect dead connections cheaply here instead:
+        // r2d2 calls has_broken when a connection is returned and drops it if
+        // true. `is_closed()` flips once the background connection task has
+        // terminated (e.g. the server closed an idle socket), so a closed
+        // connection is evicted rather than handed back out.
+        conn.is_closed()
     }
 }
 
@@ -6720,6 +6726,11 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
         .max_size(10)
         .min_idle(Some(1))
         .connection_timeout(std::time::Duration::from_secs(30))
+        // Do NOT ping `SELECT 1` on every checkout (Lucee parity / remote-DB
+        // perf): Lucee's pool defaults `validate` off, so a cfquery is ONE
+        // round-trip, not two. We rely on PostgresConnectionManager::has_broken
+        // (is_closed) to evict dead connections on return instead. See PR #125.
+        .test_on_check_out(false)
         .build(mgr)
         .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to create PostgreSQL pool: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
