@@ -579,8 +579,10 @@ impl CfmlCompiler {
 
     /// Scope roots whose nested member writes are routed through the runtime
     /// scope-path store (`SetDynamicVar` → `store_runtime_path`), which
-    /// auto-vivifies missing intermediate structs scope-aware. Excludes
-    /// `this`/`super`/`arguments`/`thread`, whose member chains keep their
+    /// auto-vivifies missing intermediate structs scope-aware. The `this`
+    /// scope is handled separately in `flatten_scope_path` (it parses to
+    /// `Expression::This`, not an `Identifier`). Excludes
+    /// `super`/`arguments`/`thread`, whose member chains keep their
     /// established struct-receiver writeback semantics.
     fn is_autoviv_scope_root(name: &str) -> bool {
         matches!(name.to_lowercase().as_str(),
@@ -599,6 +601,10 @@ impl CfmlCompiler {
             Expression::Identifier(id) if Self::is_autoviv_scope_root(&id.name) => {
                 Some(id.name.clone())
             }
+            // `this` is its own AST node (Expression::This), not an Identifier.
+            // A nested write rooted at it (`this.paths.migrate = v`) auto-vivifies
+            // the same way: store_runtime_path resolves "this" via locals["this"].
+            Expression::This(_) => Some("this".to_string()),
             Expression::MemberAccess(access) if !access.null_safe => {
                 let base = Self::flatten_scope_path(&access.object)?;
                 Some(format!("{}.{}", base, access.member))
