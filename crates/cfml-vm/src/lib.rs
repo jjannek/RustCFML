@@ -7779,7 +7779,17 @@ impl CfmlVirtualMachine {
                 "expandpath" => {
                     // CFML expandPath: resolve relative to current template dir,
                     // absolute paths (starting with /) resolve via mappings then source dir
-                    let rel = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    let raw = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    // Collapse a leading run of slashes to a single '/' before
+                    // mapping resolution — Lucee/ACF/BoxLang treat expandPath("//x")
+                    // as expandPath("/x"). Wheels' bootstrap concatenates paths that
+                    // yield "//plugins", which must still hit this.mappings.
+                    let rel = if raw.starts_with('/') || raw.starts_with('\\') {
+                        let trimmed = raw.trim_start_matches(['/', '\\']);
+                        format!("/{}", trimmed)
+                    } else {
+                        raw.clone()
+                    };
                     let base_dir = self
                         .source_file
                         .as_ref()

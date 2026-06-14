@@ -381,6 +381,16 @@ try { include "core/test_undefined_var_autovivify.cfm"; } catch (any e) { writeO
 //     throws at instantiation -> non-object -> empty dispatch.
 try { include "core/test_multiword_operators.cfm"; } catch (any e) { writeOutput("ERROR | core/test_multiword_operators.cfm | " & e.message & chr(10)); }
 try { include "tags/test_mapping_include.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_mapping_include.cfm | " & e.message & chr(10)); }
+//   - expandpath_leading_double_slash: a leading "//" must normalize to a
+//     single "/" before this.mappings resolution — expandPath("//x") ==
+//     expandPath("/x"), resolving the same mapping. RustCFML resolved
+//     expandPath("/wheelsmapprobe") via the mapping but let "//wheelsmapprobe"
+//     fall through to a docroot-relative path, missing the mapping. The stock
+//     `wheels new` Application.cfc declares a /plugins mapping and boot joins
+//     webPath("/") & "/plugins" = "//plugins", so Plugins.cfc's
+//     cfdirectory(ExpandPath("//plugins")) hits a nonexistent dir, throws, and
+//     $init aborts — every request 500s on a pristine Wheels app.
+try { include "tags/test_expandpath_leading_double_slash.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_expandpath_leading_double_slash.cfm | " & e.message & chr(10)); }
 //   - component_soft_keyword: `component` is a SOFT keyword on Lucee/ACF/BoxLang
 //     (a CFC introducer only when it begins a declaration; otherwise an ordinary
 //     identifier). RustCFML used to treat it as a HARD reserved keyword, so a
