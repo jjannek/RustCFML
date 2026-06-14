@@ -3092,8 +3092,12 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         return parse_odbc_literal(s);
     }
 
-    // DateTime formats (most specific first)
+    // DateTime formats (most specific first). `%.f` optionally consumes a
+    // fractional-seconds component (".177"), so the fractional variants also
+    // match values with no fraction.
     for fmt in &[
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M",
@@ -3130,6 +3134,14 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         if let Ok(t) = NaiveTime::parse_from_str(s, fmt) {
             return NaiveDate::from_ymd_opt(2000, 1, 1).map(|d| d.and_time(t));
         }
+    }
+
+    // RFC 3339 / ISO 8601 with a timezone offset or 'Z' suffix
+    // ("2026-06-10T07:20:42.177+00:00", "...Z"). Return the wall-clock fields
+    // as written (naive); callers that need the absolute instant (timestamptz)
+    // use `parse_cfml_datetime_utc`, which honours the offset instead.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.naive_local());
     }
 
     // Date serial number (days since 1899-12-30, OLE Automation date)
@@ -7251,6 +7263,21 @@ fn parse_cfml_time(s: &str) -> Option<NaiveTime> {
     parse_cfml_date(t).map(|dt| dt.time())
 }
 
+/// Parse a date/time string to an absolute instant in UTC, for binding to a
+/// PostgreSQL `timestamptz` column. RFC 3339 / ISO 8601 strings carrying a
+/// numeric offset or 'Z' suffix ("2026-06-10T07:20:42.177+00:00", "...Z") are
+/// honoured — the offset is applied to recover the true instant. A zone-less
+/// value (a plain CFML datetime) carries no offset, so its wall-clock is
+/// interpreted as UTC (matching the existing behaviour for a UTC server).
+#[cfg(feature = "postgres_db")]
+fn parse_cfml_datetime_utc(s: &str) -> Option<chrono::DateTime<Utc>> {
+    let t = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    parse_cfml_date(t).map(|ndt| Utc.from_utc_datetime(&ndt))
+}
+
 /// Encode a CFML vector-literal string ("[1,0,0]") into pgvector's binary wire
 /// format: `u16` dimension count, `u16` flags (always 0), then one big-endian
 /// IEEE-754 `f32` per element. pgvector extension types carry no static OID, so
@@ -7374,13 +7401,14 @@ impl postgres::types::ToSql for PgParam {
                     .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date/time"))?
                     .to_sql(ty, out),
                 Type::TIMESTAMPTZ => {
-                    // A naive CFML datetime carries no zone; interpret the
-                    // wall-clock as UTC (Lucee binds the server-tz instant — for
-                    // a UTC server, identical). The server then renders it back
-                    // in its session TimeZone.
-                    let ndt = parse_cfml_date(s)
-                        .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date/time"))?;
-                    Utc.from_utc_datetime(&ndt).to_sql(ty, out)
+                    // An ISO 8601 string carrying a zone offset or 'Z' is bound
+                    // at the true instant it denotes; a zone-less CFML datetime
+                    // is interpreted as UTC wall-clock (Lucee binds the
+                    // server-tz instant — for a UTC server, identical). The
+                    // server then renders it back in its session TimeZone.
+                    parse_cfml_datetime_utc(s)
+                        .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date/time"))?
+                        .to_sql(ty, out)
                 }
                 Type::DATE => parse_cfml_date(s)
                     .ok_or_else(|| bind_parse_err(s, ty, "not a recognised date"))?

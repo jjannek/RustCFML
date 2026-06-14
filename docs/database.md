@@ -93,7 +93,12 @@ CFML values are frequently strings (form and URL values are untyped). Because Po
 
 CFML date/time values (and ISO-ish date strings) bind to `timestamp`, `timestamptz`,
 `date`, and `time` columns; a `timestamptz` value with no zone is interpreted as
-UTC. JSON text (e.g. the output of `serializeJSON`) binds to `json` and `jsonb`
+UTC. ISO 8601 / RFC 3339 strings carrying a numeric offset, a `Z` (Zulu/UTC)
+suffix, and/or fractional seconds also bind — `"2026-06-10T07:20:42.177+00:00"`,
+`"...Z"`, `"...177"` — so a record read out (and serialized in that exact shape)
+can be re-bound and saved back. For a `timestamptz` column the offset is honoured
+to recover the true instant; a zone-less value is taken as UTC wall-clock.
+JSON text (e.g. the output of `serializeJSON`) binds to `json` and `jsonb`
 columns — the `jsonb` version prefix is written for you. Vector-literal strings
 (`"[1,0,0]"`) bind to pgvector `vector` columns (INSERT and `<->` nearest-neighbour
 queries), encoded in pgvector's binary wire format.
