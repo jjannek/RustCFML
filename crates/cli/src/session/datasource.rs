@@ -446,11 +446,26 @@ mod tests {
     }
 
     /// Each test gets its own sqlite file + datasource so they don't collide
-    /// when cargo runs them in parallel.
+    /// when cargo runs them in parallel — AND across runs. The path carries the
+    /// process id plus a per-run atomic counter so a stale file (or its
+    /// `-wal`/`-shm` sidecars) left by an earlier `cargo test` invocation can
+    /// never resurrect data into a fresh test (this caused an intermittent
+    /// `rotate_preserves_data` failure under heavy parallel `--workspace` runs).
     fn store_for(name: &str) -> DatasourceStore {
-        let path = std::env::temp_dir().join(format!("rustcfml_sess_{}.db", name));
-        let _ = std::fs::remove_file(&path);
-        let ds_name = format!("sesstest_{}", name);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let uniq = format!(
+            "{}_{}_{}",
+            name,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = std::env::temp_dir().join(format!("rustcfml_sess_{}.db", uniq));
+        // Clear the db and any WAL/SHM sidecars so we always start clean.
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.to_string_lossy(), suffix));
+        }
+        let ds_name = format!("sesstest_{}", uniq);
         cfml_stdlib::builtins::register_datasource(&ds_name, path.to_string_lossy().to_string());
         DatasourceStore::new(&ds_name, "cf_session_data", "appA")
     }

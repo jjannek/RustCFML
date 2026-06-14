@@ -871,11 +871,21 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             for (k, v) in &attrs {
                 let val = strip_hashes(&v);
                 if k == "reset" {
-                    let lower = val.to_lowercase();
-                    if lower == "true" || lower == "yes" {
-                        parts.push(format!("{}: true", k));
+                    if v.contains('#') {
+                        // reset="#expr#" — evaluate at runtime (Lucee parity),
+                        // don't literal-match the raw "#...#" text.
+                        parts.push(format!(
+                            "{}: {}",
+                            k,
+                            format_attr_value(v, quoted.contains(k.as_str()))
+                        ));
                     } else {
-                        parts.push(format!("{}: false", k));
+                        let lower = val.to_lowercase();
+                        if lower == "true" || lower == "yes" {
+                            parts.push(format!("{}: true", k));
+                        } else {
+                            parts.push(format!("{}: false", k));
+                        }
                     }
                 } else if k == "variable" {
                     parts.push(format!("{}: {}", k, val));
@@ -1144,7 +1154,15 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             for (k, v) in &attrs {
                 let lower = v.to_lowercase();
                 if k == "secure" || k == "httponly" {
-                    if lower == "true" || lower == "yes" {
+                    if v.contains('#') {
+                        // Expression like secure="#isHttps#" — evaluate at runtime
+                        // (Lucee parity), don't literal-match the raw "#...#" text.
+                        parts.push(format!(
+                            "{}: {}",
+                            k,
+                            format_attr_value(v, quoted.contains(k.as_str()))
+                        ));
+                    } else if lower == "true" || lower == "yes" {
                         parts.push(format!("{}: true", k));
                     } else {
                         parts.push(format!("{}: false", k));
