@@ -9,9 +9,9 @@ RustCFML runs parameterized queries via `queryExecute` (and the `<cfquery>` tag)
 | Engine | Driver | Feature flag | Notes |
 |---|---|---|---|
 | **SQLite** | `rusqlite` (bundled) | on by default | Zero-config; file-based or in-memory (`:memory:`). The default fallback datasource. |
-| **MySQL / MariaDB** | `mysql` | `mysql_db` | MariaDB is wire-compatible and uses the same driver. |
-| **PostgreSQL** | `postgres` (native, TLS) | `postgres_db` | See [Working with PostgreSQL](#working-with-postgresql) below. On Cloudflare Workers, reached via **Hyperdrive** (see below). |
-| **Microsoft SQL Server** | `tiberius` | `mssql_db` | Also covers Azure SQL. |
+| **MySQL / MariaDB** | `mysql` (TLS via native-tls) | `mysql_db` | MariaDB is wire-compatible and uses the same driver. TLS via `ssl_mode` — see [Working with MySQL](#working-with-mysql-and-mariadb). |
+| **PostgreSQL** | `postgres` (TLS via rustls) | `postgres_db` | See [Working with PostgreSQL](#working-with-postgresql) below. On Cloudflare Workers, reached via **Hyperdrive** (see below). |
+| **Microsoft SQL Server** | `tiberius` (TLS via rustls) | `mssql_db` | Also covers Azure SQL — connections are encrypted by default. See [Working with SQL Server](#working-with-sql-server). |
 
 Drivers are feature-gated so unused subsystems compile out. SQLite is on by default; enable the others at build time:
 
@@ -80,6 +80,35 @@ cftransaction {
 ## Working with PostgreSQL
 
 PostgreSQL is well supported, but it is stricter on the wire than the other engines — it uses `$1`/`$2` positional placeholders. RustCFML binds common scalar types in **binary** format (encoded at the column's exact type) and sends the rest (arrays, network/temporal-zone, extension types) in **text** format for the server to parse, matching the JDBC engines. RustCFML handles the translation so ordinary CFML works, but a few behaviours are worth knowing.
+
+### TLS / SSL connections (Neon, Supabase, RDS, Azure, …)
+
+Managed PostgreSQL services require an encrypted connection. RustCFML negotiates
+TLS over PostgreSQL's `SSLRequest` preamble using **rustls**, honouring the
+`sslmode` option in the datasource URL — so a Neon/Supabase/RDS connection
+string works as-is:
+
+```cfc
+queryExecute("select 1", [], { datasource =
+    "postgresql://user:pass@ep-xxx-pooler.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require" });
+```
+
+Supported `sslmode` values (libpq-compatible, default **`prefer`**):
+
+| `sslmode` | Behaviour |
+|-----------|-----------|
+| `disable` | No TLS — plaintext only. |
+| `allow` / `prefer` | Attempt TLS, fall back to plaintext if the server refuses. **Default** — keeps local, non-TLS databases working with zero config. |
+| `require` | TLS required; the channel is encrypted but the server certificate is **not** verified (matches libpq / pgjdbc). |
+| `verify-ca` / `verify-full` | TLS required **and** the server certificate is verified against the platform's native root certificate store (full chain + hostname). |
+
+`channel_binding` (`disable`/`prefer`/`require`) is supported via SCRAM
+`tls-server-end-point`. SNI is sent automatically, so pooler endpoints route
+correctly.
+
+> **Note:** `verify-ca` is treated identically to `verify-full` (it also checks
+> the hostname). If you need CA-only verification without a hostname match
+> (e.g. connecting by IP), use `require` or open an issue.
 
 ### Placeholders are translated automatically
 
@@ -172,6 +201,58 @@ If the number of supplied parameters doesn't match what the statements consume, 
 ### PostgreSQL on Cloudflare Workers
 
 The same `queryExecute` API works in the WebAssembly/Cloudflare Workers build, where PostgreSQL is reached through a [Hyperdrive](https://developers.cloudflare.com/hyperdrive/) binding (via `postgres.js`). The placeholder rewriting and multi-statement handling described above apply there too, so application code is portable between the native server and the edge build. See **[RustCFML-Cloudflare-worker](https://github.com/RustCFML/RustCFML-Cloudflare-worker)**.
+
+## Working with MySQL and MariaDB
+
+For managed MySQL/MariaDB services that require an encrypted connection
+(PlanetScale, Aiven, Amazon RDS, Azure Database for MySQL, …) add an
+`ssl_mode` option to the datasource URL:
+
+```cfc
+queryExecute("select 1", [], { datasource =
+    "mysql://user:pass@host:3306/db?ssl_mode=REQUIRED" });
+```
+
+Supported `ssl_mode` values (case-insensitive):
+
+| `ssl_mode` | Behaviour |
+|------------|-----------|
+| `DISABLED` | No TLS (also the default when no `ssl_mode` is given). |
+| `PREFERRED` / `REQUIRED` | TLS required; channel encrypted, server certificate **not** verified. |
+| `VERIFY_CA` | TLS required + verify the certificate chain (not the hostname). |
+| `VERIFY_IDENTITY` | TLS required + verify the chain **and** the hostname. |
+
+JDBC-style options are also honoured: `useSSL=true`, `requireSSL=true`,
+`verifyServerCertificate=true`. A custom root CA can be supplied with
+`ssl_ca=/path/to/ca.pem` (also accepted as `sslrootcert`). Verification uses
+the platform's native trust store. TLS uses the `mysql` crate's `native-tls`
+backend.
+
+> **Note:** unlike PostgreSQL, the default is **no TLS** (to preserve
+> zero-config local connections), and there is no automatic "try TLS then fall
+> back" — a non-`DISABLED` mode requires a successful TLS handshake. Set
+> `ssl_mode=REQUIRED` (or stricter) explicitly for managed databases.
+
+## Working with SQL Server
+
+Microsoft SQL Server connections are **encrypted by default** — the `tiberius`
+driver negotiates TLS (via rustls) and, out of the box, trusts the server
+certificate. This works with Azure SQL Database and any managed instance
+without extra configuration:
+
+```cfc
+queryExecute("select 1", [], { datasource =
+    "sqlserver://user:pass@host:1433/db" });
+```
+
+To validate the server certificate against the platform trust store instead of
+trusting it blindly, add `trustServerCertificate=false` (or `encrypt=strict`)
+to the URL:
+
+```cfc
+queryExecute("select 1", [], { datasource =
+    "sqlserver://user:pass@host.database.windows.net:1433/db?trustServerCertificate=false" });
+```
 
 ## Query-of-Queries
 

@@ -6366,6 +6366,106 @@ fn get_sqlite_pool(path: &str) -> Result<r2d2::Pool<SqliteConnectionManager>, Cf
     Ok(pool)
 }
 
+/// Resolve a MySQL TLS configuration from the connection URL's query string,
+/// returning a sanitised URL (with the TLS-related keys removed, since the
+/// `mysql` crate's `Opts::from_url` errors on parameters it doesn't recognise)
+/// and the `SslOpts` to apply, if any.
+///
+/// Recognised keys (case-insensitive):
+/// - `ssl_mode` / `ssl-mode` / `sslmode`: `disabled` | `preferred` | `required`
+///   | `verify_ca` | `verify_identity` (aliases `verify-full`/`verify_full`).
+/// - JDBC compatibility: `useSSL=true|false`, `requireSSL=true|false`,
+///   `verifyServerCertificate=true|false`.
+/// - `ssl_ca` / `sslrootcert` / `ssl-ca`: path to a root CA certificate
+///   (.pem/.der) used for verify modes.
+///
+/// When no TLS key is present the result is `None`, preserving the historic
+/// plaintext behaviour so local, non-TLS databases keep working with zero
+/// config. The `mysql` crate can't do libpq-style "try TLS then fall back", so
+/// any non-disabled mode requires a successful TLS handshake. Verification uses
+/// the platform trust store (native-tls) unless a root cert path is supplied.
+#[cfg(feature = "mysql_db")]
+fn mysql_extract_ssl(url: &str) -> (String, Option<mysql::SslOpts>) {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => return (url.to_string(), None),
+    };
+
+    let mut mode: Option<String> = None; // explicit ssl_mode wins
+    let mut use_ssl: Option<bool> = None;
+    let mut require_ssl: Option<bool> = None;
+    let mut verify_cert: Option<bool> = None;
+    let mut root_cert: Option<String> = None;
+    let mut kept: Vec<&str> = Vec::new();
+
+    for pair in query.split('&') {
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => {
+                kept.push(pair);
+                continue;
+            }
+        };
+        match k.to_lowercase().as_str() {
+            "ssl_mode" | "ssl-mode" | "sslmode" => mode = Some(v.trim().to_lowercase()),
+            "usessl" => use_ssl = Some(v.eq_ignore_ascii_case("true") || v == "1"),
+            "requiressl" => require_ssl = Some(v.eq_ignore_ascii_case("true") || v == "1"),
+            "verifyservercertificate" => {
+                verify_cert = Some(v.eq_ignore_ascii_case("true") || v == "1")
+            }
+            "ssl_ca" | "sslrootcert" | "ssl-ca" => root_cert = Some(v.to_string()),
+            _ => kept.push(pair),
+        }
+    }
+
+    // Resolve an effective mode. Explicit ssl_mode takes precedence; otherwise
+    // derive one from the JDBC-style booleans.
+    let effective = match mode.as_deref() {
+        Some(m) => Some(m.to_string()),
+        None => {
+            if use_ssl == Some(true) || require_ssl == Some(true) {
+                Some(match verify_cert {
+                    Some(true) => "verify_identity".to_string(),
+                    _ => "required".to_string(),
+                })
+            } else if use_ssl == Some(false) || require_ssl == Some(false) {
+                Some("disabled".to_string())
+            } else {
+                None
+            }
+        }
+    };
+
+    let sanitized = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, kept.join("&"))
+    };
+
+    let ssl = match effective.as_deref() {
+        None | Some("disabled") | Some("disable") => None,
+        Some(m) => {
+            let (accept_invalid, skip_domain) = match m {
+                // encrypt only, do not authenticate the server certificate
+                "preferred" | "prefer" | "required" | "require" => (true, true),
+                // verify the chain but not the hostname
+                "verify_ca" | "verify-ca" => (false, true),
+                // verify the chain and the hostname (verify_identity / full)
+                _ => (false, false),
+            };
+            let mut opts = mysql::SslOpts::default()
+                .with_danger_accept_invalid_certs(accept_invalid)
+                .with_danger_skip_domain_validation(skip_domain);
+            if let Some(path) = root_cert {
+                opts = opts.with_root_cert_path(Some(std::path::PathBuf::from(path)));
+            }
+            Some(opts)
+        }
+    };
+
+    (sanitized, ssl)
+}
+
 #[cfg(feature = "mysql_db")]
 fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     let mut manager = get_pool_manager().lock().unwrap();
@@ -6375,7 +6475,11 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
             return Ok(pool.clone());
         }
     }
-    let pool = mysql::Pool::new(url)
+    let (sanitized, ssl) = mysql_extract_ssl(url);
+    let opts = mysql::Opts::from_url(&sanitized)
+        .map_err(|e| CfmlError::runtime(format!("queryExecute: invalid MySQL connection string: {}", e)))?;
+    let builder = mysql::OptsBuilder::from_opts(opts).ssl_opts(ssl);
+    let pool = mysql::Pool::new(builder)
         .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL pool creation error: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
     Ok(pool)
@@ -6386,22 +6490,220 @@ struct PostgresConnectionManager {
     url: String,
 }
 
+/// Error type for the Postgres connection manager. TLS setup can fail with
+/// non-`postgres::Error` causes (cert-store load, rustls config), so the
+/// manager surfaces a single concrete error rather than `postgres::Error`.
+#[cfg(feature = "postgres_db")]
+#[derive(Debug)]
+struct PgConnError(String);
+
+#[cfg(feature = "postgres_db")]
+impl std::fmt::Display for PgConnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "postgres_db")]
+impl std::error::Error for PgConnError {}
+
+#[cfg(feature = "postgres_db")]
+impl From<postgres::Error> for PgConnError {
+    fn from(e: postgres::Error) -> Self {
+        PgConnError(e.to_string())
+    }
+}
+
 #[cfg(feature = "postgres_db")]
 impl r2d2::ManageConnection for PostgresConnectionManager {
     type Connection = postgres::Client;
-    type Error = postgres::Error;
+    type Error = PgConnError;
 
     fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        postgres::Client::connect(&self.url, postgres::NoTls)
+        connect_postgres(&self.url)
     }
 
     fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        conn.simple_query("SELECT 1").map(|_| ())
+        conn.simple_query("SELECT 1").map(|_| ()).map_err(Into::into)
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
         false
     }
+}
+
+/// rustls verifier that performs the TLS handshake (so the channel is
+/// encrypted and `tls-server-end-point` channel binding still works) but does
+/// NOT validate the certificate chain or hostname. This mirrors libpq /
+/// pgjdbc behaviour for `sslmode=require` (and `prefer`/`allow`): the
+/// connection is encrypted but the server certificate is not authenticated.
+/// Signature checks are still delegated to the crypto provider so the cert
+/// presented for channel binding is genuinely the peer's.
+#[cfg(feature = "postgres_db")]
+#[derive(Debug)]
+struct PgNoCertVerify(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+#[cfg(feature = "postgres_db")]
+impl rustls::client::danger::ServerCertVerifier for PgNoCertVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Extract the effective `sslmode` from a Postgres connection URL, lower-cased.
+/// Defaults to `prefer` (libpq's default) when absent — keeps local, non-TLS
+/// databases working without configuration while still attempting TLS first.
+#[cfg(feature = "postgres_db")]
+fn pg_sslmode_from_url(url: &str) -> String {
+    let query = match url.split_once('?') {
+        Some((_, q)) => q,
+        None => return "prefer".to_string(),
+    };
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.eq_ignore_ascii_case("sslmode") {
+                return v.trim().to_lowercase();
+            }
+        }
+    }
+    "prefer".to_string()
+}
+
+/// tokio-postgres only understands `disable`/`prefer`/`require` for the
+/// `sslmode` URL option and errors on libpq's `allow`/`verify-ca`/`verify-full`.
+/// Rewrite the URL's `sslmode` to a token tokio-postgres accepts; the richer
+/// verification semantics are applied via the rustls config we pass to
+/// `connect`, not the URL. Other options (incl. `channel_binding`) are
+/// preserved verbatim.
+#[cfg(feature = "postgres_db")]
+fn pg_sanitize_url_sslmode(url: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => return url.to_string(),
+    };
+    let rewritten: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) if k.eq_ignore_ascii_case("sslmode") => {
+                let token = match v.trim().to_lowercase().as_str() {
+                    "disable" => "disable",
+                    "allow" | "prefer" => "prefer",
+                    // require / verify-ca / verify-full and anything else all
+                    // require an encrypted channel; verification differences
+                    // are handled by the rustls config.
+                    _ => "require",
+                };
+                format!("{}={}", k, token)
+            }
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{}?{}", base, rewritten.join("&"))
+}
+
+/// Build a rustls `ClientConfig` for a Postgres TLS connection.
+///
+/// `verify == true` (sslmode `verify-ca`/`verify-full`) loads the platform's
+/// native root certificate store and performs full chain + hostname
+/// verification. `verify == false` (sslmode `require`/`prefer`/`allow`)
+/// encrypts the channel without authenticating the certificate, matching libpq.
+#[cfg(feature = "postgres_db")]
+fn build_pg_tls_config(verify: bool) -> Result<rustls::ClientConfig, PgConnError> {
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| PgConnError(format!("PostgreSQL TLS init failed: {e}")))?;
+
+    let config = if verify {
+        let mut roots = rustls::RootCertStore::empty();
+        let loaded = rustls_native_certs::load_native_certs();
+        for cert in loaded.certs {
+            let _ = roots.add(cert);
+        }
+        if roots.is_empty() {
+            return Err(PgConnError(format!(
+                "PostgreSQL TLS: no native root certificates available for sslmode verify-ca/verify-full{}",
+                loaded
+                    .errors
+                    .first()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            )));
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(PgNoCertVerify(provider)))
+            .with_no_client_auth()
+    };
+    Ok(config)
+}
+
+/// Open a single PostgreSQL connection, honouring the `sslmode` URL option and
+/// negotiating TLS via rustls where required. Used by the r2d2 manager.
+#[cfg(feature = "postgres_db")]
+fn connect_postgres(url: &str) -> Result<postgres::Client, PgConnError> {
+    use std::str::FromStr;
+
+    let mode = pg_sslmode_from_url(url);
+    let sanitized = pg_sanitize_url_sslmode(url);
+    let mut config = postgres::Config::from_str(&sanitized)
+        .map_err(|e| PgConnError(format!("invalid PostgreSQL connection string: {e}")))?;
+
+    if mode == "disable" {
+        config.ssl_mode(tokio_postgres::config::SslMode::Disable);
+        return config.connect(postgres::NoTls).map_err(PgConnError::from);
+    }
+
+    config.ssl_mode(match mode.as_str() {
+        "allow" | "prefer" => tokio_postgres::config::SslMode::Prefer,
+        _ => tokio_postgres::config::SslMode::Require,
+    });
+
+    let verify = mode == "verify-ca" || mode == "verify-full";
+    let tls_config = build_pg_tls_config(verify)?;
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
+    config.connect(tls).map_err(PgConnError::from)
 }
 
 #[cfg(feature = "postgres_db")]
@@ -7720,8 +8022,14 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
     use tokio::runtime::Builder;
     use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-    // Parse URL: mssql://user:pass@host:port/database or sqlserver://...
+    // Parse URL: mssql://user:pass@host:port/database[?options] or sqlserver://...
     let clean_url = url.replace("mssql://", "").replace("sqlserver://", "");
+    // Split off an optional query string before parsing the path components, so
+    // the database name isn't polluted by `?trustServerCertificate=...` etc.
+    let (clean_url, query) = match clean_url.split_once('?') {
+        Some((b, q)) => (b.to_string(), Some(q.to_string())),
+        None => (clean_url, None),
+    };
     // Format: user:pass@host:port/database
     let (auth_part, host_db) = clean_url.split_once('@')
         .ok_or_else(|| CfmlError::runtime("queryExecute: MSSQL URL must be mssql://user:pass@host:port/database".to_string()))?;
@@ -7733,12 +8041,34 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
         .unwrap_or((host_port, "1433"));
     let port: u16 = port_str.parse().unwrap_or(1433);
 
+    // TLS: tiberius (rustls feature) negotiates encryption by default. By
+    // default we trust the server certificate (works with Azure SQL and any
+    // managed instance out of the box). Set `trustServerCertificate=false`
+    // (or `encrypt=strict`) in the URL to instead validate the certificate
+    // against the platform trust store.
+    let mut trust_cert = true;
+    if let Some(q) = &query {
+        for pair in q.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k.to_lowercase().as_str() {
+                    "trustservercertificate" => {
+                        trust_cert = !(v.eq_ignore_ascii_case("false") || v == "0");
+                    }
+                    "encrypt" if v.eq_ignore_ascii_case("strict") => trust_cert = false,
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let mut config = Config::new();
     config.host(host);
     config.port(port);
     config.database(database);
     config.authentication(AuthMethod::sql_server(user, pass));
-    config.trust_cert();
+    if trust_cert {
+        config.trust_cert();
+    }
 
     let addr = format!("{}:{}", host, port);
 
@@ -11697,4 +12027,143 @@ fn cfzip_add_directory(
 #[cfg(target_arch = "wasm32")]
 fn fn_cfzip(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("cfzip is not supported in wasm".into()))
+}
+
+#[cfg(all(test, any(feature = "postgres_db", feature = "mysql_db")))]
+mod db_tls_tests {
+
+    #[cfg(feature = "postgres_db")]
+    mod postgres {
+    use crate::builtins::{pg_sanitize_url_sslmode, pg_sslmode_from_url};
+
+    #[test]
+    fn sslmode_defaults_to_prefer_when_absent() {
+        assert_eq!(pg_sslmode_from_url("postgresql://u:p@host/db"), "prefer");
+        assert_eq!(
+            pg_sslmode_from_url("postgresql://u:p@host/db?application_name=x"),
+            "prefer"
+        );
+    }
+
+    #[test]
+    fn sslmode_is_extracted_case_insensitively() {
+        assert_eq!(
+            pg_sslmode_from_url("postgresql://u:p@host/db?sslmode=require"),
+            "require"
+        );
+        assert_eq!(
+            pg_sslmode_from_url("postgresql://u:p@host/db?SSLMode=Verify-Full"),
+            "verify-full"
+        );
+        assert_eq!(
+            pg_sslmode_from_url("postgresql://u:p@host/db?x=1&sslmode=disable&y=2"),
+            "disable"
+        );
+    }
+
+    #[test]
+    fn sanitize_maps_libpq_only_modes_to_tokio_tokens() {
+        // verify-ca / verify-full / allow are not understood by tokio-postgres
+        // and must be rewritten; the verification semantics are applied via the
+        // rustls config, not the URL.
+        assert_eq!(
+            pg_sanitize_url_sslmode("postgresql://u:p@host/db?sslmode=verify-full"),
+            "postgresql://u:p@host/db?sslmode=require"
+        );
+        assert_eq!(
+            pg_sanitize_url_sslmode("postgresql://u:p@host/db?sslmode=verify-ca"),
+            "postgresql://u:p@host/db?sslmode=require"
+        );
+        assert_eq!(
+            pg_sanitize_url_sslmode("postgresql://u:p@host/db?sslmode=allow"),
+            "postgresql://u:p@host/db?sslmode=prefer"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_standard_modes_and_other_options() {
+        assert_eq!(
+            pg_sanitize_url_sslmode("postgresql://u:p@host/db?sslmode=require&channel_binding=require"),
+            "postgresql://u:p@host/db?sslmode=require&channel_binding=require"
+        );
+        assert_eq!(
+            pg_sanitize_url_sslmode("postgresql://u:p@host/db?sslmode=disable"),
+            "postgresql://u:p@host/db?sslmode=disable"
+        );
+        // No query string at all → untouched.
+        assert_eq!(
+            pg_sanitize_url_sslmode("postgresql://u:p@host/db"),
+            "postgresql://u:p@host/db"
+        );
+    }
+    }
+
+    #[cfg(feature = "mysql_db")]
+    mod mysql {
+        use crate::builtins::mysql_extract_ssl;
+
+        #[test]
+        fn no_ssl_param_stays_plaintext_and_untouched() {
+            let (url, ssl) = mysql_extract_ssl("mysql://u:p@host:3306/db");
+            assert_eq!(url, "mysql://u:p@host:3306/db");
+            assert!(ssl.is_none());
+            let (url, ssl) = mysql_extract_ssl("mysql://u:p@host/db?pool_max=4");
+            assert_eq!(url, "mysql://u:p@host/db?pool_max=4");
+            assert!(ssl.is_none());
+        }
+
+        #[test]
+        fn ssl_keys_are_stripped_from_url() {
+            // The mysql crate errors on unknown URL params, so our SSL keys must
+            // be removed while genuine options are preserved.
+            let (url, ssl) =
+                mysql_extract_ssl("mysql://u:p@host/db?ssl_mode=REQUIRED&pool_max=4");
+            assert_eq!(url, "mysql://u:p@host/db?pool_max=4");
+            assert!(ssl.is_some());
+        }
+
+        #[test]
+        fn required_encrypts_without_verifying() {
+            let (_, ssl) = mysql_extract_ssl("mysql://u:p@host/db?ssl_mode=required");
+            let ssl = ssl.expect("ssl opts");
+            assert!(ssl.accept_invalid_certs());
+            assert!(ssl.skip_domain_validation());
+        }
+
+        #[test]
+        fn verify_identity_validates_fully() {
+            let (_, ssl) = mysql_extract_ssl("mysql://u:p@host/db?ssl_mode=VERIFY_IDENTITY");
+            let ssl = ssl.expect("ssl opts");
+            assert!(!ssl.accept_invalid_certs());
+            assert!(!ssl.skip_domain_validation());
+        }
+
+        #[test]
+        fn verify_ca_checks_chain_not_hostname() {
+            let (_, ssl) = mysql_extract_ssl("mysql://u:p@host/db?ssl_mode=verify_ca");
+            let ssl = ssl.expect("ssl opts");
+            assert!(!ssl.accept_invalid_certs());
+            assert!(ssl.skip_domain_validation());
+        }
+
+        #[test]
+        fn disabled_is_none() {
+            let (_, ssl) = mysql_extract_ssl("mysql://u:p@host/db?ssl_mode=DISABLED");
+            assert!(ssl.is_none());
+        }
+
+        #[test]
+        fn jdbc_use_ssl_and_verify_flags() {
+            let (_, ssl) = mysql_extract_ssl(
+                "mysql://u:p@host/db?useSSL=true&verifyServerCertificate=true",
+            );
+            let ssl = ssl.expect("ssl opts");
+            assert!(!ssl.accept_invalid_certs());
+            assert!(!ssl.skip_domain_validation());
+
+            let (_, ssl) = mysql_extract_ssl("mysql://u:p@host/db?useSSL=true");
+            let ssl = ssl.expect("ssl opts");
+            assert!(ssl.accept_invalid_certs()); // required, no verify
+        }
+    }
 }
