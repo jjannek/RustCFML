@@ -15590,6 +15590,9 @@ where
 }
 
 fn to_number(val: &CfmlValue) -> Option<f64> {
+    // A QueryColumn proxy behaves as its first-row value in scalar numeric
+    // contexts (arithmetic, coercion) — mirrors cfml_equal/cfml_compare.
+    let val = val.query_column_scalar();
     match val {
         CfmlValue::Int(i) => Some(*i as f64),
         CfmlValue::Double(d) => Some(*d),

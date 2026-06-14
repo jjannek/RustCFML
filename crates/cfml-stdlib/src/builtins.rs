@@ -2610,7 +2610,9 @@ fn fn_is_simple_value(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_numeric(args: Vec<CfmlValue>) -> CfmlResult {
-    match args.first() {
+    // A QueryColumn proxy (bare q.col access) behaves as its first-row scalar
+    // value in numeric type tests — mirrors to_number/cfml_equal/cfml_compare.
+    match args.first().map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) => Ok(CfmlValue::Bool(true)),
         Some(CfmlValue::String(s)) => Ok(CfmlValue::Bool(s.trim().parse::<f64>().is_ok())),
         Some(CfmlValue::Bool(_)) => Ok(CfmlValue::Bool(true)),
