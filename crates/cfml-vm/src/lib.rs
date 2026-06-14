@@ -178,6 +178,69 @@ fn now_epoch_secs() -> u64 {
     cfml_common::clock::now_unix_secs()
 }
 
+/// Parse a CFML date/datetime string for cookie-expiry rendering. Mirrors the
+/// common formats accepted by the stdlib `parse_cfml_date`, including the
+/// `createDateTime` output form (`%Y-%m-%d %H:%M:%S`).
+fn parse_cookie_expiry_date(s: &str) -> Option<chrono::NaiveDateTime> {
+    use chrono::{NaiveDate, NaiveDateTime};
+    for fmt in &[
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%d-%b-%Y %H:%M:%S",
+        "%a, %d-%b-%Y %H:%M:%S GMT",
+        "%a, %d %b %Y %H:%M:%S GMT",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(dt);
+        }
+    }
+    for fmt in &["%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d-%b-%Y"] {
+        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
+            return d.and_hms_opt(0, 0, 0);
+        }
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.naive_utc());
+    }
+    None
+}
+
+/// Render a `<cfcookie expires=...>` value as an RFC-1123 / RFC-6265 cookie date
+/// in GMT (Lucee parity), e.g. `Tue, 14-Jul-2026 06:30:57 GMT`. Browsers require
+/// a month *name* and `GMT`; a raw `2026-12-31 00:00:00` or bare `30` fails to
+/// parse and the cookie silently degrades to a session cookie.
+///
+/// Accepts a date/datetime, a number of days from now, `"now"` (expires
+/// immediately), or `"never"` (far future). Unparseable values pass through
+/// unchanged.
+fn format_cookie_expires(raw: &str) -> String {
+    use chrono::{Duration, Utc};
+    const FMT: &str = "%a, %d-%b-%Y %H:%M:%S GMT";
+    let now = Utc::now().naive_utc();
+    let trimmed = raw.trim();
+    let lower = trimmed.to_lowercase();
+
+    let dt = match lower.as_str() {
+        "never" => now + Duration::days(3650),
+        "now" => now,
+        _ => {
+            if let Ok(days) = trimmed.parse::<f64>() {
+                now + Duration::seconds((days * 86400.0) as i64)
+            } else if let Some(parsed) = parse_cookie_expiry_date(trimmed) {
+                parsed
+            } else {
+                return trimmed.to_string();
+            }
+        }
+    };
+    dt.format(FMT).to_string()
+}
+
 /// A cached compiled bytecode program with its source file modification time.
 pub struct CachedProgram {
     pub program: BytecodeProgram,
@@ -8939,7 +9002,10 @@ impl CfmlVirtualMachine {
                         if let Some((_, expires)) =
                             opts.iter().find(|(k, _)| k.to_lowercase() == "expires")
                         {
-                            cookie.push_str(&format!("; Expires={}", expires.as_string()));
+                            cookie.push_str(&format!(
+                                "; Expires={}",
+                                format_cookie_expires(&expires.as_string())
+                            ));
                         }
                         if let Some((_, domain)) =
                             opts.iter().find(|(k, _)| k.to_lowercase() == "domain")
