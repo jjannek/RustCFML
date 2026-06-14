@@ -60,6 +60,18 @@ writeOutput("9. InetAddress.getByName: ");
 addr = createObject("java", "java.net.InetAddress").getByName("localhost");
 writeOutput("OK - " & addr.getHostAddress() & "<br>");
 
+// Assertions for the InetAddress shim. Regression: createObject for
+// java.net.InetAddress returned null (no `init` arm), so the chained static
+// call `.getLocalHost()` threw "cannot call method on a null value" once
+// null-receiver calls became hard errors (v0.119.0). v0.149.0 added an `init`
+// arm returning a class-reference shim.
+inetClass = createObject("java", "java.net.InetAddress");
+assertTrue("createObject java.net.InetAddress is not null", !isNull(inetClass));
+localAddr = inetClass.getLocalHost();
+assertTrue("InetAddress.getLocalHost() returns a usable object", len(localAddr.getHostAddress()) > 0);
+namedAddr = createObject("java", "java.net.InetAddress").getByName("localhost");
+assert("InetAddress.getByName('localhost').getHostAddress()", namedAddr.getHostAddress(), "127.0.0.1");
+
 // Test 10: File.exists
 writeOutput("10. File.exists: ");
 f = createObject("java", "java.io.File").init("/tmp");

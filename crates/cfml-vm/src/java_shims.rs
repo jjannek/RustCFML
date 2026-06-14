@@ -178,6 +178,21 @@ pub fn handle_java_inetaddress(
     object: &CfmlValue,
 ) -> CfmlResult {
     match method {
+        // `createObject("java", "java.net.InetAddress")` lands here via the
+        // "init" path. Java's InetAddress has no public constructor, but we must
+        // still return a non-null class-reference shim so the static factory
+        // methods can be dispatched on it (e.g.
+        // `createObject(...).getLocalHost()`); otherwise the receiver is null
+        // and the chained call throws since v0.119.0.
+        "init" => {
+            let mut shim = IndexMap::new();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.net.inetaddress".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
         "getlocalhost" => {
             let hostname = std::env::var("HOSTNAME")
                 .or_else(|_| std::env::var("HOST"))
