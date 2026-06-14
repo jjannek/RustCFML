@@ -2615,7 +2615,9 @@ fn fn_is_numeric(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first().map(|v| v.query_column_scalar()) {
         Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) => Ok(CfmlValue::Bool(true)),
         Some(CfmlValue::String(s)) => Ok(CfmlValue::Bool(s.trim().parse::<f64>().is_ok())),
-        Some(CfmlValue::Bool(_)) => Ok(CfmlValue::Bool(true)),
+        // A CFML boolean is NOT numeric — isNumeric(true)/isNumeric(false) are
+        // false on Lucee, Adobe CF and BoxLang. (Wheels guards its finder
+        // `parameterize` flag with isNumeric(), which defaults to boolean true.)
         _ => Ok(CfmlValue::Bool(false)),
     }
 }

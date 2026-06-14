@@ -670,13 +670,14 @@ extern "C" fn cfml_replace_no_case_3_boxed(tag_s: i64, tag_f: i64, tag_r: i64) -
 // Array / Struct, fine elsewhere). Owned `CfmlValue` lives the body's
 // lifetime — drops on return.
 
-/// Mirrors `fn_is_numeric`: Int/Double/Bool → true; String → parses as f64
-/// (after trim); everything else → false.
+/// Mirrors `fn_is_numeric`: Int/Double → true; String → parses as f64
+/// (after trim); everything else (incl. Bool) → false. A CFML boolean is NOT
+/// numeric (Lucee/ACF/BoxLang parity).
 extern "C" fn cfml_is_numeric_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
     let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
     let b = match &v {
-        CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::Bool(_) => true,
+        CfmlValue::Int(_) | CfmlValue::Double(_) => true,
         CfmlValue::String(s) => s.trim().parse::<f64>().is_ok(),
         _ => false,
     };
@@ -2173,7 +2174,7 @@ mod tests {
             }
         };
 
-        // isNumeric: Int / Double / Bool / numeric-string → true.
+        // isNumeric: Int / Double / numeric-string → true; Bool → false.
         let int_arg = boxed::box_value(CfmlValue::Int(42)) as i64;
         let dbl_arg = boxed::box_value(CfmlValue::Double(1.5)) as i64;
         let bool_arg = boxed::box_value(CfmlValue::Bool(true)) as i64;
@@ -2181,7 +2182,7 @@ mod tests {
         let alpha_str = boxed::box_value(CfmlValue::string("hello")) as i64;
         assert!(extract_bool(cfml_is_numeric_boxed(int_arg)));
         assert!(extract_bool(cfml_is_numeric_boxed(dbl_arg)));
-        assert!(extract_bool(cfml_is_numeric_boxed(bool_arg)));
+        assert!(!extract_bool(cfml_is_numeric_boxed(bool_arg)));
         assert!(extract_bool(cfml_is_numeric_boxed(num_str)));
         assert!(!extract_bool(cfml_is_numeric_boxed(alpha_str)));
 
