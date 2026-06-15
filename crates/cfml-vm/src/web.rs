@@ -224,6 +224,54 @@ pub fn parse_query_string(qs: &str) -> IndexMap<String, CfmlValue> {
     map
 }
 
+/// HTTP "singleton" response headers: ones that must carry exactly one value
+/// and therefore have to be *replaced*, not appended. `cfheader` can set any of
+/// these; per HTTP semantics the last value wins. See issue #148.
+pub const SINGLETON_RESPONSE_HEADERS: [&str; 3] =
+    ["content-type", "content-length", "location"];
+
+/// Resolve serve-mode response headers, enforcing singleton-header semantics.
+///
+/// CFML exposes the response content type through two channels — `cfcontent`
+/// (→ `response_content_type`) and `cfheader(name="Content-Type")` (→ a row in
+/// `response_headers`). Naively the host would emit the engine default *and*
+/// the cfheader value, producing two `Content-Type` headers (issue #148).
+///
+/// This returns the single effective `Content-Type` (an explicit `cfheader`
+/// wins over a `cfcontent` type, which wins over the engine default) plus the
+/// remaining headers to emit. `Content-Type` is stripped from that list (the
+/// caller applies it as the singleton); every other singleton header is
+/// de-duplicated so only its last occurrence survives, while non-singleton
+/// headers (e.g. `Set-Cookie`) keep their full, ordered multiplicity.
+pub fn resolve_response_headers(
+    response_content_type: Option<&str>,
+    response_headers: &[(String, String)],
+) -> (String, Vec<(String, String)>) {
+    let explicit_ct = response_headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+        .last();
+    let content_type = explicit_ct
+        .or_else(|| response_content_type.map(str::to_string))
+        .unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+
+    let mut out: Vec<(String, String)> = Vec::with_capacity(response_headers.len());
+    for (name, value) in response_headers {
+        let lname = name.to_lowercase();
+        if lname == "content-type" {
+            // Applied separately as the singleton above.
+            continue;
+        }
+        if SINGLETON_RESPONSE_HEADERS.contains(&lname.as_str()) {
+            // Drop any earlier value so the last one wins (singleton replace).
+            out.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        }
+        out.push((name.clone(), value.clone()));
+    }
+    (content_type, out)
+}
+
 /// Minimal URL decoder: `+` → space, `%XX` → byte.
 pub fn url_decode(s: &str) -> String {
     let mut result = Vec::new();
@@ -376,4 +424,88 @@ fn write_multipart_file(fname: &str, bytes: &[u8]) -> (String, String) {
 fn write_multipart_file(_fname: &str, _bytes: &[u8]) -> (String, String) {
     // No filesystem on Workers — surface metadata only.
     (String::new(), String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn default_content_type_when_none_set() {
+        let (ct, hdrs) = resolve_response_headers(None, &[]);
+        assert_eq!(ct, "text/html; charset=utf-8");
+        assert!(hdrs.is_empty());
+    }
+
+    #[test]
+    fn cfcontent_type_used_when_no_cfheader() {
+        let (ct, hdrs) =
+            resolve_response_headers(Some("application/pdf"), &h(&[("X-Foo", "bar")]));
+        assert_eq!(ct, "application/pdf");
+        assert_eq!(hdrs, h(&[("X-Foo", "bar")]));
+    }
+
+    #[test]
+    fn cfheader_content_type_replaces_default_and_is_not_duplicated() {
+        // Issue #148: cfheader(name="Content-Type") must REPLACE, not append.
+        let (ct, hdrs) = resolve_response_headers(
+            None,
+            &h(&[("Content-Type", "application/json; charset=utf-8")]),
+        );
+        assert_eq!(ct, "application/json; charset=utf-8");
+        // Content-Type is stripped from the emit list (applied as the singleton).
+        assert!(hdrs.iter().all(|(n, _)| !n.eq_ignore_ascii_case("content-type")));
+    }
+
+    #[test]
+    fn cfheader_content_type_wins_over_cfcontent() {
+        let (ct, _) = resolve_response_headers(
+            Some("text/html; charset=utf-8"),
+            &h(&[("content-type", "application/json")]),
+        );
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn last_content_type_wins() {
+        let (ct, _) = resolve_response_headers(
+            None,
+            &h(&[("Content-Type", "text/plain"), ("Content-Type", "application/json")]),
+        );
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn other_singletons_deduped_last_wins() {
+        let (_, hdrs) = resolve_response_headers(
+            None,
+            &h(&[("Location", "/a"), ("X-Foo", "1"), ("location", "/b")]),
+        );
+        let locs: Vec<_> = hdrs
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("location"))
+            .collect();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].1, "/b");
+    }
+
+    #[test]
+    fn non_singleton_headers_keep_multiplicity() {
+        let (_, hdrs) = resolve_response_headers(
+            None,
+            &h(&[("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")]),
+        );
+        let cookies: Vec<_> = hdrs
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("set-cookie"))
+            .collect();
+        assert_eq!(cookies.len(), 2);
+    }
 }

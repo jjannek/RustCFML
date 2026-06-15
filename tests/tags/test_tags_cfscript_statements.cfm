@@ -110,6 +110,18 @@ if (serverPort == "" || serverPort == "0") {
     assertTrue("content type is json",
         findNoCase("application/json", contentResult.responseheader["Content-Type"]) > 0);
 
+    // --- content type via cfheader (issue #148: must REPLACE, not append) ---
+    http url=baseUrl & targetPath & "?test=content-header" method="GET" result="ctHeaderResult";
+    assert("content-header target responds", ctHeaderResult.statuscode, "200 OK");
+    assert("content-header body", trim(ctHeaderResult.filecontent), '{"ok":1}');
+    ctVal = ctHeaderResult.responseheader["Content-Type"];
+    // A duplicate would surface as an array or a comma-joined string containing
+    // the engine default; a correct singleton is just the cfheader value.
+    assertTrue("cfheader Content-Type is a single (not duplicated) value",
+        isSimpleValue(ctVal));
+    assertTrue("cfheader Content-Type is the json type, not the html default",
+        findNoCase("application/json", ctVal) > 0 && findNoCase("text/html", ctVal) == 0);
+
     // --- location (redirect) ---
     http url=baseUrl & targetPath & "?test=location" method="GET" redirect="false" result="locResult";
     assertTrue("location returns 3xx",

@@ -185,13 +185,17 @@ pub async fn handle_fetch(
     }
 
     let status = response_data.status.unwrap_or(200);
-    let content_type = response_data
-        .content_type
-        .unwrap_or_else(|| "text/html; charset=utf-8".into());
+    // Resolve the singleton Content-Type and de-duplicate other singleton
+    // headers so a cfheader(name="Content-Type") (or Content-Length/Location)
+    // replaces rather than appends to the engine default (issue #148).
+    let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
+        response_data.content_type.as_deref(),
+        &response_data.headers,
+    );
 
     let headers = Headers::new();
     headers.set("Content-Type", &content_type)?;
-    for (k, v) in response_data.headers {
+    for (k, v) in emit_headers {
         headers.append(&k, &v)?;
     }
 

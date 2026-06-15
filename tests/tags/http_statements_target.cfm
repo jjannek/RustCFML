@@ -35,6 +35,13 @@ switch (url.test) {
         writeOutput('{"status":"ok"}');
         break;
 
+    case "content-header":
+        // Issue #148: cfheader(name="Content-Type") must REPLACE the engine
+        // default, not append a second Content-Type header.
+        cfheader(name="Content-Type", value="application/json; charset=utf-8");
+        writeOutput('{"ok":1}');
+        break;
+
     case "url-echo":
         writeOutput(url.probe ?: "");
         break;

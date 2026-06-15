@@ -1563,10 +1563,14 @@ async fn handle_request(
                         return builder.body(axum::body::Body::empty()).unwrap();
                     }
 
-                    // Determine content type
-                    let content_type = response.response_content_type
-                        .as_deref()
-                        .unwrap_or("text/html; charset=utf-8");
+                    // Resolve the singleton Content-Type and de-duplicate other
+                    // singleton headers so a cfheader(name="Content-Type") (or
+                    // Content-Length/Location) replaces rather than appends to
+                    // the engine default (issue #148).
+                    let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
+                        response.response_content_type.as_deref(),
+                        &response.response_headers,
+                    );
 
                     // Determine body
                     let body = if let Some(ref body_override) = response.response_body {
@@ -1583,9 +1587,9 @@ async fn handle_request(
 
                     let mut builder = axum::response::Response::builder()
                         .status(status_code)
-                        .header("Content-Type", content_type);
+                        .header("Content-Type", content_type.as_str());
 
-                    for (name, value) in &response.response_headers {
+                    for (name, value) in &emit_headers {
                         builder = builder.header(name.as_str(), value.as_str());
                     }
 
@@ -1751,10 +1755,14 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
                 state.vfs.clone(),
                 state.sandbox,
             ) {
+                let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
+                    resp.response_content_type.as_deref(),
+                    &resp.response_headers,
+                );
                 let mut builder = axum::response::Response::builder()
                     .status(status)
-                    .header("Content-Type", "text/html; charset=utf-8");
-                for (k, v) in &resp.response_headers {
+                    .header("Content-Type", content_type.as_str());
+                for (k, v) in &emit_headers {
                     builder = builder.header(k, v);
                 }
                 return builder
