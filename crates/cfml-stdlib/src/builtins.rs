@@ -2627,8 +2627,12 @@ fn fn_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_simple_value(args: Vec<CfmlValue>) -> CfmlResult {
+    // A bare query-column access (q.col) yields a QueryColumn proxy that stands
+    // in for its first-row scalar in scalar contexts (arithmetic, coercion,
+    // isNumeric — see to_number/fn_is_numeric). A single query cell IS a simple
+    // value on Lucee/ACF/BoxLang, so unwrap the proxy before the type test.
     Ok(CfmlValue::Bool(matches!(
-        args.first(),
+        args.first().map(|v| v.query_column_scalar()),
         Some(CfmlValue::Bool(_) | CfmlValue::Int(_) | CfmlValue::Double(_) | CfmlValue::String(_))
     )))
 }
@@ -4266,6 +4270,13 @@ fn serialize_value(val: &CfmlValue) -> String {
             let name = obj.read().map(|g| g.class_name().to_string())
                 .unwrap_or_else(|_| "poisoned".to_string());
             format!("\"<NativeObject:{}>\"", name.replace('"', "\\\""))
+        }
+        CfmlValue::QueryColumn(_) => {
+            // A bare query-column access (q.col) is a proxy standing in for its
+            // first-row scalar in scalar contexts. Serializing a struct/array
+            // holding a query cell must emit the value, not drop it to null
+            // (Lucee/ACF/BoxLang treat a query cell as a simple value).
+            serialize_value(val.query_column_scalar())
         }
         _ => "null".to_string(),
     }

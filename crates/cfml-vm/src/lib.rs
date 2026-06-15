@@ -718,6 +718,11 @@ impl ServerState {
 enum HeldLock {
     Write(std::sync::RwLockWriteGuard<'static, ()>),
     Read(std::sync::RwLockReadGuard<'static, ()>),
+    /// A reentrant re-acquire of a lock already held by this request/thread.
+    /// Holds no real guard — named locks are reentrant per thread, so the inner
+    /// acquire must not block on the non-reentrant RwLock. Popped in LIFO order
+    /// by __cflock_end without releasing the underlying guard.
+    Reentrant,
 }
 
 pub struct CfmlVirtualMachine {
@@ -8605,6 +8610,40 @@ impl CfmlVirtualMachine {
                             }
                             return self.call_function(&func, call_args, &method_locals);
                         } else {
+                            // An undeclared method must follow the same dispatch
+                            // rules as a direct dot-call: if the component defines
+                            // onMissingMethod, route through it (Lucee/ACF/BoxLang
+                            // all do). Wheels dispatches association cascade methods
+                            // (deleteAll<assoc> etc.) by name via cfinvoke and relies
+                            // on this landing in the model's onMissingMethod.
+                            let omm = comp_struct
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("onmissingmethod"))
+                                .map(|(_, v)| v.clone());
+                            if let Some(handler @ CfmlValue::Function(_)) = omm {
+                                // cfinvoke marshals its args into a struct; pass it
+                                // straight through as missingMethodArguments (already
+                                // keyed by name, mirroring the dot-call fallback).
+                                let missing_args = match invoke_args {
+                                    s @ CfmlValue::Struct(_) => s,
+                                    _ => CfmlValue::strukt(IndexMap::new()),
+                                };
+                                let mut method_locals = IndexMap::new();
+                                method_locals.insert("this".to_string(), component.clone());
+                                if let CfmlValue::Struct(ref cs) = component {
+                                    if let Some(vars) = cs.get("__variables") {
+                                        method_locals.insert("__variables".to_string(), vars.clone());
+                                    }
+                                }
+                                return self.call_function(
+                                    &handler,
+                                    vec![
+                                        CfmlValue::string(method_name.clone()),
+                                        missing_args,
+                                    ],
+                                    &method_locals,
+                                );
+                            }
                             return Err(CfmlError::runtime(format!(
                                 "Method '{}' not found in component",
                                 method_name
@@ -9178,6 +9217,16 @@ impl CfmlVirtualMachine {
                         };
 
                     if let Some(ref server_state) = self.server_state {
+                        // Named locks are reentrant within the same request/thread:
+                        // if this VM already holds a lock by this name, re-acquiring
+                        // it must succeed immediately rather than self-deadlock on the
+                        // non-reentrant RwLock (Lucee/ACF/BoxLang all permit same-thread
+                        // re-entry). Push a placeholder that __cflock_end pops in LIFO
+                        // order without releasing the real guard.
+                        if self.held_locks.iter().any(|(n, _)| *n == lock_name) {
+                            self.held_locks.push((lock_name, HeldLock::Reentrant));
+                            return Ok(CfmlValue::Null);
+                        }
                         // Get or create the named lock
                         let lock = {
                             let mut locks = server_state.named_locks.lock().unwrap();

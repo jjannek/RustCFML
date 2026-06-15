@@ -111,6 +111,9 @@ try { include "types/test_ordered_struct_literals.cfm"; } catch (any e) { writeO
 try { include "types/test_nested_writeback.cfm"; } catch (any e) { writeOutput("ERROR | types/test_nested_writeback.cfm | " & e.message & chr(10)); }
 try { include "types/test_query.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_column.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_column.cfm | " & e.message & chr(10)); }
+// A query cell must be a SIMPLE value: IsSimpleValue()=true and SerializeJSON of a
+// struct holding it preserves the value. RustCFML 0.161.0 returned boxed cells.
+try { include "types/test_query_cell_simple_value.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_cell_simple_value.cfm | " & e.message & chr(10)); }
 try { include "types/test_query_reference.cfm"; } catch (any e) { writeOutput("ERROR | types/test_query_reference.cfm | " & e.message & chr(10)); }
 try { include "types/test_binary.cfm"; } catch (any e) { writeOutput("ERROR | types/test_binary.cfm | " & e.message & chr(10)); }
 try { include "types/test_hash_in_strings.cfm"; } catch (any e) { writeOutput("ERROR | types/test_hash_in_strings.cfm | " & e.message & chr(10)); }
@@ -214,6 +217,13 @@ try { include "oop/test_relative_component_resolution.cfm"; } catch (any e) { wr
 // Inherited-method sibling of #132: a bare CreateObject inside an inherited method must
 // resolve against the PARENT (defining) component's package, not the concrete subclass's dir.
 try { include "oop/test_inherited_bare_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_bare_component_resolution.cfm | " & e.message & chr(10)); }
+// cfinvoke method="<name>" must dispatch an unknown method to onMissingMethod (as a
+// direct dot-call does). RustCFML 0.161.0 threw "Method not found"; breaks Wheels
+// hasMany dependent=delete/deleteAll/removeAll cascade (deleteAll<assoc> via cfinvoke).
+try { include "oop/test_cfinvoke_onmissingmethod.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_cfinvoke_onmissingmethod.cfm | " & e.message & chr(10)); }
+// A named exclusive lock must be reentrant within the same request/thread.
+// RustCFML 0.161.0 self-deadlocked on re-entry (inner timed out + threw).
+try { include "core/test_named_lock_reentrant.cfm"; } catch (any e) { writeOutput("ERROR | core/test_named_lock_reentrant.cfm | " & e.message & chr(10)); }
 // `new Comp(args)` must propagate an exception thrown by init() (constructor-guard
 // validation). RustCFML 0.161.0 swallowed it under the `new` sugar and returned a
 // half-built object; createObject(...).init() propagates correctly.
