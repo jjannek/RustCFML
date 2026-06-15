@@ -125,4 +125,4 @@ crates/
 
 Reference: [cfdocs.org/functions](https://cfdocs.org/functions) | [cfdocs.org/tags](https://cfdocs.org/tags) | BoxLang ANTLR grammar | Lucee expression grammar
 
-*Last Updated: 2026-03-04* | 1181 tests across 89 suites
+*Last Updated: 2026-06-15* | 3965 assertions across 478 suites

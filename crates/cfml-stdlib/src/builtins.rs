@@ -7445,6 +7445,37 @@ pub fn fn_query_execute_dynamic(args: Vec<CfmlValue>) -> CfmlResult {
     driver.execute(&sql, &raw_params, &return_type)
 }
 
+/// Normalize a `cfqueryparam`-style positional param array (an array of
+/// `{value, cfsqltype, …}` structs) to plain bind values, and expand any
+/// `list` params in the SQL (one `?` → `?,?,?`). Returns the (possibly
+/// rewritten) SQL plus the normalized params. Non-struct arrays and named
+/// (struct) params pass through unchanged.
+///
+/// Both the normal `queryExecute` path and the transaction path must run
+/// this before handing params to a driver — otherwise the raw cfqueryparam
+/// struct reaches the driver and gets stringified into the SQL (issue #147).
+/// Idempotent: an already-normalized plain array has no `value`-keyed structs,
+/// so it returns unchanged.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn normalize_positional_params(sql: String, raw_params: &CfmlValue) -> (String, CfmlValue) {
+    if let CfmlValue::Array(arr) = raw_params {
+        if let Some(CfmlValue::Struct(first)) = arr.first() {
+            if first.iter().any(|(k, _)| k.eq_ignore_ascii_case("value")) {
+                let (values, _hints) = normalize_query_params(raw_params);
+                // Check if any list params require SQL expansion
+                let placeholder_counts = get_list_placeholder_counts(raw_params);
+                let expanded_sql = if placeholder_counts.iter().any(|&c| c > 1) {
+                    expand_sql_placeholders(&sql, &placeholder_counts)
+                } else {
+                    sql
+                };
+                return (expanded_sql, CfmlValue::array(values));
+            }
+        }
+    }
+    (sql, raw_params.clone())
+}
+
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     let sql = get_str(&args, 0);
@@ -7457,28 +7488,7 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
 
     // Normalize structured params (cfqueryparam-style array of structs) to plain values
     // Also expand SQL for list params (single ? → multiple ?,?,?)
-    let (sql, params_arg) = match &raw_params {
-        CfmlValue::Array(arr) if !arr.is_empty() => {
-            if let Some(CfmlValue::Struct(first)) = arr.first() {
-                if first.iter().any(|(k, _)| k.eq_ignore_ascii_case("value")) {
-                    let (values, _hints) = normalize_query_params(&raw_params);
-                    // Check if any list params require SQL expansion
-                    let placeholder_counts = get_list_placeholder_counts(&raw_params);
-                    let expanded_sql = if placeholder_counts.iter().any(|&c| c > 1) {
-                        expand_sql_placeholders(&sql, &placeholder_counts)
-                    } else {
-                        sql
-                    };
-                    (expanded_sql, CfmlValue::array(values))
-                } else {
-                    (sql, raw_params)
-                }
-            } else {
-                (sql, raw_params)
-            }
-        }
-        _ => (sql, raw_params),
-    };
+    let (sql, params_arg) = normalize_positional_params(sql, &raw_params);
 
     // Extract datasource from options. Look up against the cfconfig
     // registry first; fall back to the default datasource if the call
@@ -8886,6 +8896,13 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
 /// Execute a query using an existing transaction connection
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
+    // The transaction path receives the raw cfqueryparam param array (the
+    // non-transaction `fn_query_execute` does this normalization before the
+    // driver sees the params). Without it the `{value, cfsqltype}` structs are
+    // stringified into the SQL instead of bound (issue #147).
+    let (sql, params_arg) = normalize_positional_params(sql.to_string(), params_arg);
+    let sql = sql.as_str();
+    let params_arg = &params_arg;
     match conn {
         #[cfg(feature = "sqlite")]
         TransactionConn::Sqlite(c) => {

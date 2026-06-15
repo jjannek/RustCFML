@@ -9,7 +9,7 @@ CFML (ColdFusion Markup Language) interpreter written in Rust. Compiles CFML sou
 ```bash
 cargo build                          # Debug build
 cargo build --release                # Release build
-cargo run -- tests/runner.cfm        # Run all tests (~1181 assertions, 89 suites)
+cargo run -- tests/runner.cfm        # Run all tests (~3965 assertions, 478 suites)
 cargo run --release -- file.cfm      # Run a CFML file
 cargo run --release -- --serve       # Start web server on port 8500
 cargo test --workspace               # ALL Rust tests — incl. the JIT integration
