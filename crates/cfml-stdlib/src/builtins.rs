@@ -4143,8 +4143,18 @@ fn serialize_value(val: &CfmlValue) -> String {
             // serialization and framework model inspection see only data.
             let is_cfc = s.contains_key("__variables")
                 && (s.contains_key("this") || s.contains_key("__name"));
+            // An arguments-derived struct carries private sentinel markers.
+            // structKeyList/Count/Exists/for-in already hide these; serializeJSON
+            // must too, or a struct built via structAppend(s, arguments) leaks
+            // them into the JSON (Lucee has no such keys).
+            let is_args = s.contains_key("__arguments_scope");
             let items: Vec<String> = s
                 .iter()
+                .filter(|(k, _)| {
+                    !is_args
+                        || (k.as_str() != "__arguments_scope"
+                            && k.as_str() != "__arguments_params")
+                })
                 .filter(|(k, v)| {
                     if !is_cfc {
                         return true;

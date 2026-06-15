@@ -564,6 +564,11 @@ try { include "core/test_new_udf_dispatch_and_null_call.cfm"; } catch (any e) { 
 //     second physical key. Surfaced booting Wheels (params / option structs
 //     written under one casing and read under another).
 try { include "core/test_struct_key_case_parity.cfm"; } catch (any e) { writeOutput("ERROR | core/test_struct_key_case_parity.cfm | " & e.message & chr(10)); }
+//   - serializejson_arguments_sentinels: SerializeJSON must filter the internal
+//     __arguments_scope/__arguments_params sentinels (structKeyList/Count/Exists/
+//     for-in already do). A struct built via structAppend(s, arguments) otherwise
+//     leaks them into JSON; breaks Wheels helpers that serialize copied arg structs.
+try { include "core/test_serializejson_arguments_sentinels.cfm"; } catch (any e) { writeOutput("ERROR | core/test_serializejson_arguments_sentinels.cfm | " & e.message & chr(10)); }
 //   - delegate annotation metadata: bare + arbitrary-named property annotations
 //     are captured, and component-level annotations surface top-level in
 //     getComponentMetadata (Lucee parity) — the surface WireBox delegation reads.
