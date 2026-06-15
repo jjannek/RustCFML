@@ -473,7 +473,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("applicationStop".into(), fn_application_stop);
     f.insert("getApplicationMetadata".into(), fn_get_application_metadata);
     f.insert("getApplicationSettings".into(), fn_get_application_metadata);  // alias
-    f.insert("location".into(), fn_cflocation_stub);  // VM intercepts
+    // `location` (script alias for `cflocation`) is intentionally NOT registered
+    // as a builtin: it must flow through the LoadGlobal script-tag-call mapping to
+    // the `__cflocation` VM intercept (see `lib.rs`). Registering it as a builtin
+    // shadowed that mapping and hit the stub — a 500 "requires VM intercept".
     f.insert("trace".into(), fn_trace);
     f.insert("exceptionKeyExists".into(), fn_exception_key_exists);
 

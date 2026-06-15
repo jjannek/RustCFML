@@ -3034,6 +3034,7 @@ impl CfmlVirtualMachine {
                         "cfheader"
                             | "cfcontent"
                             | "cflocation"
+                            | "location"
                             | "cfabort"
                             | "cfsetting"
                             | "cfcookie"
@@ -3041,7 +3042,15 @@ impl CfmlVirtualMachine {
                             | "cfinvoke"
                     ) {
                         // Script-style tag calls: `cfcontent(reset=true)` routes to `__cfcontent`.
-                        let underscored = format!("__{}", name_lower);
+                        // `location(...)` is the documented script alias for `cflocation(...)`
+                        // (CFML BIF `Location(url, addToken, statusCode)`); both must reach the
+                        // `__cflocation` VM intercept, else `location()` falls through to the
+                        // builtin stub and 500s with "requires VM intercept".
+                        let underscored = if name_lower == "location" {
+                            "__cflocation".to_string()
+                        } else {
+                            format!("__{}", name_lower)
+                        };
                         stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
                             name: underscored,
                             params: Vec::new(),
@@ -8410,31 +8419,50 @@ impl CfmlVirtualMachine {
                     ));
                 }
                 "__cflocation" => {
-                    if let Some(CfmlValue::Struct(opts)) = args.get(0) {
-                        let url = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "url")
-                            .map(|(_, v)| v.as_string())
-                            .unwrap_or_default();
-                        let status_code = opts
-                            .iter()
-                            .find(|(k, _)| k.to_lowercase() == "statuscode")
-                            .map(|(_, v)| match v {
-                                CfmlValue::Int(n) => n as u16,
-                                CfmlValue::String(s) => s.parse::<u16>().unwrap_or(302),
-                                CfmlValue::Double(d) => d as u16,
-                                _ => 302,
-                            })
-                            .unwrap_or(302);
-                        self.redirect_url = Some(url.clone());
-                        self.response_headers.push(("Location".to_string(), url));
-                        self.response_status = Some((status_code, "Found".to_string()));
-                        return Err(CfmlError::new(
-                            "__cflocation_redirect".to_string(),
-                            CfmlErrorType::Custom("redirect".to_string()),
-                        ));
+                    let to_status = |v: &CfmlValue| -> u16 {
+                        match v {
+                            CfmlValue::Int(n) => *n as u16,
+                            CfmlValue::String(s) => s.parse::<u16>().unwrap_or(302),
+                            CfmlValue::Double(d) => *d as u16,
+                            _ => 302,
+                        }
+                    };
+                    // Two call shapes reach here: the tag / named-arg form bundles
+                    // a single options struct `{url, statusCode, addToken}`; the
+                    // positional script BIF `Location(url, addToken, statusCode)`
+                    // arrives as raw positional args. Support both.
+                    let (url, status_code) = match args.get(0) {
+                        Some(CfmlValue::Struct(opts)) => {
+                            let url = opts
+                                .iter()
+                                .find(|(k, _)| k.to_lowercase() == "url")
+                                .map(|(_, v)| v.as_string())
+                                .unwrap_or_default();
+                            let status_code = opts
+                                .iter()
+                                .find(|(k, _)| k.to_lowercase() == "statuscode")
+                                .map(|(_, v)| to_status(&v))
+                                .unwrap_or(302);
+                            (url, status_code)
+                        }
+                        Some(url_val) => {
+                            // Positional: Location(url, addToken, statusCode).
+                            let url = url_val.as_string();
+                            let status_code = args.get(2).map(to_status).unwrap_or(302);
+                            (url, status_code)
+                        }
+                        None => return Ok(CfmlValue::Null),
+                    };
+                    if url.is_empty() {
+                        return Ok(CfmlValue::Null);
                     }
-                    return Ok(CfmlValue::Null);
+                    self.redirect_url = Some(url.clone());
+                    self.response_headers.push(("Location".to_string(), url));
+                    self.response_status = Some((status_code, "Found".to_string()));
+                    return Err(CfmlError::new(
+                        "__cflocation_redirect".to_string(),
+                        CfmlErrorType::Custom("redirect".to_string()),
+                    ));
                 }
                 "gethttprequestdata" => {
                     if let Some(ref data) = self.http_request_data {

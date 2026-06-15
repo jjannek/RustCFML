@@ -304,6 +304,7 @@ try { include "lifecycle/test_application_load_errors.cfm"; } catch (any e) { wr
 try { include "lifecycle/test_application_scope_custom_tag.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_scope_custom_tag.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_onerror_onabort.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_onerror_onabort.cfm | " & e.message & chr(10)); }
 try { include "server/test_front_controller_fallback.cfm"; } catch (any e) { writeOutput("ERROR | server/test_front_controller_fallback.cfm | " & e.message & chr(10)); }
+try { include "server/test_location_redirect.cfm"; } catch (any e) { writeOutput("ERROR | server/test_location_redirect.cfm | " & e.message & chr(10)); }
 
 // --- Java Shims ---
 try { include "java_shims/test_all.cfm"; } catch (any e) { writeOutput("ERROR | java_shims/test_all.cfm | " & e.message & chr(10)); }
