@@ -12,6 +12,14 @@ switch (url.test) {
         writeOutput("header-ok");
         break;
 
+    case "header-named":
+        // Parenthesized call form with direct named args (issue #141).
+        // Previously these were silent no-ops; only attributeCollection worked.
+        cfheader(name="X-Script-Named", value="snamed");
+        cfheader(attributeCollection={name:"X-Script-AC", value:"sac"});
+        writeOutput("header-named-ok");
+        break;
+
     case "cookie":
         cookie name="testcookie" value="cookievalue";
         cookie name="securecookie" value="secret" httponly="true" secure="true";

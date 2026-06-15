@@ -87,6 +87,17 @@ if (serverPort == "" || serverPort == "0") {
         structKeyExists(headerResult.responseheader, "X-Test-Header")
         && headerResult.responseheader["X-Test-Header"] == "hello123");
 
+    // --- header via parenthesized call form with direct named args (issue #141) ---
+    http url=baseUrl & targetPath & "?test=header-named" method="GET" result="headerNamedResult";
+    assert("header-named target responds", headerNamedResult.statuscode, "200 OK");
+    assert("header-named body", trim(headerNamedResult.filecontent), "header-named-ok");
+    assertTrue("cfheader(name=,value=) named-arg form sets header",
+        structKeyExists(headerNamedResult.responseheader, "X-Script-Named")
+        && headerNamedResult.responseheader["X-Script-Named"] == "snamed");
+    assertTrue("cfheader(attributeCollection=) form sets header",
+        structKeyExists(headerNamedResult.responseheader, "X-Script-AC")
+        && headerNamedResult.responseheader["X-Script-AC"] == "sac");
+
     // --- cookie ---
     http url=baseUrl & targetPath & "?test=cookie" method="GET" result="cookieResult";
     assert("cookie target responds", cookieResult.statuscode, "200 OK");

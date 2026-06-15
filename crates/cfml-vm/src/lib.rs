@@ -10852,6 +10852,19 @@ impl CfmlVirtualMachine {
                 | "__cfmail"
                 | "cfdbinfo"
                 | "dbinfo"
+                // Script-form response/control tags. These resolve to a
+                // `__cfX` builtin that consumes a single struct-of-options
+                // (see the intercepts in `call_function`). Without bundling,
+                // the script named-arg form `cfheader(name=…, value=…)` drops
+                // every attribute and silently no-ops — only the
+                // `attributeCollection={…}` single-struct form reached the
+                // intercept. (GitHub issue #141.)
+                | "__cfheader"
+                | "__cfcontent"
+                | "__cflocation"
+                | "__cfcookie"
+                | "__cflog"
+                | "__cfsetting"
         )
     }
 
@@ -10863,10 +10876,15 @@ impl CfmlVirtualMachine {
     /// block form `cfhttp(…){…}` is rewritten to an explicit assignment in the
     /// parser, so only the no-block call form was affected).
     fn tag_call_writeback_attr(tag: &str) -> &'static [&'static str] {
-        if tag.eq_ignore_ascii_case("cfhttp") {
-            &["result"]
-        } else {
-            &["name", "variable"]
+        let tag = tag.trim_start_matches("__");
+        match tag.to_lowercase().as_str() {
+            "cfhttp" => &["result"],
+            // Response/control tags have no return-value write-back: their
+            // `name` attribute is a real option (header/cookie name), not a
+            // caller-scope target.
+            "cfheader" | "cfcontent" | "cflocation" | "cfcookie" | "cflog"
+            | "cfsetting" => &[],
+            _ => &["name", "variable"],
         }
     }
 
