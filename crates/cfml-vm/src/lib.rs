@@ -14016,9 +14016,25 @@ impl CfmlVirtualMachine {
             parent_map.insert("__variables".to_string(), CfmlValue::strukt(merged_vars));
         }
 
+        // Component-level metadata (displayName, hint, and any other
+        // <cfcomponent>-declared attributes) is per-class and must NOT be
+        // inherited onto a child's leaf metadata. Lucee/ACF/BoxLang expose a
+        // parent's attributes only via the metadata `extends` chain, never
+        // duplicated on the child. The parent snapshot carries the parent's
+        // __metadata, so replace it with the child's own (or drop it entirely
+        // when the child declared no component attributes).
+        match child_map.get("__metadata") {
+            Some(child_md) => {
+                parent_map.insert("__metadata".to_string(), child_md.clone());
+            }
+            None => {
+                parent_map.shift_remove("__metadata");
+            }
+        }
+
         // Layer child on top of parent (child overrides parent)
         for (k, v) in child_map.iter() {
-            if k == "__extends" || k == "__variables" {
+            if k == "__extends" || k == "__variables" || k == "__metadata" {
                 continue; // Already merged above; don't overwrite
             }
             parent_map.insert(k.clone(), v.clone());
