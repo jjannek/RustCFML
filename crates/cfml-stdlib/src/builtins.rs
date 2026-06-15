@@ -2254,47 +2254,65 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
 fn fn_struct_count(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Int(visible_struct_keys(s).len() as i64)),
+        // A query's columns are its keys (Lucee parity, issue #146).
+        Some(CfmlValue::Query(q)) => Ok(CfmlValue::Int(q.column_count() as i64)),
         _ => Ok(CfmlValue::Int(0)),
     }
 }
 
 fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        if let CfmlValue::Struct(s) = &args[0] {
-            let key = args[1].as_string();
-            let found = struct_find_key_ci(s, &key).is_some();
-            // Hide the private arguments-scope markers from introspection.
-            if found
-                && s.contains_key("__arguments_scope")
-                && (key == "__arguments_scope" || key == "__arguments_params")
-            {
-                return Ok(CfmlValue::Bool(false));
+        let key = args[1].as_string();
+        match &args[0] {
+            CfmlValue::Struct(s) => {
+                let found = struct_find_key_ci(s, &key).is_some();
+                // Hide the private arguments-scope markers from introspection.
+                if found
+                    && s.contains_key("__arguments_scope")
+                    && (key == "__arguments_scope" || key == "__arguments_params")
+                {
+                    return Ok(CfmlValue::Bool(false));
+                }
+                return Ok(CfmlValue::Bool(found));
             }
-            return Ok(CfmlValue::Bool(found));
+            // Lucee treats a query's columns as its keys, so the struct
+            // introspection BIFs work on a query (e.g. cfdbinfo type="version"
+            // results, issue #146). Row count is irrelevant.
+            CfmlValue::Query(q) => {
+                let found = q.columns().iter().any(|c| c.eq_ignore_ascii_case(&key));
+                return Ok(CfmlValue::Bool(found));
+            }
+            _ => {}
         }
     }
     Ok(CfmlValue::Bool(false))
 }
 
 fn fn_struct_key_list(args: Vec<CfmlValue>) -> CfmlResult {
-    if let Some(CfmlValue::Struct(s)) = args.first() {
-        let delimiter = get_delimiter(&args, 1);
-        Ok(CfmlValue::string(visible_struct_keys(s).join(&delimiter)))
-    } else {
-        Ok(CfmlValue::string(String::new()))
+    match args.first() {
+        Some(CfmlValue::Struct(s)) => {
+            let delimiter = get_delimiter(&args, 1);
+            Ok(CfmlValue::string(visible_struct_keys(s).join(&delimiter)))
+        }
+        Some(CfmlValue::Query(q)) => {
+            let delimiter = get_delimiter(&args, 1);
+            Ok(CfmlValue::string(q.columns().join(&delimiter)))
+        }
+        _ => Ok(CfmlValue::string(String::new())),
     }
 }
 
 fn fn_struct_key_array(args: Vec<CfmlValue>) -> CfmlResult {
-    if let Some(CfmlValue::Struct(s)) = args.first() {
-        let keys: Vec<CfmlValue> = visible_struct_keys(s)
-            .into_iter()
-            .map(CfmlValue::string)
-            .collect();
-        Ok(CfmlValue::array(keys))
-    } else {
-        Ok(CfmlValue::array(Vec::new()))
-    }
+    let keys: Vec<CfmlValue> = match args.first() {
+        Some(CfmlValue::Struct(s)) => {
+            visible_struct_keys(s).into_iter().map(CfmlValue::string).collect()
+        }
+        Some(CfmlValue::Query(q)) => {
+            q.columns().into_iter().map(CfmlValue::string).collect()
+        }
+        _ => Vec::new(),
+    };
+    Ok(CfmlValue::array(keys))
 }
 
 fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
@@ -2479,6 +2497,9 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
     match args.first() {
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::Bool(s.is_empty())),
+        // A query's columns are its keys, so a query with columns is never
+        // "empty" — even with zero rows (Lucee parity, issue #146).
+        Some(CfmlValue::Query(q)) => Ok(CfmlValue::Bool(q.column_count() == 0)),
         _ => Ok(CfmlValue::Bool(true)),
     }
 }

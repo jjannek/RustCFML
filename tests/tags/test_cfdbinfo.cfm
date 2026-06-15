@@ -33,6 +33,22 @@ if (NOT dbiSkip) {
     assertTrue("version: database_version populated", len(vinfo.database_version[1]) GT 0);
     assertTrue("version: has jdbc columns", listFindNoCase(vinfo.columnList, "jdbc_major_version") GT 0);
 
+    // Issue #146: the version result is a query, but Lucee lets the struct
+    // introspection BIFs read a query's columns as its keys — the Wheels
+    // migrator uses structKeyExists/structKeyList against the version result.
+    assertTrue("version: structKeyExists sees a column",
+        structKeyExists(vinfo, "database_productname"));
+    assertFalse("version: structKeyExists false for absent column",
+        structKeyExists(vinfo, "no_such_column"));
+    assertTrue("version: structKeyList returns the columns",
+        listFindNoCase(structKeyList(vinfo), "database_productname") GT 0);
+    assert("version: structCount equals column count",
+        structCount(vinfo), listLen(vinfo.columnList));
+    assertFalse("version: structIsEmpty false when columns exist",
+        structIsEmpty(vinfo));
+    assert("version: structKeyArray length equals column count",
+        arrayLen(structKeyArray(vinfo)), listLen(vinfo.columnList));
+
     // --- columns: names, types, PK/FK enrichment, defaults ---
     cfdbinfo(type="columns", name="cols", table="users", datasource=dbiDs);
     assert("columns: names", valueList(cols.COLUMN_NAME), "id,username,role_id");

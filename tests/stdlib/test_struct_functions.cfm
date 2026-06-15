@@ -77,5 +77,21 @@ assert("structValueArray value", vals[1], 1);
 assertTrue("isEmpty empty struct", isEmpty({}));
 assertFalse("isEmpty non-empty struct", isEmpty({a: 1}));
 
+// --- struct introspection BIFs treat a query's columns as its keys (issue
+// #146; Lucee parity). cfdbinfo type="version" returns a query and the Wheels
+// migrator reads it with structKeyExists/structKeyList. ---
+qIntro = queryNew("aa,bb,cc", "varchar,integer,varchar", [["x", 1, "p"], ["y", 2, "q"]]);
+assertTrue("structKeyExists on query column", structKeyExists(qIntro, "bb"));
+assertTrue("structKeyExists on query column case-insensitive", structKeyExists(qIntro, "BB"));
+assertFalse("structKeyExists false for absent query column", structKeyExists(qIntro, "zz"));
+assertTrue("structKeyList lists query columns", listFindNoCase(structKeyList(qIntro), "aa") > 0);
+assert("structCount equals query column count", structCount(qIntro), 3);
+assert("structKeyArray length equals query column count", arrayLen(structKeyArray(qIntro)), 3);
+assertFalse("structIsEmpty false for query with columns", structIsEmpty(qIntro));
+// columns are keys regardless of row count — a zero-row query is not empty
+qZero = queryNew("mm,nn", "varchar,varchar");
+assert("structCount counts columns of zero-row query", structCount(qZero), 2);
+assertFalse("structIsEmpty false for zero-row query with columns", structIsEmpty(qZero));
+
 suiteEnd();
 </cfscript>
