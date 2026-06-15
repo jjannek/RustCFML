@@ -6090,11 +6090,40 @@ impl CfmlVirtualMachine {
                         } else {
                             parent_locals
                         };
-                        return self.execute_function_with_args(
+                        // Lexical relative-component resolution: while a user
+                        // function runs, a bare createObject("component","X")/
+                        // `new X()` inside it must resolve X relative to the
+                        // package of the file that DEFINES the function, not the
+                        // caller's file. call_member_function does this for
+                        // receiver dispatch (this.m()/child.m(), the #132/#133
+                        // fixes); a BARE call to an inherited method (e.g. a
+                        // child-defined `go()` calling the inherited
+                        // `makeSibling()`) routes here instead, so it needs the
+                        // same swap or it would search the outer frame's dir.
+                        // Skip when the callee carries no source (dynamic
+                        // closures) or already matches the active file — the
+                        // common same-file / self-recursion case pays only a
+                        // cheap comparison, no clone. (Wheels migrator shape:
+                        // migration up() -> inherited createTable() ->
+                        // createObject("TableDefinition").)
+                        let saved_source_file = if user_func.source_file.is_some()
+                            && user_func.source_file != self.source_file
+                        {
+                            let prev = self.source_file.clone();
+                            self.source_file = user_func.source_file.clone();
+                            Some(prev)
+                        } else {
+                            None
+                        };
+                        let result = self.execute_function_with_args(
                             &user_func,
                             args,
                             Some(effective_parent),
                         );
+                        if let Some(prev) = saved_source_file {
+                            self.source_file = prev;
+                        }
+                        return result;
                     }
                 }
             }
