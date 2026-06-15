@@ -118,6 +118,12 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `csrfVerifyToken(token, key)` | `key` | Same. |
 | `fileSetAccessMode` / file mode setters | mode | No-op on non-Unix platforms. |
 | `fileUpload()` / `fileUploadAll()` | — | Stub: returns `fileWasSaved=false` (needs form-scope wiring). |
+| `fileClose(handle)` | — | Stub: returns null, closes nothing (no real file-handle management). |
+| `setTimeZone(tz)` | `tz` | No-op: the argument is ignored (only cfconfig `runtime.timezone` is honoured — see §1). |
+| `<cfstoredproc>` / `cfprocparam` | `direction`, `dbVarName`, `maxLength`, `scale` | Only `value`/`cfsqltype` survive lowering, so OUT/INOUT stored-proc params don't round-trip. |
+| `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
+| `s3Write` / `s3Upload` / `s3Copy` / `s3Move` | `acl`, `location` | Accepted but not sent to the backend. |
+| `s3Read` / `s3Download` | `charset` | Accepted but ignored. |
 
 ## 8. Environment-specific 🌍
 
@@ -127,6 +133,8 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cfzip>` | Not supported on `wasm32`. |
 | `<cflock>` | No-op in CLI mode (no server state); enforced in serve mode. |
 | `<cfcache>` | No-op today (could emit Cache-Control in serve mode). |
+| `runAsync` / `_schedule` delay+period | On `wasm32` (and other no-real-threads builds) the `delayMs`/`periodMs` args are ignored — the closure runs inline immediately rather than being scheduled. |
+| `java.util.Collections.unmodifiable*` / `synchronized*` shims | Identity no-ops — they return the same collection with no true immutability / synchronization. |
 
 ## 9. Query-of-Queries — RustCFML/BoxLang superset 🏗
 
