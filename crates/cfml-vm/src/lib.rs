@@ -1450,9 +1450,12 @@ impl CfmlVirtualMachine {
     ) -> ThreadSeed {
         let mut body = closure;
         if let CfmlValue::Function(f) = &mut body {
-            if let Some(cap) = &f.captured_scope {
-                let snap = cap.read().map(|g| g.clone()).unwrap_or_default();
-                f.captured_scope = Some(Arc::new(std::sync::RwLock::new(snap)));
+            let snap = f
+                .captured_scope
+                .as_ref()
+                .map(|cap| cap.read().map(|g| g.clone()).unwrap_or_default());
+            if let Some(snap) = snap {
+                Arc::make_mut(f).captured_scope = Some(Arc::new(std::sync::RwLock::new(snap)));
             }
         }
         ThreadSeed {
@@ -1666,7 +1669,7 @@ impl CfmlVirtualMachine {
         self.builtins.insert(name.to_string(), f);
         self.globals.insert(
             name.to_string(),
-            CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+            CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                 name: name.to_string(),
                 params: Vec::new(),
                 body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -2450,7 +2453,7 @@ impl CfmlVirtualMachine {
                                 let mut bound_fn = (**f).clone();
                                 bound_fn.captured_scope =
                                     Some(Arc::new(std::sync::RwLock::new(bound)));
-                                CfmlValue::Function(Box::new(bound_fn))
+                                CfmlValue::Function(Arc::new(bound_fn))
                             } else {
                                 val
                             }
@@ -2479,7 +2482,7 @@ impl CfmlVirtualMachine {
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
                         let scope = Arc::new(RwLock::new(filtered));
-                        CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+                        CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: bc_func.name.clone(),
                             params: bc_func
                                 .params
@@ -2937,7 +2940,7 @@ impl CfmlVirtualMachine {
                         } else {
                             (CfmlValue::Null, None)
                         };
-                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: name.clone(),
                             params,
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -2999,7 +3002,7 @@ impl CfmlVirtualMachine {
                         } else {
                             (CfmlValue::Null, None, canonical)
                         };
-                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: resolved_name,
                             params,
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -3019,7 +3022,7 @@ impl CfmlVirtualMachine {
                             | "callstackdump"
                             | "precisionevaluate"
                     ) {
-                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: name.clone(),
                             params: Vec::new(),
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -3051,7 +3054,7 @@ impl CfmlVirtualMachine {
                         } else {
                             format!("__{}", name_lower)
                         };
-                        stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+                        stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: underscored,
                             params: Vec::new(),
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -4270,7 +4273,7 @@ impl CfmlVirtualMachine {
                     if func.name == "__main__" || func.name == "__cfc_body__" {
                         for (_, v) in locals.iter_mut() {
                             if let CfmlValue::Function(ref mut f) = v {
-                                f.captured_scope = None;
+                                Arc::make_mut(f).captured_scope = None;
                             }
                         }
                         if let Some(ref env) = closure_env {
@@ -4960,7 +4963,7 @@ impl CfmlVirtualMachine {
                     };
                     // Push function reference — encode func_idx in body for super dispatch
                     let bc_func_ref = &bc_func_arc;
-                    stack.push(CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+                    stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                         name: func_name,
                         params: bc_func_ref
                             .params
@@ -6088,7 +6091,7 @@ impl CfmlVirtualMachine {
             // snapshotting — CFC methods resolve via __variables, not closures.
             for (_, v) in locals.iter_mut() {
                 if let CfmlValue::Function(ref mut f) = v {
-                    f.captured_scope = None;
+                    Arc::make_mut(f).captured_scope = None;
                 }
             }
             // Break the closure-env reference cycle. The pseudo-constructor's
@@ -13438,7 +13441,7 @@ impl CfmlVirtualMachine {
                 s.with_write(|m| {
                     for (_, v) in m.iter_mut() {
                         if let CfmlValue::Function(f) = v {
-                            f.captured_scope = None;
+                            Arc::make_mut(f).captured_scope = None;
                         }
                     }
                 });
@@ -13481,7 +13484,7 @@ impl CfmlVirtualMachine {
                             .iter()
                             .any(|f| f.name == *func_name)
                         {
-                            let cf = CfmlValue::Function(Box::new(cfml_common::dynamic::CfmlFunction {
+                            let cf = CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                                 name: func_name.clone(),
                                 params: func_def
                                     .params
@@ -13526,7 +13529,7 @@ impl CfmlVirtualMachine {
                     }
                     if let CfmlValue::Function(ref f) = v {
                         let mut clean = f.clone();
-                        clean.captured_scope = None;
+                        Arc::make_mut(&mut clean).captured_scope = None;
                         vars_scope.insert(k.clone(), CfmlValue::Function(clean));
                     } else {
                         vars_scope.insert(k.clone(), v.clone());
@@ -13556,7 +13559,7 @@ impl CfmlVirtualMachine {
                             continue;
                         }
                         let mut clean = f.clone();
-                        clean.captured_scope = None;
+                        Arc::make_mut(&mut clean).captured_scope = None;
                         vars_scope.insert(k.clone(), CfmlValue::Function(clean));
                     }
                 }

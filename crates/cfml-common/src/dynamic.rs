@@ -530,13 +530,18 @@ pub enum CfmlValue {
     Struct(CfmlStruct),
     Closure(Box<CfmlClosure>),
     Component(Box<CfmlComponent>),
-    // Boxed (PR-A): inlining `CfmlFunction` (112 B) pinned `CfmlValue` at 112 B;
-    // boxing it makes it an 8 B pointer and drops the enum to 32 B (String-
-    // dominated), shrinking the operand stack and every scope/struct map ~3.6×.
-    // Box deref-coerces, so field/method reads are unchanged; only construction
-    // (`Box::new`) and move-out destructures (`*b`) needed touching. (`Query` is
-    // no longer boxed — it's now an 8 B `Arc` handle, reference-typed.)
-    Function(Box<CfmlFunction>),
+    // `Arc`-handle (was `Box<CfmlFunction>`): a `CfmlFunction` carries a `name`
+    // String, a `params` Vec<CfmlParam>, and a body — so a `Box` clone deep-copied
+    // all of it plus a fresh allocation. Profiling stock Wheels (`/posts`, 100-row
+    // ORM + view render) showed ~50% of request CPU was `CfmlFunction` clone+drop:
+    // scopes are IndexMaps full of CFC-method `Function` values, and every scope
+    // clone (per call / per CFC-method dispatch) deep-cloned every method. Sharing
+    // the function behind an `Arc` makes a `CfmlValue::Function` clone a refcount
+    // bump (no alloc, no copy) — the same handle pattern already used for String/
+    // Array/Struct/Query. Still an 8 B pointer, so `CfmlValue` stays 32 B. Arc
+    // deref-coerces, so field/method reads are unchanged; in-place field writes
+    // (only `captured_scope`) go through `Arc::make_mut` (copy-on-write).
+    Function(Arc<CfmlFunction>),
     /// Reference-typed query (Lucee/BoxLang semantics): a shared, interior-
     /// mutable handle. `b = a` aliases (a mutation through either is visible
     /// through both); `duplicate(a)` deep-copies. The `Arc` is the indirection,

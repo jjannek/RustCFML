@@ -743,7 +743,7 @@ fn fn_s3_unavailable_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn create_builtin_func(name: &str) -> CfmlValue {
-    CfmlValue::Function(Box::new(CfmlFunction {
+    CfmlValue::Function(std::sync::Arc::new(CfmlFunction {
         name: name.to_string(),
         params: Vec::new(),
         body: CfmlClosureBody::Expression(Box::new(CfmlValue::Null)),
@@ -5406,7 +5406,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 Ok(CfmlValue::array(files))
             }
         }
-        Err(e) => Err(CfmlError::runtime(format!("directoryList: {}", e))),
+        Err(e) => Err(CfmlError::runtime(format!("directoryList: {} (path: {})", e, path))),
     }
 }
 
@@ -6282,8 +6282,27 @@ pub(crate) enum DbDriver {
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 pub(crate) fn parse_datasource(ds: &str) -> DbDriver {
+    // JDBC URL normalisation. `this.datasources` (Lucee/ACF/BoxLang style) and
+    // cfconfig `connectionString`s commonly use `jdbc:<subprotocol>:<rest>`
+    // forms, e.g. `jdbc:sqlite:/path/to.db`. Map them onto the native driver
+    // URLs the rest of this layer understands. (sqlserver uses a different
+    // `;`-delimited syntax and is left to the existing `mssql://` form.)
+    if let Some(rest) = ds.strip_prefix("jdbc:") {
+        if let Some(path) = rest.strip_prefix("sqlite:") {
+            return DbDriver::Sqlite(path.to_string());
+        }
+        if rest.starts_with("postgresql://")
+            || rest.starts_with("postgres://")
+            || rest.starts_with("mysql://")
+            || rest.starts_with("mariadb://")
+        {
+            return parse_datasource(rest);
+        }
+    }
     if ds.starts_with("mysql://") {
         DbDriver::Mysql(ds.to_string())
+    } else if let Some(rest) = ds.strip_prefix("mariadb://") {
+        DbDriver::Mysql(format!("mysql://{}", rest))
     } else if ds.starts_with("postgresql://") || ds.starts_with("postgres://") {
         DbDriver::Postgres(ds.to_string())
     } else if ds.starts_with("mssql://") || ds.starts_with("sqlserver://") {
