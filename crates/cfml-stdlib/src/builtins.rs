@@ -4135,7 +4135,27 @@ fn serialize_value(val: &CfmlValue) -> String {
             format!("[{}]", items.join(","))
         }
         CfmlValue::Struct(s) => {
-            let items: Vec<String> = s.iter().map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(&v))).collect();
+            // A struct carrying CFC instance markers (`__variables` plus a
+            // `this`/`__name` marker) is a component instance — this engine
+            // materialises CFCs as marker-bearing structs. Lucee/ACF serialize
+            // only a component's data members, never engine internals (`__*`),
+            // the `this` scope, or its methods (UDFs). Filter those out so REST
+            // serialization and framework model inspection see only data.
+            let is_cfc = s.contains_key("__variables")
+                && (s.contains_key("this") || s.contains_key("__name"));
+            let items: Vec<String> = s
+                .iter()
+                .filter(|(k, v)| {
+                    if !is_cfc {
+                        return true;
+                    }
+                    if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+                        return false;
+                    }
+                    !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
+                })
+                .map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(&v)))
+                .collect();
             format!("{{{}}}", items.join(","))
         }
         CfmlValue::Query(q) => {

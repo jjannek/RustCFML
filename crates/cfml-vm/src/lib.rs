@@ -111,6 +111,16 @@ pub struct SessionData {
     pub app_name: String,
 }
 
+/// True when a struct carries CFC instance markers — this engine materialises
+/// CFCs as marker-bearing structs (as well as the `Component` variant), so a
+/// struct with a `__variables` scope plus a `this`/`__name` marker is a
+/// component instance, not user data. Used to suppress engine internals during
+/// for-in iteration and serialization.
+fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool {
+    s.contains_key_ci("__variables")
+        && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
+}
+
 /// Data-only session rule (issue #88): the session scope persists data values
 /// only — no components, closures/functions, or native objects. Returns the
 /// offending key-path on the first violation so the error names exactly what
@@ -5530,6 +5540,13 @@ impl CfmlVirtualMachine {
                                 // (overflow positional args) still surface,
                                 // matching Lucee.
                                 let is_args = s.contains_key("__arguments_scope");
+                                // A struct carrying CFC instance markers is a
+                                // component instance (this engine materialises
+                                // CFCs as marker-bearing structs). Lucee/ACF
+                                // for-in over a component yields only its data
+                                // members — never engine-internal `__` keys, the
+                                // `this` scope itself, or methods (UDFs).
+                                let is_cfc = is_component_struct(&s);
                                 let keys: Vec<CfmlValue> = s
                                     .keys()
                                     .into_iter()
@@ -5537,6 +5554,19 @@ impl CfmlVirtualMachine {
                                         !is_args
                                             || (k != "__arguments_scope"
                                                 && k != "__arguments_params")
+                                    })
+                                    .filter(|k| {
+                                        if !is_cfc {
+                                            return true;
+                                        }
+                                        if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+                                            return false;
+                                        }
+                                        !matches!(
+                                            s.get(k),
+                                            Some(CfmlValue::Function(_))
+                                                | Some(CfmlValue::Closure(_))
+                                        )
                                     })
                                     .map(CfmlValue::string)
                                     .collect();
