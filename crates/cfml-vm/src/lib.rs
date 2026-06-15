@@ -798,6 +798,11 @@ pub struct CfmlVirtualMachine {
     pub transaction_conn: Option<Box<dyn std::any::Any>>,
     /// Datasource URL of the active transaction
     pub transaction_datasource: Option<String>,
+    /// True while inside a `transaction { }` block whose connection has NOT yet
+    /// been established because no datasource was resolvable at block entry.
+    /// The first query inside the block begins the transaction lazily on its
+    /// own datasource — Lucee/ACF "defer begin until the first query" behaviour.
+    pub transaction_pending: bool,
     /// Function pointer: begin transaction (datasource) -> conn
     pub txn_begin: Option<fn(&str) -> Result<Box<dyn std::any::Any>, CfmlError>>,
     /// Function pointer: commit transaction (conn)
@@ -1165,6 +1170,7 @@ impl CfmlVirtualMachine {
             captured_locals: None,
             transaction_conn: None,
             transaction_datasource: None,
+            transaction_pending: false,
             txn_begin: None,
             txn_commit: None,
             txn_rollback: None,
@@ -8619,6 +8625,31 @@ impl CfmlVirtualMachine {
                         // per-app cfconfig) to its connection URL before any path
                         // below sees the args. No-op when this request has none.
                         let args = self.rewrite_query_datasource(args);
+                        // Lazy transaction begin: a `transaction { }` block that
+                        // had no datasource at entry begins here, on the first
+                        // query's datasource (Lucee/ACF defer-begin parity).
+                        if self.transaction_pending
+                            && self.transaction_conn.is_none()
+                        {
+                            if let Some(txn_begin) = self.txn_begin {
+                                let ds = match args.get(2) {
+                                    Some(CfmlValue::Struct(opts)) => {
+                                        opts.get_ci("datasource").map(|v| v.as_string())
+                                    }
+                                    _ => None,
+                                }
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| {
+                                    self.get_default_datasource(parent_locals)
+                                });
+                                if !ds.is_empty() {
+                                    let conn = txn_begin(&ds)?;
+                                    self.transaction_conn = Some(conn);
+                                    self.transaction_datasource = Some(ds);
+                                    self.transaction_pending = false;
+                                }
+                            }
+                        }
                         // Route through the transaction conn if one is active.
                         if self.transaction_conn.is_some() && self.txn_execute.is_some() {
                             let txn_execute = self.txn_execute.unwrap();
@@ -8785,7 +8816,7 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cftransaction_start" => {
-                    if self.transaction_conn.is_some() {
+                    if self.transaction_conn.is_some() || self.transaction_pending {
                         return Err(CfmlError::runtime(
                             "cftransaction: nested transactions are not supported".to_string(),
                         ));
@@ -8810,8 +8841,10 @@ impl CfmlVirtualMachine {
                     if datasource.is_empty() {
                         // Lucee/ACF defer transaction-connection setup until a query
                         // actually runs — `transaction { ... }` around non-query code
-                        // is allowed. Commit/rollback are already no-ops without a
-                        // connection, so we mirror that behaviour here.
+                        // is allowed, and a query inside the block begins the
+                        // transaction lazily on its own datasource. Mark the block
+                        // pending so the queryExecute path performs that lazy begin.
+                        self.transaction_pending = true;
                         return Ok(CfmlValue::Null);
                     }
                     if let Some(txn_begin) = self.txn_begin {
@@ -8832,6 +8865,7 @@ impl CfmlVirtualMachine {
                     }
                     self.transaction_conn = None;
                     self.transaction_datasource = None;
+                    self.transaction_pending = false;
                     return Ok(CfmlValue::Null);
                 }
                 "__cftransaction_rollback" => {
@@ -8842,6 +8876,7 @@ impl CfmlVirtualMachine {
                     }
                     self.transaction_conn = None;
                     self.transaction_datasource = None;
+                    self.transaction_pending = false;
                     return Ok(CfmlValue::Null);
                 }
                 "__cflog" => {
