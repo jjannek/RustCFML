@@ -694,7 +694,16 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (format!("}} catch ({} cfcatch) {{\n", catch_type), tag_end - start)
         }
         "cfabort" => {
-            ("__cfabort();\n".to_string(), tag_end - start)
+            // `<cfabort showError="msg">` raises a CATCHABLE error that is routed
+            // through Application.cfc::onError — NOT onAbort (Adobe/Lucee parity).
+            // Plain `<cfabort>` unwinds silently and fires onAbort instead.
+            match attrs.get("showerror") {
+                Some(raw) => (
+                    format!("__cfabort({});\n", format_attr_value(raw, quoted.contains("showerror"))),
+                    tag_end - start,
+                ),
+                None => ("__cfabort();\n".to_string(), tag_end - start),
+            }
         }
         "cfparam" => {
             let name = attrs.get("name").cloned().unwrap_or_default();

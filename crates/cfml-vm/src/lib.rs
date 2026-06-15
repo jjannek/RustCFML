@@ -1858,6 +1858,40 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Invoke `Application.cfc::onError(exception, eventName)` for an uncaught
+    /// runtime error and translate the outcome into the request's final result.
+    ///
+    /// Lucee/ACF parity: when an uncaught exception escapes the target page (or
+    /// `onRequest`/`onRequestStart`), the engine calls `onError` with the
+    /// exception struct and the name of the event that was running ("" for the
+    /// target page itself). If `onError` exists and returns normally, it owns the
+    /// response — the request ends 200 with whatever `onError` wrote, and the
+    /// engine's default error page is suppressed.
+    ///
+    /// - `Ok(Null)`   → `onError` handled it (existed and returned), OR `onError`
+    ///   itself aborted/redirected (control-flow sentinel).
+    /// - `Err(orig)`  → no `onError` defined: surface the original error so the
+    ///   default error page renders.
+    /// - `Err(other)` → `onError` itself threw: surface that error instead.
+    fn run_on_error(
+        &mut self,
+        template: &mut CfmlValue,
+        e: CfmlError,
+        event_name: &str,
+    ) -> CfmlResult {
+        let exc = self.resolve_catch_error_val(&e);
+        match self.call_lifecycle_method(
+            template,
+            "onError",
+            vec![exc, CfmlValue::string(event_name.to_string())],
+        ) {
+            Ok(true) => Ok(CfmlValue::Null),
+            Ok(false) => Err(e),
+            Err(oe) if Self::is_control_flow_error(&oe) => Ok(CfmlValue::Null),
+            Err(oe) => Err(oe),
+        }
+    }
+
     /// Control-flow sentinels that look like exceptions in the VM but must
     /// NOT be caught by user-level `try { ... } catch (any e) { ... }` blocks.
     /// `cfabort` and `cflocation` use these to unwind the call stack; if
@@ -8359,6 +8393,17 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "__cfabort" => {
+                    // `cfabort showError="msg"` passes a non-empty message: it is a
+                    // catchable application error (a user `try`/`catch` can trap it,
+                    // and an uncaught one is handed to onError), NOT the silent
+                    // control-flow unwind that fires onAbort. Plain `cfabort` (no
+                    // arg) raises the abort sentinel.
+                    if let Some(msg) = args.get(0) {
+                        let m = msg.as_string();
+                        if !m.is_empty() {
+                            return Err(CfmlError::runtime(m));
+                        }
+                    }
                     return Err(CfmlError::new(
                         "__cfabort".to_string(),
                         CfmlErrorType::Custom("abort".to_string()),
@@ -15577,7 +15622,17 @@ impl CfmlVirtualMachine {
             "onRequestStart",
             vec![CfmlValue::string(target_page.clone())],
         ) {
-            Err(e) if e.message == "__cfabort" || e.message == "__cflocation_redirect" => {
+            Err(e) if e.message == "__cfabort" => {
+                // A request aborted in onRequestStart still fires onAbort, then
+                // ends (onRequest/target page/onRequestEnd are skipped).
+                let _ = self.call_lifecycle_method(
+                    &mut template,
+                    "onAbort",
+                    vec![CfmlValue::string(target_page.clone())],
+                );
+                return Ok(CfmlValue::Null);
+            }
+            Err(e) if e.message == "__cflocation_redirect" => {
                 return Ok(CfmlValue::Null);
             }
             _ => {}
@@ -15592,6 +15647,12 @@ impl CfmlVirtualMachine {
             false
         };
 
+        // `aborted` → the request unwound via cfabort/abort, so step 8 fires
+        // `onAbort` instead of `onRequestEnd`. `errored` → an uncaught exception
+        // was routed to `onError` (whether or not a handler existed): onError is
+        // the terminal handler, so onRequestEnd is skipped (Lucee/ACF parity).
+        let mut aborted = false;
+        let mut errored = false;
         let result = if has_on_request {
             match self.call_lifecycle_method(
                 &mut template,
@@ -15599,27 +15660,50 @@ impl CfmlVirtualMachine {
                 vec![CfmlValue::string(target_page.clone())],
             ) {
                 Ok(_) => Ok(CfmlValue::Null),
-                Err(e) if e.message == "__cflocation_redirect" || e.message == "__cfabort" => {
+                Err(e) if e.message == "__cflocation_redirect" => Ok(CfmlValue::Null),
+                Err(e) if e.message == "__cfabort" => {
+                    aborted = true;
                     Ok(CfmlValue::Null)
                 }
-                Err(e) => Err(e),
+                // An uncaught exception in onRequest is handed to onError with
+                // the running event name; if no onError exists it surfaces.
+                Err(e) => {
+                    errored = true;
+                    self.run_on_error(&mut template, e, "onRequest")
+                }
             }
         } else {
             match self.execute() {
                 Ok(v) => Ok(v),
-                Err(e) if e.message == "__cflocation_redirect" || e.message == "__cfabort" => {
+                Err(e) if e.message == "__cflocation_redirect" => Ok(CfmlValue::Null),
+                Err(e) if e.message == "__cfabort" => {
+                    aborted = true;
                     Ok(CfmlValue::Null)
                 }
-                Err(e) => Err(e),
+                // An uncaught exception in the target page is handed to onError;
+                // the event name is empty since no lifecycle event was running.
+                Err(e) => {
+                    errored = true;
+                    self.run_on_error(&mut template, e, "")
+                }
             }
         };
 
-        // 8. onRequestEnd
-        let _ = self.call_lifecycle_method(
-            &mut template,
-            "onRequestEnd",
-            vec![CfmlValue::string(target_page)],
-        );
+        // 8. onAbort (cfabort unwind) or onRequestEnd (normal completion).
+        // Both are skipped when an uncaught error was routed to onError.
+        if aborted {
+            let _ = self.call_lifecycle_method(
+                &mut template,
+                "onAbort",
+                vec![CfmlValue::string(target_page)],
+            );
+        } else if !errored {
+            let _ = self.call_lifecycle_method(
+                &mut template,
+                "onRequestEnd",
+                vec![CfmlValue::string(target_page)],
+            );
+        }
 
         // 8a. Persist the live session scope back to the store. Session
         // reads/writes during the request mutate a cached live CfmlStruct (so

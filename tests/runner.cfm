@@ -302,6 +302,7 @@ try { include "lifecycle/test_session_app_namespace.cfm"; } catch (any e) { writ
 try { include "lifecycle/test_application_mapping_coverage.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_mapping_coverage.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_load_errors.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_load_errors.cfm | " & e.message & chr(10)); }
 try { include "lifecycle/test_application_scope_custom_tag.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_scope_custom_tag.cfm | " & e.message & chr(10)); }
+try { include "lifecycle/test_application_onerror_onabort.cfm"; } catch (any e) { writeOutput("ERROR | lifecycle/test_application_onerror_onabort.cfm | " & e.message & chr(10)); }
 try { include "server/test_front_controller_fallback.cfm"; } catch (any e) { writeOutput("ERROR | server/test_front_controller_fallback.cfm | " & e.message & chr(10)); }
 
 // --- Java Shims ---

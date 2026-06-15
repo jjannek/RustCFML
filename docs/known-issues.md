@@ -45,14 +45,14 @@ Accepted but **ignored** (no error, no effect):
 Note: any unrecognised `this.X` is captured into an internal `config` map that is then
 never read — so nothing throws, but nothing happens either.
 
-## 2. Application.cfc lifecycle methods — not (fully) invoked 🔇
+## 2. Application.cfc lifecycle methods — mostly invoked; two gaps remain 🔇
 
 | Method | Status |
 |---|---|
 | `onApplicationStart`, `onApplicationEnd`, `onRequestStart`, `onRequest`, `onRequestEnd`, `onSessionStart`, `onSessionEnd` | ✅ invoked |
-| `onError` | ⚠️ Partial — only fires when `onApplicationStart` throws, not as a general request-error handler. |
+| `onError` | ✅ invoked. An uncaught exception in the target page / `onRequest` / `onRequestStart` is handed to `onError(exception, eventName)` (`eventName` is `""` for a target-page error, otherwise the running event method). If `onError` returns normally it owns the response (the engine's default error page is suppressed); if absent the error surfaces as the default error page. When `onError` handles an error, `onRequestEnd` is skipped. *(fixed v0.173.0, issue #145)* |
 | `onMissingTemplate` | 🔇 Not invoked. (cfconfig front-controller `fallback` exists as an alternative.) |
-| `onAbort` | 🔇 Not invoked on `<cfabort>` / `abort()`. |
+| `onAbort` | ✅ invoked on `<cfabort>` / `abort` — fired in place of `onRequestEnd`. `<cfabort showError="msg">` is a *catchable* error and is routed to `onError` instead (Adobe/Lucee parity), not `onAbort`. *(fixed v0.173.0)* |
 | `onCFCRequest` | 🔇 Not invoked (no CFC-over-HTTP / remote method dispatch). |
 
 ## 3. `.cfconfig.json` keys — accepted but not enforced 🔇
