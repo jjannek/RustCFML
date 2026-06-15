@@ -11576,6 +11576,32 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
         ));
     }
 
+    // Collect multipart bodies declared via cfmailpart (text + html
+    // alternatives). Each part carries a `type` ("text"/"html") and a captured
+    // `body`; a part may also wrap its attributes in an `attributeCollection`
+    // struct (the form Wheels' Global.cfc $mail() emits), so look there too.
+    #[cfg(feature = "smtp")]
+    let mail_parts: Vec<(String, String)> = if let Some((_, CfmlValue::Array(parts))) =
+        opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("parts"))
+    {
+        parts.iter().filter_map(|p| {
+            if let CfmlValue::Struct(ps) = p {
+                let lookup = |key: &str| -> Option<String> {
+                    ps.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))
+                        .map(|(_, v)| v.as_string())
+                        .or_else(|| ps.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("attributeCollection"))
+                            .and_then(|(_, v)| if let CfmlValue::Struct(ac) = v {
+                                ac.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))
+                                    .map(|(_, v)| v.as_string())
+                            } else { None }))
+                };
+                Some((lookup("type").unwrap_or_else(|| "text".into()),
+                      lookup("body").unwrap_or_default()))
+            } else { None }
+        }).collect()
+    } else { Vec::new() };
+
     // Collect file attachments from params array
     let mut attachments: Vec<String> = Vec::new();
     if let Some((_, CfmlValue::Array(params))) = opts.iter().find(|(k, _)| k.eq_ignore_ascii_case("params")) {
@@ -11644,7 +11670,55 @@ fn fn_cfmail(args: Vec<CfmlValue>) -> CfmlResult {
             }
         }
 
-        let email = if attachments.is_empty() {
+        // Build a multipart/alternative from cfmailpart parts when present.
+        let alternative = if mail_parts.is_empty() {
+            None
+        } else {
+            let mut alt = MultiPart::alternative().build();
+            for (ptype, pbody) in &mail_parts {
+                let ct = if ptype.eq_ignore_ascii_case("html")
+                    || ptype.eq_ignore_ascii_case("text/html")
+                {
+                    ContentType::TEXT_HTML
+                } else {
+                    ContentType::TEXT_PLAIN
+                };
+                alt = alt.singlepart(SinglePart::builder().header(ct).body(pbody.clone()));
+            }
+            Some(alt)
+        };
+
+        let email = if let Some(alternative) = alternative {
+            // Multipart message: cfmailpart-declared text/html alternatives,
+            // optionally wrapped in a mixed part alongside file attachments.
+            if attachments.is_empty() {
+                email_builder
+                    .multipart(alternative)
+                    .map_err(|e| CfmlError::runtime(format!("cfmail: failed to build email: {}", e)))?
+            } else {
+                let mut multipart = MultiPart::mixed().multipart(alternative);
+                for file_path in &attachments {
+                    let path = std::path::Path::new(file_path);
+                    let filename = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "attachment".to_string());
+                    match std::fs::read(path) {
+                        Ok(data) => {
+                            let attachment = Attachment::new(filename)
+                                .body(data, ContentType::parse("application/octet-stream").unwrap());
+                            multipart = multipart.singlepart(attachment);
+                            eprintln!("[CFMAIL] Attachment: {}", file_path);
+                        }
+                        Err(e) => {
+                            eprintln!("[CFMAIL] Warning: could not read attachment '{}': {}", file_path, e);
+                        }
+                    }
+                }
+                email_builder
+                    .multipart(multipart)
+                    .map_err(|e| CfmlError::runtime(format!("cfmail: failed to build email: {}", e)))?
+            }
+        } else if attachments.is_empty() {
             // Simple message (no attachments)
             let content_type = if mail_type.eq_ignore_ascii_case("html") {
                 ContentType::TEXT_HTML

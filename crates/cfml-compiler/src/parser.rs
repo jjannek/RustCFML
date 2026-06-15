@@ -1082,6 +1082,51 @@ impl Parser {
                 }
                 self.current = saved;
             }
+            // cfmailpart(type="text") { body } / cfmailparam(name=…, value=…)
+            // statement forms inside a script cfmail(){ } block. They mirror the
+            // <cfmailpart>/<cfmailparam> child tags: cfmailpart captures its own
+            // body via a nested savecontent and appends {attrs, body} to the
+            // runtime __cfmail_parts array; cfmailparam appends {attrs} to
+            // __cfmail_params. The surrounding script cfmail(){ } lowering seeds
+            // both arrays and forwards them to __cfmail. Wheels' Global.cfc
+            // $mail() emits these in script form for every multipart email, so
+            // without this the whole file fails to PARSE (issue: PR #138).
+            if nlow == "cfmailpart" && matches!(self.peek(1), Token::LParen) {
+                let saved = self.current;
+                self.advance(); // cfmailpart
+                self.advance(); // (
+                let attrs = match self.parse_tag_call_attrs() {
+                    Ok(a) => a,
+                    Err(_) => { self.current = saved; Vec::new() }
+                };
+                if self.current != saved && self.check(&Token::RParen) {
+                    self.advance(); // )
+                    if self.check(&Token::LBrace) {
+                        let body = self.parse_block()?;
+                        return Ok(self.lower_script_mailpart(attrs, body, stmt_loc));
+                    } else {
+                        self.match_token(&Token::Semicolon);
+                        return Ok(self.lower_script_mailpart(attrs, Vec::new(), stmt_loc));
+                    }
+                }
+                self.current = saved;
+            }
+            if nlow == "cfmailparam" && matches!(self.peek(1), Token::LParen) {
+                let saved = self.current;
+                self.advance(); // cfmailparam
+                self.advance(); // (
+                let attrs = match self.parse_tag_call_attrs() {
+                    Ok(a) => a,
+                    Err(_) => { self.current = saved; Vec::new() }
+                };
+                if self.current != saved && self.check(&Token::RParen) {
+                    self.advance(); // )
+                    self.match_token(&Token::Semicolon); // optional trailing ;
+                    let param_struct = self.attrs_to_struct_literal(&attrs, stmt_loc);
+                    return Ok(self.array_append_stmt("__cfmail_params", param_struct, stmt_loc));
+                }
+                self.current = saved;
+            }
         }
 
         // Handle 'abort' keyword as __cfabort() call
@@ -2564,6 +2609,17 @@ impl Parser {
                 // Capture the body text via savecontent, then call __cfmail({...attrs, body: captured}).
                 let capture_var = "__cfmail_body_capture".to_string();
                 let mut stmts: Vec<Statement> = Vec::new();
+                // Seed the runtime arrays that script-form cfmailpart/cfmailparam
+                // statements in the body append to (mirrors the angle-bracket
+                // runtime cfmail path). __cfmail forwards them as parts/params.
+                for arr in ["__cfmail_params", "__cfmail_parts"] {
+                    stmts.push(Statement::Assignment(Assignment {
+                        target: AssignTarget::Variable(arr.to_string()),
+                        value: Expression::Array(Array { elements: vec![], location: loc }),
+                        operator: AssignOp::Equal,
+                        location: loc,
+                    }));
+                }
                 stmts.push(Statement::Expression(ExpressionStatement {
                     expr: Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
@@ -2604,6 +2660,17 @@ impl Parser {
                         name: capture_var, location: loc,
                     }),
                 ));
+                for arr in ["params", "parts"] {
+                    pairs.push((
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String(arr.to_string()),
+                            location: loc,
+                        }),
+                        Expression::Identifier(Identifier {
+                            name: format!("__cfmail_{}", arr), location: loc,
+                        }),
+                    ));
+                }
                 let opts_struct = Expression::Struct(Struct {
                     pairs, ordered: false, location: loc,
                 });
@@ -2621,6 +2688,103 @@ impl Parser {
             }
             _ => unreachable!("unknown body tag: {}", tag),
         }
+    }
+
+    /// Build a `{ key: value, ... }` struct literal from parsed tag-call attrs.
+    fn attrs_to_struct_literal(
+        &self,
+        attrs: &[(String, Expression)],
+        loc: SourceLocation,
+    ) -> Expression {
+        Expression::Struct(Struct {
+            pairs: attrs.iter().map(|(k, v)| (
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(k.clone()),
+                    location: loc,
+                }),
+                v.clone(),
+            )).collect(),
+            ordered: false,
+            location: loc,
+        })
+    }
+
+    /// Build an `arrayAppend(<array_var>, <value>)` statement-expression.
+    fn array_append_stmt(
+        &self,
+        array_var: &str,
+        value: Expression,
+        loc: SourceLocation,
+    ) -> CfmlNode {
+        CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+            expr: Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: "arrayAppend".to_string(),
+                    location: loc,
+                })),
+                arguments: vec![
+                    Expression::Identifier(Identifier {
+                        name: array_var.to_string(),
+                        location: loc,
+                    }),
+                    value,
+                ],
+                location: loc,
+            })),
+            location: loc,
+        }))
+    }
+
+    /// Lower a script-statement `cfmailpart(...) { body }`: capture the part's
+    /// own body via a nested savecontent, then append `{ ...attrs, body }` to
+    /// the runtime `__cfmail_parts` array seeded by the surrounding script
+    /// `cfmail(){ }` block. Mirrors the tag-form runtime cfmailpart lowering.
+    fn lower_script_mailpart(
+        &self,
+        attrs: Vec<(String, Expression)>,
+        body: Vec<Statement>,
+        loc: SourceLocation,
+    ) -> CfmlNode {
+        let mut stmts: Vec<Statement> = Vec::new();
+        // __cfsavecontent_start();
+        stmts.push(Statement::Expression(ExpressionStatement {
+            expr: Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: "__cfsavecontent_start".to_string(), location: loc,
+                })),
+                arguments: vec![],
+                location: loc,
+            })),
+            location: loc,
+        }));
+        stmts.extend(body);
+        // { ...attrs, body: __cfsavecontent_end() } — the end() call is
+        // evaluated during struct construction, i.e. after the body output.
+        let mut pairs: Vec<(Expression, Expression)> = attrs.iter().map(|(k, v)| (
+            Expression::Literal(Literal {
+                value: LiteralValue::String(k.clone()),
+                location: loc,
+            }),
+            v.clone(),
+        )).collect();
+        pairs.push((
+            Expression::Literal(Literal {
+                value: LiteralValue::String("body".to_string()),
+                location: loc,
+            }),
+            Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier {
+                    name: "__cfsavecontent_end".to_string(), location: loc,
+                })),
+                arguments: vec![],
+                location: loc,
+            })),
+        ));
+        let part_struct = Expression::Struct(Struct { pairs, ordered: false, location: loc });
+        if let CfmlNode::Statement(s) = self.array_append_stmt("__cfmail_parts", part_struct, loc) {
+            stmts.push(s);
+        }
+        CfmlNode::Statement(Statement::Output(Output { body: stmts, location: loc }))
     }
 
     fn parse_lock(&mut self, loc: SourceLocation) -> Result<CfmlNode, ParseError> {
