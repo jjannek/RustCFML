@@ -1841,6 +1841,28 @@ impl CfmlVirtualMachine {
         CfmlValue::strukt(err_struct)
     }
 
+    /// Does a `catch (catch_type e)` clause match an exception whose `type` is
+    /// `exc_type`? Mirrors Lucee/ACF: `any` (or an empty/missing type) catches
+    /// everything; otherwise a case-insensitive exact match, or a dotted-type
+    /// hierarchy match where catching a parent type (`Foo`) also catches its
+    /// subtypes (`Foo.Bar`). Custom exception types are dotted strings, so this
+    /// keeps `catch (Foo.InvalidConfiguration)` and `catch (Foo)` both working.
+    fn catch_type_matches(catch_type: &str, exc_type: &str) -> bool {
+        let ct = catch_type.trim();
+        if ct.is_empty() || ct.eq_ignore_ascii_case("any") {
+            return true;
+        }
+        if ct.eq_ignore_ascii_case(exc_type) {
+            return true;
+        }
+        // Hierarchy: catch "Foo" also catches "Foo.Bar" (but not "Foobar").
+        let ct_l = ct.to_lowercase();
+        let exc_l = exc_type.to_lowercase();
+        exc_l.len() > ct_l.len()
+            && exc_l.starts_with(&ct_l)
+            && exc_l.as_bytes()[ct_l.len()] == b'.'
+    }
+
     // If `last_exception` already holds a struct whose `message` matches
     // `e.message`, reuse it (inner throw preserved detail); otherwise build a
     // fresh error struct. Avoids cloning the whole exception just to compare
@@ -5156,6 +5178,20 @@ impl CfmlVirtualMachine {
                             _ => error_val.as_string(),
                         }));
                     }
+                }
+
+                BytecodeOp::CatchMatch(catch_type) => {
+                    // Peek (do NOT consume) the exception value the catch handler
+                    // was entered with, and push whether its `type` matches this
+                    // clause's declared type.
+                    let exc_type = match stack.last() {
+                        Some(CfmlValue::Struct(s)) => {
+                            s.get("type").map(|v| v.as_string()).unwrap_or_default()
+                        }
+                        _ => String::new(),
+                    };
+                    let matches = Self::catch_type_matches(catch_type, &exc_type);
+                    stack.push(CfmlValue::Bool(matches));
                 }
 
                 BytecodeOp::CallMethod(method_name, arg_count, write_back)
@@ -16155,6 +16191,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         // Exception handling
         BytecodeOp::TryStart(_) | BytecodeOp::TryEnd => (0, 0),
         BytecodeOp::Throw | BytecodeOp::Rethrow => (0, 1),
+        BytecodeOp::CatchMatch(_) => (1, 0), // peeks exception, pushes match bool
         // Method call: pops obj + args, pushes 1
         BytecodeOp::CallMethod(_, n, _) | BytecodeOp::CallMethodNamed(_, _, n, _) => (1, n + 1),
         BytecodeOp::CallRustSuperCtor(n) => (1, *n),

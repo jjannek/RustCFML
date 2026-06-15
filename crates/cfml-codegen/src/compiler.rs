@@ -304,6 +304,11 @@ pub enum BytecodeOp {
     TryEnd,
     Throw,
     Rethrow,            // Re-throw current exception
+    // Peek the exception value on top of the stack (does NOT consume it) and
+    // push a boolean: does its `type` match this catch clause's declared type?
+    // "any"/empty matches everything; otherwise case-insensitive exact match or
+    // dotted-hierarchy prefix (catch "Foo" also catches "Foo.Bar").
+    CatchMatch(String),
 
     // Method call: object is on stack, then args, method name + arg count
     // Optional write-back: (object_var, Option<property_name>)
@@ -2187,25 +2192,60 @@ impl CfmlCompiler {
         let jump_over_catch = instructions.len();
         instructions.push(BytecodeOp::Jump(0));
 
-        // Catch handler
+        // Catch handler. On entry the thrown exception value is on top of the
+        // operand stack. Walk the catch clauses in source order, runtime-testing
+        // each clause's declared type against the exception's `type`; the FIRST
+        // matching clause runs and then jumps clear of the remaining clauses.
+        // (Previously every clause body ran unconditionally and the declared
+        // type was ignored entirely — both `catch (X)` and `catch (any)` fired.)
         let catch_start = instructions.len();
         instructions[try_start_idx] = BytecodeOp::TryStart(catch_start);
 
+        let mut jumps_to_end = Vec::new();
         for catch in &try_stmt.catches {
-            // The error value will be on the stack
+            // `catch (e)` with no declared type behaves like `catch (any e)`.
+            let catch_type = catch.var_type.clone().unwrap_or_else(|| "any".to_string());
+            // Peek the exception (leaves it on the stack), push the match bool.
+            instructions.push(BytecodeOp::CatchMatch(catch_type));
+            let jump_if_no_match = instructions.len();
+            instructions.push(BytecodeOp::JumpIfFalse(0)); // -> next clause's test
+            // Matched: bind the exception to the catch variable (consumes it).
             instructions.push(BytecodeOp::StoreLocal(catch.var_name.clone()));
-
             for s in &catch.body {
                 self.compile_statement(s, instructions);
             }
+            // Skip the remaining clauses and land on the shared finally/end.
+            let j = instructions.len();
+            instructions.push(BytecodeOp::Jump(0));
+            jumps_to_end.push(j);
+            // A non-match falls through to the next clause's test.
+            let next = instructions.len();
+            instructions[jump_if_no_match] = BytecodeOp::JumpIfFalse(next);
         }
 
+        // A `return`/`rethrow` inside a catch BODY must run this try's finally
+        // inline, so the pop happens only after the clause bodies are compiled.
         if has_finally {
             self.finally_stack.pop();
         }
 
+        // No clause matched the thrown type: drop the exception value, run this
+        // try's finally inline (finally_stack already popped, so a return/rethrow
+        // in the finally targets the ENCLOSING handler), then re-raise so an
+        // outer try sees it.
+        instructions.push(BytecodeOp::Pop);
+        if let Some(finally_body) = &try_stmt.finally_body {
+            for s in finally_body {
+                self.compile_statement(s, instructions);
+            }
+        }
+        instructions.push(BytecodeOp::Rethrow);
+
         let end_pos = instructions.len();
         instructions[jump_over_catch] = BytecodeOp::Jump(end_pos);
+        for j in jumps_to_end {
+            instructions[j] = BytecodeOp::Jump(end_pos);
+        }
 
         // Finally (normal completion + caught path)
         if let Some(finally_body) = &try_stmt.finally_body {

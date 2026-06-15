@@ -509,6 +509,9 @@ try { include "core/test_invoke_canonical_forms.cfm"; } catch (any e) { writeOut
 //     Lucee/ACF/BoxLang now accepted by RustCFML.
 try { include "core/test_reserved_word_identifiers.cfm"; } catch (any e) { writeOutput("ERROR | core/test_reserved_word_identifiers.cfm | " & e.message & chr(10)); }
 try { include "core/test_quoted_catch_type.cfm"; } catch (any e) { writeOutput("ERROR | core/test_quoted_catch_type.cfm | " & e.message & chr(10)); }
+// Multi-catch must select exactly ONE clause by declared type (was: every
+// clause body ran unconditionally, type ignored); unmatched types propagate.
+try { include "core/test_multi_catch_type_dispatch.cfm"; } catch (any e) { writeOutput("ERROR | core/test_multi_catch_type_dispatch.cfm | " & e.message & chr(10)); }
 //   - chained_compound_assignment: `a = b &= c` (compound assignment as the RHS
 //     of an assignment); switch_braced_case: a compound-assignment statement
 //     inside a braced `case`/`default` body. Both surfaced while booting Wheels.
