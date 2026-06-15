@@ -1764,7 +1764,7 @@ impl CfmlVirtualMachine {
         // reads the source tables, so sharing is correct and avoids a deep copy.
         if let Some(CfmlValue::Query(q)) = parent_locals
             .iter()
-            .find(|(k, _)| k.to_lowercase() == lower)
+            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
             .map(|(_, v)| v)
         {
             return Some(q.clone());
@@ -1772,7 +1772,7 @@ impl CfmlVirtualMachine {
         if let Some(CfmlValue::Query(q)) = self
             .globals
             .iter()
-            .find(|(k, _)| k.to_lowercase() == lower)
+            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
             .map(|(_, v)| v)
         {
             return Some(q.clone());
@@ -1967,7 +1967,7 @@ impl CfmlVirtualMachine {
                     .or_else(|| {
                         let name_lower = name.to_lowercase();
                         s.iter()
-                            .find(|(k, _)| k.to_lowercase() == name_lower)
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                             .map(|(_, v)| v)
                     })
                     .or_else(|| {
@@ -1977,7 +1977,7 @@ impl CfmlVirtualMachine {
                                 .or_else(|| vars.get(&name_lower))
                                 .or_else(|| {
                                     vars.iter()
-                                        .find(|(k, _)| k.to_lowercase() == name_lower)
+                                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                                         .map(|(_, v)| v)
                                 })
                         } else {
@@ -2886,7 +2886,7 @@ impl CfmlVirtualMachine {
                     // matched key so we can ask whether it was inherited.
                     let local_hit = locals
                         .get_key_value(name.as_str())
-                        .or_else(|| locals.iter().find(|(k, _)| k.to_lowercase() == name_lower))
+                        .or_else(|| locals.iter().find(|(k, _)| k.eq_ignore_ascii_case(&name_lower)))
                         .map(|(k, v)| (k.clone(), v.clone()));
                     // PR #97: CFML is lexically scoped — a non-Function value that
                     // leaked in from an ANCESTOR frame (the parent-scope copy above)
@@ -2942,7 +2942,7 @@ impl CfmlVirtualMachine {
                     } else if let Some(val) = self
                         .globals
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == name_lower)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                         .map(|(_, v)| v.clone())
                     {
                         stack.push(val);
@@ -2991,27 +2991,27 @@ impl CfmlVirtualMachine {
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: scope,
                         })));
-                    } else if self.builtins.keys().any(|k| k.to_lowercase() == name_lower)
+                    } else if self.builtins.keys().any(|k| k.eq_ignore_ascii_case(&name_lower))
                         || self
                             .user_functions
                             .keys()
-                            .any(|k| k.to_lowercase() == name_lower)
+                            .any(|k| k.eq_ignore_ascii_case(&name_lower))
                     {
                         let canonical = self
                             .builtins
                             .keys()
-                            .find(|k| k.to_lowercase() == name_lower)
+                            .find(|k| k.eq_ignore_ascii_case(&name_lower))
                             .or_else(|| {
                                 self.user_functions
                                     .keys()
-                                    .find(|k| k.to_lowercase() == name_lower)
+                                    .find(|k| k.eq_ignore_ascii_case(&name_lower))
                             })
                             .cloned()
                             .unwrap_or(name.clone());
                         let params = self
                             .user_functions
                             .iter()
-                            .find(|(k, _)| k.to_lowercase() == name_lower)
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                             .map(|(_, uf)| {
                                 uf.params
                                     .iter()
@@ -3033,7 +3033,7 @@ impl CfmlVirtualMachine {
                         let (body_val, scope, resolved_name) = if let Some((uf_name, uf)) = self
                             .user_functions
                             .iter()
-                            .find(|(k, _)| k.to_lowercase() == name_lower)
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                         {
                             (
                                 CfmlValue::Int(uf.global_id as i64),
@@ -4417,7 +4417,7 @@ impl CfmlVirtualMachine {
                                 .or_else(|| {
                                     let key_lower = key.to_lowercase();
                                     s.iter()
-                                        .find(|(k, _)| k.to_lowercase() == key_lower)
+                                        .find(|(k, _)| k.eq_ignore_ascii_case(&key_lower))
                                         .map(|(_, v)| v)
                                 });
                             // Arguments-scope positional fallback: when the
@@ -4643,7 +4643,7 @@ impl CfmlVirtualMachine {
                                         // Full case-insensitive scan for mixed-case keys
                                         let name_lower = name.to_lowercase();
                                         s.iter()
-                                            .find(|(k, _)| k.to_lowercase() == name_lower)
+                                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                                             .map(|(_, v)| v)
                                     })
                                     .or_else(|| {
@@ -4654,7 +4654,7 @@ impl CfmlVirtualMachine {
                                                 .or_else(|| vars.get(&name_lower))
                                                 .or_else(|| {
                                                     vars.iter()
-                                                        .find(|(k, _)| k.to_lowercase() == name_lower)
+                                                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                                                         .map(|(_, v)| v)
                                                 })
                                         } else {
@@ -6559,7 +6559,7 @@ impl CfmlVirtualMachine {
                     let builtin_match = self
                         .builtins
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == name_lower)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                         .map(|(_, v)| *v);
 
                     if let Some(builtin) = builtin_match {
@@ -6595,7 +6595,7 @@ impl CfmlVirtualMachine {
             let user_match = self
                 .user_functions
                 .iter()
-                .find(|(k, _)| k.to_lowercase() == name_lower)
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                 .map(|(_, v)| v.clone());
 
             if let Some(user_func) = user_match {
@@ -8608,7 +8608,7 @@ impl CfmlVirtualMachine {
                     if let CfmlValue::Struct(ref comp_struct) = component {
                         let method_func = comp_struct
                             .iter()
-                            .find(|(k, _)| k.to_lowercase() == method_lower)
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
                             .map(|(_, v)| v.clone());
 
                         if let Some(func @ CfmlValue::Function(_)) = method_func {
@@ -8717,7 +8717,7 @@ impl CfmlVirtualMachine {
                     if let CfmlValue::Struct(ref comp_struct) = component {
                         let method_func = comp_struct
                             .iter()
-                            .find(|(k, _)| k.to_lowercase() == method_lower)
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
                             .map(|(_, v)| v.clone());
 
                         if let Some(func @ CfmlValue::Function(_)) = method_func {
@@ -9392,7 +9392,7 @@ impl CfmlVirtualMachine {
                         let field_lower = form_field.to_lowercase();
                         if let Some(CfmlValue::Struct(file_info)) = form
                             .iter()
-                            .find(|(k, _)| k.to_lowercase() == field_lower)
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&field_lower))
                             .map(|(_, v)| v)
                         {
                             let temp_path = file_info
@@ -9702,7 +9702,7 @@ impl CfmlVirtualMachine {
                                 if let CfmlValue::Struct(s) = self.get_session_scope() {
                                     if let Some(val) = s
                                         .iter()
-                                        .find(|(k, _)| k.to_lowercase() == key)
+                                        .find(|(k, _)| k.eq_ignore_ascii_case(&key))
                                         .map(|(_, v)| v.clone())
                                     {
                                         return Ok(val);
@@ -9725,7 +9725,7 @@ impl CfmlVirtualMachine {
                     // Check parent_locals
                     if let Some(val) = parent_locals
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == var_lower)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&var_lower))
                         .map(|(_, v)| v.clone())
                     {
                         return Ok(val);
@@ -9738,7 +9738,7 @@ impl CfmlVirtualMachine {
                     if let CfmlValue::Struct(s) = self.get_session_scope() {
                         if let Some(val) = s
                             .iter()
-                            .find(|(k, _)| k.to_lowercase() == var_lower)
+                            .find(|(k, _)| k.eq_ignore_ascii_case(&var_lower))
                             .map(|(_, v)| v.clone())
                         {
                             return Ok(val);
@@ -9754,7 +9754,7 @@ impl CfmlVirtualMachine {
                     if let Some(val) = self
                         .globals
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == var_lower)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&var_lower))
                         .map(|(_, v)| v.clone())
                     {
                         return Ok(val);
@@ -12212,7 +12212,7 @@ impl CfmlVirtualMachine {
             let builtin_match = self
                 .builtins
                 .iter()
-                .find(|(k, _)| k.to_lowercase() == name_lower)
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
                 .map(|(_, v)| *v);
             if let Some(builtin) = builtin_match {
                 return builtin(args);
@@ -12228,7 +12228,7 @@ impl CfmlVirtualMachine {
         let prop = if let CfmlValue::Struct(ref s) = object {
             let method_lower = method.to_lowercase();
             s.iter()
-                .find(|(k, _)| k.to_lowercase() == method_lower)
+                .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
                 .map(|(_, v)| v.clone())
                 .unwrap_or(CfmlValue::Null)
         } else {
@@ -12347,7 +12347,7 @@ impl CfmlVirtualMachine {
                     let prop_name = &method[3..];
                     let val = s
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == prop_name.to_lowercase())
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&prop_name))
                         .map(|(_, v)| v.clone());
                     if let Some(v) = val {
                         return Ok(v);
@@ -12360,7 +12360,7 @@ impl CfmlVirtualMachine {
                         if let Some(ms) = modified.as_cfml_struct() {
                             let actual_key = ms
                                 .keys().into_iter()
-                                .find(|k| k.to_lowercase() == prop_name.to_lowercase())
+                                .find(|k| k.eq_ignore_ascii_case(&prop_name))
                                 
                                 .unwrap_or_else(|| prop_name.to_string());
                             ms.insert(actual_key, value.clone());
@@ -12504,7 +12504,7 @@ impl CfmlVirtualMachine {
                 .or_else(|| {
                     locals
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == root)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&root))
                         .map(|(_, v)| v.clone())
                 })
                 // Check request scope
@@ -12514,7 +12514,7 @@ impl CfmlVirtualMachine {
                 .or_else(|| {
                     self.globals
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == root)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&root))
                         .map(|(_, v)| v.clone())
                 })
         };
@@ -12538,7 +12538,7 @@ impl CfmlVirtualMachine {
                 CfmlValue::Struct(s) => {
                     if let Some(v) = s
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == seg_lower)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&seg_lower))
                         .map(|(_, v)| v.clone())
                     {
                         current = v;
@@ -13351,7 +13351,7 @@ impl CfmlVirtualMachine {
         if let Some(val) = self
             .globals
             .iter()
-            .find(|(k, _)| k.to_lowercase() == lower)
+            .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
             .map(|(_, v)| v.clone())
         {
             if matches!(val, CfmlValue::Struct(_)) {
@@ -13560,7 +13560,7 @@ impl CfmlVirtualMachine {
                     let lower = class_name.to_lowercase();
                     self.globals
                         .iter()
-                        .find(|(k, _)| k.to_lowercase() == lower)
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
                         .map(|(_, v)| v.clone())
                 })
                 .or_else(|| self.globals.get("Anonymous").cloned())
@@ -13745,7 +13745,7 @@ impl CfmlVirtualMachine {
                 // Case-insensitive lookup in globals
                 self.globals
                     .iter()
-                    .find(|(k, _)| k.to_lowercase() == iface_name.to_lowercase())
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&iface_name))
                     .map(|(_, v)| v)
             })
             .cloned();
@@ -13838,7 +13838,7 @@ impl CfmlVirtualMachine {
             .or_else(|| {
                 self.globals
                     .iter()
-                    .find(|(k, _)| k.to_lowercase() == iface_name.to_lowercase())
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&iface_name))
                     .map(|(_, v)| v)
             })
             .cloned();
@@ -13900,7 +13900,7 @@ impl CfmlVirtualMachine {
             for method_name in &required_methods {
                 // Check if component has this method (case-insensitive)
                 let has_method = component.iter().any(|(k, v)| {
-                    k.to_lowercase() == method_name.to_lowercase()
+                    k.eq_ignore_ascii_case(&method_name)
                         && matches!(v, CfmlValue::Function(_))
                 });
                 if !has_method {
@@ -15355,7 +15355,7 @@ impl CfmlVirtualMachine {
         let method_lower = method.to_lowercase();
         let func_val = s
             .iter()
-            .find(|(k, _)| k.to_lowercase() == method_lower)
+            .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
             .map(|(_, v)| v.clone());
 
         match func_val {

@@ -801,7 +801,7 @@ fn struct_find_key_ci(s: &CfmlStruct, key: &str) -> Option<String> {
             return Some(key.to_string());
         }
         let key_lower = key.to_lowercase();
-        m.keys().find(|k| k.to_lowercase() == key_lower).cloned()
+        m.keys().find(|k| k.eq_ignore_ascii_case(&key_lower)).cloned()
     })
 }
 
@@ -2393,7 +2393,7 @@ fn struct_find_key_recursive(
     let search_lower = search_key.to_lowercase();
     for (k, v) in s.iter() {
         let current_path = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
-        if k.to_lowercase() == search_lower {
+        if k.eq_ignore_ascii_case(&search_lower) {
             let mut result_struct = IndexMap::new();
             result_struct.insert("owner".to_string(), CfmlValue::Struct(s.clone()));
             result_struct.insert("path".to_string(), CfmlValue::string(current_path.clone()));
@@ -4478,7 +4478,7 @@ fn fn_query_get_cell(args: Vec<CfmlValue>) -> CfmlResult {
             if let Some(row) = q.get_row(row_idx) {
                 let col_lower = column.to_lowercase();
                 for (k, v) in &row {
-                    if k.to_lowercase() == col_lower {
+                    if k.eq_ignore_ascii_case(&col_lower) {
                         return Ok(v.clone());
                     }
                 }
@@ -5116,7 +5116,7 @@ fn fn_get_profile_string(args: Vec<CfmlValue>) -> CfmlResult {
     for (sec_name, entries) in &sections {
         if sec_name.to_lowercase() == section_lower {
             for (k, v) in entries {
-                if k.to_lowercase() == entry_lower {
+                if k.eq_ignore_ascii_case(&entry_lower) {
                     return Ok(CfmlValue::string(v.clone()));
                 }
             }
@@ -5151,7 +5151,7 @@ fn fn_set_profile_string(args: Vec<CfmlValue>) -> CfmlResult {
     let entry_lower = entry.to_lowercase();
     let mut found = false;
     for (k, v) in entries.iter_mut() {
-        if k.to_lowercase() == entry_lower {
+        if k.eq_ignore_ascii_case(&entry_lower) {
             *v = value.clone();
             found = true;
             break;
@@ -12058,7 +12058,7 @@ fn fn_ls_day_of_week(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_exception_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
     if let (Some(CfmlValue::Struct(s)), Some(key)) = (args.get(0), args.get(1)) {
         let key_str = key.as_string().to_lowercase();
-        let exists = s.keys().iter().any(|k| k.to_lowercase() == key_str);
+        let exists = s.keys().iter().any(|k| k.eq_ignore_ascii_case(&key_str));
         Ok(CfmlValue::Bool(exists))
     } else {
         Ok(CfmlValue::Bool(false))
