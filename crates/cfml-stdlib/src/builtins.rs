@@ -8295,10 +8295,112 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
     let mut conn = pool.get()
         .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL connection error: {}", e)))?;
     let mssql = &mut *conn;
-    let client = &mut mssql.client;
-    let broken = &mut mssql.broken;
+    run_mssql_statement(&mut mssql.client, &mut mssql.broken, sql, &effective_params, return_type)
+}
+
+/// A bound MSSQL parameter. We own the value so its `ColumnData` (which borrows
+/// for strings/binary) can be handed to tiberius as `&dyn ToSql` across the
+/// query await. Replaces the old string-interpolation path: parameters are now
+/// sent as real typed bind values (sp_executesql), so values are never spliced
+/// into the SQL text — no injection surface, and SQL Server can cache the plan.
+#[cfg(feature = "mssql_db")]
+enum MssqlParam {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Double(f64),
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
+#[cfg(feature = "mssql_db")]
+impl tiberius::ToSql for MssqlParam {
+    fn to_sql(&self) -> tiberius::ColumnData<'_> {
+        use std::borrow::Cow;
+        use tiberius::ColumnData;
+        match self {
+            // Untyped NULL — sp_executesql types it as nvarchar NULL; that
+            // inserts/compares as NULL against any column type, matching the
+            // previous literal-`NULL` behaviour.
+            MssqlParam::Null => ColumnData::String(None),
+            MssqlParam::Bool(b) => ColumnData::Bit(Some(*b)),
+            MssqlParam::Int(n) => ColumnData::I64(Some(*n)),
+            MssqlParam::Double(d) => ColumnData::F64(Some(*d)),
+            MssqlParam::Str(s) => ColumnData::String(Some(Cow::Borrowed(s.as_str()))),
+            MssqlParam::Bytes(b) => ColumnData::Binary(Some(Cow::Borrowed(b.as_slice()))),
+        }
+    }
+}
+
+/// Map CFML values to typed MSSQL bind parameters. Dates and other non-scalar
+/// values fall back to their string form (SQL Server implicitly converts an
+/// nvarchar like `'2026-06-15 09:00:00'` to datetime), preserving the semantics
+/// the inline path had while now binding rather than splicing.
+#[cfg(feature = "mssql_db")]
+fn mssql_bind_params(params: &[CfmlValue]) -> Vec<MssqlParam> {
+    params.iter().map(|p| match cfqueryparam_unwrap(p) {
+        CfmlValue::Null => MssqlParam::Null,
+        CfmlValue::Bool(b) => MssqlParam::Bool(b),
+        CfmlValue::Int(n) => MssqlParam::Int(n),
+        CfmlValue::Double(d) => MssqlParam::Double(d),
+        CfmlValue::Binary(b) => MssqlParam::Bytes(b),
+        other => MssqlParam::Str(other.as_string()),
+    }).collect()
+}
+
+/// Rewrite positional `?` placeholders to tiberius/T-SQL `@P1`, `@P2`, … (1-based),
+/// skipping `?` inside single-quoted string literals. List-param `?` expansion
+/// already happened in `fn_query_execute`, so this is a 1:1 mapping onto the
+/// bound parameter vector.
+#[cfg(feature = "mssql_db")]
+fn mssql_rewrite_placeholders(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len() + 8);
+    let mut param_idx = 0usize;
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'?' {
+            param_idx += 1;
+            result.push_str("@P");
+            result.push_str(&param_idx.to_string());
+        } else if bytes[i] == b'\'' {
+            result.push('\'');
+            i += 1;
+            while i < len && bytes[i] != b'\'' {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < len { result.push('\''); }
+        } else {
+            result.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Run one MSSQL statement (SELECT → rows, otherwise → affected count) against
+/// an already-checked-out connection on the shared runtime, binding `params` as
+/// real typed parameters. Shared by the pooled (`execute_mssql`) and
+/// transaction (`execute_with_transaction`) paths. Flags `broken` on
+/// connection-level failures so r2d2 evicts the connection on return.
+#[cfg(feature = "mssql_db")]
+fn run_mssql_statement(
+    client: &mut MssqlClient,
+    broken: &mut bool,
+    sql: &str,
+    params: &[CfmlValue],
+    return_type: &str,
+) -> CfmlResult {
+    let bound = mssql_bind_params(params);
+    let rewritten = mssql_rewrite_placeholders(sql);
+    let is_select = is_select_query(sql);
 
     mssql_runtime().block_on(async move {
+        let param_refs: Vec<&dyn tiberius::ToSql> =
+            bound.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+
         // Map a tiberius error → CfmlError, flagging the connection broken so
         // r2d2 evicts it on return when the failure is connection-level.
         let to_err = |broken: &mut bool, ctx: &str, e: tiberius::error::Error| {
@@ -8308,10 +8410,8 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
             CfmlError::runtime(format!("queryExecute: MSSQL {}: {}", ctx, e))
         };
 
-        if is_select_query(sql) {
-            // Build query with inline params (tiberius simple query)
-            let query_sql = mssql_inline_params(sql, &effective_params);
-            let stream = match client.simple_query(&query_sql).await {
+        if is_select {
+            let stream = match client.query(rewritten.as_str(), &param_refs).await {
                 Ok(s) => s,
                 Err(e) => return Err(to_err(broken, "query error", e)),
             };
@@ -8340,64 +8440,39 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
 
             build_query_result(columns, rows, sql, return_type)
         } else {
-            let query_sql = mssql_inline_params(sql, &effective_params);
-            let result = match client.simple_query(&query_sql).await {
+            // execute() returns the real rows-affected total (the previous
+            // simple_query path mis-reported INSERT/UPDATE as 0 rows).
+            let result = match client.execute(rewritten.as_str(), &param_refs).await {
                 Ok(r) => r,
                 Err(e) => return Err(to_err(broken, "error", e)),
             };
-            let rows = match result.into_first_result().await {
-                Ok(r) => r,
-                Err(e) => return Err(to_err(broken, "result error", e)),
-            };
-            build_mutation_result(rows.len() as i64, 0, sql)
+            build_mutation_result(result.total() as i64, 0, sql)
         }
     })
 }
 
+/// Run a transaction-control batch (BEGIN/COMMIT/ROLLBACK TRANSACTION) on the
+/// shared runtime. These MUST go through `simple_query` (a raw batch) rather
+/// than `execute`/sp_executesql, which would raise "transaction count after
+/// EXECUTE indicates a mismatching number of BEGIN and COMMIT statements".
 #[cfg(feature = "mssql_db")]
-fn mssql_inline_params(sql: &str, params: &[CfmlValue]) -> String {
-    if params.is_empty() {
-        return sql.to_string();
-    }
-    let mut result = String::with_capacity(sql.len() + params.len() * 10);
-    let mut param_idx = 0;
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        if bytes[i] == b'?' && param_idx < params.len() {
-            match &params[param_idx] {
-                CfmlValue::Null => result.push_str("NULL"),
-                CfmlValue::Int(n) => result.push_str(&n.to_string()),
-                CfmlValue::Double(d) => result.push_str(&d.to_string()),
-                CfmlValue::Bool(b) => result.push_str(if *b { "1" } else { "0" }),
-                CfmlValue::String(s) => {
-                    result.push('\'');
-                    result.push_str(&s.replace('\'', "''"));
-                    result.push('\'');
-                }
-                _ => {
-                    let s = params[param_idx].as_string();
-                    result.push('\'');
-                    result.push_str(&s.replace('\'', "''"));
-                    result.push('\'');
-                }
+fn mssql_txn_control(client: &mut MssqlClient, broken: &mut bool, sql: &str, label: &str) -> Result<(), CfmlError> {
+    mssql_runtime().block_on(async move {
+        let on_err = |broken: &mut bool, e: tiberius::error::Error| {
+            if is_mssql_connection_error(&e) {
+                *broken = true;
             }
-            param_idx += 1;
-        } else if bytes[i] == b'\'' {
-            result.push('\'');
-            i += 1;
-            while i < len && bytes[i] != b'\'' {
-                result.push(bytes[i] as char);
-                i += 1;
-            }
-            if i < len { result.push('\''); }
-        } else {
-            result.push(bytes[i] as char);
+            CfmlError::runtime(format!("cftransaction: {} error: {}", label, e))
+        };
+        // Drain the (empty) result stream so the connection is left flushed.
+        match client.simple_query(sql).await {
+            Ok(s) => match s.into_results().await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(on_err(broken, e)),
+            },
+            Err(e) => Err(on_err(broken, e)),
         }
-        i += 1;
-    }
-    result
+    })
 }
 
 #[cfg(feature = "mssql_db")]
@@ -8528,6 +8603,8 @@ enum TransactionConn {
     Mysql(mysql::PooledConn),
     #[cfg(feature = "postgres_db")]
     Postgres(r2d2::PooledConnection<PostgresConnectionManager>),
+    #[cfg(feature = "mssql_db")]
+    Mssql(r2d2::PooledConnection<MssqlConnectionManager>),
 }
 
 // ---- Public wrappers using Box<dyn Any> for VM interop ----
@@ -8604,6 +8681,15 @@ fn transaction_begin(datasource: &str) -> Result<TransactionConn, CfmlError> {
                 .map_err(|e| CfmlError::runtime(format!("cftransaction: BEGIN error: {}", e)))?;
             Ok(TransactionConn::Postgres(conn))
         }
+        #[cfg(feature = "mssql_db")]
+        DbDriver::Mssql(url) => {
+            let pool = get_mssql_pool(&url)?;
+            let mut conn = pool.get()
+                .map_err(|e| CfmlError::runtime(format!("cftransaction: MSSQL pool error: {}", e)))?;
+            let m = &mut *conn;
+            mssql_txn_control(&mut m.client, &mut m.broken, "BEGIN TRANSACTION", "BEGIN")?;
+            Ok(TransactionConn::Mssql(conn))
+        }
         #[allow(unreachable_patterns)]
         _ => Err(CfmlError::runtime(format!(
             "cftransaction: unsupported datasource '{}'", datasource
@@ -8631,6 +8717,11 @@ fn transaction_commit(conn: &mut TransactionConn) -> Result<(), CfmlError> {
             c.client.simple_query("COMMIT").map(|_| ())
                 .map_err(|e| CfmlError::runtime(format!("cftransaction: COMMIT error: {}", e)))
         }
+        #[cfg(feature = "mssql_db")]
+        TransactionConn::Mssql(c) => {
+            let m = &mut **c;
+            mssql_txn_control(&mut m.client, &mut m.broken, "COMMIT TRANSACTION", "COMMIT")
+        }
         #[allow(unreachable_patterns)]
         _ => Ok(()),
     }
@@ -8656,6 +8747,11 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
             c.client.simple_query("ROLLBACK").map(|_| ())
                 .map_err(|e| CfmlError::runtime(format!("cftransaction: ROLLBACK error: {}", e)))
         }
+        #[cfg(feature = "mssql_db")]
+        TransactionConn::Mssql(c) => {
+            let m = &mut **c;
+            mssql_txn_control(&mut m.client, &mut m.broken, "ROLLBACK TRANSACTION", "ROLLBACK")
+        }
         #[allow(unreachable_patterns)]
         _ => Ok(()),
     }
@@ -8676,6 +8772,12 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
         #[cfg(feature = "postgres_db")]
         TransactionConn::Postgres(c) => {
             execute_postgres_with_conn(&mut c.client, sql, params_arg, return_type)
+        }
+        #[cfg(feature = "mssql_db")]
+        TransactionConn::Mssql(c) => {
+            let (effective_params, _type_hints) = normalize_query_params(params_arg);
+            let m = &mut **c;
+            run_mssql_statement(&mut m.client, &mut m.broken, sql, &effective_params, return_type)
         }
         #[allow(unreachable_patterns)]
         _ => Err(CfmlError::runtime("Transaction: unsupported driver".to_string())),
