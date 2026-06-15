@@ -6783,6 +6783,192 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
 }
 
 // -----------------------------------------------
+// MSSQL connection pool (tiberius)
+// -----------------------------------------------
+
+/// Concrete tiberius client type over a tokio TcpStream (the `compat` adapter
+/// bridges tokio's AsyncRead/Write to the futures traits tiberius expects).
+#[cfg(feature = "mssql_db")]
+type MssqlClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
+/// tiberius is async and its TCP stream is bound to a runtime's reactor, so a
+/// pooled connection only stays usable while that runtime is alive. We keep ONE
+/// long-lived multi-threaded runtime for the whole process: connections are
+/// established and queried on it, and concurrent `block_on` from multiple
+/// blocking VM threads (serve mode) is safe on a multi-thread scheduler. Before
+/// this, `execute_mssql` opened a fresh TCP + TLS + login handshake on EVERY
+/// query (no pool at all) — many round-trips per `cfquery`. Pooling brings it in
+/// line with the MySQL/PostgreSQL paths.
+#[cfg(feature = "mssql_db")]
+static MSSQL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+#[cfg(feature = "mssql_db")]
+fn mssql_runtime() -> &'static tokio::runtime::Runtime {
+    MSSQL_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build MSSQL tokio runtime")
+    })
+}
+
+/// A pooled MSSQL connection. `broken` is set when a query fails with a
+/// connection-level (not server/SQL) error so r2d2 evicts it on return — the
+/// pool does NOT ping on checkout (see `get_mssql_pool`), mirroring the
+/// PostgreSQL `has_broken` strategy.
+#[cfg(feature = "mssql_db")]
+struct MssqlConn {
+    client: MssqlClient,
+    broken: bool,
+}
+
+/// True when a tiberius error means the connection itself is unusable (I/O,
+/// protocol, TLS, encoding, or a server-requested redirect) rather than a
+/// per-statement failure (`Server` = a SQL error, `Conversion`, etc.). Only the
+/// former should evict the pooled connection.
+#[cfg(feature = "mssql_db")]
+fn is_mssql_connection_error(e: &tiberius::error::Error) -> bool {
+    use tiberius::error::Error;
+    matches!(
+        e,
+        Error::Io { .. } | Error::Protocol(_) | Error::Encoding(_) | Error::Tls(_) | Error::Routing { .. }
+    )
+}
+
+/// Error wrapper for the MSSQL connection manager (TLS/login failures surface as
+/// non-`postgres`-style strings; r2d2 just needs `Error + 'static`).
+#[cfg(feature = "mssql_db")]
+#[derive(Debug)]
+struct MssqlConnError(String);
+
+#[cfg(feature = "mssql_db")]
+impl std::fmt::Display for MssqlConnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "mssql_db")]
+impl std::error::Error for MssqlConnError {}
+
+#[cfg(feature = "mssql_db")]
+struct MssqlConnectionManager {
+    config: tiberius::Config,
+    addr: String,
+}
+
+#[cfg(feature = "mssql_db")]
+impl r2d2::ManageConnection for MssqlConnectionManager {
+    type Connection = MssqlConn;
+    type Error = MssqlConnError;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        use tokio_util::compat::TokioAsyncWriteCompatExt;
+        let config = self.config.clone();
+        let addr = self.addr.clone();
+        let client = mssql_runtime().block_on(async move {
+            let tcp = tokio::net::TcpStream::connect(&addr).await
+                .map_err(|e| MssqlConnError(format!("MSSQL connection error: {}", e)))?;
+            tcp.set_nodelay(true).ok();
+            tiberius::Client::connect(config, tcp.compat_write()).await
+                .map_err(|e| MssqlConnError(format!("MSSQL connection error: {}", e)))
+        })?;
+        Ok(MssqlConn { client, broken: false })
+    }
+
+    fn is_valid(&self, _conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        // Pool does not validate on checkout (test_on_check_out(false)).
+        Ok(())
+    }
+
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        conn.broken
+    }
+}
+
+/// Parse an `mssql://`/`sqlserver://` URL into a tiberius `Config` plus the
+/// `host:port` to dial. Extracted from the old inline `execute_mssql` body so
+/// the pool manager can re-establish connections without re-parsing per query.
+#[cfg(feature = "mssql_db")]
+fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlError> {
+    use tiberius::{Config, AuthMethod};
+
+    let clean_url = url.replace("mssql://", "").replace("sqlserver://", "");
+    // Split off an optional query string before parsing the path components, so
+    // the database name isn't polluted by `?trustServerCertificate=...` etc.
+    let (clean_url, query) = match clean_url.split_once('?') {
+        Some((b, q)) => (b.to_string(), Some(q.to_string())),
+        None => (clean_url, None),
+    };
+    // Format: user:pass@host:port/database
+    let (auth_part, host_db) = clean_url.split_once('@')
+        .ok_or_else(|| CfmlError::runtime("queryExecute: MSSQL URL must be mssql://user:pass@host:port/database".to_string()))?;
+    let (user, pass) = auth_part.split_once(':')
+        .ok_or_else(|| CfmlError::runtime("queryExecute: MSSQL URL must include user:password".to_string()))?;
+    let (host_port, database) = host_db.split_once('/')
+        .unwrap_or((host_db, "master"));
+    let (host, port_str) = host_port.split_once(':')
+        .unwrap_or((host_port, "1433"));
+    let port: u16 = port_str.parse().unwrap_or(1433);
+
+    // TLS: tiberius (rustls feature) negotiates encryption by default. By
+    // default we trust the server certificate (works with Azure SQL and any
+    // managed instance out of the box). Set `trustServerCertificate=false`
+    // (or `encrypt=strict`) in the URL to instead validate the certificate
+    // against the platform trust store.
+    let mut trust_cert = true;
+    if let Some(q) = &query {
+        for pair in q.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k.to_lowercase().as_str() {
+                    "trustservercertificate" => {
+                        trust_cert = !(v.eq_ignore_ascii_case("false") || v == "0");
+                    }
+                    "encrypt" if v.eq_ignore_ascii_case("strict") => trust_cert = false,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut config = Config::new();
+    config.host(host);
+    config.port(port);
+    config.database(database);
+    config.authentication(AuthMethod::sql_server(user, pass));
+    if trust_cert {
+        config.trust_cert();
+    }
+
+    Ok((config, format!("{}:{}", host, port)))
+}
+
+#[cfg(feature = "mssql_db")]
+fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlError> {
+    let mut manager = get_pool_manager().lock().unwrap();
+    let key = format!("mssql:{}", url);
+    if let Some(pool_any) = manager.get(&key) {
+        if let Some(pool) = pool_any.downcast_ref::<r2d2::Pool<MssqlConnectionManager>>() {
+            return Ok(pool.clone());
+        }
+    }
+    let (config, addr) = mssql_config_from_url(url)?;
+    let mgr = MssqlConnectionManager { config, addr };
+    let pool = r2d2::Pool::builder()
+        .max_size(10)
+        .min_idle(Some(1))
+        .connection_timeout(std::time::Duration::from_secs(30))
+        // No per-checkout ping (Lucee parity / remote-DB perf): rely on
+        // MssqlConnectionManager::has_broken to evict dead connections instead.
+        .test_on_check_out(false)
+        .build(mgr)
+        .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to create MSSQL pool: {}", e)))?;
+    manager.insert(key, Box::new(pool.clone()));
+    Ok(pool)
+}
+
+// -----------------------------------------------
 // Structured query parameter normalization
 // -----------------------------------------------
 
@@ -8100,82 +8286,39 @@ fn postgres_row_to_cfml(row: &postgres::Row, col_idx: usize) -> CfmlValue {
 
 #[cfg(feature = "mssql_db")]
 fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
-    use tiberius::{Client, Config, AuthMethod};
-    use tokio::runtime::Builder;
-    use tokio_util::compat::TokioAsyncWriteCompatExt;
-
-    // Parse URL: mssql://user:pass@host:port/database[?options] or sqlserver://...
-    let clean_url = url.replace("mssql://", "").replace("sqlserver://", "");
-    // Split off an optional query string before parsing the path components, so
-    // the database name isn't polluted by `?trustServerCertificate=...` etc.
-    let (clean_url, query) = match clean_url.split_once('?') {
-        Some((b, q)) => (b.to_string(), Some(q.to_string())),
-        None => (clean_url, None),
-    };
-    // Format: user:pass@host:port/database
-    let (auth_part, host_db) = clean_url.split_once('@')
-        .ok_or_else(|| CfmlError::runtime("queryExecute: MSSQL URL must be mssql://user:pass@host:port/database".to_string()))?;
-    let (user, pass) = auth_part.split_once(':')
-        .ok_or_else(|| CfmlError::runtime("queryExecute: MSSQL URL must include user:password".to_string()))?;
-    let (host_port, database) = host_db.split_once('/')
-        .unwrap_or((host_db, "master"));
-    let (host, port_str) = host_port.split_once(':')
-        .unwrap_or((host_port, "1433"));
-    let port: u16 = port_str.parse().unwrap_or(1433);
-
-    // TLS: tiberius (rustls feature) negotiates encryption by default. By
-    // default we trust the server certificate (works with Azure SQL and any
-    // managed instance out of the box). Set `trustServerCertificate=false`
-    // (or `encrypt=strict`) in the URL to instead validate the certificate
-    // against the platform trust store.
-    let mut trust_cert = true;
-    if let Some(q) = &query {
-        for pair in q.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                match k.to_lowercase().as_str() {
-                    "trustservercertificate" => {
-                        trust_cert = !(v.eq_ignore_ascii_case("false") || v == "0");
-                    }
-                    "encrypt" if v.eq_ignore_ascii_case("strict") => trust_cert = false,
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let mut config = Config::new();
-    config.host(host);
-    config.port(port);
-    config.database(database);
-    config.authentication(AuthMethod::sql_server(user, pass));
-    if trust_cert {
-        config.trust_cert();
-    }
-
-    let addr = format!("{}:{}", host, port);
-
-    // Normalize params
+    // Normalize params before touching the pool.
     let (effective_params, _type_hints) = normalize_query_params(params_arg);
 
-    // Create single-threaded tokio runtime (safe inside spawn_blocking)
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to create MSSQL runtime: {}", e)))?;
+    // Checkout a pooled connection (sync; may establish one on the shared
+    // runtime internally). The actual query runs on that same shared runtime.
+    let pool = get_mssql_pool(url)?;
+    let mut conn = pool.get()
+        .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL connection error: {}", e)))?;
+    let mssql = &mut *conn;
+    let client = &mut mssql.client;
+    let broken = &mut mssql.broken;
 
-    rt.block_on(async {
-        let tcp = tokio::net::TcpStream::connect(&addr).await
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL connection error: {}", e)))?;
-        let mut client = Client::connect(config, tcp.compat_write()).await
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL connection error: {}", e)))?;
+    mssql_runtime().block_on(async move {
+        // Map a tiberius error → CfmlError, flagging the connection broken so
+        // r2d2 evicts it on return when the failure is connection-level.
+        let to_err = |broken: &mut bool, ctx: &str, e: tiberius::error::Error| {
+            if is_mssql_connection_error(&e) {
+                *broken = true;
+            }
+            CfmlError::runtime(format!("queryExecute: MSSQL {}: {}", ctx, e))
+        };
 
         if is_select_query(sql) {
             // Build query with inline params (tiberius simple query)
             let query_sql = mssql_inline_params(sql, &effective_params);
-            let stream = client.simple_query(&query_sql).await
-                .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL query error: {}", e)))?;
-            let result = stream.into_first_result().await
-                .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL result error: {}", e)))?;
+            let stream = match client.simple_query(&query_sql).await {
+                Ok(s) => s,
+                Err(e) => return Err(to_err(broken, "query error", e)),
+            };
+            let result = match stream.into_first_result().await {
+                Ok(r) => r,
+                Err(e) => return Err(to_err(broken, "result error", e)),
+            };
 
             let columns: Vec<String> = if let Some(first_row) = result.first() {
                 first_row.columns().iter()
@@ -8198,10 +8341,14 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
             build_query_result(columns, rows, sql, return_type)
         } else {
             let query_sql = mssql_inline_params(sql, &effective_params);
-            let result = client.simple_query(&query_sql).await
-                .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL error: {}", e)))?;
-            let rows = result.into_first_result().await
-                .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL result error: {}", e)))?;
+            let result = match client.simple_query(&query_sql).await {
+                Ok(r) => r,
+                Err(e) => return Err(to_err(broken, "error", e)),
+            };
+            let rows = match result.into_first_result().await {
+                Ok(r) => r,
+                Err(e) => return Err(to_err(broken, "result error", e)),
+            };
             build_mutation_result(rows.len() as i64, 0, sql)
         }
     })
