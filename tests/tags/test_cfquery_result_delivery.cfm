@@ -23,6 +23,7 @@ qoq = queryExecute("SELECT name FROM src ORDER BY id", {}, {dbtype: "query", res
 assertTrue("QoQ result option populates variable", isDefined("qoqRes"));
 assert("QoQ result.recordCount", qoqRes.recordCount, 2);
 assertTrue("QoQ result.sql present", len(qoqRes.sql) GT 0);
+assertTrue("QoQ result.executionTime is numeric >= 0", isNumeric(qoqRes.executionTime) AND qoqRes.executionTime GTE 0);
 
 // result option delivered into a function's local scope (Lucee parity)
 function qoqResultLocal(required query src) {
@@ -75,6 +76,7 @@ if (NOT qrdSkip) {
     assert("insert result.generatedKey", insRes.generatedKey, 1);
     assertTrue("insert result.sql is the statement", insRes.sql CONTAINS "INSERT INTO t");
     assertFalse("insert result.cached", insRes.cached);
+    assertTrue("insert result.executionTime is numeric >= 0", isNumeric(insRes.executionTime) AND insRes.executionTime GTE 0);
 
     // --- incrementing generated keys, no staleness on UPDATE/DELETE ---
     queryExecute("INSERT INTO t (n) VALUES ('b')", [], {datasource: qrdDs, result: "insRes2"});
@@ -90,6 +92,7 @@ if (NOT qrdSkip) {
     queryExecute("SELECT * FROM t", [], {datasource: qrdDs, result: "selRes"});
     assert("select result.recordCount", selRes.recordCount, 2);
     assertTrue("select result.columnList present", listLen(selRes.columnList) EQ 2);
+    assertTrue("select result.executionTime is numeric >= 0", isNumeric(selRes.executionTime) AND selRes.executionTime GTE 0);
 
     // --- the exact Wheels shape: script-block cfquery, all attributes via
     //     attributeCollection, dotted name + result into local scope ---

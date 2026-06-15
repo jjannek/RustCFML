@@ -8629,6 +8629,11 @@ impl CfmlVirtualMachine {
                             .unwrap_or(false),
                         _ => false,
                     };
+                    // Measure wall-clock execution time of the driver
+                    // round-trip (Lucee's `executionTime`, in ms). Monotonic
+                    // clock isn't available on wasm32, so it reports 0 there.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let __query_start = std::time::Instant::now();
                     let ret = if is_qoq {
                         let sql = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                         let params_arg = args.get(1).cloned().unwrap_or(CfmlValue::Null);
@@ -8707,6 +8712,26 @@ impl CfmlVirtualMachine {
                         }
                     };
 
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let exec_ms = __query_start.elapsed().as_millis() as i64;
+                    #[cfg(target_arch = "wasm32")]
+                    let exec_ms = 0i64;
+
+                    // Patch the measured time into a mutation-result struct that
+                    // the driver built with a placeholder 0 (INSERT/UPDATE/DELETE
+                    // return this struct directly). SELECT/QoQ return a Query (or
+                    // a returntype=struct shape that has no executionTime key), so
+                    // those are left untouched here and timed when the `result=`
+                    // struct is built below.
+                    if let CfmlValue::Struct(s) = &ret {
+                        if s.get_ci("executionTime").is_some()
+                            && s.get_ci("recordCount").is_some()
+                            && s.get_ci("cached").is_some()
+                        {
+                            s.insert("executionTime".to_string(), CfmlValue::Int(exec_ms));
+                        }
+                    }
+
                     // Deliver `result` (queryExecute option + cfquery attr) and
                     // `name` (cfquery attr only — direct queryExecute ignores
                     // it, matching Lucee) into the caller's scope. The names
@@ -8732,7 +8757,7 @@ impl CfmlVirtualMachine {
                                         q.sql().unwrap_or_else(|| sql_text.clone()),
                                     ),
                                 );
-                                m.insert("executionTime".to_string(), CfmlValue::Int(0));
+                                m.insert("executionTime".to_string(), CfmlValue::Int(exec_ms));
                                 CfmlValue::strukt(m)
                             }
                             // Mutation metadata struct from the driver — it IS
@@ -8749,7 +8774,7 @@ impl CfmlVirtualMachine {
                                 }
                                 m.insert("cached".to_string(), CfmlValue::Bool(false));
                                 m.insert("sql".to_string(), CfmlValue::string(sql_text.clone()));
-                                m.insert("executionTime".to_string(), CfmlValue::Int(0));
+                                m.insert("executionTime".to_string(), CfmlValue::Int(exec_ms));
                                 CfmlValue::strukt(m)
                             }
                         };
