@@ -1798,6 +1798,10 @@ impl Parser {
             // Parse name=value attributes and emit __cfparam(name, default) call
             let mut name_expr: Option<Expression> = None;
             let mut default_expr: Option<Expression> = None;
+            let mut type_name: Option<String> = None;
+            let mut min_expr: Option<Expression> = None;
+            let mut max_expr: Option<Expression> = None;
+            let mut pattern_expr: Option<Expression> = None;
             while (self.is_identifier_like() || matches!(self.peek(0), Token::Identifier(_)))
                 && matches!(self.peek(1), Token::Equal) {
                 let attr_name = self.extract_identifier()?.to_lowercase();
@@ -1806,7 +1810,21 @@ impl Parser {
                 match attr_name.as_str() {
                     "name" => name_expr = Some(attr_value),
                     "default" => default_expr = Some(attr_value),
-                    _ => {} // ignore type, etc.
+                    // A literal `type="numeric"` drives validation; a non-literal
+                    // type expression is left unvalidated (rare).
+                    "type" => {
+                        if let Expression::Literal(Literal {
+                            value: LiteralValue::String(s),
+                            ..
+                        }) = &attr_value
+                        {
+                            type_name = Some(s.clone());
+                        }
+                    }
+                    "min" => min_expr = Some(attr_value),
+                    "max" => max_expr = Some(attr_value),
+                    "pattern" => pattern_expr = Some(attr_value),
+                    _ => {}
                 }
             }
             self.match_token(&Token::Semicolon);
@@ -1824,7 +1842,16 @@ impl Parser {
                             value: LiteralValue::String(String::new()),
                             location: loc,
                         }));
-                        return Ok(self.lower_param_default(var_name, default_val, loc));
+                        let base = self.lower_param_default(var_name, default_val, loc);
+                        return Ok(self.append_param_validation(
+                            base,
+                            var_name,
+                            type_name.as_deref(),
+                            min_expr,
+                            max_expr,
+                            pattern_expr,
+                            loc,
+                        ));
                     }
                 }
             }
@@ -1873,8 +1900,9 @@ impl Parser {
         // peek(1) is a Dot, so the first token is the variable, not a type —
         // this is why the old `peek(1) != Equal|Semicolon` heuristic wrongly
         // consumed `arguments` as a type and then choked on the `.`.
+        let mut type_name: Option<String> = None;
         if self.is_identifier_like_at(0) && self.is_identifier_like_at(1) {
-            let _type = self.extract_identifier()?; // discard the declared type
+            type_name = Some(self.extract_identifier()?); // the declared type
         }
 
         // Parse the (possibly dotted) lvalue path into a string, e.g.
@@ -1896,7 +1924,85 @@ impl Parser {
         };
         self.match_token(&Token::Semicolon);
 
-        Ok(self.lower_param_default(&var_name, default_value, loc))
+        let base = self.lower_param_default(&var_name, default_value, loc);
+        Ok(self.append_param_validation(base, &var_name, type_name.as_deref(), None, None, None, loc))
+    }
+
+    /// Wrap a lowered `param` default-assignment so the resulting value is
+    /// validated against `type` (with optional `min`/`max`/`pattern`). Emits
+    /// `if (true) { <default-assignment>; __cfparam_validate(<path>, ...); }`
+    /// — there is no block statement, so a `true` If supplies the statement
+    /// list. A missing / `any` type is a no-op (returns `base` unchanged).
+    #[allow(clippy::too_many_arguments)]
+    fn append_param_validation(
+        &self,
+        base: CfmlNode,
+        var_name: &str,
+        type_name: Option<&str>,
+        min_expr: Option<Expression>,
+        max_expr: Option<Expression>,
+        pattern_expr: Option<Expression>,
+        loc: SourceLocation,
+    ) -> CfmlNode {
+        let ty = match type_name {
+            Some(t) if !t.is_empty() && !t.eq_ignore_ascii_case("any") => t.to_lowercase(),
+            _ => return base,
+        };
+        let base_stmt = match base {
+            CfmlNode::Statement(s) => s,
+            other => return other,
+        };
+        // Build a (possibly dotted) lvalue expression for the variable so the
+        // validator receives its current value.
+        let mut parts = var_name.split('.');
+        let mut value_expr = Expression::Identifier(Identifier {
+            name: parts.next().unwrap_or("").to_string(),
+            location: loc,
+        });
+        for part in parts {
+            value_expr = Expression::MemberAccess(Box::new(MemberAccess {
+                object: Box::new(value_expr),
+                member: part.to_string(),
+                null_safe: false,
+                location: loc,
+            }));
+        }
+        let str_lit = |s: &str| {
+            Expression::Literal(Literal {
+                value: LiteralValue::String(s.to_string()),
+                location: loc,
+            })
+        };
+        let empty = || str_lit("");
+        let validate_call = Expression::FunctionCall(Box::new(FunctionCall {
+            name: Box::new(Expression::Identifier(Identifier {
+                name: "__cfparam_validate".to_string(),
+                location: loc,
+            })),
+            arguments: vec![
+                value_expr,
+                str_lit(&ty),
+                str_lit(var_name),
+                min_expr.unwrap_or_else(empty),
+                max_expr.unwrap_or_else(empty),
+                pattern_expr.unwrap_or_else(empty),
+            ],
+            location: loc,
+        }));
+        let validate_stmt = Statement::Expression(ExpressionStatement {
+            expr: validate_call,
+            location: loc,
+        });
+        CfmlNode::Statement(Statement::If(If {
+            condition: Expression::Literal(Literal {
+                value: LiteralValue::Bool(true),
+                location: loc,
+            }),
+            then_branch: vec![base_stmt, validate_stmt],
+            else_if: vec![],
+            else_branch: None,
+            location: loc,
+        }))
     }
 
     /// Parse a comma-separated `key = expr` list inside the parens of a

@@ -498,16 +498,97 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // <cfoutput> marks a region where # expressions are evaluated and
             // content is always output (even when enableCFOutputOnly is active).
             // Process body recursively with in_cfoutput=true so text uses writeOutput.
-            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfoutput") {
+            let (body, consumed) = if let Some(end_tag_pos) =
+                find_closing_tag(chars, tag_end, len, "cfoutput")
+            {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
                 let close_end = find_tag_end(chars, end_tag_pos, len);
-                let body_script = tags_to_script_inner(&body, imports, true);
-                (body_script, close_end - start)
+                (body, close_end - start)
             } else {
                 // No closing tag — treat remaining content as inside cfoutput
                 let body: String = chars[tag_end..len].iter().collect();
-                let body_script = tags_to_script_inner(&body, imports, true);
-                (body_script, len - start)
+                (body, len - start)
+            };
+            match attrs.get("query") {
+                None => (tags_to_script_inner(&body, imports, true), consumed),
+                Some(query_raw) => {
+                    let query = strip_hashes(query_raw);
+                    if attrs.contains_key("group") {
+                        // Grouped (control-break) output. The query rows are
+                        // materialised into an array once, then iterated in
+                        // group breaks: per-group body runs once, and a nested
+                        // <cfoutput> (the detail block) iterates that group's
+                        // rows. Nesting recurses for multi-level grouping.
+                        let group_col = strip_hashes(attrs.get("group").unwrap());
+                        let case_sensitive = group_case_sensitive(&attrs);
+                        let q = format!("__cfg_q_{}", start);
+                        let rows = format!("__cfg_rows_{}", start);
+                        let rc = format!("__cfg_rc_{}", start);
+                        let cl = format!("__cfg_cl_{}", start);
+                        let ci = format!("__cfg_ci_{}", start);
+                        let r = format!("__cfg_r_{}", start);
+                        let group_loop = emit_grouped_cfoutput(
+                            &rows, &query, &body, &group_col, case_sensitive, imports, start, 0,
+                        );
+                        (
+                            format!(
+                                "var {q} = {query};\nvar {rows} = [];\nvar {rc} = {q}.recordcount;\nvar {cl} = {q}.columnlist;\nvar {ci} = 0;\nfor (var {r} in {q}) {{\n{ci} = {ci} + 1;\n{r}.currentRow = {ci};\n{r}.recordCount = {rc};\n{r}.columnList = {cl};\narrayAppend({rows}, {r});\n}}\n{loop}{query} = {q};\n",
+                                q = q,
+                                query = query,
+                                rows = rows,
+                                rc = rc,
+                                cl = cl,
+                                ci = ci,
+                                r = r,
+                                loop = group_loop,
+                            ),
+                            consumed,
+                        )
+                    } else {
+                        // <cfoutput query="q"> iterates the query's rows. Within
+                        // the body, bare column refs (#name#) resolve to the
+                        // current row (we merge the row struct into `variables`)
+                        // and `#q.col#` resolves to the row scalar (we reassign
+                        // the query var to the row, restoring it after the loop).
+                        // `maxrows`/`startrow` bound the iteration.
+                        let body_script = tags_to_script_inner(&body, imports, true);
+                        let startrow = attrs
+                            .get("startrow")
+                            .map(|s| strip_hashes(s))
+                            .unwrap_or_else(|| "1".to_string());
+                        let maxrows = attrs
+                            .get("maxrows")
+                            .map(|s| strip_hashes(s))
+                            .unwrap_or_else(|| "-1".to_string());
+                        // Unique temp names per tag occurrence (mirrors cfloop):
+                        // a leading bare `{` block is parsed as a struct literal,
+                        // so we declare the temps inline rather than wrapping.
+                        let q = format!("__cfoq_q_{}", start);
+                        let rc = format!("__cfoq_rc_{}", start);
+                        let cl = format!("__cfoq_cl_{}", start);
+                        let sr = format!("__cfoq_sr_{}", start);
+                        let mr = format!("__cfoq_mr_{}", start);
+                        let i = format!("__cfoq_i_{}", start);
+                        let row = format!("__cfoq_row_{}", start);
+                        (
+                            format!(
+                                "var {q} = {query};\nvar {rc} = {q}.recordcount;\nvar {cl} = {q}.columnlist;\nvar {sr} = {startrow};\nvar {mr} = {maxrows};\nvar {i} = 0;\nfor (var {row} in {q}) {{\n{i} = {i} + 1;\nif ({i} < {sr}) {{ continue; }}\nif ({mr} >= 0 && {i} >= {sr} + {mr}) {{ break; }}\n{row}.currentRow = {i};\n{row}.recordCount = {rc};\n{row}.columnList = {cl};\nstructAppend(variables, {row}, true);\n{query} = {row};\n{body}\n}}\n{query} = {q};\n",
+                                q = q,
+                                rc = rc,
+                                cl = cl,
+                                sr = sr,
+                                mr = mr,
+                                i = i,
+                                row = row,
+                                query = query,
+                                startrow = startrow,
+                                maxrows = maxrows,
+                                body = body_script,
+                            ),
+                            consumed,
+                        )
+                    }
+                }
             }
         }
         "cfelse" => {
@@ -635,10 +716,41 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             };
             // Clean name - remove scope prefix quotes and strip hash expressions
             let clean_name = strip_hashes(&name.replace('"', "").replace('\'', ""));
-            (
-                format!("if (isNull({})) {{ {} = {}; }}\n", clean_name, clean_name, default),
-                tag_end - start,
-            )
+            let mut script =
+                format!("if (isNull({})) {{ {} = {}; }}\n", clean_name, clean_name, default);
+            // Enforce the `type` attribute (with optional min/max/pattern).
+            // Previously these were parsed and silently dropped.
+            if let Some(type_attr) = attrs.get("type") {
+                let ty = type_attr.to_lowercase();
+                if !ty.is_empty() && ty != "any" {
+                    let min = attrs
+                        .get("min")
+                        .map(|s| strip_hashes(s))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "\"\"".to_string());
+                    let max = attrs
+                        .get("max")
+                        .map(|s| strip_hashes(s))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "\"\"".to_string());
+                    // CFML strings don't treat backslash as an escape; only the
+                    // double-quote needs doubling for a quoted literal.
+                    let pattern = attrs
+                        .get("pattern")
+                        .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
+                        .unwrap_or_else(|| "\"\"".to_string());
+                    script.push_str(&format!(
+                        "__cfparam_validate({val}, \"{ty}\", \"{nm}\", {min}, {max}, {pat});\n",
+                        val = clean_name,
+                        ty = ty,
+                        nm = clean_name,
+                        min = min,
+                        max = max,
+                        pat = pattern,
+                    ));
+                }
+            }
+            (script, tag_end - start)
         }
         "cfcomponent" => {
             let name = attrs.get("name").cloned();
@@ -2156,6 +2268,135 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
     }
 
     names
+}
+
+/// Read the `groupCaseSensitive` attribute. CFML's documented default is
+/// `Yes` (case-sensitive group breaks).
+fn group_case_sensitive(attrs: &std::collections::HashMap<String, String>) -> bool {
+    attrs
+        .get("groupcasesensitive")
+        .map(|v| {
+            !matches!(
+                strip_hashes(v).to_lowercase().as_str(),
+                "false" | "no" | "0"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// Index of the opening `<` of the first `<cfoutput ...>` (word-bounded) at or
+/// after `from`. Locates the nested detail block inside a grouped cfoutput.
+fn find_nested_cfoutput(chars: &[char], from: usize, len: usize) -> Option<usize> {
+    const NEEDLE: [char; 8] = ['c', 'f', 'o', 'u', 't', 'p', 'u', 't'];
+    let mut i = from;
+    while i < len {
+        if chars[i] == '<' {
+            let name_start = i + 1;
+            if name_start + NEEDLE.len() <= len
+                && (0..NEEDLE.len()).all(|k| chars[name_start + k].eq_ignore_ascii_case(&NEEDLE[k]))
+            {
+                let after = name_start + NEEDLE.len();
+                let boundary = after >= len
+                    || chars[after].is_whitespace()
+                    || chars[after] == '>'
+                    || chars[after] == '/';
+                if boundary {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Emit the control-break loop for a grouped `<cfoutput>` over `rows_var` (a
+/// CFML array of row structs). The per-group body (everything outside the
+/// nested detail `<cfoutput>`) runs once per distinct consecutive value of
+/// `group_col`; the nested block iterates that group's rows, recursing for
+/// further `group=` levels. `uid`/`depth` keep generated temp names unique.
+#[allow(clippy::too_many_arguments)]
+fn emit_grouped_cfoutput(
+    rows_var: &str,
+    query_var: &str,
+    body: &str,
+    group_col: &str,
+    case_sensitive: bool,
+    imports: &mut std::collections::HashMap<String, String>,
+    uid: usize,
+    depth: usize,
+) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let len = chars.len();
+
+    // Split the body into (pre, nested-cfoutput attrs, nested inner body, post).
+    let (pre, nested_attrs, nested_inner, post) =
+        if let Some(open) = find_nested_cfoutput(&chars, 0, len) {
+            let name_end = open + 1 + "cfoutput".len();
+            let (attrs, _quoted, tag_end) = parse_tag_attributes(&chars, name_end, len);
+            let pre: String = chars[..open].iter().collect();
+            if let Some(close) = find_closing_tag(&chars, tag_end, len, "cfoutput") {
+                let inner: String = chars[tag_end..close].iter().collect();
+                let close_end = find_tag_end(&chars, close, len);
+                let post: String = chars[close_end..].iter().collect();
+                (pre, Some(attrs), inner, post)
+            } else {
+                let inner: String = chars[tag_end..].iter().collect();
+                (pre, Some(attrs), inner, String::new())
+            }
+        } else {
+            (body.to_string(), None, String::new(), String::new())
+        };
+
+    let pre_script = tags_to_script_inner(&pre, imports, true);
+    let post_script = tags_to_script_inner(&post, imports, true);
+
+    let sfx = format!("{}_{}", uid, depth);
+    let i = format!("__cfg_i_{}", sfx);
+    let gval = format!("__cfg_gval_{}", sfx);
+    let gstart = format!("__cfg_gstart_{}", sfx);
+    let sub = format!("__cfg_sub_{}", sfx);
+    let cmp = if case_sensitive { "compare" } else { "compareNoCase" };
+
+    // The nested detail block, operating on this group's sub-array `sub`.
+    let nested_script = match nested_attrs {
+        None => String::new(),
+        Some(attrs) => {
+            if let Some(g2) = attrs.get("group") {
+                let g2 = strip_hashes(g2);
+                let cs2 = group_case_sensitive(&attrs);
+                emit_grouped_cfoutput(
+                    &sub, query_var, &nested_inner, &g2, cs2, imports, uid, depth + 1,
+                )
+            } else {
+                // Innermost block: iterate every row in the current group.
+                let nested_body = tags_to_script_inner(&nested_inner, imports, true);
+                let ri = format!("__cfg_ri_{}", sfx);
+                format!(
+                    "var {ri} = 1;\nwhile ({ri} <= arrayLen({sub})) {{\nstructAppend(variables, {sub}[{ri}], true);\n{q} = {sub}[{ri}];\n{body}\n{ri} = {ri} + 1;\n}}\n",
+                    ri = ri,
+                    sub = sub,
+                    q = query_var,
+                    body = nested_body,
+                )
+            }
+        }
+    };
+
+    format!(
+        "var {i} = 1;\nwhile ({i} <= arrayLen({rows})) {{\nvar {gval} = {rows}[{i}][\"{col}\"];\nvar {gstart} = {i};\nwhile ({i} <= arrayLen({rows}) && {cmp}({rows}[{i}][\"{col}\"], {gval}) == 0) {{ {i} = {i} + 1; }}\nvar {sub} = arraySlice({rows}, {gstart}, {i} - {gstart});\nstructAppend(variables, {sub}[1], true);\n{q} = {sub}[1];\n{pre}\n{nested}{post}\n}}\n",
+        i = i,
+        rows = rows_var,
+        gval = gval,
+        gstart = gstart,
+        col = group_col,
+        cmp = cmp,
+        sub = sub,
+        q = query_var,
+        pre = pre_script,
+        nested = nested_script,
+        post = post_script,
+    )
 }
 
 fn parse_cfloop_tag(

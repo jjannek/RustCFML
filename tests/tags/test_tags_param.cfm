@@ -65,4 +65,27 @@
 <cfparam name="arrDefault" type="array" default="#[]#">
 <cfscript>assertTrue("cfparam array default is array", isArray(arrDefault));</cfscript>
 
+<!--- type validation: a value that does not match the declared type throws --->
+<cfscript>
+assertThrows("cfparam type numeric rejects non-numeric", function() {
+    badNum = "hello";
+    param name="badNum" type="numeric" default="0";
+});
+assertThrows("cfparam type boolean rejects non-boolean", function() {
+    badBool = "notabool";
+    param name="badBool" type="boolean" default="false";
+});
+assertThrows("param shorthand typed form validates", function() {
+    param numeric shortBad = "abc";
+});
+// type="any" accepts any value (no validation)
+anyVal = "whatever";
+param name="anyVal" type="any" default="ignored";
+assert("cfparam type any does not validate", anyVal, "whatever");
+// a matching value passes through untouched
+goodNum = 7;
+param name="goodNum" type="numeric" default="0";
+assert("cfparam type numeric passes valid value", goodNum, 7);
+</cfscript>
+
 <cfscript>suiteEnd();</cfscript>

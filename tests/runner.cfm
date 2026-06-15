@@ -233,6 +233,7 @@ try { include "tags/test_tags_cffunction_hoisting.cfm"; } catch (any e) { writeO
 try { include "tags/test_tags_savecontent.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_savecontent.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_param.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_param.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_param_dynamic.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_param_dynamic.cfm | " & e.message & chr(10)); }
+try { include "tags/test_tags_cfoutput_query.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfoutput_query.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_misc.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_misc.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_customtag.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_customtag.cfm | " & e.message & chr(10)); }
 try { include "tags/test_custom_tag_attribute_collection.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_custom_tag_attribute_collection.cfm | " & e.message & chr(10)); }

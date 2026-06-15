@@ -357,6 +357,40 @@ Lucee's spec default is `secure:false` everywhere, so the Worker-on default is a
 `this.sessioncookie.secure = false` is honoured verbatim on both runtimes.
 `SameSite=None` forces `Secure` on (browsers reject it otherwise).
 
+## 13. `<cfoutput query>` / grouped output — implemented, with edges 🏗
+
+`<cfoutput query="q">` now drives row iteration (previously the `query` attribute
+and friends were **silently discarded** — the body ran once against page scope).
+Supported: per-row looping, `startrow`/`maxrows`, bare column refs (`#name#`,
+resolved by merging each row into the `variables` scope), `#q.col#` row scalars,
+and `#q.currentRow#`/`#q.recordCount#`/`#q.columnList#`. The query variable is
+restored to the full query after the loop. `group` (control-break) output with a
+nested detail `<cfoutput>` is supported, including multi-level grouping;
+`groupCaseSensitive` defaults to `Yes` (case-sensitive), matching the CFML spec.
+
+Known edges:
+
+| Behaviour | Notes |
+|---|---|
+| Nested detail block placement | The detail `<cfoutput>` must sit **directly** in the group body. Wrapping it in `<cfif>`/`<cfloop>` is not supported (the pre/detail/post split would straddle the control-flow block). |
+| Multiple sibling detail blocks | Only the **first** nested `<cfoutput>` at a given group level is treated as the detail loop; later siblings render once. |
+| `group` + `startrow`/`maxrows` | `startrow`/`maxrows` apply to the **non-grouped** form only; the grouped form ignores them. |
+| Bare column scope | Columns are merged into `variables`, so a page variable sharing a column's name is shadowed for the duration of the loop. |
+
+## 14. `cfparam` / `param` `type` validation — enforced, with edges 🏗
+
+The `type` attribute (and `min`/`max`/`pattern`) was **silently dropped** —
+`<cfparam name="x" type="numeric">` never validated. It now throws on a type
+mismatch (tag form, `param name=… type=…`, and the shorthand `param numeric x`).
+Edges:
+
+| Behaviour | Notes |
+|---|---|
+| Unknown type names | Types outside the known set (e.g. `variableName`, `xml`, `component`) are **accepted without validation** rather than wrongly rejected. |
+| Dynamic / nested names | `param name="#expr#" type=…` and `param name="a.b['#k#']" type=…` set the default but do **not** validate (rare). |
+| Non-literal `type` | A `type` given as an expression (not a string literal) is not validated. |
+| "required" semantics | A typed param with no default whose value is absent is defaulted to `""` then type-checked, so the error names the type rather than "parameter required". |
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*

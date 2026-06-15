@@ -221,6 +221,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("isCustomFunction".into(), fn_is_custom_function);
     f.insert("isClosure".into(), fn_is_closure);
     f.insert("isValid".into(), fn_is_valid);
+    f.insert("__cfparam_validate".into(), fn_cfparam_validate);
 
     // ---- Conversion functions ----
     f.insert("toString".into(), fn_to_string);
@@ -2761,6 +2762,58 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         Ok(CfmlValue::Bool(false))
     }
+}
+
+/// Runtime helper emitted by the `cfparam`/`param` lowering to enforce the
+/// `type` (and `min`/`max`/`pattern`) attribute. CFML validates the resulting
+/// value's type and throws on mismatch — previously `type` was silently
+/// dropped. Args: (value, type, name, min, max, pattern).
+fn fn_cfparam_validate(args: Vec<CfmlValue>) -> CfmlResult {
+    let value = args.first().cloned().unwrap_or(CfmlValue::Null);
+    let type_name = get_str(&args, 1).to_lowercase();
+    let name = get_str(&args, 2);
+    // Types we know how to validate. Unknown / unsupported type names are
+    // accepted (no-op) rather than wrongly rejected.
+    const KNOWN: &[&str] = &[
+        "string", "numeric", "float", "double", "integer", "boolean", "date",
+        "array", "struct", "query", "email", "url", "uuid", "guid",
+        "creditcard", "zipcode", "telephone", "phone", "ssn",
+        "social_security_number", "range", "regex", "regular_expression",
+    ];
+    if type_name.is_empty() || type_name == "any" || !KNOWN.contains(&type_name.as_str()) {
+        return Ok(CfmlValue::Null);
+    }
+    let result = match type_name.as_str() {
+        "range" => {
+            // isValid("range", value, min, max)
+            let mut a = vec![CfmlValue::string("range"), value.clone()];
+            if let Some(m) = args.get(3) {
+                a.push(m.clone());
+            }
+            if let Some(m) = args.get(4) {
+                a.push(m.clone());
+            }
+            fn_is_valid(a)?
+        }
+        "regex" | "regular_expression" => {
+            // isValid("regex", value, pattern)
+            let mut a = vec![CfmlValue::string("regex"), value.clone()];
+            if let Some(p) = args.get(5) {
+                a.push(p.clone());
+            }
+            fn_is_valid(a)?
+        }
+        _ => fn_is_valid(vec![CfmlValue::string(type_name.clone()), value.clone()])?,
+    };
+    if !matches!(result, CfmlValue::Bool(true)) {
+        return Err(CfmlError::runtime(format!(
+            "The value [{}] passed to parameter [{}] is not of type [{}].",
+            value.as_string(),
+            name,
+            type_name
+        )));
+    }
+    Ok(CfmlValue::Null)
 }
 
 // ===============================================
