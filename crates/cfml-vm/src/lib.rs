@@ -4839,34 +4839,71 @@ impl CfmlVirtualMachine {
                                         ctor_args
                                     };
                                     self.closure_parent_writeback = None;
-                                    if let Ok(result) =
-                                        self.call_function(init_func, init_args, &init_locals)
-                                    {
-                                        self.closure_parent_writeback = None;
-                                        // Apply variables scope writeback from init() to the component
-                                        let vars_wb = self.method_variables_writeback.take();
-                                        let final_obj = if let Some(modified_this) =
-                                            self.method_this_writeback.take()
-                                        {
-                                            modified_this
-                                        } else if let CfmlValue::Struct(_) = &result {
-                                            result
-                                        } else {
-                                            instance
-                                        };
-                                        // Merge init()'s __variables mutations back into the component
-                                        if let Some(vars) = vars_wb {
-                                            if let Some(s) = final_obj.as_cfml_struct() {
-                                                s.insert(
-                                                    "__variables".to_string(),
-                                                    CfmlValue::strukt(vars),
-                                                );
+                                    // Isolate the try-stack so a throw inside init()
+                                    // doesn't consume the caller's handlers (and jump
+                                    // init's own ip to the caller's catch_ip). Without
+                                    // this, `new Comp(args)` inside a try{} swallowed
+                                    // init()'s exception while the explicit
+                                    // createObject(...).init(args) path (which saves the
+                                    // try-stack around CallMethod) propagated it.
+                                    let saved_try_stack = if self.try_stack.is_empty() {
+                                        None
+                                    } else {
+                                        Some(std::mem::take(&mut self.try_stack))
+                                    };
+                                    let init_call_result =
+                                        self.call_function(init_func, init_args, &init_locals);
+                                    if let Some(saved) = saved_try_stack {
+                                        self.try_stack = saved;
+                                    }
+                                    // Propagate any exception thrown by init() —
+                                    // `new Comp(args)` must fail-fast exactly like the
+                                    // explicit createObject(...).init(args) path does.
+                                    // Route the error through the in-loop try/catch
+                                    // mechanism (NOT `?`, which would unwind past an
+                                    // active try handler and escape the request).
+                                    let result = match init_call_result {
+                                        Ok(val) => val,
+                                        Err(e) => {
+                                            if Self::is_control_flow_error(&e) {
+                                                return Err(e);
+                                            }
+                                            if let Some(handler) = self.try_stack.pop() {
+                                                while stack.len() > handler.stack_depth {
+                                                    stack.pop();
+                                                }
+                                                self.restore_capture_state(&handler);
+                                                let error_val = self.resolve_catch_error_val(&e);
+                                                stack.push(error_val);
+                                                ip = handler.catch_ip;
+                                                continue;
+                                            } else {
+                                                return Err(e);
                                             }
                                         }
-                                        final_obj
+                                    };
+                                    self.closure_parent_writeback = None;
+                                    // Apply variables scope writeback from init() to the component
+                                    let vars_wb = self.method_variables_writeback.take();
+                                    let final_obj = if let Some(modified_this) =
+                                        self.method_this_writeback.take()
+                                    {
+                                        modified_this
+                                    } else if let CfmlValue::Struct(_) = &result {
+                                        result
                                     } else {
                                         instance
+                                    };
+                                    // Merge init()'s __variables mutations back into the component
+                                    if let Some(vars) = vars_wb {
+                                        if let Some(s) = final_obj.as_cfml_struct() {
+                                            s.insert(
+                                                "__variables".to_string(),
+                                                CfmlValue::strukt(vars),
+                                            );
+                                        }
                                     }
+                                    final_obj
                                 } else {
                                     instance
                                 }

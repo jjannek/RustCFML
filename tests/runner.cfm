@@ -214,6 +214,10 @@ try { include "oop/test_relative_component_resolution.cfm"; } catch (any e) { wr
 // Inherited-method sibling of #132: a bare CreateObject inside an inherited method must
 // resolve against the PARENT (defining) component's package, not the concrete subclass's dir.
 try { include "oop/test_inherited_bare_component_resolution.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_inherited_bare_component_resolution.cfm | " & e.message & chr(10)); }
+// `new Comp(args)` must propagate an exception thrown by init() (constructor-guard
+// validation). RustCFML 0.161.0 swallowed it under the `new` sugar and returned a
+// half-built object; createObject(...).init() propagates correctly.
+try { include "oop/test_new_constructor_init_throw.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_new_constructor_init_throw.cfm | " & e.message & chr(10)); }
 //   - inherited_bare_component_via_child_method: follow-on to #133. A bare
 //     CreateObject("component","X") in an inherited method must resolve to the
 //     DEFINING component's package even when reached via a CHILD-defined method
