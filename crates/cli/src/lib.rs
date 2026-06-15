@@ -213,6 +213,11 @@ struct CfmlResponse {
     /// Resolved `this.sessioncookie` attributes, used to render the session
     /// `Set-Cookie` header (Secure/HttpOnly/SameSite/Domain/Path).
     session_cookie_policy: cfml_common::session_cookie::SessionCookiePolicy,
+    /// Only meaningful on the onMissingTemplate path: true when an
+    /// Application.cfc `onMissingTemplate` handler ran and handled the request
+    /// (returned anything but `false`). When false the embedder emits its
+    /// default 404 instead of this response's output.
+    missing_template_handled: bool,
 }
 
 /// Error from CFML execution, carrying any output generated before the error.
@@ -468,7 +473,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
     let server_state = ServerState::with_config(false, cfconfig);
-    match compile_and_run(source, debug, source_file, IndexMap::new(), Some(&server_state), None, None, vfs::real_fs(), false) {
+    match compile_and_run(source, debug, source_file, IndexMap::new(), Some(&server_state), None, None, vfs::real_fs(), false, None) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
@@ -497,7 +502,28 @@ fn compile_and_run_with_session(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox)
+    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None)
+}
+
+/// Run the Application.cfc lifecycle for a requested template that does NOT
+/// exist on disk, so an `onMissingTemplate` handler can intercept it. There is
+/// no target page to compile — the VM runs onApplicationStart/onSessionStart
+/// then onMissingTemplate(targetPage). `would_be_path` is the filesystem path
+/// the template would have occupied (used to discover the governing
+/// Application.cfc and resolve mappings); `target_page` is the web-root-relative
+/// path handed to the handler. Inspect `missing_template_handled` on the result.
+#[allow(clippy::too_many_arguments)]
+fn run_missing_template(
+    would_be_path: String,
+    target_page: String,
+    extra_globals: IndexMap<String, CfmlValue>,
+    server_state: Option<&ServerState>,
+    http_request_data: Option<CfmlValue>,
+    session_id: Option<String>,
+    vfs: Arc<dyn Vfs>,
+    sandbox: bool,
+) -> Result<CfmlResponse, CfmlRunError> {
+    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page))
 }
 
 /// Register the standard runtime fixtures onto a fresh VM: builtins, builtin
@@ -568,9 +594,18 @@ fn compile_and_run(
     session_id: Option<String>,
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
+    missing_template: Option<String>,
 ) -> Result<CfmlResponse, CfmlRunError> {
+    // onMissingTemplate path: there is no target page to compile, so use an
+    // empty program. execute_with_lifecycle never runs it — it dispatches to
+    // the Application.cfc onMissingTemplate handler and returns.
+    let program = if missing_template.is_some() {
+        let compiler = CfmlCompiler::new();
+        let ast = CfmlParser::new(String::new()).parse().expect("empty source parses");
+        compiler.compile(ast)
+    }
     // In serve mode with a source file, use the bytecode cache to skip recompilation
-    let program = if !debug && source_file.is_some() && server_state.is_some() {
+    else if !debug && source_file.is_some() && server_state.is_some() {
         let path = source_file.as_ref().unwrap();
         let cache = &server_state.unwrap().bytecode_cache;
         compile_file_cached(path, Some(cache), vfs.as_ref()).map_err(|e| CfmlRunError { output: String::new(), message: format!("{}", e) })?
@@ -697,6 +732,10 @@ fn compile_and_run(
     // Wire up session ID
     vm.session_id = session_id;
 
+    // onMissingTemplate: hand the VM the web-root-relative requested path so
+    // execute_with_lifecycle dispatches to the handler instead of a target page.
+    vm.missing_template = missing_template;
+
     let result = vm.execute_with_lifecycle();
 
     // Diagnostic: dump JIT compile counts to stderr if --jit-stats was set.
@@ -741,6 +780,7 @@ fn compile_and_run(
                 session_id: vm.session_id,
                 session_record_created: vm.session_record_created,
                 session_cookie_policy: vm.session_cookie_policy,
+                missing_template_handled: vm.missing_template_handled,
             })
         }
         Err(e) => {
@@ -1530,83 +1570,7 @@ async fn handle_request(
             }).await.unwrap();
 
             match result {
-                Ok(response) => {
-                    // Check for redirect
-                    if let Some(ref redirect_url) = response.redirect_url {
-                        let status_code = response.response_status
-                            .as_ref()
-                            .map(|(c, _)| *c)
-                            .unwrap_or(302);
-                        let mut builder = axum::response::Response::builder()
-                            .status(status_code)
-                            .header("Location", redirect_url.as_str());
-                        for (name, value) in &response.response_headers {
-                            if name.to_lowercase() != "location" {
-                                builder = builder.header(name.as_str(), value.as_str());
-                            }
-                        }
-                        // Carry the session cookie through a redirect too, so a
-                        // write-then-cflocation (the POST/redirect/GET pattern)
-                        // hands the new CFID to the browser.
-                        if let Some(ref sid) = response.session_id {
-                            if response.session_record_created || Some(sid) != existing_sid.as_ref() {
-                                builder = builder.header(
-                                    "Set-Cookie",
-                                    response.session_cookie_policy.render(
-                                        "CFID",
-                                        sid,
-                                        conn_is_secure,
-                                    ),
-                                );
-                            }
-                        }
-                        return builder.body(axum::body::Body::empty()).unwrap();
-                    }
-
-                    // Resolve the singleton Content-Type and de-duplicate other
-                    // singleton headers so a cfheader(name="Content-Type") (or
-                    // Content-Length/Location) replaces rather than appends to
-                    // the engine default (issue #148).
-                    let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
-                        response.response_content_type.as_deref(),
-                        &response.response_headers,
-                    );
-
-                    // Determine body
-                    let body = if let Some(ref body_override) = response.response_body {
-                        body_override.as_string()
-                    } else {
-                        response.output
-                    };
-
-                    // Determine status code
-                    let status_code = response.response_status
-                        .as_ref()
-                        .map(|(c, _)| *c)
-                        .unwrap_or(200);
-
-                    let mut builder = axum::response::Response::builder()
-                        .status(status_code)
-                        .header("Content-Type", content_type.as_str());
-
-                    for (name, value) in &emit_headers {
-                        builder = builder.header(name.as_str(), value.as_str());
-                    }
-
-                    // Set session cookie only when a record was minted this
-                    // request (lazy default: a read-only request writes nothing
-                    // and gets no cookie) or the id changed (sessionRotate).
-                    if let Some(ref sid) = response.session_id {
-                        if response.session_record_created || Some(sid) != existing_sid.as_ref() {
-                            builder = builder.header(
-                                "Set-Cookie",
-                                response.session_cookie_policy.render("CFID", sid, conn_is_secure),
-                            );
-                        }
-                    }
-
-                    builder.body(axum::body::Body::from(body)).unwrap()
-                }
+                Ok(response) => build_success_response(response, existing_sid.as_ref(), conn_is_secure),
                 Err(e) => {
                     render_error_response(&state, &e)
                 }
@@ -1635,6 +1599,65 @@ async fn handle_request(
             }
         }
         None => {
+            // A missing template that maps to the CFML engine (.cfm/.cfc) gets a
+            // chance to be handled by Application.cfc onMissingTemplate before the
+            // default 404. Non-CFML 404s (images, .html, directory requests) bypass
+            // the engine entirely — they never reach a handler in ColdFusion/Lucee.
+            if is_cfml_file(Path::new(&path)) {
+                let relative = path.trim_start_matches('/');
+                let would_be_path = state.doc_root.join(relative).to_string_lossy().to_string();
+                // target_page is web-root-relative, as ColdFusion passes it.
+                let target_page = if path.starts_with('/') { path.clone() } else { format!("/{}", path) };
+
+                let (extra_globals, http_request_data) = build_web_scopes(
+                    &method, &headers, &body_bytes, &target_page, "", &query_string, state.port, &remote_addr,
+                );
+
+                let existing_sid: Option<String> = {
+                    let cookie_header = headers.iter()
+                        .find(|(n, _)| n.to_lowercase() == "cookie")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    cookie_header.split(';').find_map(|c| {
+                        let c = c.trim();
+                        c.strip_prefix("CFID=").map(|v| v.to_string())
+                    })
+                };
+                let conn_is_secure = headers.iter().any(|(n, v)| {
+                    n.eq_ignore_ascii_case("x-forwarded-proto") && v.eq_ignore_ascii_case("https")
+                });
+
+                let server_state = state.server_state.clone();
+                let vfs = state.vfs.clone();
+                let sandbox = state.sandbox;
+                let session_id_clone = existing_sid.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    run_missing_template(
+                        would_be_path,
+                        target_page,
+                        extra_globals,
+                        Some(&server_state),
+                        Some(http_request_data),
+                        session_id_clone,
+                        vfs,
+                        sandbox,
+                    )
+                }).await.unwrap();
+
+                match result {
+                    Ok(response) if response.missing_template_handled => {
+                        return build_success_response(response, existing_sid.as_ref(), conn_is_secure);
+                    }
+                    // Unhandled (no handler, or it returned false) → default 404.
+                    Ok(_) => {}
+                    // A throw inside onMissingTemplate (with no onError) surfaces as
+                    // a normal 500 error page, like any other uncaught CFML error.
+                    Err(e) => {
+                        return render_error_response(&state, &e);
+                    }
+                }
+            }
+
             axum::response::Response::builder()
                 .status(404)
                 .header("Content-Type", "text/html; charset=utf-8")
@@ -1645,6 +1668,89 @@ async fn handle_request(
                 .unwrap()
         }
     }
+}
+
+/// Build the HTTP response for a successful CFML execution: honour a
+/// `cflocation` redirect, resolve singleton headers + content-type, pick the
+/// `cfheader` status (default 200), emit the body, and attach the session
+/// `CFID` cookie when one was minted or rotated this request. Shared by the
+/// normal target-page path and the onMissingTemplate path.
+fn build_success_response(
+    response: CfmlResponse,
+    existing_sid: Option<&String>,
+    conn_is_secure: bool,
+) -> axum::response::Response<axum::body::Body> {
+    // Check for redirect
+    if let Some(ref redirect_url) = response.redirect_url {
+        let status_code = response.response_status
+            .as_ref()
+            .map(|(c, _)| *c)
+            .unwrap_or(302);
+        let mut builder = axum::response::Response::builder()
+            .status(status_code)
+            .header("Location", redirect_url.as_str());
+        for (name, value) in &response.response_headers {
+            if name.to_lowercase() != "location" {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+        }
+        // Carry the session cookie through a redirect too, so a
+        // write-then-cflocation (the POST/redirect/GET pattern)
+        // hands the new CFID to the browser.
+        if let Some(ref sid) = response.session_id {
+            if response.session_record_created || Some(sid) != existing_sid {
+                builder = builder.header(
+                    "Set-Cookie",
+                    response.session_cookie_policy.render("CFID", sid, conn_is_secure),
+                );
+            }
+        }
+        return builder.body(axum::body::Body::empty()).unwrap();
+    }
+
+    // Resolve the singleton Content-Type and de-duplicate other
+    // singleton headers so a cfheader(name="Content-Type") (or
+    // Content-Length/Location) replaces rather than appends to
+    // the engine default (issue #148).
+    let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
+        response.response_content_type.as_deref(),
+        &response.response_headers,
+    );
+
+    // Determine body
+    let body = if let Some(ref body_override) = response.response_body {
+        body_override.as_string()
+    } else {
+        response.output
+    };
+
+    // Determine status code
+    let status_code = response.response_status
+        .as_ref()
+        .map(|(c, _)| *c)
+        .unwrap_or(200);
+
+    let mut builder = axum::response::Response::builder()
+        .status(status_code)
+        .header("Content-Type", content_type.as_str());
+
+    for (name, value) in &emit_headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+
+    // Set session cookie only when a record was minted this
+    // request (lazy default: a read-only request writes nothing
+    // and gets no cookie) or the id changed (sessionRotate).
+    if let Some(ref sid) = response.session_id {
+        if response.session_record_created || Some(sid) != existing_sid {
+            builder = builder.header(
+                "Set-Cookie",
+                response.session_cookie_policy.render("CFID", sid, conn_is_secure),
+            );
+        }
+    }
+
+    builder.body(axum::body::Body::from(body)).unwrap()
 }
 
 use cfml_vm::web::{ResolvedFile, resolve_file};
@@ -1754,6 +1860,7 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
                 None,
                 state.vfs.clone(),
                 state.sandbox,
+                None,
             ) {
                 let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
                     resp.response_content_type.as_deref(),
@@ -2638,7 +2745,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
     extra_globals.insert("cli".to_string(), CfmlValue::strukt(cli_scope));
 
     // Execute
-    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox) {
+    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);

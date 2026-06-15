@@ -45,13 +45,13 @@ Accepted but **ignored** (no error, no effect):
 Note: any unrecognised `this.X` is captured into an internal `config` map that is then
 never read — so nothing throws, but nothing happens either.
 
-## 2. Application.cfc lifecycle methods — mostly invoked; two gaps remain 🔇
+## 2. Application.cfc lifecycle methods — mostly invoked; one gap remains 🔇
 
 | Method | Status |
 |---|---|
 | `onApplicationStart`, `onApplicationEnd`, `onRequestStart`, `onRequest`, `onRequestEnd`, `onSessionStart`, `onSessionEnd` | ✅ invoked |
 | `onError` | ✅ invoked. An uncaught exception in the target page / `onRequest` / `onRequestStart` is handed to `onError(exception, eventName)` (`eventName` is `""` for a target-page error, otherwise the running event method). If `onError` returns normally it owns the response (the engine's default error page is suppressed); if absent the error surfaces as the default error page. When `onError` handles an error, `onRequestEnd` is skipped. *(fixed v0.173.0, issue #145)* |
-| `onMissingTemplate` | 🔇 Not invoked. (cfconfig front-controller `fallback` exists as an alternative.) |
+| `onMissingTemplate` | ✅ invoked (serve mode). A request for a `.cfm`/`.cfc` template that doesn't exist on disk calls `onMissingTemplate(targetPage)` (`targetPage` is the web-root-relative requested path) after `onApplicationStart`/`onSessionStart`. Returning `true` (or nothing) handles the request and suppresses the default 404; returning `false` — or having no handler — falls through to the default 404. `onRequestStart`/`onRequest`/`onRequestEnd` are skipped (Adobe semantics). A throw inside the handler routes to `onError`. Non-CFML 404s (`.html`, images, directory requests) bypass the engine and never reach the handler. The cfconfig front-controller `fallback` remains available as an alternative. *(fixed v0.183.0)* |
 | `onAbort` | ✅ invoked on `<cfabort>` / `abort` — fired in place of `onRequestEnd`. `<cfabort showError="msg">` is a *catchable* error and is routed to `onError` instead (Adobe/Lucee parity), not `onAbort`. *(fixed v0.173.0)* |
 | `onCFCRequest` | 🔇 Not invoked (no CFC-over-HTTP / remote method dispatch). |
 

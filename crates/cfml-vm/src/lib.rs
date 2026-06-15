@@ -830,6 +830,18 @@ pub struct CfmlVirtualMachine {
     pub query_execute_fn: Option<fn(Vec<CfmlValue>) -> CfmlResult>,
     /// Session ID for current request
     pub session_id: Option<String>,
+    /// Web-root-relative path of a requested template that does NOT exist on
+    /// disk. When set, `execute_with_lifecycle` runs the Application.cfc
+    /// `onMissingTemplate(targetPage)` handler (after onApplicationStart /
+    /// onSessionStart) instead of executing a target page. The embedder sets
+    /// this for a 404'd `.cfm`/`.cfc` request and reads `missing_template_handled`
+    /// back to decide whether to emit the handler's output or a default 404.
+    pub missing_template: Option<String>,
+    /// Set by the onMissingTemplate path: true when a handler ran and returned
+    /// a value other than `false` (i.e. it handled the request and the default
+    /// 404 should be suppressed). Stays false when no handler exists or it
+    /// explicitly returned `false`.
+    pub missing_template_handled: bool,
     /// Resolved `this.sessioncookie` attributes for the current application.
     /// Embedders (the `--serve` HTTP layer, the Workers fetch handler) read
     /// this to render the session `Set-Cookie`. Defaults until an
@@ -1191,6 +1203,8 @@ impl CfmlVirtualMachine {
             txn_rollback: None,
             txn_execute: None,
             session_id: None,
+            missing_template: None,
+            missing_template_handled: false,
             session_cookie_policy: cfml_common::session_cookie::SessionCookiePolicy::default(),
             lazy_session_creation: false,
             session_lazy_pending: false,
@@ -15390,6 +15404,70 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Invoke Application.cfc `onMissingTemplate(targetPage)`, returning the
+    /// handler's CFML return value so the caller can honour its boolean
+    /// contract (true/void = handled, false = fall through). This mirrors
+    /// [`call_lifecycle_method`]'s `this`/`variables` binding and writeback,
+    /// but — unlike that helper, which collapses every successful call to
+    /// `Ok(true)` — it preserves the actual return value. `Ok(None)` means no
+    /// `onMissingTemplate` method is defined on the component.
+    fn call_missing_template(
+        &mut self,
+        template: &mut CfmlValue,
+        target_page: CfmlValue,
+    ) -> Result<Option<CfmlValue>, CfmlError> {
+        let s = match template {
+            CfmlValue::Struct(ref s) => s.clone(),
+            _ => return Ok(None),
+        };
+
+        let func_val = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("onmissingtemplate"))
+            .map(|(_, v)| v.clone());
+
+        let func = match func_val {
+            Some(f @ CfmlValue::Function(_)) => f,
+            _ => return Ok(None),
+        };
+
+        // Bind `this` and __variables exactly as call_lifecycle_method does.
+        let mut parent_locals = IndexMap::new();
+        if let Some(vars) = s
+            .iter()
+            .find(|(k, _)| *k == "__variables")
+            .map(|(_, v)| v.clone())
+        {
+            parent_locals.insert("__variables".to_string(), vars);
+        }
+        parent_locals.insert("this".to_string(), template.clone());
+
+        let result = self.call_function(&func, vec![target_page], &parent_locals);
+
+        // Propagate variables/this mutations back into the template.
+        if let Some(vars_wb) = self.method_variables_writeback.take() {
+            if let Some(ts) = template.as_cfml_struct() {
+                let vs = ts.get_or_insert_struct("__variables");
+                for (k, v) in vars_wb {
+                    vs.insert(k, v);
+                }
+            }
+        }
+        if let Some(modified_this) = self.method_this_writeback.take() {
+            if let Some(ts) = template.as_cfml_struct() {
+                if let CfmlValue::Struct(ref modified_s) = modified_this {
+                    for (k, v) in modified_s.iter() {
+                        if k != "__variables" && k != "__extends" {
+                            ts.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        result.map(Some)
+    }
+
     /// Return the page path exposed to Application.cfc lifecycle methods.
     ///
     /// The VM keeps `source_file` as the physical path for include and
@@ -15782,6 +15860,54 @@ impl CfmlVirtualMachine {
             if !self.session_lazy_pending {
                 self.attach_session_scope();
             }
+        }
+
+        // 5c. onMissingTemplate — the requested template does not exist on disk.
+        // Adobe semantics: onApplicationStart/onSessionStart have already fired
+        // above; onRequestStart/onRequest/onRequestEnd are SKIPPED. The handler
+        // receives the web-root-relative requested path and returns `true` (or
+        // nothing) to mark the request handled — suppressing the default 404 —
+        // or `false` to fall through to it. A missing handler also falls through.
+        // The embedder reads `missing_template_handled` to choose the response.
+        if let Some(missing) = self.missing_template.clone() {
+            self.missing_template_handled = match self.call_missing_template(
+                &mut template,
+                CfmlValue::string(missing.clone()),
+            ) {
+                // Ran and returned a value: anything but an explicit `false`
+                // means handled (true / void / a string body are all "handled").
+                Ok(Some(v)) => !matches!(v, CfmlValue::Bool(false)),
+                // No onMissingTemplate defined: fall through to the default 404.
+                Ok(None) => false,
+                // cflocation/cfabort inside the handler is a deliberate response.
+                Err(e) if e.message == "__cflocation_redirect" || e.message == "__cfabort" => true,
+                // An uncaught error routes to onError (like any lifecycle event);
+                // if onError handles it the request is considered handled.
+                Err(e) => {
+                    let r = self.run_on_error(&mut template, e, "onMissingTemplate");
+                    self.missing_template_handled = r.is_ok();
+                    if session_management {
+                        let _ = self.sync_session_scope_to_store();
+                    }
+                    return r;
+                }
+            };
+            // Persist session writes the handler may have made, then end the
+            // request — no onRequestEnd for the missing-template path.
+            if session_management {
+                if let Err(e) = self.sync_session_scope_to_store() {
+                    let _ = self.call_lifecycle_method(
+                        &mut template,
+                        "onError",
+                        vec![
+                            CfmlValue::string(e.message.clone()),
+                            CfmlValue::string("onMissingTemplate".to_string()),
+                        ],
+                    );
+                    return Err(e);
+                }
+            }
+            return Ok(CfmlValue::Null);
         }
 
         // 6. onRequestStart

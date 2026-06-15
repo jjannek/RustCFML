@@ -646,7 +646,7 @@
 | `onapplicationstart` | ❌ | Other |
 | `onerror` | ❌ | Other |
 | `onmissingmethod` | ❌ | Other |
-| `onmissingtemplate` | ❌ | Other |
+| `onmissingtemplate` | ✅ | Other |
 | `onrequest` | ❌ | Other |
 | `onrequestend` | ❌ | Other |
 | `onrequeststart` | ❌ | Other |
