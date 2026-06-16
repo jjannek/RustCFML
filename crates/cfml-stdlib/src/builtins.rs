@@ -44,6 +44,38 @@ static SSN_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^\d{3}-\d{2}-\d{4}$").expect("SSN_REGEX pattern is valid")
 });
 
+// Bounded cache of compiled regexes keyed by the full pattern string (the
+// `(?i)` case-insensitivity prefix is folded into the key by callers, so the
+// key uniquely identifies the compiled program). reFind/reReplace/reMatch/
+// isValid previously recompiled the same handful of framework patterns on
+// every call — profiling stock Wheels (`/posts`) showed regex NFA/DFA
+// construction (`regex_automata` compiler/onepass) at ~3.5% of request CPU,
+// because Wheels routing / pluralization / view helpers lean on reReplace &
+// reFind with fixed patterns. A compiled `Regex` is cheap to clone (internally
+// `Arc`-shared), so caching it turns the second-and-later call into a hashmap
+// hit + refcount bump instead of a full recompile.
+static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, Regex>>> =
+    Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
+const REGEX_CACHE_CAP: usize = 4096;
+
+/// Compile `pat`, returning a clone of the cached `Regex` on hit. On a compile
+/// error returns `Err` (callers fall back to their no-match behavior). The
+/// cache is bounded: if inserting would exceed `REGEX_CACHE_CAP` distinct
+/// patterns (e.g. an adversarial workload generating unique patterns) the cache
+/// is cleared first, trading a rare cold rebuild for a hard memory ceiling.
+fn cached_regex(pat: &str) -> Result<Regex, regex::Error> {
+    if let Some(re) = REGEX_CACHE.read().unwrap().get(pat) {
+        return Ok(re.clone());
+    }
+    let re = Regex::new(pat)?;
+    let mut cache = REGEX_CACHE.write().unwrap();
+    if cache.len() >= REGEX_CACHE_CAP {
+        cache.clear();
+    }
+    cache.entry(pat.to_string()).or_insert_with(|| re.clone());
+    Ok(re)
+}
+
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 
 /// Returns all builtin functions as CfmlValue::Function references for the globals table
@@ -1158,7 +1190,7 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     let return_sub = if args.len() >= 4 { args[3].is_true() } else { false };
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
-    let re = match Regex::new(&pat) {
+    let re = match cached_regex(&pat) {
         Ok(r) => r,
         Err(_) => return Ok(CfmlValue::Int(0)),
     };
@@ -1280,7 +1312,7 @@ fn re_replace_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     let scope = get_str(&args, 3).to_lowercase();
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
-    let re = match Regex::new(&pat) {
+    let re = match cached_regex(&pat) {
         Ok(r) => r,
         Err(_) => return Ok(CfmlValue::string(string)),
     };
@@ -1317,7 +1349,7 @@ fn re_match_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     let string = get_str(&args, 1);
 
     let pat = if case_insensitive { format!("(?i){}", pattern) } else { pattern };
-    let re = match Regex::new(&pat) {
+    let re = match cached_regex(&pat) {
         Ok(r) => r,
         Err(_) => return Ok(CfmlValue::array(Vec::new())),
     };
@@ -2758,7 +2790,7 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
                 }
                 let s = value.as_string();
                 let pattern = get_str(&args, 2);
-                match Regex::new(&pattern) {
+                match cached_regex(&pattern) {
                     Ok(re) => Ok(CfmlValue::Bool(re.is_match(&s))),
                     Err(_) => Ok(CfmlValue::Bool(false)),
                 }

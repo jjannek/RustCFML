@@ -38,5 +38,19 @@ assert("reMatchNoCase count", arrayLen(wordMatches), 2);
 assert("reMatchNoCase first", wordMatches[1], "Hello");
 assert("reMatchNoCase second", wordMatches[2], "World");
 
+// --- compiled-regex cache correctness (v0.189.0) ---
+// Compiled regexes are cached keyed by the final pattern string. The case-
+// insensitive variants fold a "(?i)" prefix into that key, so the SAME base
+// pattern must NOT collide between the case-sensitive and case-insensitive
+// forms, and repeated calls (cache hits) must return identical results.
+assert("cache: case-sensitive miss", reFind("[a-z]+", "ABC"), 0);
+assert("cache: case-insensitive hit", reFindNoCase("[a-z]+", "ABC"), 1);
+assert("cache: case-sensitive still miss after NoCase", reFind("[a-z]+", "ABC"), 0);
+assert("cache: repeated call stable 1", reReplace("a1b2", "[0-9]", "X", "all"), "aXbX");
+assert("cache: repeated call stable 2", reReplace("a1b2", "[0-9]", "X", "all"), "aXbX");
+assert("cache: NoCase vs sensitive distinct", reReplaceNoCase("AbC", "b", "X"), "AXC");
+assert("cache: sensitive same pattern matches lower", reReplace("AbC", "b", "X"), "AXC");
+assert("cache: sensitive pattern no match on upper", reReplace("ABC", "b", "X"), "ABC");
+
 suiteEnd();
 </cfscript>
