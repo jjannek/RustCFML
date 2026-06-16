@@ -1311,6 +1311,83 @@ impl CfmlVirtualMachine {
     pub fn jit_disable(&mut self) {
         self.jit = None;
     }
+
+    /// Adopt this thread's persistent JIT engine into `self.jit`, replacing the
+    /// empty per-request engine `new()` installed. Used by serve mode so the
+    /// hotness counters and compiled native code accumulate across requests
+    /// landing on the same `spawn_blocking` worker thread, instead of being
+    /// rebuilt cold every request. The Cranelift module is `!Send`, so it can
+    /// never be *shared* across threads — but a `thread_local!` keeps one engine
+    /// per worker thread, and the module never leaves the thread that built it.
+    ///
+    /// First use per thread lazily constructs the engine via `maybe_new()`
+    /// (honouring `RUSTCFML_JIT` / `RUSTCFML_JIT_THRESHOLD`). A `None` engine
+    /// (JIT disabled) round-trips cleanly. Pair with [`Self::jit_return_persistent`]
+    /// — or, better, use [`JitLease`] which guarantees the return even on unwind.
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    pub fn jit_take_persistent(&mut self) {
+        self.jit = PERSISTENT_JIT.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                // `take()` below would yield `None` and the worker would never
+                // warm up. `Some(None)` marks "constructed, but disabled" so we
+                // don't re-run `maybe_new()` (and its env reads) every request.
+                *slot = Some(jit::JitEngine::maybe_new());
+            }
+            slot.take().flatten()
+        });
+    }
+
+    /// Return this VM's JIT engine to the thread-local so the next request on
+    /// this worker reuses its warmed cache. Inverse of [`Self::jit_take_persistent`].
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    pub fn jit_return_persistent(&mut self) {
+        let engine = self.jit.take();
+        PERSISTENT_JIT.with(|cell| {
+            *cell.borrow_mut() = Some(engine);
+        });
+    }
+}
+
+// Per-worker-thread persistent JIT engine for serve mode. `None` = not yet
+// initialised on this thread; `Some(None)` = initialised but JIT disabled.
+// The engine is moved out into the executing VM for the duration of a request
+// (so all the hot-path `self.jit.as_mut()` sites are unchanged) and moved back
+// afterwards. The Cranelift `JITModule` it owns is `!Send`, so it lives and
+// dies on a single thread — never shared, only persisted per thread.
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+thread_local! {
+    static PERSISTENT_JIT: std::cell::RefCell<Option<Option<jit::JitEngine>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard that adopts the thread-local persistent JIT engine into a VM for
+/// the lifetime of the guard and returns it on `Drop` — even on an early return
+/// or panic unwind. This is what makes serve-mode persistence panic-safe: a
+/// panic inside `execute_with_lifecycle` costs at most a one-thread cold engine
+/// rebuild, never a permanently-lost engine. No-op when the `jit` feature is off.
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+pub struct JitLease<'a> {
+    vm: &'a mut CfmlVirtualMachine,
+}
+
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+impl<'a> JitLease<'a> {
+    pub fn new(vm: &'a mut CfmlVirtualMachine) -> Self {
+        vm.jit_take_persistent();
+        JitLease { vm }
+    }
+    /// Borrow the leased VM (so callers can drive execution through the guard).
+    pub fn vm(&mut self) -> &mut CfmlVirtualMachine {
+        self.vm
+    }
+}
+
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+impl Drop for JitLease<'_> {
+    fn drop(&mut self) {
+        self.vm.jit_return_persistent();
+    }
 }
 
 /// Shared OSR/JIT shadow-guard predicate: `true` when calling the canonical

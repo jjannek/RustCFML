@@ -473,7 +473,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
     let server_state = ServerState::with_config(false, cfconfig);
-    match compile_and_run(source, debug, source_file, IndexMap::new(), Some(&server_state), None, None, vfs::real_fs(), false, None) {
+    match compile_and_run(source, debug, source_file, IndexMap::new(), Some(&server_state), None, None, vfs::real_fs(), false, None, false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
@@ -502,7 +502,7 @@ fn compile_and_run_with_session(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None)
+    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true)
 }
 
 /// Run the Application.cfc lifecycle for a requested template that does NOT
@@ -523,7 +523,7 @@ fn run_missing_template(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page))
+    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true)
 }
 
 /// Register the standard runtime fixtures onto a fresh VM: builtins, builtin
@@ -584,6 +584,29 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
     }
 }
 
+/// `--jit-stats` dump (jit builds): cumulative per-worker compile counts.
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+fn dump_jit_stats(vm: &CfmlVirtualMachine) {
+    if JIT_STATS_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "jit-stats: fn_compiled={} osr_compiled={}",
+            vm.jit_compiled_count(),
+            vm.osr_compiled_count()
+        );
+    }
+}
+
+/// Whether serve-mode cross-request JIT persistence is enabled. On by default;
+/// set `RUSTCFML_JIT_PERSIST=0` (or false/off/no) to fall back to a per-request
+/// engine without a rebuild.
+#[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+fn jit_persist_enabled() -> bool {
+    std::env::var("RUSTCFML_JIT_PERSIST")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compile_and_run(
     source: &str,
     debug: bool,
@@ -595,6 +618,7 @@ fn compile_and_run(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
     missing_template: Option<String>,
+    persist_jit: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
     // onMissingTemplate path: there is no target page to compile, so use an
     // empty program. execute_with_lifecycle never runs it — it dispatches to
@@ -736,21 +760,30 @@ fn compile_and_run(
     // execute_with_lifecycle dispatches to the handler instead of a target page.
     vm.missing_template = missing_template;
 
-    let result = vm.execute_with_lifecycle();
-
-    // Diagnostic: dump JIT compile counts to stderr if --jit-stats was set.
-    // No-op when JIT was off at compile-time (counts return 0 by definition).
-    if JIT_STATS_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
-        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
-        {
-            eprintln!(
-                "jit-stats: fn_compiled={} osr_compiled={}",
-                vm.jit_compiled_count(),
-                vm.osr_compiled_count()
-            );
+    // Run the lifecycle. In serve mode (`persist_jit`), adopt this worker
+    // thread's persistent JIT engine for the duration via `JitLease` so
+    // compiled native code + hotness counters accumulate across requests
+    // instead of being rebuilt cold every request. The lease returns the
+    // engine to the thread-local on scope exit (incl. panic/early return).
+    // The `--jit-stats` read must happen while the engine is still in the VM
+    // (before the lease drops), so it reports the cumulative per-worker count.
+    let result;
+    #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+    {
+        if persist_jit && jit_persist_enabled() {
+            let mut lease = cfml_vm::JitLease::new(&mut vm);
+            result = lease.vm().execute_with_lifecycle();
+            dump_jit_stats(lease.vm());
+        } else {
+            result = vm.execute_with_lifecycle();
+            dump_jit_stats(&vm);
         }
-        #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
-        {
+    }
+    #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
+    {
+        let _ = persist_jit;
+        result = vm.execute_with_lifecycle();
+        if JIT_STATS_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("jit-stats: JIT feature not built in (rebuild with --features jit)");
         }
     }
@@ -1865,6 +1898,7 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
                 state.vfs.clone(),
                 state.sandbox,
                 None,
+                true,
             ) {
                 let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
                     resp.response_content_type.as_deref(),
@@ -2749,7 +2783,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
     extra_globals.insert("cli".to_string(), CfmlValue::strukt(cli_scope));
 
     // Execute
-    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None) {
+    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
