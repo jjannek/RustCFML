@@ -2060,31 +2060,16 @@ impl CfmlVirtualMachine {
     fn lookup_property(obj: &CfmlValue, name: &str) -> CfmlValue {
         match obj {
             CfmlValue::Struct(s) => {
-                let val = s
-                    .get(name)
-                    .or_else(|| s.get(&name.to_uppercase()))
-                    .or_else(|| s.get(&name.to_lowercase()))
-                    .or_else(|| {
-                        let name_lower = name.to_lowercase();
-                        s.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                            .map(|(_, v)| v)
-                    })
-                    .or_else(|| {
-                        if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
-                            let name_lower = name.to_lowercase();
-                            vars.get(name)
-                                .or_else(|| vars.get(&name_lower))
-                                .or_else(|| {
-                                    vars.iter()
-                                        .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                                        .map(|(_, v)| v)
-                                })
-                        } else {
-                            None
-                        }
-                    })
-                    ;
+                // get_ci does exact-then-CI under one read lock, cloning only the
+                // matched value — replaces the old get/get(upper)/get(lower) chain
+                // plus a full `s.iter()` snapshot (whole-IndexMap clone) per miss.
+                let val = s.get_ci(name).or_else(|| {
+                    if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+                        vars.get_ci(name)
+                    } else {
+                        None
+                    }
+                });
                 if let Some(v) = val {
                     return v;
                 }
@@ -3048,11 +3033,12 @@ impl CfmlVirtualMachine {
                     // 1b. Check __variables scope for CFC methods
                     } else if let Some(val) = locals.get("__variables").and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
-                            vars.get(name.as_str()).or_else(|| {
-                                vars.iter()
-                                    .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
-                                    .map(|(_, v)| v.clone())
-                            })
+                            // get_ci does exact-then-CI under one read lock and
+                            // clones only the matched value — never snapshots the
+                            // whole __variables map (the old `vars.iter()` path
+                            // cloned the entire IndexMap on every CI-fallback read,
+                            // the single hottest clone site on the Wheels /posts path).
+                            vars.get_ci(name.as_str())
                         } else {
                             None
                         }
