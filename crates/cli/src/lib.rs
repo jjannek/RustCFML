@@ -755,6 +755,10 @@ fn compile_and_run(
         }
     }
 
+    // Flush any buffered <cfhtmlhead>/<cfhtmlbody> content into the output
+    // before it is consumed.
+    vm.finalize_html_injections();
+
     // Catch redirect errors as success
     let result = match result {
         Err(e) if e.message == "__cflocation_redirect" || e.message == "__cfabort" => Ok(CfmlValue::Null),

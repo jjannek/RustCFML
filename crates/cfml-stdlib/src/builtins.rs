@@ -539,6 +539,9 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cfsavecontent_start".into(), fn_cfsavecontent_start_stub);
     f.insert("__cfsavecontent_end".into(), fn_cfsavecontent_end_stub);
     f.insert("__cfabort".into(), fn_cfabort_stub);
+    f.insert("__cfexit".into(), fn_cfexit_stub);
+    f.insert("__cfhtmlhead".into(), fn_cfhtmlhead_stub);
+    f.insert("__cfhtmlbody".into(), fn_cfhtmlbody_stub);
     f.insert("invoke".into(), fn_invoke_stub);
     f.insert("__cftransaction_start".into(), fn_cftransaction_start_stub);
     f.insert("__cftransaction_commit".into(), fn_cftransaction_commit_stub);
@@ -9144,6 +9147,18 @@ fn fn_cfsavecontent_end_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cfabort_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfabort requires VM intercept".into()))
+}
+
+fn fn_cfexit_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("__cfexit requires VM intercept".into()))
+}
+
+fn fn_cfhtmlhead_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("__cfhtmlhead requires VM intercept".into()))
+}
+
+fn fn_cfhtmlbody_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("__cfhtmlbody requires VM intercept".into()))
 }
 
 fn fn_write_text_stub(_args: Vec<CfmlValue>) -> CfmlResult {

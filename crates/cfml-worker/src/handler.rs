@@ -352,6 +352,9 @@ pub(crate) fn run_cfml(
         other => other,
     };
 
+    // Flush buffered <cfhtmlhead>/<cfhtmlbody> content into the response body.
+    vm.finalize_html_injections();
+
     let output = vm.output_buffer.clone();
     let status = vm.response_status.map(|(c, _)| c);
     let content_type = vm.response_content_type.clone();

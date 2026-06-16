@@ -896,6 +896,21 @@ pub struct CfmlVirtualMachine {
     pub app_local_mode_modern: bool,
     /// Stack for nested body-mode custom tags
     custom_tag_stack: Vec<CustomTagState>,
+    /// `cfexit` control-flow signal. `__cfexit` sets this to the lowered method
+    /// ("exittag" / "exittemplate" / "loop"); the bytecode loop then unwinds the
+    /// current function like reaching its end (preserving partial locals so a
+    /// custom tag's start-phase caller writes still propagate). The owning
+    /// `__main__`/`__cfc_body__` frame moves the method into `last_exit_method`
+    /// as it unwinds, so callers (e.g. the custom-tag handlers) can act on it.
+    pending_exit: Option<String>,
+    /// The `cfexit` method carried out of the most recently unwound template
+    /// frame. Consumed by the custom-tag handlers to decide exittag (skip body +
+    /// end) vs exittemplate (run body + end normally).
+    last_exit_method: Option<String>,
+    /// Buffered `<cfhtmlhead>` / `<cfhtmlbody>` content, injected into the
+    /// response `<head>` / `<body>` (or appended) at output finalization.
+    html_head_buffer: String,
+    html_body_buffer: String,
     /// Per-request handle on the application's carried function table
     /// (`ApplicationState::app_function_table`). At request start these Arcs are
     /// registered into `fn_registry` by global_id so an application-scope
@@ -1158,6 +1173,10 @@ struct CustomTagState {
     template_path: String,
     attributes: CfmlValue,
     start_locals: IndexMap<String, CfmlValue>,
+    /// `cfexit method="exittag"` fired during the start phase: the body and the
+    /// end phase must be skipped, but partial start-phase caller writes still
+    /// propagate.
+    exit_tag: bool,
 }
 
 impl CfmlVirtualMachine {
@@ -1219,6 +1238,10 @@ impl CfmlVirtualMachine {
             custom_tag_paths: Vec::new(),
             app_local_mode_modern: false,
             custom_tag_stack: Vec::new(),
+            pending_exit: None,
+            last_exit_method: None,
+            html_head_buffer: String::new(),
+            html_body_buffer: String::new(),
             app_function_table: Vec::new(),
             fn_registry: Vec::new(),
             app_fn_table_dirty: false,
@@ -2369,6 +2392,14 @@ impl CfmlVirtualMachine {
         let is_inside_function = func.name != "__main__";
 
         loop {
+            // `cfexit` unwind: a pending exit signal terminates the current
+            // function as if it had run off its end (the epilogue below captures
+            // partial locals). The signal keeps propagating up the call stack
+            // until the owning template frame (`__main__`/`__cfc_body__`) moves
+            // it into `last_exit_method`.
+            if self.pending_exit.is_some() {
+                break;
+            }
             if ip >= func.instructions.len() {
                 break;
             }
@@ -6199,6 +6230,15 @@ impl CfmlVirtualMachine {
                 env.write().unwrap().clear();
             }
             self.captured_locals = Some(locals);
+
+            // `cfexit` stops at the template boundary: a template frame is the
+            // owner of an unwinding exit. Hand the method off to
+            // `last_exit_method` so the surrounding handler (custom tag, page
+            // runner) can decide what to do, and stop the signal propagating
+            // past this frame.
+            if let Some(method) = self.pending_exit.take() {
+                self.last_exit_method = Some(method);
+            }
         }
 
         debug_assert!(
@@ -6470,6 +6510,9 @@ impl CfmlVirtualMachine {
                 | "__cfcontent"
                 | "__cflocation"
                 | "__cfabort"
+                | "__cfexit"
+                | "__cfhtmlhead"
+                | "__cfhtmlbody"
                 | "gethttprequestdata"
                 | "__cfinvoke"
                 | "__cfsavecontent_start"
@@ -8513,6 +8556,37 @@ impl CfmlVirtualMachine {
                         CfmlErrorType::Custom("abort".to_string()),
                     ));
                 }
+                "__cfexit" => {
+                    // `cfexit` control-flow signal. Set `pending_exit`; the
+                    // bytecode loop unwinds the current function at its next op
+                    // (preserving partial locals) and the owning template frame
+                    // hands the method off to `last_exit_method`. Unlike an
+                    // exception this is invisible to user `try`/`catch`.
+                    let method = args
+                        .get(0)
+                        .map(|v| v.as_string().to_lowercase())
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| "exittemplate".to_string());
+                    self.pending_exit = Some(method);
+                    return Ok(CfmlValue::Null);
+                }
+                "__cfhtmlhead" | "__cfhtmlbody" => {
+                    // Buffer the content; injected into the response <head>/<body>
+                    // at output finalization (see finalize_html_injections).
+                    let text = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    if name_lower == "__cfhtmlhead" {
+                        self.html_head_buffer.push_str(&text);
+                        if !text.ends_with('\n') {
+                            self.html_head_buffer.push('\n');
+                        }
+                    } else {
+                        self.html_body_buffer.push_str(&text);
+                        if !text.ends_with('\n') {
+                            self.html_body_buffer.push('\n');
+                        }
+                    }
+                    return Ok(CfmlValue::Null);
+                }
                 "__cflocation" => {
                     let to_status = |v: &CfmlValue| -> u16 {
                         match v {
@@ -10389,9 +10463,17 @@ impl CfmlVirtualMachine {
 
                     self.execute_custom_tag_template(&resolved, &tag_locals)?;
 
+                    // `cfexit method="exittag"` in the start phase skips the end
+                    // phase entirely (partial start-phase caller writes were still
+                    // captured and propagate below).
+                    let exit_tag = matches!(
+                        self.last_exit_method.take().as_deref(),
+                        Some("exittag")
+                    );
+
                     let start_locals = self.captured_locals.clone().unwrap_or_default();
 
-                    if run_end_phase {
+                    if run_end_phase && !exit_tag {
                         let caller_for_end = if let Some(CfmlValue::Struct(modified_caller)) =
                             start_locals.get("caller")
                         {
@@ -10489,6 +10571,14 @@ impl CfmlVirtualMachine {
 
                     self.execute_custom_tag_template(&resolved, &tag_locals)?;
 
+                    // `cfexit method="exittag"` in the start phase: the body and
+                    // the end phase are skipped, but partial start-phase caller
+                    // writes were still captured and must propagate (below).
+                    let exit_tag = matches!(
+                        self.last_exit_method.take().as_deref(),
+                        Some("exittag")
+                    );
+
                     let start_locals = self.captured_locals.clone().unwrap_or_default();
 
                     // Caller write-back from start execution
@@ -10505,6 +10595,7 @@ impl CfmlVirtualMachine {
                         template_path: resolved,
                         attributes: attrs_val,
                         start_locals,
+                        exit_tag,
                     });
 
                     // Push output buffer to capture body content (like savecontent)
@@ -10527,6 +10618,14 @@ impl CfmlVirtualMachine {
                         }
                     };
 
+                    // `cfexit method="exittag"` in the start phase: drop the
+                    // captured body output and skip the end phase. Start-phase
+                    // caller writes already propagated from `__cfcustomtag_start`.
+                    if state.exit_tag {
+                        let _ = body_content;
+                        return Ok(CfmlValue::Null);
+                    }
+
                     let mut this_tag = IndexMap::new();
                     this_tag.insert(
                         "executionmode".to_string(),
@@ -10542,6 +10641,7 @@ impl CfmlVirtualMachine {
                         template_path,
                         attributes,
                         start_locals,
+                        exit_tag: _,
                     } = state;
 
                     let caller_snapshot = parent_locals.clone();
@@ -16138,6 +16238,46 @@ impl CfmlVirtualMachine {
 
     pub fn get_output(&self) -> String {
         self.output_buffer.clone()
+    }
+
+    /// Flush buffered `<cfhtmlhead>` / `<cfhtmlbody>` content into the response
+    /// output. Head content is inserted just before the last `</head>`; body
+    /// content just before the last `</body>`. When the corresponding marker is
+    /// absent the content is appended to the end of the output so it is never
+    /// silently dropped. Idempotent — clears the buffers after flushing. Called
+    /// once at the end of request execution (CLI, serve, worker).
+    pub fn finalize_html_injections(&mut self) {
+        if !self.html_head_buffer.is_empty() {
+            let head = std::mem::take(&mut self.html_head_buffer);
+            if let Some(pos) = Self::rfind_ci(&self.output_buffer, "</head>") {
+                self.output_buffer.insert_str(pos, &head);
+            } else {
+                self.output_buffer.push_str(&head);
+            }
+        }
+        if !self.html_body_buffer.is_empty() {
+            let body = std::mem::take(&mut self.html_body_buffer);
+            if let Some(pos) = Self::rfind_ci(&self.output_buffer, "</body>") {
+                self.output_buffer.insert_str(pos, &body);
+            } else {
+                self.output_buffer.push_str(&body);
+            }
+        }
+    }
+
+    /// ASCII-case-insensitive `rfind` returning the byte offset of the last
+    /// match of `needle` in `haystack`. Operates on bytes so the returned offset
+    /// is valid for the original string even with non-ASCII (multi-byte) content
+    /// — `needle` is always an ASCII HTML close tag.
+    fn rfind_ci(haystack: &str, needle: &str) -> Option<usize> {
+        let h = haystack.as_bytes();
+        let n = needle.as_bytes();
+        if n.is_empty() || h.len() < n.len() {
+            return None;
+        }
+        (0..=h.len() - n.len())
+            .rev()
+            .find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
     }
 }
 

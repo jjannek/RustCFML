@@ -1745,6 +1745,56 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             }
             (String::new(), tag_end - start)
         }
+        "cfsleep" => {
+            // <cfsleep time="ms"> → sleep(ms);  (the sleep() BIF already exists)
+            let raw = attrs.get("time").cloned().unwrap_or_else(|| "0".to_string());
+            (
+                format!("sleep({});\n", format_attr_value(&raw, quoted.contains("time"))),
+                tag_end - start,
+            )
+        }
+        "cfexit" => {
+            // <cfexit method="exittag|exittemplate|loop">. When `method` is
+            // omitted the default is "exittemplate". Lowered to the VM-intercepted
+            // `__cfexit` control-flow signal.
+            let method = attrs
+                .get("method")
+                .map(|m| m.trim().to_lowercase())
+                .unwrap_or_else(|| "exittemplate".to_string());
+            (format!("__cfexit(\"{}\");\n", method), tag_end - start)
+        }
+        "cfhtmlhead" | "cfhtmlbody" => {
+            // <cfhtmlhead text="..."> / <cfhtmlbody text="..."> (and the body
+            // form <cfhtmlhead>...</cfhtmlhead>). Content is buffered by the VM
+            // and injected into the response <head>/<body> at output flush time.
+            let fn_name = if tag_lower == "cfhtmlhead" {
+                "__cfhtmlhead"
+            } else {
+                "__cfhtmlbody"
+            };
+            if let Some(body_start) = find_closing_tag(chars, tag_end, len, &tag_lower) {
+                let body_text: String = chars[tag_end..body_start].iter().collect();
+                let close_end = find_tag_end(chars, body_start, len);
+                (
+                    format!(
+                        "{}(\"{}\");\n",
+                        fn_name,
+                        escape_for_string_literal(&body_text)
+                    ),
+                    close_end - start,
+                )
+            } else {
+                let raw = attrs.get("text").cloned().unwrap_or_default();
+                (
+                    format!(
+                        "{}({});\n",
+                        fn_name,
+                        format_attr_value(&raw, quoted.contains("text"))
+                    ),
+                    tag_end - start,
+                )
+            }
+        }
         _ => {
             if tag_lower.starts_with("cf_") {
                 // Custom tag: <cf_tagname attr1="val1">
