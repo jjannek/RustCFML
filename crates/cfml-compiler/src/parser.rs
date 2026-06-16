@@ -3695,6 +3695,7 @@ impl Parser {
             | Token::Function | Token::Var | Token::Throw | Token::Component
             | Token::Interface | Token::Package | Token::Remote
             | Token::Public | Token::Private | Token::Extends | Token::Implements
+            | Token::ImpKeyword
         )
     }
 
@@ -3736,6 +3737,11 @@ impl Parser {
             // here, so accepting them as identifiers does not shadow inheritance.
             Token::Extends => { self.advance(); Ok("extends".to_string()) }
             Token::Implements => { self.advance(); Ok("implements".to_string()) }
+            // `imp` (logical implication) is an operator only between two
+            // operands; as a bare token it is a legal identifier on Lucee/Adobe
+            // CF/BoxLang (e.g. `var imp = ...`). The operator is consumed at the
+            // parse_imp precedence level before primary/identifier contexts see it.
+            Token::ImpKeyword => { self.advance(); Ok("imp".to_string()) }
             _ => Err(self.parse_error("Expected identifier")),
         }
     }
@@ -4669,6 +4675,10 @@ impl Parser {
             })),
             Token::Implements => Ok(Expression::Identifier(Identifier {
                 name: "implements".to_string(),
+                location: self.current_location(),
+            })),
+            Token::ImpKeyword => Ok(Expression::Identifier(Identifier {
+                name: "imp".to_string(),
                 location: self.current_location(),
             })),
             Token::This => Ok(Expression::This(This {

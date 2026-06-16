@@ -603,6 +603,11 @@ try { include "core/test_serializejson_arguments_sentinels.cfm"; } catch (any e)
 //     getComponentMetadata (Lucee parity) — the surface WireBox delegation reads.
 try { include "oop/test_delegate_annotation_metadata.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_delegate_annotation_metadata.cfm | " & e.message & chr(10)); }
 
+// --- Lucee-compat regression tests (PRs #153/#154/#155/#156) ---
+try { include "comments/test_cfset_expression_comments.cfm"; } catch (any e) { writeOutput("ERROR | comments/test_cfset_expression_comments.cfm | " & e.message & chr(10)); }
+try { include "tags/test_cfloop_list_literal.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfloop_list_literal.cfm | " & e.message & chr(10)); }
+try { include "tags/test_tag_attribute_escaped_hash.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tag_attribute_escaped_hash.cfm | " & e.message & chr(10)); }
+
 // --- Query of Queries ---
 try { include "qoq/test_qoq_select.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_select.cfm | " & e.message & chr(10)); }
 try { include "qoq/test_qoq_aggregates.cfm"; } catch (any e) { writeOutput("ERROR | qoq/test_qoq_aggregates.cfm | " & e.message & chr(10)); }

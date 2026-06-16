@@ -468,6 +468,11 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
         "cfset" | "cfif" | "cfelseif" | "cfreturn" => {
             let tag_end = find_tag_end(chars, name_end, len);
             let raw: String = chars[name_end..tag_end - 1].iter().collect();
+            // Lucee ignores CFML comments (`<!--- ... --->`) embedded inside a
+            // tag-mode expression body — e.g. section comments inside a
+            // multi-line array/struct literal. Strip them before the script
+            // parser sees the body, or the leftover `<!---` mis-parses.
+            let raw = strip_cfml_comments(&raw);
             let body = raw.trim();
             let body = if body.ends_with('/') {
                 body[..body.len() - 1].trim()
@@ -1842,6 +1847,19 @@ fn find_tag_end(chars: &[char], start: usize, len: usize) -> usize {
     let mut in_string = false;
     let mut string_char = '"';
     while i < len {
+        // A CFML comment embedded in the tag (e.g. inside a multi-line cfset
+        // expression body) may contain `>` in its `--->` terminator — skip the
+        // whole comment so it doesn't prematurely end the tag.
+        if !in_string && i + 4 < len && chars[i] == '<' && chars[i + 1] == '!'
+            && chars[i + 2] == '-' && chars[i + 3] == '-' && chars[i + 4] == '-'
+        {
+            let mut j = i + 5;
+            while j + 2 < len && !(chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>') {
+                j += 1;
+            }
+            i = if j + 2 < len { j + 3 } else { len };
+            continue;
+        }
         if !in_string && (chars[i] == '"' || chars[i] == '\'') {
             in_string = true;
             string_char = chars[i];
@@ -2021,7 +2039,7 @@ fn format_attr_value(raw: &str, was_quoted: bool) -> String {
             }
             // Flush literal, then collect expression up to closing '#'
             if !buf.is_empty() || parts.is_empty() {
-                parts.push(format!("\"{}\"", escape_for_string_literal(&buf)));
+                parts.push(format!("\"{}\"", escape_literal_segment(&buf)));
                 buf.clear();
             }
             i += 1;
@@ -2044,7 +2062,7 @@ fn format_attr_value(raw: &str, was_quoted: bool) -> String {
         }
     }
     if !buf.is_empty() || parts.is_empty() {
-        parts.push(format!("\"{}\"", escape_for_string_literal(&buf)));
+        parts.push(format!("\"{}\"", escape_literal_segment(&buf)));
     }
     if parts.len() == 1 {
         parts.remove(0)
@@ -2068,11 +2086,59 @@ fn single_hash_expr(raw: &str) -> Option<&str> {
     Some(inner)
 }
 
+/// Remove CFML comments (`<!--- ... --->`) from a string, honouring nesting
+/// (CFML allows `<!--- outer <!--- inner ---> --->`). An unclosed comment is
+/// dropped through end-of-input, matching the document-level stripper.
+fn strip_cfml_comments(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let is_open = |k: usize| {
+        k + 4 < len && chars[k] == '<' && chars[k + 1] == '!'
+            && chars[k + 2] == '-' && chars[k + 3] == '-' && chars[k + 4] == '-'
+    };
+    let is_close = |k: usize| {
+        k + 2 < len && chars[k] == '-' && chars[k + 1] == '-' && chars[k + 2] == '>'
+    };
+    while i < len {
+        if is_open(i) {
+            let mut depth = 1usize;
+            i += 5;
+            while i < len && depth > 0 {
+                if is_open(i) {
+                    depth += 1;
+                    i += 5;
+                } else if is_close(i) {
+                    depth -= 1;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 fn escape_for_string_literal(s: &str) -> String {
     // CFML double-quoted strings escape `"` by doubling. We emit script-style
     // string literals into generated code that goes through the script parser;
     // the script parser supports both `\"` and `""`. Use `""` to keep it CFML-native.
     s.replace('"', "\"\"")
+}
+
+/// Escape a value that is KNOWN to be a pure literal segment (no interpolation)
+/// for emission into a generated script double-quoted string. In addition to
+/// doubling `"`, a literal `#` must be doubled to `##` — otherwise the script
+/// lexer reads it as the start of `#expr#` interpolation. Used for attribute
+/// literal segments where any `#...#` interpolation has already been split out
+/// into separate expression parts, so every remaining `#` is genuinely literal.
+fn escape_literal_segment(s: &str) -> String {
+    s.replace('"', "\"\"").replace('#', "##")
 }
 
 /// Quote a string value if it's not already a number, boolean, expression, or quoted
@@ -2529,12 +2595,15 @@ fn parse_cfloop_tag(
     {
         // `item` is a Lucee alias for `index` on list loops: either names the
         // current element binding, so accept whichever is present.
-        // If the list contains #expr#, strip hashes to get the expression.
-        // Otherwise treat it as a string literal and quote it.
+        // The `list` attribute is ALWAYS a literal string on Lucee/Adobe CF —
+        // only `#expr#` interpolation makes it dynamic. Quote it verbatim so
+        // values containing operators or spaces (e.g. date masks like
+        // "yyyy-MM-dd HH:mm:ss") survive intact rather than being mis-parsed as
+        // an expression by quote_if_needed's heuristic.
         let list = if list.contains('#') {
             strip_hashes(list)
         } else {
-            quote_if_needed(list)
+            format!("\"{}\"", escape_for_string_literal(list))
         };
         let index = strip_hashes(index);
         let delimiters = attrs
