@@ -13573,11 +13573,21 @@ impl CfmlVirtualMachine {
             // context where DefineFunction attaches a captured scope, but that scope
             // carries stale/unfixed data.  CFC method scope resolution should use
             // __variables (injected at call time), not captured scopes.
+            //
+            // Guard on `is_some()`: `Arc::make_mut` deep-copies the inner
+            // CfmlFunction (name+params+body) whenever the Arc is shared — and
+            // these method Arcs are always shared with the canonical
+            // bytecode-cached program. The common case is captured_scope already
+            // None, so the unconditional make_mut needlessly cloned every method
+            // body on every component resolution. Skipping it when None keeps the
+            // instance's methods as cheap shared Arcs.
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 s.with_write(|m| {
                     for (_, v) in m.iter_mut() {
                         if let CfmlValue::Function(f) = v {
-                            Arc::make_mut(f).captured_scope = None;
+                            if f.captured_scope.is_some() {
+                                Arc::make_mut(f).captured_scope = None;
+                            }
                         }
                     }
                 });
@@ -15035,6 +15045,15 @@ impl CfmlVirtualMachine {
         // Store component body variables as __variables on the template
         // This makes variables.framework etc. accessible to component methods
         if !component_variables.is_empty() {
+            // The component instance is visible in its own pseudo-constructor
+            // body locals under its auto-generated name (e.g. "Anonymous").
+            // Copying that self-alias into __variables (which we then store back
+            // ON the component) forms an Arc cycle
+            //   template -> __variables -> <self-alias> -> template
+            // that refcounting never frees — leaking the entire Application.cfc
+            // instance every request in serve mode (PR #149). Skip any body
+            // local whose backing store IS this component's.
+            let self_ptr = template.as_cfml_struct().map(|s| s.backing_ptr());
             let mut vars_scope: IndexMap<String, CfmlValue> = IndexMap::new();
             for (k, v) in &component_variables {
                 let k_lower = k.to_lowercase();
@@ -15045,6 +15064,12 @@ impl CfmlVirtualMachine {
                     || matches!(v, CfmlValue::Function(_))
                 {
                     continue;
+                }
+                // Skip the component's own self-alias (would form a cycle).
+                if let (Some(sp), Some(vs)) = (self_ptr, v.as_cfml_struct()) {
+                    if vs.backing_ptr() == sp {
+                        continue;
+                    }
                 }
                 vars_scope.insert(k.clone(), v.clone());
             }
