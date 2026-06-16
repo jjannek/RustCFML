@@ -563,6 +563,14 @@ pub fn analyze(
                     let s = intern(name, &mut locals, &mut local_slot);
                     events.push(Ev::Read(s));
                 }
+                // `local.foo` read. The unfused form (LoadLocal("local") +
+                // GetProperty) already bails here via the reserved-scope guard
+                // on LoadLocal, so bailing keeps JIT admission identical — any
+                // function reading the per-call `local` scope by name stays an
+                // interpreter function.
+                BytecodeOp::LoadLocalKey(_) => {
+                    return None;
+                }
                 // v0.99.5 — `obj.prop` where obj is on the stack. Operand
                 // tracking happens in simulate_block; Pass 1 just admits.
                 BytecodeOp::GetProperty(_) => {}

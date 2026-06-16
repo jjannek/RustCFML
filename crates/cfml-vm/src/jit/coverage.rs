@@ -196,6 +196,7 @@ fn op_name(op: &BytecodeOp) -> &'static str {
         BuildArray(_) => "BuildArray", BuildStruct(_) => "BuildStruct",
         GetProperty(_) => "GetProperty", SetProperty(_) => "SetProperty",
         LoadLocalProperty(..) => "LoadLocalProperty",
+        LoadLocalKey(_) => "LoadLocalKey",
         StoreLocalProperty(..) => "StoreLocalProperty",
         NewObject(_) => "NewObject", NewObjectNamed(..) => "NewObjectNamed",
         DefineFunction(_) => "DefineFunction",

@@ -2989,7 +2989,17 @@ impl CfmlVirtualMachine {
                     }
                 }
                 BytecodeOp::LoadGlobal(name) | BytecodeOp::LoadVariablesKey(name) => {
-                    let name_lower = name.to_lowercase();
+                    // Avoid allocating a lowercase String when the identifier is
+                    // already all-lowercase ASCII (the common case for the most
+                    // frequent read op). Unicode/mixed-case idents still get full
+                    // case-folding. Mirrors the LoadLocal guard above.
+                    let name_lower_owned: String;
+                    let name_lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                        name_lower_owned = name.to_lowercase();
+                        &name_lower_owned
+                    } else {
+                        name.as_str()
+                    };
                     // Resolve from this frame's locals (exact, then CI), keeping the
                     // matched key so we can ask whether it was inherited.
                     let local_hit = locals
@@ -3030,7 +3040,11 @@ impl CfmlVirtualMachine {
                     };
                     // 1. Check locals (exact, then CI)
                     if local_hit_visible {
-                        stack.push(local_hit.as_ref().map(|(_, v)| v.clone()).unwrap());
+                        // Move the already-cloned value out of `local_hit` rather
+                        // than cloning it a second time — this is the hottest read
+                        // path. `local_hit` is only consumed again in the
+                        // mutually-exclusive "restore the data" else-if below.
+                        stack.push(local_hit.unwrap().1);
                     // 1b. Check __variables scope for CFC methods
                     } else if let Some(val) = locals.get("__variables").and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
@@ -3163,7 +3177,7 @@ impl CfmlVirtualMachine {
                         })));
                     // 4. Check VM-intercepted function names (custom tags, etc.)
                     } else if matches!(
-                        name_lower.as_str(),
+                        name_lower,
                         "__cfcustomtag"
                             | "__cfcustomtag_start"
                             | "__cfcustomtag_end"
@@ -3182,7 +3196,7 @@ impl CfmlVirtualMachine {
                             captured_scope: None,
                         })));
                     } else if matches!(
-                        name_lower.as_str(),
+                        name_lower,
                         "cfheader"
                             | "cfcontent"
                             | "cflocation"
@@ -4692,6 +4706,45 @@ impl CfmlVirtualMachine {
                         });
                     let val = receiver
                         .map(|obj| Self::lookup_property(&obj, prop_name))
+                        .unwrap_or(CfmlValue::Null);
+                    stack.push(val);
+                }
+                BytecodeOp::LoadLocalKey(prop_name) => {
+                    // Fused LoadLocal("local") + GetProperty for an explicit
+                    // `local.foo` read. Reads the single member directly from
+                    // `locals` rather than materializing the whole per-call
+                    // `local` scope view. Applies the SAME visibility filter as
+                    // `build_local_scope_view`: a key is part of `local` only if
+                    // it was established in THIS frame — inherited/param keys,
+                    // `this`/`super`, and `__`-prefixed bridge keys are invisible.
+                    // A miss yields Null, matching GetProperty on the view struct.
+                    let is_visible = |k: &str| {
+                        !inherited_or_param_keys.contains(k)
+                            && k != "this"
+                            && k != "super"
+                            && !k.starts_with("__")
+                    };
+                    let name_lower_owned: String;
+                    let name_lower: &str =
+                        if prop_name.bytes().any(|b| b.is_ascii_uppercase()) {
+                            name_lower_owned = prop_name.to_lowercase();
+                            &name_lower_owned
+                        } else {
+                            prop_name.as_str()
+                        };
+                    // Exact hit first (the common case), then a case-insensitive
+                    // scan — mirrors GetProperty's resolution order.
+                    let val = locals
+                        .get_key_value(prop_name.as_str())
+                        .filter(|(k, _)| is_visible(k))
+                        .or_else(|| {
+                            locals
+                                .iter()
+                                .find(|(k, _)| {
+                                    k.eq_ignore_ascii_case(name_lower) && is_visible(k)
+                                })
+                        })
+                        .map(|(_, v)| v.clone())
                         .unwrap_or(CfmlValue::Null);
                     stack.push(val);
                 }
@@ -16608,6 +16661,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::SetIndex => (0, 3),       // obj + key + value → (modifies in place)
         BytecodeOp::GetProperty(_) => (1, 1), // obj → value
         BytecodeOp::LoadLocalProperty(_, _) => (1, 0), // pushes value, reads nothing
+        BytecodeOp::LoadLocalKey(_) => (1, 0), // pushes value, reads nothing
         BytecodeOp::StoreLocalProperty(_, _) => (0, 1), // pops 1 (value), pushes 0
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value

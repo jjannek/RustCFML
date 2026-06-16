@@ -266,6 +266,16 @@ pub enum BytecodeOp {
     /// field of a named local in one dispatch. Only emitted for non-null-safe
     /// accesses where the receiver is a plain identifier (the common `s.foo = x` pattern).
     StoreLocalProperty(String, String),
+    /// Fused LoadLocal("local") + GetProperty(member) for an explicit `local.foo`
+    /// read. The generic path materializes the ENTIRE per-call `local` scope view
+    /// (cloning every visible key+value into a fresh struct) just to extract one
+    /// key — profiling stock Wheels showed `build_local_scope_view` was ~35% of
+    /// request allocations. This op reads the single member directly from the
+    /// frame's `locals`, applying the same per-call visibility filter
+    /// (`build_local_scope_view`): inherited/param keys, `this`/`super`, and
+    /// `__`-prefixed bridge keys are invisible; a miss yields Null (matching
+    /// GetProperty on the materialized view).
+    LoadLocalKey(String),
     SetProperty(String), // Set object.property = value
     /// Dynamic/quoted-string LHS assignment: `"#scope#.#prop#" = v` or
     /// `"variables.x" = v`. Stack: [pathString, value]. The path is resolved at
@@ -2985,6 +2995,15 @@ impl CfmlCompiler {
                 // value (typically null).
                 if !access.null_safe {
                     if let Expression::Identifier(ref ident) = *access.object {
+                        // `local.foo` read: fuse into LoadLocalKey so we read one
+                        // key directly instead of materializing the whole per-call
+                        // `local` scope view (see LoadLocalKey docs). Reads only —
+                        // `local.foo = x` writes go through the assignment path.
+                        if ident.name.eq_ignore_ascii_case("local") {
+                            instructions
+                                .push(BytecodeOp::LoadLocalKey(access.member.clone()));
+                            return;
+                        }
                         if !is_reserved_scope_name(&ident.name) {
                             instructions.push(BytecodeOp::LoadLocalProperty(
                                 ident.name.clone(),
