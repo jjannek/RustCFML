@@ -62,6 +62,7 @@ try { include "core/test_builtin_shadowing.cfm"; } catch (any e) { writeOutput("
 try { include "core/test_builtin_data_shadow.cfm"; } catch (any e) { writeOutput("ERROR | core/test_builtin_data_shadow.cfm | " & e.message & chr(10)); }
 try { include "core/test_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_functions.cfm | " & e.message & chr(10)); }
 try { include "core/test_arrow_functions.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arrow_functions.cfm | " & e.message & chr(10)); }
+try { include "core/test_comma_less_params.cfm"; } catch (any e) { writeOutput("ERROR | core/test_comma_less_params.cfm | " & e.message & chr(10)); }
 try { include "core/test_arguments_writeback.cfm"; } catch (any e) { writeOutput("ERROR | core/test_arguments_writeback.cfm | " & e.message & chr(10)); }
 //   - local_shadows_arguments: `local` and `arguments` are separate scopes
 //     within ONE frame — after `local.X = ...` (or `var X = ...`), an explicit

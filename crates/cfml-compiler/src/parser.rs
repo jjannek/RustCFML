@@ -3576,7 +3576,17 @@ impl Parser {
             });
 
             if !self.match_token(&Token::Comma) {
-                break;
+                // Lucee/ACF/BoxLang treat a newline between parameters as a soft
+                // separator and tolerate a missing comma. Mirror that: only stop
+                // looping at the closing paren / EOF, or when the next token
+                // clearly isn't another parameter.
+                if self.check(&Token::RParen) || self.is_at_end() {
+                    break;
+                }
+                if !(self.is_identifier_like() || self.check(&Token::Required)) {
+                    break;
+                }
+                // otherwise fall through and parse the next param
             }
         }
 
