@@ -2355,6 +2355,12 @@ impl CfmlVirtualMachine {
         let effective_local_mode_modern: bool =
             func.declared_local_mode.unwrap_or(self.app_local_mode_modern);
 
+        // A component pseudo-constructor (`__cfc_body__`) or page template
+        // (`__main__`) frame: its locals are the component's `variables` scope,
+        // captured via `captured_locals`, and must never leak out as a closure
+        // parent-scope writeback (see the two write-back sites below).
+        let is_template_frame = func.name == "__cfc_body__" || func.name == "__main__";
+
         // Copy parent scope variables (closures and nested functions see parent vars).
         // Skip Function values — they're immutable and already available via
         // user_functions, so cloning them (and their captured scopes) is pure waste.
@@ -4461,7 +4467,18 @@ impl CfmlVirtualMachine {
                     // closure's own `local`. Explicit `variables.x = …` writes
                     // bypass StoreLocal's locals path entirely, so they're
                     // unaffected by this skip.
-                    if let Some(parent) = parent_scope {
+                    //
+                    // A component pseudo-constructor (`__cfc_body__`) / template
+                    // (`__main__`) frame is NOT a closure: its locals are the
+                    // component's `variables` scope (captured separately via
+                    // `captured_locals`) and must never propagate out as a
+                    // closure writeback. When such a body runs with an injected
+                    // parent scope (e.g. an inherited component's vars), a stale
+                    // writeback of all the body's method declarations would be
+                    // misattributed to the enclosing method's call site and leak
+                    // the freshly-built component's methods into the caller's
+                    // locals — poisoning later bare-name calls.
+                    if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
                         if !effective_local_mode_modern {
                             let mut writeback = ValueMap::default();
                             for (k, v) in &locals {
@@ -6369,7 +6386,13 @@ impl CfmlVirtualMachine {
         // the closure — neither new keys nor shadowing-mutations of captured
         // outer vars. All bareword writes stayed in the closure's own `local`.
         // Explicit `variables.x = …` bypasses this path, so it still works.
-        if let Some(parent) = parent_scope {
+        //
+        // Skip for `__cfc_body__`/`__main__` frames — see the matching note on
+        // the early-return path above: a component-body/template frame's locals
+        // are captured as the component's `variables` scope and must never leak
+        // out as a closure writeback (which would poison the enclosing method's
+        // caller locals with the new component's methods).
+        if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
             if !effective_local_mode_modern {
                 let mut writeback = ValueMap::default();
                 for (k, v) in &locals {

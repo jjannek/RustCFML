@@ -209,6 +209,7 @@ try { include "oop/test_dynamic_lhs_assign.cfm"; } catch (any e) { writeOutput("
 try { include "oop/test_getmetadata_properties.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_getmetadata_properties.cfm | " & e.message & chr(10)); }
 try { include "oop/test_component_bool_attr.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_component_bool_attr.cfm | " & e.message & chr(10)); }
 try { include "oop/test_chained_writeback_clobber.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_chained_writeback_clobber.cfm | " & e.message & chr(10)); }
+try { include "oop/test_method_return_name_collision.cfm"; } catch (any e) { writeOutput("ERROR | oop/test_method_return_name_collision.cfm | " & e.message & chr(10)); }
 // Bare component name resolves relative to the CALLING CFC's package. From
 // inside oop.relcomp.Maker, createObject("component","Sibling") must find
 // oop.relcomp.Sibling. Was the deepest blocker for the Wheels migrator
