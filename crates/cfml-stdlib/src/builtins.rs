@@ -5397,8 +5397,10 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
             let is_dir = entry_path.is_dir();
             let is_file = entry_path.is_file();
 
-            // Include both files and directories (matching CFML behavior)
-            if (is_file && matches_filter(&file_name, filter)) || (is_dir && (filter.is_empty() || !filter.starts_with("*."))) {
+            // The name filter applies to BOTH files and directories (Lucee/ACF
+            // behavior); directories are still always recursed into below
+            // regardless of whether their own name matches the filter.
+            if (is_file || is_dir) && matches_filter(&file_name, filter) {
                 match list_info {
                     "query" => {
                         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);

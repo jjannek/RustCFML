@@ -14688,7 +14688,8 @@ impl CfmlVirtualMachine {
                     .get(2)
                     .map(|v| v.as_string().to_lowercase())
                     .unwrap_or_else(|| "path".to_string());
-                Some(self.sandbox_directory_list(&path, recurse, &list_info))
+                let filter = args.get(3).map(|v| v.as_string()).unwrap_or_default();
+                Some(self.sandbox_directory_list(&path, recurse, &list_info, &filter))
             }
             "getfileinfo" => {
                 let path = get_str(0);
@@ -14835,13 +14836,19 @@ impl CfmlVirtualMachine {
     }
 
     /// Sandbox directoryList: list entries from the VFS.
-    fn sandbox_directory_list(&self, path: &str, recurse: bool, list_info: &str) -> CfmlResult {
+    fn sandbox_directory_list(&self, path: &str, recurse: bool, list_info: &str, filter: &str) -> CfmlResult {
         let mut entries = Vec::new();
         let mut visited = std::collections::HashSet::new();
         if let Ok(canon) = self.vfs.canonicalize(path) {
             visited.insert(canon);
         }
         self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
+
+        // The name filter applies to both files and directories (Lucee/ACF);
+        // recursion already descended into every subdir above regardless.
+        if !filter.is_empty() {
+            entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
+        }
 
         if list_info == "name" {
             Ok(CfmlValue::array(

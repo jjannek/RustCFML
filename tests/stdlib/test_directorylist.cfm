@@ -49,6 +49,18 @@ cfmOnly = directoryList(tmpDir, false, "name", "*.cfm");
 assert("filter returns matching files", arrayLen(cfmOnly), 1);
 assert("filter matches correct file", cfmOnly[1], "file2.cfm");
 
+// Non-glob filter applies to BOTH files and directories (Lucee/ACF), but
+// recursion still descends into every subdir. Regression: a literal filter
+// like "ModuleConfig.cfc" used to leak every directory (broke TestBox module
+// discovery). Set up Target.cfc at root + nested, plus non-matching dirs.
+fileWrite(tmpDir & "/Target.cfc", "x");
+fileWrite(tmpDir & "/subdir1/Target.cfc", "x");
+recTargets = directoryList(tmpDir, true, "name", "Target.cfc");
+assert("literal filter applies to dirs too (recursive)", arrayLen(recTargets), 2);
+for (item in recTargets) {
+    assert("only Target.cfc entries returned", item, "Target.cfc");
+}
+
 // Cleanup
 directoryDelete(tmpDir, true);
 
