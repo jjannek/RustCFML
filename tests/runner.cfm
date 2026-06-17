@@ -124,6 +124,8 @@ try { include "comments/test_tags_in_block_comments.cfm"; } catch (any e) { writ
 try { include "stdlib/test_string_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_string_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_string_functions_regex.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_string_functions_regex.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_string_functions_encoding.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_string_functions_encoding.cfm | " & e.message & chr(10)); }
+// EncodeForHTMLAttribute must encode attribute-dangerous chars (space, =) per OWASP/Lucee; RustCFML leaves them raw.
+try { include "functions/test_encodeforhtmlattribute_space_equals.cfm"; } catch (any e) { writeOutput("ERROR | functions/test_encodeforhtmlattribute_space_equals.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_array_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_array_functions.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_array_higher_order.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_array_higher_order.cfm | " & e.message & chr(10)); }
 try { include "stdlib/test_struct_functions.cfm"; } catch (any e) { writeOutput("ERROR | stdlib/test_struct_functions.cfm | " & e.message & chr(10)); }
@@ -292,6 +294,8 @@ try { include "tags/test_cffile_script_form.cfm"; } catch (any e) { writeOutput(
 try { include "tags/test_cfhttpparam_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfhttpparam_runtime_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfmail_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfmail_runtime_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfmailpart_script_form.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfmailpart_script_form.cfm | " & e.message & chr(10)); }
+// cfhtmlhead exists as a tag (v0.186) but must ALSO be script-callable (cfhtmlhead(text=)); RustCFML threw "undefined".
+try { include "tags/test_cfhtmlhead_script_callable.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfhtmlhead_script_callable.cfm | " & e.message & chr(10)); }
 try { include "tags/test_cfstoredproc_runtime_body.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_cfstoredproc_runtime_body.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfimport.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfimport.cfm | " & e.message & chr(10)); }
 try { include "tags/test_tags_cfthread.cfm"; } catch (any e) { writeOutput("ERROR | tags/test_tags_cfthread.cfm | " & e.message & chr(10)); }

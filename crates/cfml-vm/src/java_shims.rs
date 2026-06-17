@@ -117,6 +117,57 @@ pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue)
     }
 }
 
+pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    // java.util.Date shim. Lucee/Adobe commonly construct it from epoch millis
+    // (`new Date(0)` as a UTC base date for date math) and read `getTime()`.
+    // State: `__millis` (epoch milliseconds, as a Java `long`). (PR #163.)
+    let to_millis = |v: &CfmlValue| -> i64 {
+        match v {
+            CfmlValue::Int(n) => *n,
+            CfmlValue::Double(d) => *d as i64,
+            other => other.as_string().trim().parse::<i64>().unwrap_or(0),
+        }
+    };
+    match method {
+        "init" => {
+            // `Date()` (no arg) = now; `Date(long)` = the given epoch millis.
+            let millis = match args.first() {
+                Some(v) => to_millis(v),
+                None => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+            };
+            let mut shim = IndexMap::new();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.util.date".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__millis".to_string(), CfmlValue::Int(millis));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "gettime" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(v) = shim.get("__millis") {
+                    return Ok(CfmlValue::Int(to_millis(&v)));
+                }
+            }
+            Ok(CfmlValue::Int(0))
+        }
+        "settime" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                let millis = args.first().map(&to_millis).unwrap_or(0);
+                let mut ns = shim.snapshot();
+                ns.insert("__millis".to_string(), CfmlValue::Int(millis));
+                return Ok(CfmlValue::strukt(ns));
+            }
+            Ok(CfmlValue::Null)
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
 pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     // "threadgroup" is a nested shim for java.lang.ThreadGroup accessed via
     // Thread.getThreadGroup(). We route its own methods here too.

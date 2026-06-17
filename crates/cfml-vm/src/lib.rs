@@ -25,7 +25,7 @@ pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_collections, handle_java_concurrenthashmap, handle_java_concurrentlinkedqueue,
-    handle_java_file, handle_java_inetaddress, handle_java_linkedhashmap,
+    handle_java_date, handle_java_file, handle_java_inetaddress, handle_java_linkedhashmap,
     handle_java_messagedigest, handle_java_paths, handle_java_pattern, handle_java_stringbuilder,
     handle_java_system, handle_java_thread, handle_java_treemap, handle_java_uuid,
 };
@@ -3192,6 +3192,8 @@ impl CfmlVirtualMachine {
                             | "cfcookie"
                             | "cflog"
                             | "cfinvoke"
+                            | "cfhtmlhead"
+                            | "cfhtmlbody"
                     ) {
                         // Script-style tag calls: `cfcontent(reset=true)` routes to `__cfcontent`.
                         // `location(...)` is the documented script alias for `cflocation(...)`
@@ -8529,6 +8531,9 @@ impl CfmlVirtualMachine {
                                 "java.util.uuid" => {
                                     handle_java_uuid("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.util.date" => {
+                                    handle_java_date("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.lang.thread" => {
                                     handle_java_thread("init", empty_args, &CfmlValue::Null)
                                 }
@@ -8689,7 +8694,19 @@ impl CfmlVirtualMachine {
                 "__cfhtmlhead" | "__cfhtmlbody" => {
                     // Buffer the content; injected into the response <head>/<body>
                     // at output finalization (see finalize_html_injections).
-                    let text = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    // Two shapes reach here: the tag form `<cfhtmlhead text="…">`
+                    // lowers to a single positional string; the script call form
+                    // `cfhtmlhead(text="…")` bundles a `{text: …}` options struct
+                    // (see is_tag_call_builtin). Unwrap the struct's `text` key.
+                    let text = match args.get(0) {
+                        Some(CfmlValue::Struct(opts)) => opts
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("text"))
+                            .map(|(_, v)| v.as_string())
+                            .unwrap_or_default(),
+                        Some(v) => v.as_string(),
+                        None => String::new(),
+                    };
                     if name_lower == "__cfhtmlhead" {
                         self.html_head_buffer.push_str(&text);
                         if !text.ends_with('\n') {
@@ -11293,6 +11310,11 @@ impl CfmlVirtualMachine {
                 | "__cfcookie"
                 | "__cflog"
                 | "__cfsetting"
+                // cfhtmlhead/cfhtmlbody exist as tags (v0.186); the script
+                // call form `cfhtmlhead(text=…)` bundles its named args into a
+                // single options struct that the intercept unwraps. (PR #161.)
+                | "__cfhtmlhead"
+                | "__cfhtmlbody"
         )
     }
 
@@ -11311,7 +11333,7 @@ impl CfmlVirtualMachine {
             // `name` attribute is a real option (header/cookie name), not a
             // caller-scope target.
             "cfheader" | "cfcontent" | "cflocation" | "cfcookie" | "cflog"
-            | "cfsetting" => &[],
+            | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" => &[],
             _ => &["name", "variable"],
         }
     }
@@ -11766,6 +11788,7 @@ impl CfmlVirtualMachine {
                         handle_java_messagedigest(&m, all_args, object)
                     }
                     "java.util.uuid" => handle_java_uuid(&m, all_args, object),
+                    "java.util.date" => handle_java_date(&m, all_args, object),
                     "java.lang.thread" | "java.lang.threadgroup" => {
                         handle_java_thread(&m, all_args, object)
                     }

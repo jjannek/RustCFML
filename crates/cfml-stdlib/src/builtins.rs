@@ -5603,19 +5603,20 @@ fn fn_charset_encode(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_encode_for_html_attribute(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
     let mut result = String::new();
+    // OWASP/ESAPI semantics (matches Lucee/Adobe): in HTML-attribute context every
+    // non-alphanumeric char below U+0100 is encoded — including space (&#x20;) and = (&#x3d;) —
+    // because an UNQUOTED attribute value can be broken out of with a raw space + =. Use a named
+    // entity where one exists, otherwise a hex numeric entity. Codepoints >= U+0100 are passed
+    // through (immune), mirroring ESAPI's default.
     for c in s.chars() {
         match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => result.push(c),
             '&' => result.push_str("&amp;"),
             '<' => result.push_str("&lt;"),
             '>' => result.push_str("&gt;"),
             '"' => result.push_str("&quot;"),
-            '\'' => result.push_str("&#x27;"),
-            '/' => result.push_str("&#x2f;"),
-            '\t' => result.push_str("&#x9;"),
-            '\n' => result.push_str("&#xa;"),
-            '\r' => result.push_str("&#xd;"),
-            '`' => result.push_str("&#x60;"),
-            _ => result.push(c),
+            c if (c as u32) >= 0x100 => result.push(c),
+            c => result.push_str(&format!("&#x{:x};", c as u32)),
         }
     }
     Ok(CfmlValue::string(result))

@@ -1197,7 +1197,31 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (format!("while ({}) {{\n", condition), tag_end - start)
         }
         "cffinally" => {
-            ("finally {\n".to_string(), tag_end - start)
+            // `<cffinally>` opens a `finally {` block, but the preceding `try {`
+            // (or catch) must be closed first. In the catch+finally form the
+            // preceding `</cfcatch>` already emitted that closing `}`, so we emit
+            // only `finally {`. In the CATCHLESS form (`<cftry>…<cffinally>`)
+            // nothing has closed the `try {` yet, so we must emit `} finally {`.
+            // Detect by scanning back over whitespace for a preceding
+            // `</cfcatch>`. (PR #162 — Lucee accepts catchless try/finally.)
+            let mut j = start;
+            while j > 0 && chars[j - 1].is_whitespace() {
+                j -= 1;
+            }
+            let preceded_by_catch = j > 0 && chars[j - 1] == '>' && {
+                // Walk back to the matching `<` and normalise the tag text.
+                let mut k = j - 1;
+                while k > 0 && chars[k - 1] != '<' {
+                    k -= 1;
+                }
+                let tag: String = chars[k.saturating_sub(1)..j]
+                    .iter()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                tag.eq_ignore_ascii_case("</cfcatch>")
+            };
+            let prefix = if preceded_by_catch { "" } else { "}\n" };
+            (format!("{}finally {{\n", prefix), tag_end - start)
         }
         "cfrethrow" => {
             ("rethrow;\n".to_string(), tag_end - start)
