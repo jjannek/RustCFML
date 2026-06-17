@@ -590,6 +590,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cflock_end".into(), fn_cflock_end_stub);
     f.insert("__cfcookie".into(), fn_cfcookie_stub);
     f.insert("__cfcache".into(), fn_cfcache_stub);
+    f.insert("__cfloop_file_lines".into(), fn_cfloop_file_lines_stub);
     f.insert("__cfexecute".into(), fn_cfexecute_stub);
     f.insert("__cfmail".into(), fn_cfmail);
 
@@ -11569,6 +11570,10 @@ fn fn_cffile_upload(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cfcache_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("cfcache requires VM-level support and was not intercepted.".to_string()))
+}
+
+fn fn_cfloop_file_lines_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime("__cfloop_file_lines requires VM intercept".into()))
 }
 
 fn fn_cfexecute_stub(_args: Vec<CfmlValue>) -> CfmlResult {

@@ -1,0 +1,1 @@
+<cfoutput>arg=[#arguments.injected#]</cfoutput>

@@ -527,17 +527,26 @@ pub fn compile_file_cached(
 
     // Tag preprocessing. Run when the file looks like a template — either it
     // contains CFML tags, or its extension marks it as static markup that
-    // cfinclude is expected to splice in verbatim (.css, .html, .htm, .txt).
-    // Without this, e.g. `<cfinclude template="dashboard.css">` parses raw CSS
-    // (`body { background-color: #f3f4f6; }`) as CFML script and explodes on
-    // the first hex color. Skip preprocessing for .cfc files that don't have
-    // CFML tags — those are script-only components (`component { ... }`).
+    // cfinclude is expected to splice in verbatim (markup, stylesheets,
+    // scripts, data files). Without this, e.g. `<cfinclude template="x.css">`
+    // parses raw CSS (`body { background-color: #f3f4f6; }`) as CFML script and
+    // explodes on the first hex color, and `<cfinclude template="jquery.min.js">`
+    // (Wheels' error-page layout does exactly this) parses minified JS as
+    // cfscript and dies on `typeof window`. Skip preprocessing for .cfc files
+    // that don't have CFML tags — those are script-only components
+    // (`component { ... }`).
     let lower_path = path.to_lowercase();
     let is_template_ext = lower_path.ends_with(".cfm")
         || lower_path.ends_with(".css")
         || lower_path.ends_with(".html")
         || lower_path.ends_with(".htm")
-        || lower_path.ends_with(".txt");
+        || lower_path.ends_with(".txt")
+        || lower_path.ends_with(".js")
+        || lower_path.ends_with(".mjs")
+        || lower_path.ends_with(".json")
+        || lower_path.ends_with(".svg")
+        || lower_path.ends_with(".xml")
+        || lower_path.ends_with(".map");
     let needs_tag_parse =
         cfml_compiler::tag_parser::has_cfml_tags(&source_code) || is_template_ext;
     let source_code = if needs_tag_parse {
@@ -1957,7 +1966,35 @@ impl CfmlVirtualMachine {
         );
         err_struct.insert("detail".to_string(), CfmlValue::string(String::new()));
         err_struct.insert("tagcontext".to_string(), tag_context);
+        Self::add_root_cause(&mut err_struct);
         CfmlValue::strukt(err_struct)
+    }
+
+    /// Populate a `rootCause` key on an exception struct (Lucee/ACF parity): a
+    /// snapshot of the error's own core fields. Frameworks inspect
+    /// `exception.rootCause.type` to classify errors — Wheels' `onError` uses it
+    /// to render its styled error/404 page (GitHub issue #158). The copy
+    /// deliberately omits its own `rootCause`, so cfdump/serializeJSON over an
+    /// exception never recurse. A pre-existing `rootCause` (e.g. carried by an
+    /// object re-thrown via `throw(object=…)`) is left untouched.
+    fn add_root_cause(exc: &mut ValueMap) {
+        if exc.keys().any(|k| k.eq_ignore_ascii_case("rootcause")) {
+            return;
+        }
+        let mut rc = ValueMap::default();
+        for key in [
+            "type",
+            "message",
+            "detail",
+            "extendedinfo",
+            "errorcode",
+            "tagcontext",
+        ] {
+            if let Some((k, v)) = exc.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                rc.insert(k.clone(), v.clone());
+            }
+        }
+        exc.insert("rootCause".to_string(), CfmlValue::strukt(rc));
     }
 
     /// Does a `catch (catch_type e)` clause match an exception whose `type` is
@@ -2421,6 +2458,26 @@ impl CfmlVirtualMachine {
             "__arguments_params".to_string(),
             CfmlValue::array(params_array),
         );
+        // A `cfinclude`d template (the included file's `__main__`, run with the
+        // caller's scope as parent) shares the CALLER's `arguments` scope in
+        // CFML — e.g. Wheels renders error/view templates with
+        // `$includeAndReturnOutput($template=…, wheelsError=…)` and the template
+        // reads `arguments.wheelsError`. The included `__main__` has no params of
+        // its own, so without this its `arguments` would be empty and every such
+        // reference would silently render blank (GitHub issue #158). Seed this
+        // frame's `arguments` from the parent's so those entries are visible;
+        // our freshly-built markers/params take precedence.
+        if func.name == "__main__" {
+            if let Some(parent) = parent_scope {
+                if let Some(CfmlValue::Struct(parent_args)) = parent.get(ARGUMENTS_SCOPE_KEY) {
+                    for (k, v) in parent_args.snapshot() {
+                        if !arguments_map.contains_key(&k) {
+                            arguments_map.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
         locals.insert(
             ARGUMENTS_SCOPE_KEY.to_string(),
             CfmlValue::strukt(arguments_map),
@@ -2664,6 +2721,7 @@ impl CfmlVirtualMachine {
                             exception.insert("tagcontext".to_string(), self.build_tag_context());
                             stack.truncate(handler.stack_depth);
                             self.restore_capture_state(&handler);
+                            Self::add_root_cause(&mut exception);
                             let exc = CfmlValue::strukt(exception);
                             self.last_exception = Some(exc.clone());
                             // The catch handler begins with StoreLocal(catch_var),
@@ -3248,6 +3306,7 @@ impl CfmlVirtualMachine {
                             exception.insert("tagcontext".to_string(), self.build_tag_context());
                             stack.truncate(handler.stack_depth);
                             self.restore_capture_state(&handler);
+                            Self::add_root_cause(&mut exception);
                             let exc = CfmlValue::strukt(exception);
                             self.last_exception = Some(exc.clone());
                             stack.push(exc);
@@ -3332,6 +3391,7 @@ impl CfmlVirtualMachine {
                             exception
                                 .insert("detail".to_string(), CfmlValue::string(String::new()));
                             exception.insert("tagcontext".to_string(), self.build_tag_context());
+                            Self::add_root_cause(&mut exception);
                             let error_val = CfmlValue::strukt(exception);
                             self.last_exception = Some(error_val.clone());
                             if let Some(handler) = self.try_stack.pop() {
@@ -6696,6 +6756,7 @@ impl CfmlVirtualMachine {
                 | "cachegetall"
                 | "cachegetallids"
                 | "__cfcache"
+                | "__cfloop_file_lines"
                 | "__cfexecute"
                 | "__cfthread_run"
                 | "__cfthread_join"
@@ -10010,26 +10071,65 @@ impl CfmlVirtualMachine {
                     return Ok(value);
                 }
                 "throw" => {
-                    // throw(message="...", type="...", detail="...", errorcode="...")
-                    // Build exception struct from named args or positional
-                    let mut exception = ValueMap::default();
-                    let message = args
-                        .get(0)
-                        .map(|v| v.as_string())
-                        .unwrap_or_else(|| "".to_string());
-                    let error_type = args
-                        .get(1)
-                        .map(|v| v.as_string())
-                        .unwrap_or_else(|| "Application".to_string());
-                    let detail = args.get(2).map(|v| v.as_string()).unwrap_or_default();
-                    let errorcode = args.get(3).map(|v| v.as_string()).unwrap_or_default();
+                    // throw(message, type, detail, errorcode, extendedinfo, object)
+                    // The positional order is fixed by the parser's throw(...) call
+                    // lowering (see parser.rs). `object` re-throws an existing
+                    // exception object (CF/Lucee/BoxLang `cfthrow object=`): any
+                    // struct it carries is preserved verbatim, with explicitly
+                    // supplied attributes overriding its fields. Without this the
+                    // standard re-throw idiom `throw(object=e)` lost the original
+                    // message/type/detail and surfaced as a blank error — Wheels'
+                    // onError default path (`Throw(object=arguments.exception)`)
+                    // depended on it (GitHub issue #158).
+                    let is_present = |v: &CfmlValue| match v {
+                        CfmlValue::Null => false,
+                        CfmlValue::String(s) => !s.is_empty(),
+                        _ => true,
+                    };
 
-                    exception.insert("message".to_string(), CfmlValue::string(message.clone()));
-                    exception.insert("type".to_string(), CfmlValue::string(error_type));
-                    exception.insert("detail".to_string(), CfmlValue::string(detail));
-                    exception.insert("errorcode".to_string(), CfmlValue::string(errorcode));
-                    exception.insert("tagcontext".to_string(), self.build_tag_context());
+                    // When `object` is a struct, start from it so all of its keys
+                    // (rootCause, stacktrace, custom fields, …) survive the throw.
+                    let mut exception: ValueMap = match args.get(5) {
+                        Some(CfmlValue::Struct(s)) => s.snapshot(),
+                        _ => ValueMap::default(),
+                    };
+                    let object_supplied = matches!(args.get(5), Some(CfmlValue::Struct(_)));
 
+                    // Helper: set `key` from the positional arg when it was supplied,
+                    // otherwise keep whatever the object already had (or the default).
+                    let apply = |exc: &mut ValueMap, key: &str, arg: Option<&CfmlValue>, default: &str| {
+                        let provided = arg.filter(|v| is_present(v)).map(|v| v.as_string());
+                        match provided {
+                            Some(v) => {
+                                exc.insert(key.to_string(), CfmlValue::string(v));
+                            }
+                            None => {
+                                if !exc.keys().any(|k| k.eq_ignore_ascii_case(key)) {
+                                    exc.insert(key.to_string(), CfmlValue::string(default.to_string()));
+                                }
+                            }
+                        }
+                    };
+                    apply(&mut exception, "message", args.get(0), "");
+                    apply(&mut exception, "type", args.get(1), "Application");
+                    apply(&mut exception, "detail", args.get(2), "");
+                    apply(&mut exception, "errorcode", args.get(3), "");
+                    apply(&mut exception, "extendedinfo", args.get(4), "");
+                    // Preserve the original tagcontext when re-throwing an object;
+                    // otherwise capture the current location.
+                    if !object_supplied
+                        || !exception.keys().any(|k| k.eq_ignore_ascii_case("tagcontext"))
+                    {
+                        exception.insert("tagcontext".to_string(), self.build_tag_context());
+                    }
+
+                    let message = exception
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("message"))
+                        .map(|(_, v)| v.as_string())
+                        .unwrap_or_default();
+
+                    Self::add_root_cause(&mut exception);
                     let error_val = CfmlValue::strukt(exception);
                     self.last_exception = Some(error_val.clone());
 
@@ -10164,6 +10264,30 @@ impl CfmlVirtualMachine {
                 "__cfcache" => {
                     // Stub/no-op; in serve mode could push Cache-Control header
                     return Ok(CfmlValue::Null);
+                }
+
+                // ---- <cfloop file="..." index="..."> line iterator ----
+                // Returns the file's lines as a 1-based array, splitting on \n and
+                // \r\n and preserving empty lines (so line numbers stay accurate —
+                // Wheels' error page renders source context by line number). Routed
+                // through the VFS like fileRead so it works in CLI and serve modes.
+                // Without a `file=` handler `<cfloop file=…>` previously fell through
+                // to `while(true)` and hung the request (GitHub issue #158).
+                "__cfloop_file_lines" => {
+                    let path = args.get(0).map(|v| v.as_string()).unwrap_or_default();
+                    return match self.vfs.read_to_string(&path) {
+                        Ok(content) => {
+                            let lines: Vec<CfmlValue> = content
+                                .lines()
+                                .map(|l| CfmlValue::string(l.to_string()))
+                                .collect();
+                            Ok(CfmlValue::array(lines))
+                        }
+                        Err(e) => Err(CfmlError::runtime(format!(
+                            "cfloop file: cannot read '{}': {}",
+                            path, e
+                        ))),
+                    };
                 }
 
                 // ---- cfexecute tag handler ----

@@ -239,7 +239,14 @@ impl Parser {
                             break;
                         }
                     }
-                    // Map to positional: message, type, detail, errorcode
+                    // Map to positional: message, type, detail, errorcode,
+                    // extendedinfo, object. `extendedinfo` and `object` were
+                    // previously dropped here — that silently discarded the
+                    // re-throw idiom `throw(object=caughtException)` (CF/Lucee/
+                    // BoxLang `cfthrow object=`) and any `extendedInfo` passed by
+                    // the throw(...) call form. Wheels' `Throw(object=...)` and
+                    // `$throwErrorOrShow404Page(... extendedInfo=...)` both relied
+                    // on these (GitHub issue #158).
                     let get_arg = |name: &str| -> Expression {
                         named.iter()
                             .find(|(k, _)| k == name)
@@ -249,7 +256,14 @@ impl Parser {
                                 location: stmt_loc,
                             }))
                     };
-                    vec![get_arg("message"), get_arg("type"), get_arg("detail"), get_arg("errorcode")]
+                    vec![
+                        get_arg("message"),
+                        get_arg("type"),
+                        get_arg("detail"),
+                        get_arg("errorcode"),
+                        get_arg("extendedinfo"),
+                        get_arg("object"),
+                    ]
                 } else {
                     self.parse_arguments()?
                 };

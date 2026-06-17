@@ -1,0 +1,92 @@
+<cfscript>
+suiteBegin("throw object / extendedInfo / rootCause");
+
+// --- throw(...) call form preserves extendedInfo ---
+extErr = "";
+try {
+	throw(type = "Custom.T1", message = "m1", extendedInfo = "extra-info");
+} catch (any e) {
+	extErr = e;
+}
+assert("throw extendedInfo preserved", extErr.extendedInfo, "extra-info");
+
+// --- throw(object=...) re-throws the caught exception verbatim ---
+orig = "";
+try {
+	throw(type = "Custom.T2", message = "m2", detail = "d2", extendedInfo = "ext2");
+} catch (any e) {
+	orig = e;
+}
+rethrown = "";
+try {
+	throw(object = orig);
+} catch (any e) {
+	rethrown = e;
+}
+assert("throw object preserves message", rethrown.message, "m2");
+assert("throw object preserves type", rethrown.type, "Custom.T2");
+assert("throw object preserves detail", rethrown.detail, "d2");
+assert("throw object preserves extendedInfo", rethrown.extendedInfo, "ext2");
+
+// --- explicit attrs override the object ---
+override = "";
+try {
+	throw(object = orig, message = "overridden");
+} catch (any e) {
+	override = e;
+}
+assert("throw object message override", override.message, "overridden");
+assert("throw object keeps type under override", override.type, "Custom.T2");
+
+// --- plain throw still works ---
+plain = "";
+try {
+	throw(message = "plain");
+} catch (any e) {
+	plain = e;
+}
+assert("plain throw message", plain.message, "plain");
+
+// --- every exception carries a rootCause (Lucee/ACF parity) ---
+rc = "";
+try {
+	throw(type = "Custom.T3", message = "m3", extendedInfo = "ext3");
+} catch (any e) {
+	rc = e;
+}
+assertTrue("exception has rootCause", structKeyExists(rc, "rootCause"));
+assert("rootCause.type matches", rc.rootCause.type, "Custom.T3");
+assert("rootCause.message matches", rc.rootCause.message, "m3");
+assert("rootCause.extendedInfo matches", rc.rootCause.extendedInfo, "ext3");
+assertFalse("rootCause does not nest a rootCause", structKeyExists(rc.rootCause, "rootCause"));
+
+// runtime errors also get a rootCause
+divErr = "";
+try {
+	dummy = 1 / 0;
+} catch (any e) {
+	divErr = e;
+}
+assertTrue("runtime error has rootCause", structKeyExists(divErr, "rootCause"));
+
+tagObjErr = "";
+tagExtErr = "";
+</cfscript>
+
+<!--- tag forms: <cfthrow object=...> and extendedInfo --->
+<cftry>
+	<cfthrow object="#orig#">
+	<cfcatch type="any"><cfset tagObjErr = cfcatch></cfcatch>
+</cftry>
+<cftry>
+	<cfthrow message="tagmsg" type="Custom.T4" extendedinfo="tagext">
+	<cfcatch type="any"><cfset tagExtErr = cfcatch></cfcatch>
+</cftry>
+
+<cfscript>
+assert("cfthrow object= preserves message", tagObjErr.message, "m2");
+assert("cfthrow object= preserves type", tagObjErr.type, "Custom.T2");
+assert("cfthrow extendedInfo preserved", tagExtErr.extendedInfo, "tagext");
+
+suiteEnd();
+</cfscript>

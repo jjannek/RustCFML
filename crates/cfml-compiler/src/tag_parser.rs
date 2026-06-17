@@ -684,12 +684,33 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                     None => format!("\"{}\"", default_lit),
                 }
             };
-            let message = attr_expr("message", "An error occurred");
-            let type_ = attr_expr("type", "Application");
+            // `<cfthrow object="#e#">` re-throws an existing exception object and
+            // `extendedInfo` is a first-class attribute — both were previously
+            // dropped (only message/type/detail/errorcode were forwarded), so
+            // `cfthrow object=` lost the original error (GitHub issue #158). When
+            // no message is given default to empty (not "An error occurred") so an
+            // object/extendedInfo-only throw doesn't fabricate a message.
+            // When re-throwing an object, unspecified attributes must NOT inject
+            // literal defaults (e.g. type="Application") — that would clobber the
+            // object's own fields. Default to empty so the object's values survive;
+            // an explicitly supplied attribute still overrides.
+            let has_object = attrs.contains_key("object");
+            let dflt_msg = if has_object { "" } else { "An error occurred" };
+            let dflt_type = if has_object { "" } else { "Application" };
+            let message = attr_expr("message", dflt_msg);
+            let type_ = attr_expr("type", dflt_type);
             let detail = attr_expr("detail", "");
             let errorcode = attr_expr("errorcode", "");
+            let extendedinfo = attr_expr("extendedinfo", "");
+            let object = if has_object { attr_expr("object", "") } else { "\"\"".to_string() };
 
-            (format!("throw({}, {}, {}, {});\n", message, type_, detail, errorcode), tag_end - start)
+            (
+                format!(
+                    "throw({}, {}, {}, {}, {}, {});\n",
+                    message, type_, detail, errorcode, extendedinfo, object
+                ),
+                tag_end - start,
+            )
         }
         "cftry" => {
             ("try {\n".to_string(), tag_end - start)
@@ -2667,6 +2688,20 @@ fn parse_cfloop_tag(
         } else {
             (format!("for (var {} in {}) {{\n", item, collection), consumed)
         }
+    } else if let (Some(file), Some(index)) = (
+        attrs.get("file"),
+        attrs.get("index").or_else(|| attrs.get("item")),
+    ) {
+        // <cfloop file="path" index="line"> iterates the file line by line,
+        // binding `index` to each line. `__cfloop_file_lines` reads via the VFS
+        // and preserves empty lines (accurate line numbering). Without this the
+        // file form fell through to `while(true)` and hung (GitHub issue #158).
+        let file = strip_hashes(file);
+        let index = strip_hashes(index);
+        (
+            format!("for (var {} in __cfloop_file_lines({})) {{\n", index, file),
+            consumed,
+        )
     } else {
         // Infinite loop? Just use while(true)
         ("while (true) {\n".to_string(), consumed)
