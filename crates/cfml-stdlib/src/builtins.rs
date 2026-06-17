@@ -623,6 +623,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // ---- Session & Auth functions (VM-intercepted) ----
     f.insert("sessionInvalidate".into(), fn_session_stub);
     f.insert("sessionRotate".into(), fn_session_stub);
+    f.insert("sessionCommit".into(), fn_session_stub);
     f.insert("sessionGetMetaData".into(), fn_session_stub);
     f.insert("getAuthUser".into(), fn_session_stub);
     f.insert("isUserInRole".into(), fn_session_stub);

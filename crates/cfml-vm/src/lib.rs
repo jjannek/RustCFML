@@ -2586,6 +2586,25 @@ impl CfmlVirtualMachine {
                         }
                     } else if name_lower == "request" {
                         CfmlValue::strukt(self.request_scope.snapshot())
+                    } else if name_lower == "thread" {
+                        // The `thread` scope always exists in CFML. Inside a
+                        // cfthread it's the per-thread scope seeded in
+                        // run_thread_body; at PAGE level it's a lazily-created
+                        // struct so `thread.x = y` works outside any cfthread
+                        // (TestBox's BDDRunner sets/reads thread.testResults,
+                        // thread.target, thread.suiteStats at page scope for its
+                        // "in case a suite is async" bookkeeping). Return the live
+                        // Arc-backed handle so member writes persist and read back.
+                        if !self.globals.contains_key("thread") {
+                            self.globals.insert(
+                                "thread".to_string(),
+                                CfmlValue::strukt(ValueMap::default()),
+                            );
+                        }
+                        self.globals
+                            .get("thread")
+                            .cloned()
+                            .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()))
                     } else if name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
                             // Live handle clone, not a snapshot, so `var p =
@@ -6765,6 +6784,7 @@ impl CfmlVirtualMachine {
                 | "__cffile_upload"
                 | "sessioninvalidate"
                 | "sessionrotate"
+                | "sessioncommit"
                 | "sessiongetmetadata"
                 | "applicationstop"
                 | "getauthuser"
@@ -9894,6 +9914,15 @@ impl CfmlVirtualMachine {
                     self.attach_session_scope();
                     return Ok(CfmlValue::Null);
                 }
+                "sessioncommit" => {
+                    // Lucee SessionCommit(): force the current session's pending
+                    // live-scope writes out to the persistent store immediately,
+                    // before a redirect/abort crosses a control-flow boundary.
+                    // (RustCFML normally syncs at request end; this makes it
+                    // explicit and is a no-op when there's no live session.)
+                    self.sync_session_scope_to_store()?;
+                    return Ok(CfmlValue::Null);
+                }
                 "sessiongetmetadata" => {
                     let mut meta = ValueMap::default();
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
@@ -12005,6 +12034,13 @@ impl CfmlVirtualMachine {
         // The object becomes the first argument
         let builtin_name = match object {
             CfmlValue::String(_) => match method_lower.as_str() {
+                "tostring" => {
+                    // java.lang.String.toString() / Lucee string member: returns
+                    // the receiver text unchanged. (Was falling through to None →
+                    // empty string; broke e.g. fileContent.toString() before JSON
+                    // parsing — GitHub PR #166.)
+                    return Ok(CfmlValue::string(object.as_string()));
+                }
                 "len" | "length" => Some("len"),
                 "getbytes" => {
                     // java.lang.String.getBytes() returns byte[]. Users wire
