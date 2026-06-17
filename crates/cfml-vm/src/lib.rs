@@ -2524,6 +2524,13 @@ impl CfmlVirtualMachine {
                             CfmlValue::strukt(ValueMap::default())
                         }
                     } else if name_lower == "session" {
+                        // Attach the live session scope before returning it, so a
+                        // bare `session` READ hands back the same Arc-backed
+                        // handle on every read (Lucee scope-reference semantics).
+                        // Reads previously returned a detached snapshot/empty
+                        // struct until a write attached the scope, which broke
+                        // the read-first scope-pointer caching pattern.
+                        self.attach_session_scope();
                         self.get_session_scope()
                     } else if name_lower == "cookie" {
                         self.globals
@@ -13476,15 +13483,29 @@ impl CfmlVirtualMachine {
         if self.session_scope.is_some() {
             return;
         }
-        if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id) {
+        // Establish a single stable, live (Arc-backed) handle for the session
+        // scope so reads and writes round-trip for the lifetime of this request
+        // — exactly like `application`, which is always a process-lifetime live
+        // Arc. Seed it from the session store when we have a server AND a
+        // session id (serve mode with an established session); otherwise start
+        // empty (CLI, or a serve request before any session id exists). Without
+        // a stable handle every `session` read returned a throwaway snapshot/
+        // empty struct and writes through the "scope pointer" pattern
+        // (`var p = session; p[k]=v; … session[k]`) vanished — WireBox
+        // session-scoped singletons never cached.
+        let vars = if let (Some(ref state), Some(ref sid)) =
+            (&self.server_state, &self.session_id)
+        {
             let app = self.current_application_name.as_deref().unwrap_or("");
-            let vars = state
+            state
                 .sessions
                 .get(app, sid)
                 .map(|s| s.variables)
-                .unwrap_or_default();
-            self.session_scope = Some(CfmlStruct::new(vars));
-        }
+                .unwrap_or_default()
+        } else {
+            ValueMap::default()
+        };
+        self.session_scope = Some(CfmlStruct::new(vars));
     }
 
     /// Persist the live session scope back to the session store. Called at the
@@ -13502,9 +13523,19 @@ impl CfmlVirtualMachine {
         if let (Some(state), Some(sid)) = (self.server_state.clone(), self.session_id.clone()) {
             let now = now_epoch_secs();
             let app = self.current_application_name.clone().unwrap_or_default();
+            let existing = state.sessions.get(&app, &sid);
+            // Read-only access must NOT materialise a record (the Preside-CMS
+            // defensive-read pattern). Reading `session` now attaches an empty
+            // live scope; if nothing was written into it and no record exists,
+            // there is nothing to persist — bail rather than mint an empty
+            // session. A genuine (pointer or direct) write leaves a non-empty
+            // snapshot, and an already-existing record is still refreshed.
+            if existing.is_none() && snap.is_empty() {
+                return Ok(());
+            }
             // Create the record if missing so a write after sessionInvalidate
             // re-creates the session (matching the pre-cache set_session_* path).
-            let mut session = state.sessions.get(&app, &sid).unwrap_or_else(|| SessionData {
+            let mut session = existing.unwrap_or_else(|| SessionData {
                 variables: ValueMap::default(),
                 created_secs: now,
                 last_accessed_secs: now,

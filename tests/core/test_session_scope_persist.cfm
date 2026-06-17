@@ -6,6 +6,14 @@ suiteBegin("Session scope is a live reference within a request");
 // Lucee/ACF and what WireBox's ScopeStorage relies on for session-scoped
 // caching. Requires session management (enabled in tests/Application.cfc).
 
+// READ-FIRST (the WireBox ScopeStorage shape): grab the scope pointer BEFORE
+// any session write. Reads used to return a detached snapshot/empty struct
+// until a write attached the live scope, so a write through this pointer
+// vanished and session-scoped singletons never cached.
+readFirstRef = session;
+readFirstRef.readFirstProbe = "rf";
+assert("read-first scope-pointer write is visible on session", session.readFirstProbe, "rf");
+
 session.sProbe = "v1";
 assert("session write is readable", session.sProbe, "v1");
 
