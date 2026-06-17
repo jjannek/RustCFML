@@ -641,7 +641,7 @@ mod tests {
         // cached (shape, idx) and uses set_at_index directly.
         use cfml_common::dynamic::CfmlStruct;
         use indexmap::IndexMap;
-        let mut m = IndexMap::new();
+        let mut m = cfml_common::dynamic::ValueMap::default();
         m.insert("x".to_string(), CfmlValue::Int(1));
         let s = CfmlStruct::new(m);
         let shape_before = s.shape_id();
@@ -720,11 +720,11 @@ mod tests {
         // the marker the interpreter uses to recognise CFCs.
         use cfml_common::dynamic::CfmlStruct;
         use indexmap::IndexMap;
-        let mut m = IndexMap::new();
+        let mut m = cfml_common::dynamic::ValueMap::default();
         m.insert("flag".to_string(), CfmlValue::Int(0));
         m.insert(
             "__variables".to_string(),
-            CfmlValue::strukt(IndexMap::new()),
+            CfmlValue::strukt(cfml_common::dynamic::ValueMap::default()),
         );
         let s = CfmlStruct::new(m);
         let obj_tag = boxed::box_value(CfmlValue::Struct(s.clone())) as i64;

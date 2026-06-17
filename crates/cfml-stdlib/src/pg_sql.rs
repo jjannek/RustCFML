@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn named_params_reused_within_statement() {
-        let mut m = IndexMap::new();
+        let mut m = cfml_common::dynamic::ValueMap::default();
         m.insert("id".to_string(), CfmlValue::Int(5));
         m.insert("name".to_string(), s("bob"));
         let p = prepare_pg_statements(
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn named_params_cast_operator_not_treated_as_placeholder() {
-        let mut m = IndexMap::new();
+        let mut m = cfml_common::dynamic::ValueMap::default();
         m.insert("id".to_string(), s("abc"));
         let p = prepare_pg_statements(
             "select id::text from t where id = :id",

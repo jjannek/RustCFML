@@ -14,10 +14,9 @@
 //! - Query functions
 //! - System functions
 
-use cfml_common::dynamic::{CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue};
+use cfml_common::dynamic::{CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use std::collections::HashMap;
-use indexmap::IndexMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
 use serde_json;
@@ -79,8 +78,8 @@ fn cached_regex(pat: &str) -> Result<Regex, regex::Error> {
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
 
 /// Returns all builtin functions as CfmlValue::Function references for the globals table
-pub fn get_builtins() -> IndexMap<String, CfmlValue> {
-    let mut builtins = IndexMap::new();
+pub fn get_builtins() -> ValueMap {
+    let mut builtins = ValueMap::default();
     for (name, _) in get_builtin_functions() {
         builtins.insert(name.clone(), create_builtin_func(name.as_str()));
     }
@@ -874,7 +873,7 @@ fn xorshift64(state: u64) -> u64 {
 }
 
 fn cfml_random() -> f64 {
-    PRNG_SEEDED.with(|seeded| {
+    PRNG_SEEDED.with(|_seeded| {
         PRNG_STATE.with(|state| {
             let current = state.get();
             let next = if current == 0 {
@@ -1213,13 +1212,13 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
                     len_arr.push(CfmlValue::Int(0));
                 }
             }
-            let mut result = IndexMap::new();
+            let mut result = ValueMap::default();
             result.insert("POS".to_string(), CfmlValue::array(pos_arr));
             result.insert("MATCH".to_string(), CfmlValue::array(match_arr));
             result.insert("LEN".to_string(), CfmlValue::array(len_arr));
             Ok(CfmlValue::strukt(result))
         } else {
-            let mut result = IndexMap::new();
+            let mut result = ValueMap::default();
             result.insert("POS".to_string(), CfmlValue::array(vec![CfmlValue::Int(0)]));
             result.insert("MATCH".to_string(), CfmlValue::array(vec![CfmlValue::string(String::new())]));
             result.insert("LEN".to_string(), CfmlValue::array(vec![CfmlValue::Int(0)]));
@@ -2269,7 +2268,7 @@ fn fn_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
 // ===============================================
 
 fn fn_struct_new(_args: Vec<CfmlValue>) -> CfmlResult {
-    Ok(CfmlValue::strukt(IndexMap::new()))
+    Ok(CfmlValue::strukt(ValueMap::default()))
 }
 
 /// The `arguments` scope carries two private markers (`__arguments_scope` +
@@ -2429,7 +2428,7 @@ fn struct_find_key_recursive(
     for (k, v) in s.iter() {
         let current_path = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
         if k.eq_ignore_ascii_case(&search_lower) {
-            let mut result_struct = IndexMap::new();
+            let mut result_struct = ValueMap::default();
             result_struct.insert("owner".to_string(), CfmlValue::Struct(s.clone()));
             result_struct.insert("path".to_string(), CfmlValue::string(current_path.clone()));
             result_struct.insert("value".to_string(), v.clone());
@@ -2476,7 +2475,7 @@ fn struct_find_value_recursive(
     for (k, v) in s.iter() {
         let current_path = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
         if v.as_string().to_lowercase() == search_lower {
-            let mut result_struct = IndexMap::new();
+            let mut result_struct = ValueMap::default();
             result_struct.insert("owner".to_string(), CfmlValue::Struct(s.clone()));
             result_struct.insert("path".to_string(), CfmlValue::string(current_path.clone()));
             result_struct.insert("key".to_string(), CfmlValue::string(k.clone()));
@@ -2505,14 +2504,14 @@ fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
         s.clear();
         return Ok(CfmlValue::Struct(s.clone()));
     }
-    Ok(CfmlValue::strukt(IndexMap::new()))
+    Ok(CfmlValue::strukt(ValueMap::default()))
 }
 
 fn fn_struct_copy(args: Vec<CfmlValue>) -> CfmlResult {
     // Shallow copy: a fresh top-level struct over the same (shared) values.
     match args.first() {
         Some(CfmlValue::Struct(s)) => Ok(CfmlValue::strukt(s.snapshot())),
-        _ => Ok(CfmlValue::strukt(IndexMap::new())),
+        _ => Ok(CfmlValue::strukt(ValueMap::default())),
     }
 }
 
@@ -2529,7 +2528,7 @@ fn fn_struct_append(args: Vec<CfmlValue>) -> CfmlResult {
             return Ok(CfmlValue::Struct(a.clone()));
         }
     }
-    Ok(args.into_iter().next().unwrap_or(CfmlValue::strukt(IndexMap::new())))
+    Ok(args.into_iter().next().unwrap_or(CfmlValue::strukt(ValueMap::default())))
 }
 
 fn fn_struct_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
@@ -2578,9 +2577,9 @@ fn fn_is_struct(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_get(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
     let parts: Vec<&str> = path.split('.').collect();
-    let mut current = CfmlValue::strukt(IndexMap::new());
+    let mut current = CfmlValue::strukt(ValueMap::default());
     for part in parts.iter().rev() {
-        let mut s = IndexMap::new();
+        let mut s = ValueMap::default();
         s.insert(part.to_string(), current);
         current = CfmlValue::strukt(s);
     }
@@ -2639,7 +2638,7 @@ fn fn_struct_equals(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_struct_key_translate(args: Vec<CfmlValue>) -> CfmlResult {
     if let Some(CfmlValue::Struct(s)) = args.first() {
         let retain = args.get(1).map(|v| v.is_true()).unwrap_or(false);
-        let mut result = IndexMap::new();
+        let mut result = ValueMap::default();
         for (k, v) in s.iter() {
             let new_key = if retain { k.clone() } else { k.to_lowercase() };
             result.insert(new_key, v.clone());
@@ -3910,7 +3909,7 @@ fn fn_get_function_called_name(_args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_get_function_list(_args: Vec<CfmlValue>) -> CfmlResult {
     // Return a struct of all registered builtin function names
     // Keys are function names, values are empty strings (matching CFML behavior)
-    let mut result = IndexMap::new();
+    let mut result = ValueMap::default();
     for (name, _) in get_builtin_functions() {
         result.insert(name, CfmlValue::string(String::new()));
     }
@@ -3929,7 +3928,7 @@ fn fn_get_page_context(_args: Vec<CfmlValue>) -> CfmlResult {
     // getResponse() are method-faithful (getRequestURL, getMethod, setStatus,
     // …). This stub keeps the name registered as a builtin for resolution; it
     // is never reached when running on the VM.
-    let mut ctx = IndexMap::new();
+    let mut ctx = ValueMap::default();
     ctx.insert("getRequest".to_string(), CfmlValue::Null);
     ctx.insert("getResponse".to_string(), CfmlValue::Null);
     Ok(CfmlValue::strukt(ctx))
@@ -4343,7 +4342,7 @@ fn serde_json_to_cfml(value: serde_json::Value) -> CfmlValue {
             CfmlValue::array(arr.into_iter().map(serde_json_to_cfml).collect())
         }
         serde_json::Value::Object(obj) => {
-            let mut map = IndexMap::new();
+            let mut map = ValueMap::default();
             for (k, v) in obj {
                 map.insert(k, serde_json_to_cfml(v));
             }
@@ -4371,7 +4370,7 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlValue::Array(arr) => arr.iter().map(|v| v.as_string()).collect(),
         _ => Vec::new(),
     };
-    let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::new();
+    let mut rows: Vec<ValueMap> = Vec::new();
     // 3rd arg: initial data as array of arrays or array of structs
     if args.len() >= 3 {
         if let CfmlValue::Array(data_rows) = &args[2] {
@@ -4379,7 +4378,7 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
                 match row_data {
                     CfmlValue::Array(values) => {
                         // Array of arrays: each inner array maps positionally to columns
-                        let mut row = IndexMap::new();
+                        let mut row = ValueMap::default();
                         for (i, val) in values.iter().enumerate() {
                             if i < columns.len() {
                                 row.insert(columns[i].clone(), val.clone());
@@ -4392,7 +4391,7 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
                     }
                     _ => {
                         // Single-column shortcut: wrap scalar in a row
-                        let mut row = IndexMap::new();
+                        let mut row = ValueMap::default();
                         if !columns.is_empty() {
                             row.insert(columns[0].clone(), row_data.clone());
                         }
@@ -4447,7 +4446,7 @@ fn fn_query_add_row(args: Vec<CfmlValue>) -> CfmlResult {
             1
         };
         for _ in 0..num_rows {
-            q.add_row(IndexMap::new());
+            q.add_row(ValueMap::default());
         }
         Ok(CfmlValue::Query(q.clone()))
     } else {
@@ -4595,9 +4594,9 @@ fn fn_query_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
                     position + 1, data.row_count()
                 )));
             }
-            let row_data: IndexMap<String, CfmlValue> = match &args[1] {
+            let row_data: ValueMap = match &args[1] {
                 CfmlValue::Struct(d) => d.snapshot(),
-                _ => IndexMap::new(),
+                _ => ValueMap::default(),
             };
             data.insert_row_named(position, row_data);
             return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
@@ -4664,9 +4663,9 @@ fn fn_query_set_row(args: Vec<CfmlValue>) -> CfmlResult {
                     row_idx + 1, rc
                 )));
             }
-            let row_data: IndexMap<String, CfmlValue> = match &args[2] {
+            let row_data: ValueMap = match &args[2] {
                 CfmlValue::Struct(d) => d.snapshot(),
-                _ => IndexMap::new(),
+                _ => ValueMap::default(),
             };
             // Replace cells in the existing row.
             for ci in 0..data.columns.len() {
@@ -4748,7 +4747,7 @@ fn fn_sleep(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
-    let mut meta = IndexMap::new();
+    let mut meta = ValueMap::default();
     if let Some(val) = args.first() {
         match val {
             CfmlValue::Struct(s) => {
@@ -4766,7 +4765,7 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                 // Extract __extends info
                 if let Some(CfmlValue::Array(chain)) = s.get("__extends_chain") {
                     if let Some(first) = chain.first() {
-                        let mut extends_meta = IndexMap::new();
+                        let mut extends_meta = ValueMap::default();
                         extends_meta.insert("name".to_string(), first.clone());
                         meta.insert("extends".to_string(), CfmlValue::strukt(extends_meta));
                     }
@@ -4787,7 +4786,7 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                 for (k, v) in s.iter() {
                     if k.starts_with("__") { continue; }
                     if let CfmlValue::Function(f) = v {
-                        let mut func_meta = IndexMap::new();
+                        let mut func_meta = ValueMap::default();
                         func_meta.insert("name".to_string(), CfmlValue::string(k.clone()));
                         func_meta.insert("access".to_string(), CfmlValue::string(
                             match f.access {
@@ -4802,7 +4801,7 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                         }
                         // Parameter details
                         let params: Vec<CfmlValue> = f.params.iter().map(|p| {
-                            let mut pm = IndexMap::new();
+                            let mut pm = ValueMap::default();
                             pm.insert("name".to_string(), CfmlValue::string(p.name.clone()));
                             if let Some(ref t) = p.param_type {
                                 pm.insert("type".to_string(), CfmlValue::string(t.clone()));
@@ -4837,7 +4836,7 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                     for (k, v) in s.iter() {
                         if k.starts_with("__") { continue; }
                         if matches!(v, CfmlValue::Function(_)) { continue; }
-                        let mut prop_meta = IndexMap::new();
+                        let mut prop_meta = ValueMap::default();
                         prop_meta.insert("name".to_string(), CfmlValue::string(k.clone()));
                         prop_meta.insert("type".to_string(), CfmlValue::string(v.type_name().to_string()));
                         properties.push(CfmlValue::strukt(prop_meta));
@@ -4859,7 +4858,7 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                     meta.insert("returnType".to_string(), CfmlValue::string(rt.clone()));
                 }
                 let params: Vec<CfmlValue> = f.params.iter().map(|p| {
-                    let mut pm = IndexMap::new();
+                    let mut pm = ValueMap::default();
                     pm.insert("name".to_string(), CfmlValue::string(p.name.clone()));
                     if let Some(ref t) = p.param_type {
                         pm.insert("type".to_string(), CfmlValue::string(t.clone()));
@@ -4970,7 +4969,7 @@ fn fn_create_object(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         let obj_type = args[0].as_string().to_lowercase();
         if obj_type == "component" {
-            let mut s = IndexMap::new();
+            let mut s = ValueMap::default();
             s.insert("__createObject".to_string(), CfmlValue::string(args[1].as_string()));
             return Ok(CfmlValue::strukt(s));
         }
@@ -5244,7 +5243,7 @@ fn fn_get_profile_sections(args: Vec<CfmlValue>) -> CfmlResult {
     })?;
 
     let (section_order, sections) = parse_ini_file(&content);
-    let mut result = IndexMap::new();
+    let mut result = ValueMap::default();
 
     for sec_name in &section_order {
         if let Some(entries) = sections.get(sec_name) {
@@ -5433,7 +5432,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 let q = cfml_common::dynamic::CfmlQuery::new(columns);
                 for e in entries {
                     if let Entry::Row { name, directory, size, is_dir } = e {
-                        let mut row = indexmap::IndexMap::new();
+                        let mut row = ValueMap::default();
                         row.insert("name".to_string(), CfmlValue::string(name));
                         row.insert("directory".to_string(), CfmlValue::string(directory));
                         row.insert("size".to_string(), CfmlValue::Int(size as i64));
@@ -5478,7 +5477,7 @@ fn fn_get_file_info(args: Vec<CfmlValue>) -> CfmlResult {
     let meta = std::fs::metadata(path)
         .map_err(|e| CfmlError::runtime(format!("getFileInfo: {}", e)))?;
 
-    let mut info = IndexMap::new();
+    let mut info = ValueMap::default();
     info.insert("name".to_string(), CfmlValue::string(
         path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
     ));
@@ -5531,7 +5530,7 @@ fn fn_get_current_template_path(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_get_component_metadata(_args: Vec<CfmlValue>) -> CfmlResult {
     // Stub — VM intercepts this call to resolve component metadata
-    Ok(CfmlValue::strukt(IndexMap::new()))
+    Ok(CfmlValue::strukt(ValueMap::default()))
 }
 
 // ===============================================
@@ -6212,7 +6211,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
         request.call()
     };
 
-    let mut result_struct: IndexMap<String, CfmlValue> = IndexMap::new();
+    let mut result_struct: ValueMap = ValueMap::default();
 
     match response {
         Ok(resp) => {
@@ -6221,7 +6220,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let http_version = resp.http_version().to_string();
             let content_type = resp.content_type().to_string();
 
-            let mut resp_headers: IndexMap<String, CfmlValue> = IndexMap::new();
+            let mut resp_headers: ValueMap = ValueMap::default();
             for name in resp.headers_names() {
                 if let Some(val) = resp.header(&name) {
                     resp_headers.insert(name, CfmlValue::string(val.to_string()));
@@ -6257,7 +6256,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             let http_version = resp.http_version().to_string();
             let content_type = resp.content_type().to_string();
 
-            let mut resp_headers: IndexMap<String, CfmlValue> = IndexMap::new();
+            let mut resp_headers: ValueMap = ValueMap::default();
             for name in resp.headers_names() {
                 if let Some(val) = resp.header(&name) {
                     resp_headers.insert(name, CfmlValue::string(val.to_string()));
@@ -6286,7 +6285,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             result_struct.insert("fileContent".to_string(), CfmlValue::string(String::new()));
             result_struct.insert("mimeType".to_string(), CfmlValue::string(String::new()));
             result_struct.insert("charset".to_string(), CfmlValue::string("UTF-8".to_string()));
-            result_struct.insert("responseHeader".to_string(), CfmlValue::strukt(IndexMap::new()));
+            result_struct.insert("responseHeader".to_string(), CfmlValue::strukt(ValueMap::default()));
             result_struct.insert("errorDetail".to_string(), CfmlValue::string(e.to_string()));
             result_struct.insert("HTTP_Version".to_string(), CfmlValue::string(String::new()));
 
@@ -7627,9 +7626,9 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
             .collect();
 
-        let rows_result: Result<Vec<IndexMap<String, CfmlValue>>, _> = stmt
+        let rows_result: Result<Vec<ValueMap>, _> = stmt
             .query_map(rusqlite::params_from_iter(bound_params.iter()), |row| {
-                let mut row_map = IndexMap::new();
+                let mut row_map = ValueMap::default();
                 for (i, col) in columns.iter().enumerate() {
                     let val: SqlValue = row.get_unwrap(i);
                     row_map.insert(col.clone(), sqlite_to_cfml(val));
@@ -7771,9 +7770,9 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
             vec![]
         };
 
-        let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::with_capacity(result.len());
+        let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
         for row in &result {
-            let mut row_map = IndexMap::new();
+            let mut row_map = ValueMap::default();
             for (i, col) in columns.iter().enumerate() {
                 let val: mysql::Value = row.get(i).unwrap_or(mysql::Value::NULL);
                 row_map.insert(col.clone(), mysql_value_to_cfml(val));
@@ -7919,9 +7918,9 @@ fn run_postgres_statements(
             vec![]
         };
 
-        let mut result_rows: Vec<IndexMap<String, CfmlValue>> = Vec::with_capacity(rows.len());
+        let mut result_rows: Vec<ValueMap> = Vec::with_capacity(rows.len());
         for row in &rows {
-            let mut row_map = IndexMap::new();
+            let mut row_map = ValueMap::default();
             for (i, col) in columns.iter().enumerate() {
                 row_map.insert(col.clone(), postgres_row_to_cfml(row, i));
             }
@@ -8611,9 +8610,9 @@ fn run_mssql_statement(
                 vec![]
             };
 
-            let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::with_capacity(result.len());
+            let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
             for row in &result {
-                let mut row_map = IndexMap::new();
+                let mut row_map = ValueMap::default();
                 for (i, col) in columns.iter().enumerate() {
                     let val = mssql_column_to_cfml(row, i);
                     row_map.insert(col.clone(), val);
@@ -8987,9 +8986,9 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
         let columns: Vec<String> = (0..column_count)
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
             .collect();
-        let rows_result: Result<Vec<IndexMap<String, CfmlValue>>, _> = stmt
+        let rows_result: Result<Vec<ValueMap>, _> = stmt
             .query_map(rusqlite::params_from_iter(bound_params.iter()), |row| {
-                let mut row_map = IndexMap::new();
+                let mut row_map = ValueMap::default();
                 for (i, col) in columns.iter().enumerate() {
                     let val: SqlValue = row.get_unwrap(i);
                     row_map.insert(col.clone(), sqlite_to_cfml(val));
@@ -9041,9 +9040,9 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
         } else {
             vec![]
         };
-        let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::with_capacity(result.len());
+        let mut rows: Vec<ValueMap> = Vec::with_capacity(result.len());
         for row in &result {
-            let mut row_map = IndexMap::new();
+            let mut row_map = ValueMap::default();
             for (i, col) in columns.iter().enumerate() {
                 let val: mysql::Value = row.get(i).unwrap_or(mysql::Value::NULL);
                 row_map.insert(col.clone(), mysql_value_to_cfml(val));
@@ -9073,7 +9072,7 @@ fn execute_postgres_with_conn(client: &mut postgres::Client, sql: &str, params_a
 // -----------------------------------------------
 
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
-fn build_query_result(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue>>, sql: &str, return_type: &str) -> CfmlResult {
+fn build_query_result(columns: Vec<String>, rows: Vec<ValueMap>, sql: &str, return_type: &str) -> CfmlResult {
     if return_type == "array" {
         let arr: Vec<CfmlValue> = rows.into_iter()
             .map(|r| CfmlValue::strukt(r))
@@ -9085,7 +9084,7 @@ fn build_query_result(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue
         // the row struct. Schema-introspection patterns (pg_indexes, etc.)
         // rely on this.
         let key_lower = key.to_lowercase();
-        let mut out: IndexMap<String, CfmlValue> = IndexMap::new();
+        let mut out: ValueMap = ValueMap::default();
         for row in rows.into_iter() {
             let key_val = row.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(&key_lower))
@@ -9102,7 +9101,7 @@ fn build_query_result(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue
         if let Some(row) = rows.into_iter().next() {
             Ok(CfmlValue::strukt(row))
         } else {
-            Ok(CfmlValue::strukt(IndexMap::new()))
+            Ok(CfmlValue::strukt(ValueMap::default()))
         }
     } else {
         Ok(CfmlValue::Query(CfmlQuery::from_parts_sql(
@@ -9131,7 +9130,7 @@ fn sql_is_insert(sql: &str) -> bool {
 /// `generatedKey` only on an INSERT that actually inserted rows.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn build_mutation_result(affected: i64, last_id: i64, sql: &str) -> CfmlResult {
-    let mut result = IndexMap::new();
+    let mut result = ValueMap::default();
     result.insert("recordCount".to_string(), CfmlValue::Int(affected));
     result.insert("cached".to_string(), CfmlValue::Bool(false));
     result.insert("sql".to_string(), CfmlValue::string(sql.to_string()));
@@ -9312,7 +9311,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                 "size".to_string(),
                 "datelastmodified".to_string(),
             ];
-            let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::new();
+            let mut rows: Vec<ValueMap> = Vec::new();
 
             fn matches_glob(name: &str, pattern: &str) -> bool {
                 if pattern == "*" {
@@ -9329,7 +9328,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                 dir: &Path,
                 filter: &str,
                 recurse: bool,
-                rows: &mut Vec<IndexMap<String, CfmlValue>>,
+                rows: &mut Vec<ValueMap>,
                 visited: &mut std::collections::HashSet<std::path::PathBuf>,
             ) -> Result<(), CfmlError> {
                 let entries = fs::read_dir(dir).map_err(|e| {
@@ -9366,7 +9365,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                     let should_include = is_dir || matches_glob(&name, filter);
 
                     if should_include {
-                        let mut row = IndexMap::new();
+                        let mut row = ValueMap::default();
                         row.insert("name".into(), CfmlValue::string(name.clone()));
                         row.insert(
                             "directory".into(),
@@ -10007,20 +10006,20 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
     let xml_str = get_str(&args, 0);
     let mut reader = Reader::from_str(&xml_str);
 
-    let mut stack: Vec<IndexMap<String, CfmlValue>> = Vec::new();
-    let mut root: Option<IndexMap<String, CfmlValue>> = None;
+    let mut stack: Vec<ValueMap> = Vec::new();
+    let mut root: Option<ValueMap> = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let mut element = IndexMap::new();
+                let mut element = ValueMap::default();
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 element.insert("xmlName".to_string(), CfmlValue::string(tag_name));
                 element.insert("xmlType".to_string(), CfmlValue::string("ELEMENT".to_string()));
                 element.insert("xmlText".to_string(), CfmlValue::string(String::new()));
                 element.insert("xmlChildren".to_string(), CfmlValue::array(Vec::new()));
 
-                let mut attrs = IndexMap::new();
+                let mut attrs = ValueMap::default();
                 for attr in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                     let val = String::from_utf8_lossy(&attr.value).to_string();
@@ -10042,14 +10041,14 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
             Ok(Event::Empty(ref e)) => {
-                let mut element = IndexMap::new();
+                let mut element = ValueMap::default();
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 element.insert("xmlName".to_string(), CfmlValue::string(tag_name));
                 element.insert("xmlType".to_string(), CfmlValue::string("ELEMENT".to_string()));
                 element.insert("xmlText".to_string(), CfmlValue::string(String::new()));
                 element.insert("xmlChildren".to_string(), CfmlValue::array(Vec::new()));
 
-                let mut attrs = IndexMap::new();
+                let mut attrs = ValueMap::default();
                 for attr in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                     let val = String::from_utf8_lossy(&attr.value).to_string();
@@ -10086,7 +10085,7 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
 
     match root {
         Some(root_element) => {
-            let mut doc = IndexMap::new();
+            let mut doc = ValueMap::default();
             doc.insert("xmlRoot".to_string(), CfmlValue::strukt(root_element));
             doc.insert("xmlType".to_string(), CfmlValue::string("DOCUMENT".to_string()));
             Ok(CfmlValue::strukt(doc))
@@ -10199,10 +10198,10 @@ fn fn_xml_new(args: Vec<CfmlValue>) -> CfmlResult {
     let _case_sensitive = args.get(0).map(|v| v.is_true()).unwrap_or(false);
     // An empty doc has no xmlRoot until a root element is attached.
     // Matches Lucee: structKeyExists(xmlNew(), "xmlRoot") returns false.
-    let mut doc = IndexMap::new();
+    let mut doc = ValueMap::default();
     doc.insert("xmlComment".to_string(), CfmlValue::string(String::new()));
     doc.insert("__xmlDoc".to_string(), CfmlValue::Bool(true));
-    let mut doc_type = IndexMap::new();
+    let mut doc_type = ValueMap::default();
     doc_type.insert("type".to_string(), CfmlValue::string(String::new()));
     doc_type.insert("name".to_string(), CfmlValue::string(String::new()));
     doc.insert("xmlDocType".to_string(), CfmlValue::strukt(doc_type));
@@ -10218,14 +10217,14 @@ fn fn_xml_elem_new(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         (String::new(), get_str(&args, 1))
     };
-    let mut elem = IndexMap::new();
+    let mut elem = ValueMap::default();
     elem.insert("xmlName".to_string(), CfmlValue::string(child_name));
     elem.insert("xmlNsPrefix".to_string(), CfmlValue::string(String::new()));
     elem.insert("xmlNsURI".to_string(), CfmlValue::string(namespace));
     elem.insert("xmlText".to_string(), CfmlValue::string(String::new()));
     elem.insert("xmlComment".to_string(), CfmlValue::string(String::new()));
     elem.insert("xmlCData".to_string(), CfmlValue::string(String::new()));
-    elem.insert("xmlAttributes".to_string(), CfmlValue::strukt(IndexMap::new()));
+    elem.insert("xmlAttributes".to_string(), CfmlValue::strukt(ValueMap::default()));
     elem.insert("xmlChildren".to_string(), CfmlValue::array(Vec::new()));
     Ok(CfmlValue::strukt(elem))
 }
@@ -10355,11 +10354,11 @@ fn fn_html_parse(args: Vec<CfmlValue>) -> CfmlResult {
         match node_ref.value() {
             Node::Element(el) => {
                 let tag_name = el.name.local.to_string();
-                let mut element = IndexMap::new();
+                let mut element = ValueMap::default();
                 element.insert("xmlName".to_string(), CfmlValue::string(tag_name));
                 element.insert("xmlType".to_string(), CfmlValue::string("ELEMENT".to_string()));
 
-                let mut attrs = IndexMap::new();
+                let mut attrs = ValueMap::default();
                 for (name, val) in el.attrs() {
                     attrs.insert(name.to_string(), CfmlValue::string(val.to_string()));
                 }
@@ -10388,12 +10387,12 @@ fn fn_html_parse(args: Vec<CfmlValue>) -> CfmlResult {
             Node::Text(t) => {
                 let text = t.to_string();
                 if text.trim().is_empty() { return None; }
-                let mut element = IndexMap::new();
+                let mut element = ValueMap::default();
                 element.insert("xmlName".to_string(), CfmlValue::string("#text".to_string()));
                 element.insert("xmlType".to_string(), CfmlValue::string("TEXT".to_string()));
                 element.insert("xmlText".to_string(), CfmlValue::string(text));
                 element.insert("xmlChildren".to_string(), CfmlValue::array(Vec::new()));
-                element.insert("xmlAttributes".to_string(), CfmlValue::strukt(IndexMap::new()));
+                element.insert("xmlAttributes".to_string(), CfmlValue::strukt(ValueMap::default()));
                 Some(CfmlValue::strukt(element))
             }
             _ => None,
@@ -10403,19 +10402,19 @@ fn fn_html_parse(args: Vec<CfmlValue>) -> CfmlResult {
     let html_str = get_str(&args, 0);
     let html = Html::parse_document(&html_str);
 
-    let mut doc = IndexMap::new();
+    let mut doc = ValueMap::default();
     doc.insert("xmlType".to_string(), CfmlValue::string("DOCUMENT".to_string()));
 
     let root_el = html.root_element();
     if let Some(root_cfml) = walk_node(*root_el) {
         doc.insert("xmlRoot".to_string(), root_cfml);
     } else {
-        let mut root = IndexMap::new();
+        let mut root = ValueMap::default();
         root.insert("xmlName".to_string(), CfmlValue::string("html".to_string()));
         root.insert("xmlType".to_string(), CfmlValue::string("ELEMENT".to_string()));
         root.insert("xmlText".to_string(), CfmlValue::string(String::new()));
         root.insert("xmlChildren".to_string(), CfmlValue::array(Vec::new()));
-        root.insert("xmlAttributes".to_string(), CfmlValue::strukt(IndexMap::new()));
+        root.insert("xmlAttributes".to_string(), CfmlValue::strukt(ValueMap::default()));
         doc.insert("xmlRoot".to_string(), CfmlValue::strukt(root));
     }
 
@@ -10858,7 +10857,7 @@ fn fn_array_range(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_to_struct(args: Vec<CfmlValue>) -> CfmlResult {
     match args.get(0) {
         Some(CfmlValue::Array(arr)) => {
-            let mut map = IndexMap::new();
+            let mut map = ValueMap::default();
             for (i, val) in arr.iter().enumerate() {
                 map.insert((i + 1).to_string(), val.clone());
             }
@@ -10902,7 +10901,7 @@ fn fn_struct_to_sorted(args: Vec<CfmlValue>) -> CfmlResult {
             } else {
                 keys.sort();
             }
-            let mut result = IndexMap::new();
+            let mut result = ValueMap::default();
             for key in keys {
                 if let Some(val) = s.get(&key) {
                     result.insert(key, val.clone());
@@ -11101,7 +11100,7 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_query_get_result(_args: Vec<CfmlValue>) -> CfmlResult {
     // Returns metadata about last query execution
-    let mut result = IndexMap::new();
+    let mut result = ValueMap::default();
     result.insert("sql".to_string(), CfmlValue::string(String::new()));
     result.insert("cached".to_string(), CfmlValue::Bool(false));
     result.insert("executionTime".to_string(), CfmlValue::Int(0));
@@ -11321,7 +11320,7 @@ fn fn_application_stop(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_get_application_metadata(_args: Vec<CfmlValue>) -> CfmlResult {
-    let mut meta = IndexMap::new();
+    let mut meta = ValueMap::default();
     meta.insert("name".to_string(), CfmlValue::string(String::new()));
     Ok(CfmlValue::strukt(meta))
 }
@@ -11411,7 +11410,7 @@ fn fn_file_open(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
     let _mode = if args.len() > 1 { get_str(&args, 1) } else { "read".to_string() };
     // Return a struct representing the file handle
-    let mut handle = IndexMap::new();
+    let mut handle = ValueMap::default();
     handle.insert("path".to_string(), CfmlValue::string(path));
     handle.insert("isOpen".to_string(), CfmlValue::Bool(true));
     handle.insert("line".to_string(), CfmlValue::Int(0));
@@ -11523,7 +11522,7 @@ fn fn_file_upload(args: Vec<CfmlValue>) -> CfmlResult {
 
     // This is a stub — real implementation requires VM access to the form scope
     // to find the uploaded file's temp path. The VM intercepts this.
-    let mut result = IndexMap::new();
+    let mut result = ValueMap::default();
     result.insert("serverDirectory".to_string(), CfmlValue::string(destination));
     result.insert("nameConflict".to_string(), CfmlValue::string(name_conflict));
     result.insert("fileWasSaved".to_string(), CfmlValue::Bool(false));
@@ -11536,7 +11535,7 @@ fn fn_file_upload_all(args: Vec<CfmlValue>) -> CfmlResult {
     let _accept = if args.len() > 1 { get_str(&args, 1) } else { String::new() };
     let _name_conflict = if args.len() > 2 { get_str(&args, 2).to_lowercase() } else { "error".to_string() };
 
-    let mut result = IndexMap::new();
+    let mut result = ValueMap::default();
     result.insert("serverDirectory".to_string(), CfmlValue::string(destination));
     result.insert("fileWasSaved".to_string(), CfmlValue::Bool(false));
     Ok(CfmlValue::strukt(result))
@@ -11877,7 +11876,7 @@ fn fn_struct_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
         return Err(CfmlError::runtime("structGetMetadata requires a struct argument".to_string()));
     }
     // All RustCFML structs are unordered and case-insensitive
-    let mut meta = IndexMap::new();
+    let mut meta = ValueMap::default();
     meta.insert("ordered".to_string(), CfmlValue::Bool(false));
     meta.insert("casesensitive".to_string(), CfmlValue::Bool(false));
     Ok(CfmlValue::strukt(meta))
@@ -12490,7 +12489,7 @@ fn fn_cfzip(args: Vec<CfmlValue>) -> CfmlResult {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
 
-                let mut row = IndexMap::new();
+                let mut row = ValueMap::default();
                 row.insert("name".to_string(), CfmlValue::string(name));
                 row.insert("directory".to_string(), CfmlValue::string(dir));
                 row.insert("size".to_string(), CfmlValue::Int(entry.size() as i64));

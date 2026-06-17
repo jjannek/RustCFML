@@ -28,7 +28,7 @@
 //! assert the persisted payload directly, with no external service.
 
 use cfml_codegen::compiler::CfmlCompiler;
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::{EmbeddedFs, Vfs};
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
@@ -90,7 +90,7 @@ impl SessionStore for SpyStore {
     fn take_expired(
         &self,
         now_secs: u64,
-    ) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
+    ) -> Vec<(String, String, ValueMap)> {
         self.inner.take_expired(now_secs)
     }
 }
@@ -145,13 +145,13 @@ fn run_request(store: Arc<dyn SessionStore>, sid: &str, page: &str) {
     }
     vm.globals
         .entry("url".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
     vm.globals
         .entry("cgi".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
     vm.globals
         .entry("form".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     vm.server_state = Some(server_state);
     vm.session_id = Some(sid.to_string());
@@ -160,14 +160,14 @@ fn run_request(store: Arc<dyn SessionStore>, sid: &str, page: &str) {
 }
 
 /// The `auth` sub-struct out of a persisted `SessionData`.
-fn auth_struct(data: &SessionData) -> Option<IndexMap<String, CfmlValue>> {
+fn auth_struct(data: &SessionData) -> Option<ValueMap> {
     data.variables
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("auth"))
         .and_then(|(_, v)| v.as_struct())
 }
 
-fn ci_get(m: &IndexMap<String, CfmlValue>, key: &str) -> Option<CfmlValue> {
+fn ci_get(m: &ValueMap, key: &str) -> Option<CfmlValue> {
     m.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .map(|(_, v)| v.clone())

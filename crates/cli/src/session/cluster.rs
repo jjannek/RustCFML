@@ -22,9 +22,9 @@ mod inner {
         config::standard as bincode_std,
         serde::{decode_from_slice, encode_to_vec},
     };
-    use cfml_common::dynamic::CfmlValue;
+    use cfml_common::dynamic::ValueMap;
     use cfml_vm::{SessionData, session_store::SessionStore};
-    use indexmap::IndexMap;
+    
     use memberlist::{
         Options,
         agnostic::tokio::TokioRuntime,
@@ -640,7 +640,7 @@ mod inner {
         fn take_expired(
             &self,
             now_secs: u64,
-        ) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
+        ) -> Vec<(String, String, ValueMap)> {
             // Doc keys are composite `(app, id)`; collect the expired keys.
             let expired_keys: Vec<String> = match self.shared.docs.lock() {
                 Ok(docs) => docs

@@ -1,7 +1,6 @@
 //! Pluggable session storage backend.
 
-use cfml_common::dynamic::CfmlValue;
-use indexmap::IndexMap;
+use cfml_common::dynamic::ValueMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +37,7 @@ pub trait SessionStore: Send + Sync + 'static {
     /// session so callers can route `onSessionEnd` to the owning application.
     /// `app_name` is `""` for stores that do not record it (memcached / KV),
     /// which also never deliver `onSessionEnd`.
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, IndexMap<String, CfmlValue>)>;
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, ValueMap)>;
 
     /// Earliest absolute expiry instant (unix epoch seconds) across all live
     /// sessions, if the store can compute it cheaply. Drives adaptive reaper
@@ -135,7 +134,7 @@ impl SessionStore for MemoryStore {
         self.get(app, id).is_some()
     }
 
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, ValueMap)> {
         if let Ok(mut m) = self.inner.lock() {
             let expired: Vec<String> = m
                 .iter()
@@ -165,11 +164,12 @@ impl SessionStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cfml_common::dynamic::CfmlValue;
     use crate::now_epoch_secs;
 
     fn session(app: &str, last_accessed: u64, timeout: u64) -> SessionData {
         SessionData {
-            variables: IndexMap::new(),
+            variables: ValueMap::default(),
             created_secs: last_accessed,
             last_accessed_secs: last_accessed,
             auth_user: None,

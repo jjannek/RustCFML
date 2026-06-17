@@ -6,8 +6,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use cfml_common::dynamic::CfmlValue;
-use indexmap::IndexMap;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use worker::{Method, Request};
 
 /// Extracts request data and builds the four standard CFML scopes.
@@ -18,7 +17,7 @@ pub async fn build_from_request(
     req: &mut Request,
     script_name: &str,
     path_info: &str,
-) -> worker::Result<(IndexMap<String, CfmlValue>, CfmlValue)> {
+) -> worker::Result<(ValueMap, CfmlValue)> {
     let method = req.method().to_string().to_uppercase();
     let url = req.url()?;
     let query_string = url.query().unwrap_or("").to_string();

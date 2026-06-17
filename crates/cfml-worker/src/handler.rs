@@ -8,13 +8,12 @@ use crate::kv_stores::{KvBackedApplicationStore, KvBackedSessionStore};
 use crate::scopes;
 use crate::WorkerConfig;
 use cfml_codegen::compiler::CfmlCompiler;
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::Vfs;
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
 use cfml_vm::web::resolve_file;
 use cfml_vm::{ApplicationStore, CfmlVirtualMachine, MemoryApplicationStore, MemoryStore, ServerState, SessionStore};
-use indexmap::IndexMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use worker::*;
@@ -283,7 +282,7 @@ pub(crate) struct ResponseData {
 pub(crate) fn run_cfml(
     file_path: &str,
     vfs: Arc<dyn Vfs>,
-    extra_globals: IndexMap<String, CfmlValue>,
+    extra_globals: ValueMap,
     http_request_data: CfmlValue,
     server_state: &ServerState,
     session_id: Option<String>,
@@ -327,13 +326,13 @@ pub(crate) fn run_cfml(
 
     vm.globals
         .entry("url".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
     vm.globals
         .entry("cgi".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
     vm.globals
         .entry("form".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     for (name, value) in extra_globals {
         vm.globals.insert(name, value);

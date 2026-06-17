@@ -28,9 +28,8 @@
 //! instead.
 
 use crate::{ThreadHandle, ThreadResult};
-use cfml_common::dynamic::{CfmlNative, CfmlValue};
+use cfml_common::dynamic::{CfmlNative, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
-use indexmap::IndexMap;
 use std::sync::Mutex;
 
 /// A Future wrapping one spawned async task. Either holds a live
@@ -266,7 +265,7 @@ impl CfmlNative for FutureNative {
 
 /// Read a numeric option from a CFML struct (case-insensitive). Returns
 /// `None` when the key is absent or unparseable.
-pub fn struct_get_i64(s: &IndexMap<String, CfmlValue>, key: &str) -> Option<i64> {
+pub fn struct_get_i64(s: &ValueMap, key: &str) -> Option<i64> {
     s.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
         .and_then(|(_, v)| match v {

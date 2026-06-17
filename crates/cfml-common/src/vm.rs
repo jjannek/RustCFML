@@ -1,7 +1,6 @@
 //! Virtual machine types and context
 
-use crate::dynamic::CfmlValue;
-use indexmap::IndexMap;
+use crate::dynamic::{CfmlValue, ValueMap};
 
 pub type CfmlResult = Result<CfmlValue, CfmlError>;
 
@@ -72,11 +71,11 @@ impl std::fmt::Display for CfmlError {
 }
 
 pub struct CfmlContext {
-    pub scopes: Vec<IndexMap<String, CfmlValue>>,
+    pub scopes: Vec<ValueMap>,
     pub this: Option<CfmlValue>,
     pub super_scope: Option<CfmlValue>,
-    pub variables: IndexMap<String, CfmlValue>,
-    pub local_vars: IndexMap<String, CfmlValue>,
+    pub variables: ValueMap,
+    pub local_vars: ValueMap,
     pub output_buffer: String,
     pub output_enabled: bool,
 }
@@ -87,15 +86,15 @@ impl CfmlContext {
             scopes: Vec::new(),
             this: None,
             super_scope: None,
-            variables: IndexMap::new(),
-            local_vars: IndexMap::new(),
+            variables: ValueMap::default(),
+            local_vars: ValueMap::default(),
             output_buffer: String::new(),
             output_enabled: true,
         }
     }
 
     pub fn push_scope(&mut self) {
-        self.scopes.push(IndexMap::new());
+        self.scopes.push(ValueMap::default());
     }
 
     pub fn pop_scope(&mut self) {
@@ -139,7 +138,7 @@ pub struct CfmlFrame {
     pub name: String,
     pub ip: usize,
     pub stack: Vec<CfmlValue>,
-    pub locals: IndexMap<String, CfmlValue>,
+    pub locals: ValueMap,
 }
 
 impl CfmlFrame {
@@ -148,7 +147,7 @@ impl CfmlFrame {
             name,
             ip: 0,
             stack: Vec::new(),
-            locals: IndexMap::new(),
+            locals: ValueMap::default(),
         }
     }
 }

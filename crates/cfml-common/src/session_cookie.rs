@@ -27,8 +27,7 @@
 //! case: an explicit `this.sessioncookie.secure = false` is honoured verbatim on
 //! both runtimes. See `docs/known-issues.md`.
 
-use crate::dynamic::CfmlValue;
-use indexmap::IndexMap;
+use crate::dynamic::{CfmlValue, ValueMap};
 
 /// The `SameSite` cookie attribute. `Unset` emits no `SameSite` attribute at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +89,7 @@ impl SessionCookiePolicy {
     /// map (the same `IndexMap` the other `this.*` session settings are read
     /// from). Absent or non-struct → all defaults. Sub-keys are matched
     /// case-insensitively; unrecognised sub-keys are ignored.
-    pub fn from_app_config(config: &IndexMap<String, CfmlValue>) -> Self {
+    pub fn from_app_config(config: &ValueMap) -> Self {
         let mut p = SessionCookiePolicy::default();
         if let Some(CfmlValue::Struct(sc)) = config.get("sessioncookie") {
             if let Some(v) = sc.get_ci("secure") {
@@ -152,15 +151,15 @@ impl SessionCookiePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dynamic::CfmlValue;
+    use crate::dynamic::{CfmlValue, ValueMap};
     use indexmap::IndexMap;
 
-    fn cfg_with(inner: Vec<(&str, CfmlValue)>) -> IndexMap<String, CfmlValue> {
-        let mut sc = IndexMap::new();
+    fn cfg_with(inner: Vec<(&str, CfmlValue)>) -> ValueMap {
+        let mut sc = ValueMap::default();
         for (k, v) in inner {
             sc.insert(k.to_string(), v);
         }
-        let mut config = IndexMap::new();
+        let mut config = ValueMap::default();
         config.insert("sessioncookie".to_string(), CfmlValue::strukt(sc));
         config
     }
@@ -238,7 +237,7 @@ mod tests {
 
     #[test]
     fn absent_sessioncookie_is_default() {
-        let config: IndexMap<String, CfmlValue> = IndexMap::new();
+        let config: ValueMap = ValueMap::default();
         let p = SessionCookiePolicy::from_app_config(&config);
         assert_eq!(p.secure, None);
         assert_eq!(p.samesite, SameSite::Lax);

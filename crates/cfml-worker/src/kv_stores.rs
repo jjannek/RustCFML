@@ -188,7 +188,7 @@ impl SessionStore for KvBackedSessionStore {
         self.memory.contains(MEM_APP, id)
     }
 
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, indexmap::IndexMap<String, cfml_common::dynamic::CfmlValue>)> {
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, cfml_common::dynamic::ValueMap)> {
         // Worker isolates don't run a background sweeper — expiry is handled
         // by KV TTL. Always return empty so the VM doesn't try to fire
         // onSessionEnd for sessions it can't observe.
@@ -233,7 +233,7 @@ impl KvBackedApplicationStore {
                         // relies on it for per-isolate priming (function
                         // tables, caches, etc.).
                         started: false,
-                        config: indexmap::IndexMap::new(),
+                        config: cfml_common::dynamic::ValueMap::default(),
                         app_function_table: Vec::new(),
                         session_storage: None,
                         app_caches: indexmap::IndexMap::new(),
@@ -292,5 +292,5 @@ impl ApplicationStore for KvBackedApplicationStore {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedApp {
-    variables: indexmap::IndexMap<String, cfml_common::dynamic::CfmlValue>,
+    variables: cfml_common::dynamic::ValueMap,
 }

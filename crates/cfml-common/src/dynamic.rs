@@ -7,6 +7,20 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
+/// Build-hasher for all per-call scope maps, struct maps, and query-row maps.
+///
+/// CFML scope/struct keys are short ASCII identifiers and case-insensitivity is
+/// handled by callers (`get_ci`, `eq_ignore_ascii_case` scans), NOT the hasher —
+/// so SipHash's DoS-resistance buys nothing here. `FxHasher` is ~3-5x faster on
+/// short keys; hashing was the #1 self-time bucket in the v0.192 `/posts` profile.
+pub type ValueBuildHasher = std::hash::BuildHasherDefault<rustc_hash::FxHasher>;
+
+/// `ValueMap` with the fast [`ValueBuildHasher`]. The ordered
+/// key-value map underpinning CFML structs, scopes, and query rows. Construct with
+/// `ValueMap::default()` (the `ValueMap::default()` ctor only exists for `RandomState`)
+/// and pre-size with `ValueMap::with_capacity_and_hasher(n, Default::default())`.
+pub type ValueMap = IndexMap<String, CfmlValue, ValueBuildHasher>;
+
 /// Shared, interior-mutable backing for a CFML array — the basis of Lucee-style
 /// **reference semantics**. Cloning a `CfmlArray` bumps the `Arc` (it does NOT
 /// copy the elements), so `b = a` makes `a` and `b` two handles onto the *same*
@@ -171,7 +185,7 @@ impl FromIterator<CfmlValue> for CfmlArray {
 /// wide atomic counter; `0` is reserved (never used) so an
 /// uninitialised IC slot is always a miss.
 pub struct StructInner {
-    pub map: IndexMap<String, CfmlValue>,
+    pub map: ValueMap,
     pub shape_id: u64,
 }
 
@@ -188,7 +202,7 @@ pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
 impl CfmlStruct {
     #[inline]
-    pub fn new(m: IndexMap<String, CfmlValue>) -> Self {
+    pub fn new(m: ValueMap) -> Self {
         CfmlStruct(Arc::new(PlRwLock::new(StructInner {
             map: m,
             shape_id: next_shape_id(),
@@ -197,7 +211,7 @@ impl CfmlStruct {
 
     #[inline]
     pub fn empty() -> Self {
-        CfmlStruct::new(IndexMap::new())
+        CfmlStruct::new(ValueMap::default())
     }
 
     /// Two handles onto the same backing store (reference identity).
@@ -384,7 +398,7 @@ impl CfmlStruct {
     /// loop body may call back into code that touches the same struct — it
     /// releases the lock so re-entrancy can't deadlock.
     #[inline]
-    pub fn snapshot(&self) -> IndexMap<String, CfmlValue> {
+    pub fn snapshot(&self) -> ValueMap {
         self.0.read().map.clone()
     }
 
@@ -401,7 +415,7 @@ impl CfmlStruct {
 
     /// Alias for `snapshot()` — owned copy of the entries.
     #[inline]
-    pub fn to_indexmap(&self) -> IndexMap<String, CfmlValue> {
+    pub fn to_indexmap(&self) -> ValueMap {
         self.snapshot()
     }
 
@@ -412,7 +426,7 @@ impl CfmlStruct {
     /// see whether the operation was structural. Conservative: every
     /// `with_write` invalidates all ICs on this struct.
     #[inline]
-    pub fn with_write<R>(&self, f: impl FnOnce(&mut IndexMap<String, CfmlValue>) -> R) -> R {
+    pub fn with_write<R>(&self, f: impl FnOnce(&mut ValueMap) -> R) -> R {
         let mut g = self.0.write();
         g.shape_id = next_shape_id();
         f(&mut g.map)
@@ -420,7 +434,7 @@ impl CfmlStruct {
 
     /// Run a closure with shared (read) access. Same re-entrancy caveat.
     #[inline]
-    pub fn with_read<R>(&self, f: impl FnOnce(&IndexMap<String, CfmlValue>) -> R) -> R {
+    pub fn with_read<R>(&self, f: impl FnOnce(&ValueMap) -> R) -> R {
         f(&self.0.read().map)
     }
 
@@ -438,7 +452,7 @@ impl CfmlStruct {
         let entry = g
             .map
             .entry(key.to_string())
-            .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+            .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
         let result = if let CfmlValue::Struct(s) = entry {
             s.clone()
         } else {
@@ -756,7 +770,7 @@ impl CfmlValue {
     /// Construct a `CfmlValue::Struct` from an owned `IndexMap`, wrapping in
     /// the shared Arc layer. Named `strukt` because `struct` is a keyword.
     #[inline]
-    pub fn strukt(m: IndexMap<String, CfmlValue>) -> Self {
+    pub fn strukt(m: ValueMap) -> Self {
         CfmlValue::Struct(CfmlStruct::new(m))
     }
 
@@ -802,7 +816,7 @@ impl CfmlValue {
 
     /// A point-in-time copy of the struct's entries. Returns `None` for
     /// non-structs. (A snapshot, not a borrow — the backing is behind a lock.)
-    pub fn as_struct(&self) -> Option<IndexMap<String, CfmlValue>> {
+    pub fn as_struct(&self) -> Option<ValueMap> {
         match self {
             CfmlValue::Struct(s) => Some(s.snapshot()),
             _ => None,
@@ -960,7 +974,7 @@ impl fmt::Display for CfmlValue {
 pub struct CfmlClosure {
     pub params: Vec<String>,
     pub body: Box<CfmlClosureBody>,
-    pub captured_vars: IndexMap<String, CfmlValue>,
+    pub captured_vars: ValueMap,
 }
 
 #[derive(Debug, Clone)]
@@ -979,7 +993,7 @@ pub enum CfmlStatement {
 #[derive(Debug, Clone)]
 pub struct CfmlComponent {
     pub name: String,
-    pub properties: IndexMap<String, CfmlValue>,
+    pub properties: ValueMap,
     pub methods: HashMap<String, CfmlFunction>,
     pub extends: Option<String>,
     pub implements: Vec<String>,
@@ -989,7 +1003,7 @@ impl CfmlComponent {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            properties: IndexMap::new(),
+            properties: ValueMap::default(),
             methods: HashMap::new(),
             extends: None,
             implements: Vec::new(),
@@ -1006,7 +1020,7 @@ pub struct CfmlFunction {
     pub access: CfmlAccess,
     /// Captured scope for closures — shared mutable environment so multiple
     /// invocations (and sibling closures) see each other's mutations.
-    pub captured_scope: Option<Arc<RwLock<IndexMap<String, CfmlValue>>>>,
+    pub captured_scope: Option<Arc<RwLock<ValueMap>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1058,7 +1072,7 @@ impl CfmlQueryData {
     /// extend the column list (matching Lucee/ACF row-then-column behaviour).
     pub fn from_named_rows(
         columns: Vec<String>,
-        rows: Vec<IndexMap<String, CfmlValue>>,
+        rows: Vec<ValueMap>,
     ) -> Self {
         let mut q = Self::new(columns);
         for row in rows {
@@ -1132,11 +1146,11 @@ impl CfmlQueryData {
     }
 
     /// Synthesise a single row as an `IndexMap` keyed by canonical column names.
-    pub fn row_at(&self, row: usize) -> Option<IndexMap<String, CfmlValue>> {
+    pub fn row_at(&self, row: usize) -> Option<ValueMap> {
         if row >= self.row_count() {
             return None;
         }
-        let mut m = IndexMap::with_capacity(self.columns.len());
+        let mut m = ValueMap::with_capacity_and_hasher(self.columns.len(), Default::default());
         for (ci, col) in self.columns.iter().enumerate() {
             m.insert(col.clone(), self.data[ci][row].clone());
         }
@@ -1144,7 +1158,7 @@ impl CfmlQueryData {
     }
 
     /// Synthesise every row as an `IndexMap` (used by Debug, serde, snapshot).
-    pub fn synthesise_rows(&self) -> Vec<IndexMap<String, CfmlValue>> {
+    pub fn synthesise_rows(&self) -> Vec<ValueMap> {
         (0..self.row_count()).map(|r| self.row_at(r).unwrap()).collect()
     }
 
@@ -1161,7 +1175,7 @@ impl CfmlQueryData {
     /// Append a row keyed by column name (CI). Any column in `row` that is not
     /// already known extends `columns` (and back-fills prior rows with Null).
     /// Missing columns get Null. Keeps the column-major invariant.
-    pub fn push_row_named(&mut self, row: IndexMap<String, CfmlValue>) {
+    pub fn push_row_named(&mut self, row: ValueMap) {
         // Extend columns with any new keys (rare in practice — most rows have
         // the same shape).
         for k in row.keys() {
@@ -1192,7 +1206,7 @@ impl CfmlQueryData {
         }
     }
 
-    pub fn insert_row_named(&mut self, at: usize, row: IndexMap<String, CfmlValue>) {
+    pub fn insert_row_named(&mut self, at: usize, row: ValueMap) {
         for k in row.keys() {
             if self.column_index_ci(k).is_none() {
                 self.columns.push(k.clone());
@@ -1212,7 +1226,7 @@ impl CfmlQueryData {
     }
 
     /// Remove a row and return its synthesised `IndexMap`, or None if oob.
-    pub fn remove_row(&mut self, row: usize) -> Option<IndexMap<String, CfmlValue>> {
+    pub fn remove_row(&mut self, row: usize) -> Option<ValueMap> {
         if row >= self.row_count() {
             return None;
         }
@@ -1342,14 +1356,14 @@ impl CfmlQuery {
 
     /// Build from columns + row-shaped data (sql = None). Rows are unpacked
     /// into column-major storage.
-    pub fn from_parts(columns: Vec<String>, rows: Vec<IndexMap<String, CfmlValue>>) -> Self {
+    pub fn from_parts(columns: Vec<String>, rows: Vec<ValueMap>) -> Self {
         CfmlQuery::from_data(CfmlQueryData::from_named_rows(columns, rows))
     }
 
     /// Build from columns + row-shaped data + originating SQL.
     pub fn from_parts_sql(
         columns: Vec<String>,
-        rows: Vec<IndexMap<String, CfmlValue>>,
+        rows: Vec<ValueMap>,
         sql: Option<String>,
     ) -> Self {
         let mut d = CfmlQueryData::from_named_rows(columns, rows);
@@ -1417,12 +1431,12 @@ impl CfmlQuery {
     /// A point-in-time snapshot of the rows as `IndexMap`s. Synthesised from
     /// column-major storage on demand.
     #[inline]
-    pub fn rows(&self) -> Vec<IndexMap<String, CfmlValue>> {
+    pub fn rows(&self) -> Vec<ValueMap> {
         self.0.read().synthesise_rows()
     }
 
     /// Snapshot of a single 0-based row, or `None` if out of range.
-    pub fn get_row(&self, row0: usize) -> Option<IndexMap<String, CfmlValue>> {
+    pub fn get_row(&self, row0: usize) -> Option<ValueMap> {
         self.0.read().row_at(row0)
     }
 
@@ -1437,7 +1451,7 @@ impl CfmlQuery {
     /// Append a row in place (interior mutability — visible to all aliases).
     /// This is the **O(1)** push that fixes the old O(n²) query build.
     #[inline]
-    pub fn add_row(&self, row: IndexMap<String, CfmlValue>) {
+    pub fn add_row(&self, row: ValueMap) {
         self.0.write().push_row_named(row);
     }
 
@@ -1607,7 +1621,7 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
         Ok(CfmlValue::array(vec))
     }
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<CfmlValue, A::Error> {
-        let mut map: IndexMap<String, CfmlValue> = IndexMap::new();
+        let mut map: ValueMap = ValueMap::default();
         while let Some((k, v)) = a.next_entry::<String, CfmlValue>()? {
             map.insert(k, v);
         }
@@ -1627,7 +1641,7 @@ impl<'de> serde::de::Visitor<'de> for CfmlValueVisitor {
                     if let Some(CfmlValue::Array(cols)) = map.get("columns") {
                         let columns: Vec<String> =
                             cols.snapshot().iter().map(|v| v.as_string()).collect();
-                        let mut rows: Vec<IndexMap<String, CfmlValue>> = Vec::new();
+                        let mut rows: Vec<ValueMap> = Vec::new();
                         if let Some(CfmlValue::Array(row_arr)) = map.get("rows") {
                             for row_val in row_arr.snapshot() {
                                 if let CfmlValue::Struct(row_map) = row_val {

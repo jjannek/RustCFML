@@ -13,9 +13,9 @@
 
 #[cfg(feature = "memcached")]
 mod inner {
-    use cfml_common::dynamic::CfmlValue;
+    use cfml_common::dynamic::ValueMap;
     use cfml_vm::{SessionData, session_store::SessionStore};
-    use indexmap::IndexMap;
+    
     use memcache::Client;
 
     pub struct MemcachedStore {
@@ -81,7 +81,7 @@ mod inner {
         fn take_expired(
             &self,
             _now_secs: u64,
-        ) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
+        ) -> Vec<(String, String, ValueMap)> {
             // Memcached enforces TTL natively — nothing to drain here, and
             // onSessionEnd is consequently never delivered for this store.
             Vec::new()

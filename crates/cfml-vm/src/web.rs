@@ -5,9 +5,8 @@
 //! sockets, no Tokio, no platform syscalls beyond `std::fs::write` for
 //! multipart temp files (and that one is `cfg(not(target_arch = "wasm32"))`).
 
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::Vfs;
-use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 
 /// Result of resolving a URL path to a file.
@@ -112,10 +111,10 @@ pub fn build_web_scopes(
     query_string: &str,
     port: u16,
     remote_addr: &str,
-) -> (IndexMap<String, CfmlValue>, CfmlValue) {
-    let mut globals = IndexMap::new();
+) -> (ValueMap, CfmlValue) {
+    let mut globals = ValueMap::default();
 
-    let mut cgi = IndexMap::new();
+    let mut cgi = ValueMap::default();
     cgi.insert("request_method".to_string(), CfmlValue::string(method.to_string()));
     let path_info = if path_info.is_empty() { "/" } else { path_info };
     cgi.insert("path_info".to_string(), CfmlValue::string(path_info.to_string()));
@@ -168,12 +167,12 @@ pub fn build_web_scopes(
     } else if method == "POST" && content_type.starts_with("multipart/form-data") {
         parse_multipart_sync(&content_type, body)
     } else {
-        IndexMap::new()
+        ValueMap::default()
     };
     globals.insert("form".to_string(), CfmlValue::strukt(form_scope));
 
     let cookie_scope = {
-        let mut cookies = IndexMap::new();
+        let mut cookies = ValueMap::default();
         for (name, value) in headers {
             if name.to_lowercase() == "cookie" {
                 for cookie in value.split(';') {
@@ -190,12 +189,12 @@ pub fn build_web_scopes(
     };
     globals.insert("cookie".to_string(), CfmlValue::strukt(cookie_scope));
 
-    let mut headers_struct = IndexMap::new();
+    let mut headers_struct = ValueMap::default();
     for (name, value) in headers {
         headers_struct.insert(name.clone(), CfmlValue::string(value.clone()));
     }
 
-    let mut http_request_data = IndexMap::new();
+    let mut http_request_data = ValueMap::default();
     http_request_data.insert("headers".to_string(), CfmlValue::strukt(headers_struct));
     http_request_data.insert("content".to_string(), CfmlValue::string(raw_body));
     http_request_data.insert("method".to_string(), CfmlValue::string(method.to_string()));
@@ -205,8 +204,8 @@ pub fn build_web_scopes(
 }
 
 /// Parse a query string like `name=World&id=1` into an ordered map.
-pub fn parse_query_string(qs: &str) -> IndexMap<String, CfmlValue> {
-    let mut map = IndexMap::new();
+pub fn parse_query_string(qs: &str) -> ValueMap {
+    let mut map = ValueMap::default();
     if qs.is_empty() {
         return map;
     }
@@ -306,8 +305,8 @@ pub fn url_decode(s: &str) -> String {
 /// `cffile action="upload"` can move them later. On `wasm32-unknown-unknown`
 /// there is no temp dir; we still expose the metadata + inline content but
 /// `tempFilePath` is empty.
-pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> IndexMap<String, CfmlValue> {
-    let mut form = IndexMap::new();
+pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> ValueMap {
+    let mut form = ValueMap::default();
 
     let boundary = content_type
         .split(';')
@@ -384,7 +383,7 @@ pub fn parse_multipart_sync(content_type: &str, body: &[u8]) -> IndexMap<String,
         if let Some(fname) = file_name {
             let (server_dir, temp_path) = write_multipart_file(&fname, part_body.as_bytes());
 
-            let mut file_info = IndexMap::new();
+            let mut file_info = ValueMap::default();
             file_info.insert("serverFile".to_string(), CfmlValue::string(fname.clone()));
             file_info.insert("clientFile".to_string(), CfmlValue::string(fname.clone()));
             file_info.insert("serverDirectory".to_string(), CfmlValue::string(server_dir));

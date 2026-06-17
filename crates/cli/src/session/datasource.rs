@@ -31,10 +31,9 @@
 //! If DDL is denied by the datasource grants, the first operation fails with
 //! a clear error telling the operator to pre-create the documented schema.
 
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::CfmlResult;
 use cfml_vm::{SessionData, session_store::SessionStore};
-use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -102,7 +101,7 @@ impl DatasourceStore {
 
     /// Run a statement through the shared query pipeline.
     fn run(&self, sql: &str, params: Vec<CfmlValue>, return_type: &str) -> CfmlResult {
-        let mut opts = IndexMap::new();
+        let mut opts = ValueMap::default();
         opts.insert(
             "datasource".to_string(),
             CfmlValue::string(self.datasource.clone()),
@@ -346,7 +345,7 @@ impl SessionStore for DatasourceStore {
         self.get(app, id).is_some()
     }
 
-    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, IndexMap<String, CfmlValue>)> {
+    fn take_expired(&self, now_secs: u64) -> Vec<(String, String, ValueMap)> {
         self.ensure_schema();
         // Sweep every application's expired sessions (the reaper routes
         // onSessionEnd by the row's own app_name), not just one partition.
@@ -430,7 +429,7 @@ mod tests {
     use super::*;
 
     fn session(vars: &[(&str, CfmlValue)], last_accessed: u64, timeout: u64) -> SessionData {
-        let mut m = IndexMap::new();
+        let mut m = ValueMap::default();
         for (k, v) in vars {
             m.insert(k.to_string(), v.clone());
         }

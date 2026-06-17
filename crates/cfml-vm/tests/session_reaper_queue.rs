@@ -5,17 +5,17 @@
 //! tests exercise that queue directly (queueing, per-app keying, bounded
 //! capacity, drain semantics) without standing up a full server.
 
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_vm::ServerState;
 use indexmap::IndexMap;
 
-fn vars(tag: &str) -> IndexMap<String, CfmlValue> {
-    let mut m = IndexMap::new();
+fn vars(tag: &str) -> ValueMap {
+    let mut m = ValueMap::default();
     m.insert("marker".to_string(), CfmlValue::string(tag.to_string()));
     m
 }
 
-fn marker(v: &IndexMap<String, CfmlValue>) -> String {
+fn marker(v: &ValueMap) -> String {
     v.get("marker").map(|x| x.as_string()).unwrap_or_default()
 }
 

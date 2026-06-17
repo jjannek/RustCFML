@@ -18,7 +18,7 @@
 //! columns_minimal, tables, index, foreignkeys, dbnames, procedures,
 //! procedure_columns, users, terms.
 
-use cfml_common::dynamic::{CfmlQuery, CfmlValue};
+use cfml_common::dynamic::{CfmlQuery, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 
@@ -30,7 +30,7 @@ use crate::builtins::{
 /// struct argument: the cfdbinfo attributes (already attributeCollection-
 /// expanded and per-app-datasource-resolved by the VM intercept).
 pub fn fn_dbinfo_impl(args: Vec<CfmlValue>) -> CfmlResult {
-    let opts: IndexMap<String, CfmlValue> = match args.first() {
+    let opts: ValueMap = match args.first() {
         Some(CfmlValue::Struct(s)) => s.snapshot(),
         _ => {
             return Err(CfmlError::runtime(
@@ -129,7 +129,7 @@ pub fn fn_dbinfo_impl(args: Vec<CfmlValue>) -> CfmlResult {
 
 /// Run SQL on the datasource through the normal queryExecute plumbing.
 fn run(ds: &str, sql: &str, params: Vec<CfmlValue>) -> Result<CfmlQuery, CfmlError> {
-    let mut opts = IndexMap::new();
+    let mut opts = ValueMap::default();
     opts.insert("datasource".to_string(), CfmlValue::string(ds.to_string()));
     match fn_query_execute(vec![
         CfmlValue::string(sql.to_string()),
@@ -145,16 +145,16 @@ fn run(ds: &str, sql: &str, params: Vec<CfmlValue>) -> Result<CfmlQuery, CfmlErr
 }
 
 /// Case-insensitive cell read from a row.
-fn cell<'a>(row: &'a IndexMap<String, CfmlValue>, name: &str) -> Option<&'a CfmlValue> {
+fn cell<'a>(row: &'a ValueMap, name: &str) -> Option<&'a CfmlValue> {
     row.get(name)
         .or_else(|| row.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v))
 }
 
-fn cell_str(row: &IndexMap<String, CfmlValue>, name: &str) -> String {
+fn cell_str(row: &ValueMap, name: &str) -> String {
     cell(row, name).map(|v| v.as_string()).unwrap_or_default()
 }
 
-fn cell_int(row: &IndexMap<String, CfmlValue>, name: &str) -> i64 {
+fn cell_int(row: &ValueMap, name: &str) -> i64 {
     match cell(row, name) {
         Some(CfmlValue::Int(i)) => *i,
         Some(CfmlValue::Double(d)) => *d as i64,
@@ -307,7 +307,7 @@ fn type_version(ds: &str, driver: &DbDriver) -> CfmlResult {
             )
         }
     };
-    let mut row = IndexMap::new();
+    let mut row = ValueMap::default();
     row.insert("database_productname".to_string(), s(&product));
     row.insert("database_version".to_string(), s(&version));
     row.insert("driver_name".to_string(), s(driver_name));
@@ -701,7 +701,7 @@ fn type_columns(
                 continue;
             }
         }
-        let mut row = IndexMap::new();
+        let mut row = ValueMap::default();
         row.insert("TABLE_CAT".to_string(), s(&c.table_cat));
         row.insert("TABLE_SCHEM".to_string(), s(&c.table_schem));
         row.insert("TABLE_NAME".to_string(), s(&c.table_name));
@@ -889,7 +889,7 @@ fn type_tables(
                 continue;
             }
         }
-        let mut row = IndexMap::new();
+        let mut row = ValueMap::default();
         row.insert("TABLE_CAT".to_string(), s(&cat));
         row.insert("TABLE_SCHEM".to_string(), s(&schem));
         row.insert("TABLE_NAME".to_string(), s(&name));
@@ -930,7 +930,7 @@ fn type_index(ds: &str, driver: &DbDriver, table: &str, schema: Option<&str>) ->
                         column_name: &str,
                         asc: &str,
                         cardinality: i64| {
-        let mut row = IndexMap::new();
+        let mut row = ValueMap::default();
         row.insert("TABLE_CAT".to_string(), CfmlValue::Null);
         row.insert("TABLE_SCHEM".to_string(), CfmlValue::Null);
         row.insert("TABLE_NAME".to_string(), s(table_name));
@@ -1199,7 +1199,7 @@ fn type_foreignkeys(ds: &str, driver: &DbDriver, table: &str, schema: Option<&st
 
     let mut rows = Vec::new();
     for (pkcol, fktable, fkcol, key_seq, upd, del, fk_name) in raw {
-        let mut row = IndexMap::new();
+        let mut row = ValueMap::default();
         row.insert("PKTABLE_CAT".to_string(), CfmlValue::Null);
         row.insert("PKTABLE_SCHEM".to_string(), CfmlValue::Null);
         row.insert("PKTABLE_NAME".to_string(), s(&table));
@@ -1289,7 +1289,7 @@ fn type_dbnames(ds: &str, driver: &DbDriver, pattern: Option<&str>) -> CfmlResul
                 continue;
             }
         }
-        let mut row = IndexMap::new();
+        let mut row = ValueMap::default();
         row.insert("database_name".to_string(), s(&name));
         row.insert("type".to_string(), s(&kind));
         rows.push(row);
@@ -1374,7 +1374,7 @@ fn type_procedures(ds: &str, driver: &DbDriver, pattern: Option<&str>) -> CfmlRe
                 continue;
             }
         }
-        let mut row = IndexMap::new();
+        let mut row = ValueMap::default();
         row.insert("PROCEDURE_CAT".to_string(), s(&cat));
         row.insert("PROCEDURE_SCHEM".to_string(), s(&schem));
         row.insert("PROCEDURE_NAME".to_string(), s(&name));
@@ -1442,7 +1442,7 @@ fn type_procedure_columns(ds: &str, driver: &DbDriver, procedure: &str) -> CfmlR
     };
     let mut rows = Vec::new();
     for (proc_name, col, mode, type_name, ordinal) in raw {
-        let mut row = IndexMap::new();
+        let mut row = ValueMap::default();
         row.insert("PROCEDURE_CAT".to_string(), CfmlValue::Null);
         row.insert("PROCEDURE_SCHEM".to_string(), CfmlValue::Null);
         row.insert("PROCEDURE_NAME".to_string(), s(&proc_name));
@@ -1495,7 +1495,7 @@ fn type_users(ds: &str, driver: &DbDriver) -> CfmlResult {
     let rows = names
         .into_iter()
         .map(|n| {
-            let mut row = IndexMap::new();
+            let mut row = ValueMap::default();
             row.insert("USER".to_string(), s(&n));
             row
         })
@@ -1510,7 +1510,7 @@ fn type_terms(driver: &DbDriver) -> CfmlValue {
         DbDriver::Postgres(_) => ("function", "database", "schema"),
         DbDriver::Mssql(_) => ("procedure", "database", "schema"),
     };
-    let mut m = IndexMap::new();
+    let mut m = ValueMap::default();
     m.insert("procedure".to_string(), s(proc_term));
     m.insert("catalog".to_string(), s(cat_term));
     m.insert("schema".to_string(), s(schema_term));

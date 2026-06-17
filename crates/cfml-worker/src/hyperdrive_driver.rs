@@ -22,10 +22,9 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use cfml_stdlib::DynamicDbDriver;
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use worker::Hyperdrive;
@@ -201,7 +200,7 @@ fn json_to_cfml(v: serde_json::Value) -> CfmlValue {
             CfmlValue::array(arr.into_iter().map(json_to_cfml).collect())
         }
         serde_json::Value::Object(obj) => {
-            let mut m = IndexMap::new();
+            let mut m = ValueMap::default();
             for (k, val) in obj {
                 m.insert(k, json_to_cfml(val));
             }
@@ -227,7 +226,7 @@ fn rows_to_query(
 
     let mut records: Vec<CfmlValue> = Vec::with_capacity(record_count);
     for row in rows {
-        let mut rec = IndexMap::new();
+        let mut rec = ValueMap::default();
         for col in &columns {
             let val = row
                 .iter()
@@ -239,7 +238,7 @@ fn rows_to_query(
         records.push(CfmlValue::strukt(rec));
     }
 
-    let mut q = IndexMap::new();
+    let mut q = ValueMap::default();
     q.insert("recordCount".into(), CfmlValue::Int(record_count as i64));
     // columnList reports column names uppercased, matching Lucee/ACF.
     q.insert("columnList".into(), CfmlValue::string(columns.iter().map(|c| c.to_uppercase()).collect::<Vec<_>>().join(",")));
@@ -254,7 +253,7 @@ fn rows_to_query(
     );
     q.insert("data".into(), CfmlValue::array(records));
 
-    let mut driver_meta = IndexMap::new();
+    let mut driver_meta = ValueMap::default();
     driver_meta.insert("duration_ms".into(), CfmlValue::Double(meta.duration));
     driver_meta.insert(
         "rows_affected".into(),
@@ -273,7 +272,7 @@ fn rows_to_array(rows: Vec<serde_json::Map<String, serde_json::Value>>) -> CfmlV
     CfmlValue::array(
         rows.into_iter()
             .map(|row| {
-                let mut rec = IndexMap::new();
+                let mut rec = ValueMap::default();
                 for (k, v) in row {
                     rec.insert(k, json_to_cfml(v));
                 }
@@ -287,7 +286,7 @@ fn rows_to_struct_by_key(
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
     key: &str,
 ) -> CfmlValue {
-    let mut out = IndexMap::new();
+    let mut out = ValueMap::default();
     for row in rows {
         let key_val = row
             .iter()
@@ -298,7 +297,7 @@ fn rows_to_struct_by_key(
             serde_json::Value::String(s) => s,
             other => other.to_string(),
         };
-        let mut rec = IndexMap::new();
+        let mut rec = ValueMap::default();
         for (k, v) in row {
             rec.insert(k, json_to_cfml(v));
         }

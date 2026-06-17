@@ -1,7 +1,7 @@
 //! CFML Virtual Machine - Bytecode execution engine
 
 use cfml_codegen::{BytecodeFunction, BytecodeOp, BytecodeProgram, CmpOp};
-use cfml_common::dynamic::{CfmlQuery, CfmlStruct, CfmlValue};
+use cfml_common::dynamic::{CfmlQuery, CfmlStruct, CfmlValue, ValueMap};
 use cfml_common::vfs::{RealFs, Vfs};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
@@ -64,9 +64,9 @@ const ARGUMENTS_SCOPE_KEY: &str = "__arguments__";
 #[derive(Clone)]
 pub struct ApplicationState {
     pub name: String,
-    pub variables: IndexMap<String, CfmlValue>,
+    pub variables: ValueMap,
     pub started: bool,
-    pub config: IndexMap<String, CfmlValue>,
+    pub config: ValueMap,
     /// Functions reachable from application scope, carried across requests so a
     /// long-lived CFC instance / factory / closure stays resolvable even on a
     /// request that doesn't reload its source file. At request start these `Arc`s
@@ -94,7 +94,7 @@ pub struct CfmlMapping {
 /// Session data for a single user session.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionData {
-    pub variables: IndexMap<String, CfmlValue>,
+    pub variables: ValueMap,
     /// Unix epoch seconds when the session was created.
     pub created_secs: u64,
     /// Unix epoch seconds of the most recent access.
@@ -166,7 +166,7 @@ fn validate_session_value(path: &str, v: &CfmlValue) -> Result<(), String> {
 
 /// Validate a whole session variable map against the data-only rule, turning a
 /// violation into a `CfmlError` whose message names the offending key path.
-fn validate_session_data_only(vars: &IndexMap<String, CfmlValue>) -> Result<(), CfmlError> {
+fn validate_session_data_only(vars: &ValueMap) -> Result<(), CfmlError> {
     for (k, v) in vars.iter() {
         if k.starts_with("__") {
             continue;
@@ -317,7 +317,7 @@ impl BytecodeCache {
 pub(crate) fn cfconfig_to_cfml(cfg: &cfml_config::RustCfmlConfig) -> CfmlValue {
     match serde_json::to_value(cfg) {
         Ok(v) => json_value_to_cfml(v),
-        Err(_) => CfmlValue::strukt(IndexMap::new()),
+        Err(_) => CfmlValue::strukt(ValueMap::default()),
     }
 }
 
@@ -339,7 +339,7 @@ fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
             CfmlValue::array(arr.into_iter().map(json_value_to_cfml).collect())
         }
         serde_json::Value::Object(obj) => {
-            let mut map = IndexMap::new();
+            let mut map = ValueMap::default();
             for (k, v) in obj {
                 map.insert(k, json_value_to_cfml(v));
             }
@@ -348,10 +348,10 @@ fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
     }
 }
 
-fn build_server_scope() -> IndexMap<String, CfmlValue> {
-    let mut info = IndexMap::new();
+fn build_server_scope() -> ValueMap {
+    let mut info = ValueMap::default();
 
-    let mut cf = IndexMap::new();
+    let mut cf = ValueMap::default();
     cf.insert(
         "productname".to_string(),
         CfmlValue::string("RustCFML".to_string()),
@@ -366,7 +366,7 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
     );
     info.insert("coldfusion".to_string(), CfmlValue::strukt(cf));
 
-    let mut os = IndexMap::new();
+    let mut os = ValueMap::default();
     os.insert(
         "name".to_string(),
         CfmlValue::string(std::env::consts::OS.to_string()),
@@ -384,13 +384,13 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
     let path_sep = if cfg!(windows) { ";" } else { ":" }.to_string();
     let line_sep = if cfg!(windows) { "\r\n" } else { "\n" }.to_string();
 
-    let mut sep = IndexMap::new();
+    let mut sep = ValueMap::default();
     sep.insert("file".to_string(), CfmlValue::string(file_sep.clone()));
     sep.insert("path".to_string(), CfmlValue::string(path_sep.clone()));
     sep.insert("line".to_string(), CfmlValue::string(line_sep.clone()));
     info.insert("separator".to_string(), CfmlValue::strukt(sep));
 
-    let mut java = IndexMap::new();
+    let mut java = ValueMap::default();
     java.insert(
         "version".to_string(),
         CfmlValue::string(String::new()),
@@ -407,15 +407,15 @@ fn build_server_scope() -> IndexMap<String, CfmlValue> {
     );
     info.insert("java".to_string(), CfmlValue::strukt(java));
 
-    let mut system = IndexMap::new();
+    let mut system = ValueMap::default();
 
-    let mut env = IndexMap::new();
+    let mut env = ValueMap::default();
     for (k, v) in std::env::vars() {
         env.insert(k, CfmlValue::string(v));
     }
     system.insert("environment".to_string(), CfmlValue::strukt(env));
 
-    let mut props = IndexMap::new();
+    let mut props = ValueMap::default();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -647,7 +647,7 @@ pub struct ServerState {
     /// fires `onSessionEnd` with that context. Bounded per app by
     /// `session.reapBatchMax` (oldest dropped beyond the cap).
     pub pending_session_ends:
-        Arc<Mutex<HashMap<String, std::collections::VecDeque<IndexMap<String, CfmlValue>>>>>,
+        Arc<Mutex<HashMap<String, std::collections::VecDeque<ValueMap>>>>,
 }
 
 impl ServerState {
@@ -684,7 +684,7 @@ impl ServerState {
     pub fn queue_session_end(
         &self,
         app_name: &str,
-        vars: IndexMap<String, CfmlValue>,
+        vars: ValueMap,
         batch_max: usize,
     ) -> bool {
         if let Ok(mut q) = self.pending_session_ends.lock() {
@@ -702,7 +702,7 @@ impl ServerState {
 
     /// Drain all queued `onSessionEnd` deliveries for `app_name`, returning
     /// their variable maps in arrival order. Empty when nothing is pending.
-    pub fn drain_session_ends(&self, app_name: &str) -> Vec<IndexMap<String, CfmlValue>> {
+    pub fn drain_session_ends(&self, app_name: &str) -> Vec<ValueMap> {
         if let Ok(mut q) = self.pending_session_ends.lock() {
             if let Some(dq) = q.get_mut(app_name) {
                 return dq.drain(..).collect();
@@ -727,7 +727,7 @@ enum HeldLock {
 
 pub struct CfmlVirtualMachine {
     pub program: BytecodeProgram,
-    pub globals: IndexMap<String, CfmlValue>,
+    pub globals: ValueMap,
     pub builtins: HashMap<String, BuiltinFunction>,
     pub output_buffer: String,
     /// Virtual filesystem for source file I/O (real disk or embedded archive)
@@ -756,10 +756,10 @@ pub struct CfmlVirtualMachine {
     method_this_writeback: Option<CfmlValue>,
     /// After a component method executes, holds modified variables scope entries for
     /// write-back to the component's __variables. Enables `variables.x = y` to persist.
-    method_variables_writeback: Option<IndexMap<String, CfmlValue>>,
+    method_variables_writeback: Option<ValueMap>,
     /// After a closure executes, holds modified parent-scope variables for write-back
     /// to the caller's locals. Enables closures to mutate parent scope.
-    closure_parent_writeback: Option<IndexMap<String, CfmlValue>>,
+    closure_parent_writeback: Option<ValueMap>,
     /// Request scope — lives for the duration of one request
     /// Request scope, backed by a shared `CfmlStruct` (`Arc<RwLock<IndexMap>>`)
     /// so spawned `cfthread` child VMs can share it live with the parent (CFML
@@ -808,7 +808,7 @@ pub struct CfmlVirtualMachine {
     pub mappings: Vec<CfmlMapping>,
     /// Captured locals from most recent execute_function_with_args call
     /// Used to capture component body variables (variables scope) after component loading
-    captured_locals: Option<IndexMap<String, CfmlValue>>,
+    captured_locals: Option<ValueMap>,
     /// Active transaction connection (held during cftransaction block, type-erased)
     pub transaction_conn: Option<Box<dyn std::any::Any>>,
     /// Datasource URL of the active transaction
@@ -1057,7 +1057,7 @@ pub struct ThreadResult {
     /// Wall-clock duration of the body in milliseconds.
     pub elapsed: i64,
     /// The body's `thread` scope (thread.x = ...), surfaced as cfthread.NAME.x.
-    pub thread_vars: IndexMap<String, CfmlValue>,
+    pub thread_vars: ValueMap,
     /// The closure's return value (Ok-arm). Used by the async kernel
     /// (`future.get()`) to surface the result; `cfthread` ignores it.
     pub return_value: Option<CfmlValue>,
@@ -1073,7 +1073,7 @@ pub struct ThreadSeed {
     /// Per-thread copy of the parent `variables` scope at spawn (CFML copy
     /// semantics: top-level reassignments don't leak back; nested objects stay
     /// by-reference since `CfmlValue` arrays/structs are `Arc`-backed).
-    pub variables_snapshot: IndexMap<String, CfmlValue>,
+    pub variables_snapshot: ValueMap,
     pub vfs: Arc<dyn Vfs>,
     pub server_state: Option<ServerState>,
     /// Shared live with the parent (handle clone) — see VM `application_scope`.
@@ -1172,7 +1172,7 @@ struct TryHandler {
 struct CustomTagState {
     template_path: String,
     attributes: CfmlValue,
-    start_locals: IndexMap<String, CfmlValue>,
+    start_locals: ValueMap,
     /// `cfexit method="exittag"` fired during the start phase: the body and the
     /// end phase must be skipped, but partial start-phase caller writes still
     /// propagate.
@@ -1183,7 +1183,7 @@ impl CfmlVirtualMachine {
     pub fn new(program: BytecodeProgram) -> Self {
         let mut vm = Self {
             program,
-            globals: IndexMap::new(),
+            globals: ValueMap::default(),
             builtins: HashMap::new(),
             output_buffer: String::new(),
             vfs: Arc::new(RealFs),
@@ -1401,7 +1401,7 @@ impl Drop for JitLease<'_> {
 #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
 fn jit_is_shadowed(
     user_functions: &HashMap<String, Arc<BytecodeFunction>>,
-    globals: &IndexMap<String, CfmlValue>,
+    globals: &ValueMap,
     name: &str,
 ) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -1656,11 +1656,11 @@ impl CfmlVirtualMachine {
         &mut self,
         closure: &CfmlValue,
         attributes: Option<CfmlValue>,
-        parent_locals: &IndexMap<String, CfmlValue>,
+        parent_locals: &ValueMap,
     ) -> ThreadResult {
         // Fresh `thread` scope the body writes into (thread.x = ...).
         self.globals
-            .insert("thread".to_string(), CfmlValue::strukt(IndexMap::new()));
+            .insert("thread".to_string(), CfmlValue::strukt(ValueMap::default()));
         // Expose any passed attributes as the `attributes` scope.
         if let Some(attrs) = attributes {
             self.globals.insert("attributes".to_string(), attrs);
@@ -1679,7 +1679,7 @@ impl CfmlVirtualMachine {
         };
         let thread_vars = match self.globals.shift_remove("thread") {
             Some(CfmlValue::Struct(ts)) => ts.snapshot(),
-            _ => IndexMap::new(),
+            _ => ValueMap::default(),
         };
         let status = if error.is_empty() {
             "COMPLETED"
@@ -1742,7 +1742,7 @@ impl CfmlVirtualMachine {
     /// Store a completed `ThreadResult` into the `cfthread` scope as
     /// `cfthread.NAME = { status, name, output, error, elapsedtime, ...vars }`.
     pub fn store_cfthread_result(&mut self, thread_name: &str, r: ThreadResult) {
-        let mut meta = IndexMap::new();
+        let mut meta = ValueMap::default();
         meta.insert("status".to_string(), CfmlValue::string(r.status));
         meta.insert(
             "name".to_string(),
@@ -1819,7 +1819,7 @@ impl CfmlVirtualMachine {
         params_arg: &CfmlValue,
         return_type: &str,
         column_key: Option<String>,
-        parent_locals: &IndexMap<String, CfmlValue>,
+        parent_locals: &ValueMap,
     ) -> CfmlResult {
         let stmt = cfml_qoq::parse(sql)
             .map_err(|e| CfmlError::runtime(format!("Query of Queries syntax error: {}", e)))?;
@@ -1857,7 +1857,7 @@ impl CfmlVirtualMachine {
     fn find_query_in_scope(
         &self,
         name: &str,
-        parent_locals: &IndexMap<String, CfmlValue>,
+        parent_locals: &ValueMap,
     ) -> Option<cfml_common::dynamic::CfmlQuery> {
         let lower = name.to_lowercase();
         // Cloning a query handle shares the Arc (cheap) — the QoQ engine only
@@ -1930,7 +1930,7 @@ impl CfmlVirtualMachine {
         let context: Vec<CfmlValue> = frames
             .iter()
             .map(|f| {
-                let mut entry = IndexMap::new();
+                let mut entry = ValueMap::default();
                 entry.insert(
                     "template".to_string(),
                     CfmlValue::string(f.template.clone()),
@@ -1949,7 +1949,7 @@ impl CfmlVirtualMachine {
     }
 
     fn build_error_struct(e: &CfmlError, tag_context: CfmlValue) -> CfmlValue {
-        let mut err_struct = IndexMap::new();
+        let mut err_struct = ValueMap::default();
         err_struct.insert("message".to_string(), CfmlValue::string(e.message.clone()));
         err_struct.insert(
             "type".to_string(),
@@ -2172,7 +2172,7 @@ impl CfmlVirtualMachine {
         &mut self,
         func: &BytecodeFunction,
         args: Vec<CfmlValue>,
-        parent_scope: Option<&IndexMap<String, CfmlValue>>,
+        parent_scope: Option<&ValueMap>,
     ) -> CfmlResult {
         // Tier-1 JIT fast path. Returns `Some` only when a compiled native body
         // ran to completion for these exact (all-Int) arguments; otherwise this
@@ -2302,7 +2302,7 @@ impl CfmlVirtualMachine {
             }
         }
 
-        let mut locals: IndexMap<String, CfmlValue> = IndexMap::new();
+        let mut locals: ValueMap = ValueMap::default();
         let mut stack: Vec<CfmlValue> = Vec::new();
         let mut ip = 0;
         // Track variables declared with `var` (function-local, not written back to parent)
@@ -2310,7 +2310,7 @@ impl CfmlVirtualMachine {
             std::collections::HashSet::new();
         // Shared closure environment: all closures defined within this function
         // invocation share one Rc<RefCell<HashMap>>. Lazily created on first DefineFunction.
-        let mut closure_env: Option<Arc<RwLock<IndexMap<String, CfmlValue>>>> = None;
+        let mut closure_env: Option<Arc<RwLock<ValueMap>>> = None;
 
         // Effective Lucee localMode for this frame: function's declared attribute
         // wins; otherwise inherits the application default (`this.localMode` in
@@ -2347,7 +2347,7 @@ impl CfmlVirtualMachine {
         // seeds the local + the `arguments` key at runtime. An omitted param
         // with no default must stay ABSENT from both `locals` and `arguments`,
         // so `structKeyExists(arguments, "p")` is false — matching Lucee/ACF.
-        let mut arguments_map: IndexMap<String, CfmlValue> = IndexMap::new();
+        let mut arguments_map: ValueMap = ValueMap::default();
         // Lucee/ACF/BoxLang: a value bound to a declared parameter appears in
         // the `arguments` scope under its parameter NAME — never under its
         // 1-based positional index. Positional access (`arguments[1]`) still
@@ -2521,7 +2521,7 @@ impl CfmlVirtualMachine {
                             // application; p.x = 1` writes through (Lucee semantics).
                             CfmlValue::Struct(app_scope.clone())
                         } else {
-                            CfmlValue::strukt(IndexMap::new())
+                            CfmlValue::strukt(ValueMap::default())
                         }
                     } else if name_lower == "session" {
                         self.get_session_scope()
@@ -2529,7 +2529,7 @@ impl CfmlVirtualMachine {
                         self.globals
                             .get("cookie")
                             .cloned()
-                            .unwrap_or(CfmlValue::strukt(IndexMap::new()))
+                            .unwrap_or(CfmlValue::strukt(ValueMap::default()))
                     } else if name_lower == "server" {
                         let mut scope = build_server_scope();
                         // Prefer the per-request application-level cfconfig overlay
@@ -2572,8 +2572,8 @@ impl CfmlVirtualMachine {
                                 && (locals.contains_key("this")
                                     || locals.contains_key("__variables"))
                             {
-                                let mut bound: IndexMap<String, CfmlValue> =
-                                    IndexMap::new();
+                                let mut bound: ValueMap =
+                                    ValueMap::default();
                                 for key in [
                                     "this",
                                     "__variables",
@@ -2610,7 +2610,7 @@ impl CfmlVirtualMachine {
                         // Capture the current scope so the function retains access to its
                         // defining scope's variables when stored in a struct and called later.
                         // Filter out Function values to avoid recursive reference chains.
-                        let filtered: IndexMap<String, CfmlValue> = locals
+                        let filtered: ValueMap = locals
                             .iter()
                             .filter(|(_, v)| !matches!(v, CfmlValue::Function(_)))
                             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2643,7 +2643,7 @@ impl CfmlVirtualMachine {
                     } else {
                         // Variable not found — check try_stack for error handler
                         if let Some(handler) = self.try_stack.pop() {
-                            let mut exception = IndexMap::new();
+                            let mut exception = ValueMap::default();
                             exception.insert(
                                 "message".to_string(),
                                 CfmlValue::string(format!("Variable '{}' is undefined", name)),
@@ -3227,7 +3227,7 @@ impl CfmlVirtualMachine {
                         // undefined function must be catchable (the standard
                         // CFML feature-detection idiom relies on it).
                         if let Some(handler) = self.try_stack.pop() {
-                            let mut exception = IndexMap::new();
+                            let mut exception = ValueMap::default();
                             exception.insert(
                                 "message".to_string(),
                                 CfmlValue::string(format!("Variable '{}' is undefined", name)),
@@ -3313,7 +3313,7 @@ impl CfmlVirtualMachine {
                         let y = to_number(&b).unwrap_or(1.0);
                         if y == 0.0 {
                             // CFML throws on division by zero
-                            let mut exception = IndexMap::new();
+                            let mut exception = ValueMap::default();
                             exception.insert(
                                 "message".to_string(),
                                 CfmlValue::string("Division by zero is not allowed.".to_string()),
@@ -3887,7 +3887,7 @@ impl CfmlVirtualMachine {
                             let mut method_str: Option<String> = None;
                             let mut return_var: Option<String> = None;
                             let mut arg_collection: Option<CfmlValue> = None;
-                            let mut extra_args: IndexMap<String, CfmlValue> = IndexMap::new();
+                            let mut extra_args: ValueMap = ValueMap::default();
                             let mut positional: Vec<CfmlValue> = Vec::new();
 
                             // attributeCollection supplies the base attributes;
@@ -3897,7 +3897,7 @@ impl CfmlVirtualMachine {
                                 method_str: &mut Option<String>,
                                 return_var: &mut Option<String>,
                                 arg_collection: &mut Option<CfmlValue>,
-                                extra_args: &mut IndexMap<String, CfmlValue>| {
+                                extra_args: &mut ValueMap| {
                                 match key.to_lowercase().as_str() {
                                     "component" => *comp_val = Some(v),
                                     "method" => *method_str = Some(v.as_string()),
@@ -4050,7 +4050,7 @@ impl CfmlVirtualMachine {
                             _ => None,
                         };
                         if let Some(ref tag_name) = tag_builtin_name {
-                            let mut opts: IndexMap<String, CfmlValue> = IndexMap::new();
+                            let mut opts: ValueMap = ValueMap::default();
                             let mut writeback_var: Option<String> = None;
                             let writeback_attr = Self::tag_call_writeback_attr(tag_name);
                             let is_dbinfo = matches!(
@@ -4061,7 +4061,7 @@ impl CfmlVirtualMachine {
                             // `name`/`variable` write-back target as we go.
                             let apply_attr =
                                 |key: &str, value: CfmlValue,
-                                 opts: &mut IndexMap<String, CfmlValue>,
+                                 opts: &mut ValueMap,
                                  writeback_var: &mut Option<String>| {
                                     if key.is_empty() {
                                         return;
@@ -4364,7 +4364,7 @@ impl CfmlVirtualMachine {
                                 self.method_variables_writeback = Some(vars.snapshot());
                             }
                         } else {
-                            let mut vars_wb = IndexMap::new();
+                            let mut vars_wb = ValueMap::default();
                             for (k, v) in &locals {
                                 let kl = k.to_lowercase();
                                 if kl == "this"
@@ -4391,7 +4391,7 @@ impl CfmlVirtualMachine {
                     // unaffected by this skip.
                     if let Some(parent) = parent_scope {
                         if !effective_local_mode_modern {
-                            let mut writeback = IndexMap::new();
+                            let mut writeback = ValueMap::default();
                             for (k, v) in &locals {
                                 if k == "arguments"
                                     || k == "this"
@@ -4462,7 +4462,7 @@ impl CfmlVirtualMachine {
                         let key = stack.pop().unwrap_or(CfmlValue::string(String::new()));
                         pairs.push((key.as_string(), value));
                     }
-                    let mut map = IndexMap::new();
+                    let mut map = ValueMap::default();
                     for (k, v) in pairs.into_iter().rev() {
                         map.insert(k, v);
                     }
@@ -4653,7 +4653,7 @@ impl CfmlVirtualMachine {
                                 }
                                 collection = CfmlValue::Array(arr);
                             } else {
-                                let mut s = IndexMap::new();
+                                let mut s = ValueMap::default();
                                 s.insert(index.as_string(), value);
                                 collection = CfmlValue::strukt(s);
                             }
@@ -4774,7 +4774,7 @@ impl CfmlVirtualMachine {
                             // variable that does not yet exist creates that variable
                             // as a struct, matching Lucee/ACF/BoxLang. e.g.
                             // `initArgs.path = "x"` where initArgs was never declared.
-                            let mut s = IndexMap::new();
+                            let mut s = ValueMap::default();
                             s.insert(prop_name.clone(), value);
                             locals.insert(local_name.clone(), CfmlValue::strukt(s));
                         }
@@ -5003,7 +5003,7 @@ impl CfmlVirtualMachine {
                                 if matches!(init_func, CfmlValue::Function(_)) {
                                     // Build init scope from the component's own scope,
                                     // NOT the caller's locals (which may be a different CFC)
-                                    let mut init_locals = IndexMap::new();
+                                    let mut init_locals = ValueMap::default();
                                     init_locals.insert("this".to_string(), instance.clone());
                                     // Inject component __variables as a dedicated scope (like Lucee/BoxLang)
                                     if let CfmlValue::Struct(ref cs) = instance {
@@ -5180,7 +5180,7 @@ impl CfmlVirtualMachine {
                             env
                         }
                         None => {
-                            let seed: IndexMap<String, CfmlValue> = locals
+                            let seed: ValueMap = locals
                                 .iter()
                                 .filter(|(_, v)| !matches!(v, CfmlValue::Function(_)))
                                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -5447,7 +5447,7 @@ impl CfmlVirtualMachine {
                                     );
                                     self.pending_extra_named_args =
                                         if extras.is_empty() { None } else { Some(extras) };
-                                    let mut method_locals = IndexMap::new();
+                                    let mut method_locals = ValueMap::default();
                                     // Merge captured scope first (closure vars from defining scope)
                                     if let Some(ref shared_env) = f.captured_scope {
                                         for (k, v) in shared_env.read().unwrap().iter() {
@@ -6010,7 +6010,7 @@ impl CfmlVirtualMachine {
                                         stack.pop();
                                     }
                                     self.restore_capture_state(&handler);
-                                    let mut err_struct = IndexMap::new();
+                                    let mut err_struct = ValueMap::default();
                                     err_struct.insert(
                                         "message".to_string(),
                                         CfmlValue::string(e.message.clone()),
@@ -6110,7 +6110,7 @@ impl CfmlVirtualMachine {
                                         stack.pop();
                                     }
                                     self.restore_capture_state(&handler);
-                                    let mut err_struct = IndexMap::new();
+                                    let mut err_struct = ValueMap::default();
                                     err_struct.insert(
                                         "message".to_string(),
                                         CfmlValue::string(e.message.clone()),
@@ -6165,8 +6165,8 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::MergeStructs => {
-                    let right = stack.pop().unwrap_or(CfmlValue::strukt(IndexMap::new()));
-                    let left = stack.pop().unwrap_or(CfmlValue::strukt(IndexMap::new()));
+                    let right = stack.pop().unwrap_or(CfmlValue::strukt(ValueMap::default()));
+                    let left = stack.pop().unwrap_or(CfmlValue::strukt(ValueMap::default()));
                     if let (CfmlValue::Struct(a), CfmlValue::Struct(b)) = (left, right) {
                         let mut m = a.snapshot();
                         for (k, v) in b.iter() {
@@ -6174,7 +6174,7 @@ impl CfmlVirtualMachine {
                         }
                         stack.push(CfmlValue::strukt(m));
                     } else {
-                        stack.push(CfmlValue::strukt(IndexMap::new()));
+                        stack.push(CfmlValue::strukt(ValueMap::default()));
                     }
                 }
 
@@ -6271,7 +6271,7 @@ impl CfmlVirtualMachine {
                 }
             } else {
                 // Non-CFC or legacy path: collect from locals
-                let mut vars_wb = IndexMap::new();
+                let mut vars_wb = ValueMap::default();
                 for (k, v) in &locals {
                     let kl = k.to_lowercase();
                     if kl == "this"
@@ -6297,7 +6297,7 @@ impl CfmlVirtualMachine {
         // Explicit `variables.x = …` bypasses this path, so it still works.
         if let Some(parent) = parent_scope {
             if !effective_local_mode_modern {
-                let mut writeback = IndexMap::new();
+                let mut writeback = ValueMap::default();
                 for (k, v) in &locals {
                     // Skip function params, arguments scope, 'this', var-declared
                     // locals, and __variables (handled by method_variables_writeback)
@@ -6372,7 +6372,7 @@ impl CfmlVirtualMachine {
         &mut self,
         func_ref: &CfmlValue,
         args: Vec<CfmlValue>,
-        parent_locals: &IndexMap<String, CfmlValue>,
+        parent_locals: &ValueMap,
     ) -> CfmlResult {
         if let CfmlValue::Function(func) = func_ref {
             // security.disallowedFunctions: enforced at the very top so the
@@ -6788,7 +6788,7 @@ impl CfmlVirtualMachine {
                             // Lazily materialize parent_locals copy only if a
                             // writeback arrives. Most callbacks don't write back,
                             // so this skips a full map clone per call.
-                            let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                            let mut pl: Option<ValueMap> = None;
                             for (i, item) in arr.iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(item.clone());
@@ -6820,7 +6820,7 @@ impl CfmlVirtualMachine {
                         if let CfmlValue::Array(arr) = arr_val {
                             let mut result = Vec::new();
                             let callback = callback.clone();
-                            let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                            let mut pl: Option<ValueMap> = None;
                             for (i, item) in arr.iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(item.clone());
@@ -6857,7 +6857,7 @@ impl CfmlVirtualMachine {
                             // Check if second arg is a callback (Function) or a simple value
                             if matches!(arg1, CfmlValue::Function(_)) {
                                 let callback = arg1.clone();
-                                let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                                let mut pl: Option<ValueMap> = None;
                                 let mut result = Vec::new();
                                 for (i, item) in arr.iter().enumerate() {
                                     let mut cb_args = Vec::with_capacity(3);
@@ -6895,7 +6895,7 @@ impl CfmlVirtualMachine {
                         if let CfmlValue::Array(arr) = arr_val {
                             let mut acc = args.get(2).cloned().unwrap_or(CfmlValue::Null);
                             let callback = callback.clone();
-                            let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                            let mut pl: Option<ValueMap> = None;
                             for (i, item) in arr.iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(4);
                                 cb_args.push(acc.clone());
@@ -6926,7 +6926,7 @@ impl CfmlVirtualMachine {
                     if let (Some(arr_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Array(arr) = arr_val {
                             let callback = callback.clone();
-                            let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                            let mut pl: Option<ValueMap> = None;
                             for (i, item) in arr.iter().enumerate() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(item.clone());
@@ -6955,7 +6955,7 @@ impl CfmlVirtualMachine {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Struct(s) = struct_val {
                             let callback = callback.clone();
-                            let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                            let mut pl: Option<ValueMap> = None;
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
@@ -6983,9 +6983,9 @@ impl CfmlVirtualMachine {
                 "structmap" => {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Struct(s) = struct_val {
-                            let mut result = IndexMap::new();
+                            let mut result = ValueMap::default();
                             let callback = callback.clone();
-                            let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                            let mut pl: Option<ValueMap> = None;
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
@@ -7010,14 +7010,14 @@ impl CfmlVirtualMachine {
                             return Ok(CfmlValue::strukt(result));
                         }
                     }
-                    return Ok(CfmlValue::strukt(IndexMap::new()));
+                    return Ok(CfmlValue::strukt(ValueMap::default()));
                 }
                 "structfilter" => {
                     if let (Some(struct_val), Some(callback)) = (args.get(0), args.get(1)) {
                         if let CfmlValue::Struct(s) = struct_val {
-                            let mut result = IndexMap::new();
+                            let mut result = ValueMap::default();
                             let callback = callback.clone();
-                            let mut pl: Option<IndexMap<String, CfmlValue>> = None;
+                            let mut pl: Option<ValueMap> = None;
                             for (k, v) in s.iter() {
                                 let mut cb_args = Vec::with_capacity(3);
                                 cb_args.push(CfmlValue::string(k.clone()));
@@ -7044,7 +7044,7 @@ impl CfmlVirtualMachine {
                             return Ok(CfmlValue::strukt(result));
                         }
                     }
-                    return Ok(CfmlValue::strukt(IndexMap::new()));
+                    return Ok(CfmlValue::strukt(ValueMap::default()));
                 }
                 "arraysome" => {
                     if let (Some(arr_val), Some(callback)) = (args.get(0), args.get(1)) {
@@ -7618,7 +7618,7 @@ impl CfmlVirtualMachine {
                                 return Ok(CfmlValue::array(result));
                             }
                             CfmlValue::Struct(s) => {
-                                let mut result = IndexMap::new();
+                                let mut result = ValueMap::default();
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(3);
                                     cb_args.push(CfmlValue::string(key.clone()));
@@ -7683,7 +7683,7 @@ impl CfmlVirtualMachine {
                                 return Ok(CfmlValue::array(result));
                             }
                             CfmlValue::Struct(s) => {
-                                let mut result = IndexMap::new();
+                                let mut result = ValueMap::default();
                                 for (key, val) in s.iter() {
                                     let mut cb_args = Vec::with_capacity(3);
                                     cb_args.push(CfmlValue::string(key.clone()));
@@ -8110,7 +8110,7 @@ impl CfmlVirtualMachine {
                             match &args[1] {
                                 CfmlValue::Int(n) => {
                                     for _ in 0..*n {
-                                        q.add_row(IndexMap::new());
+                                        q.add_row(ValueMap::default());
                                     }
                                 }
                                 CfmlValue::Struct(data) => {
@@ -8142,11 +8142,11 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 _ => {
-                                    q.add_row(IndexMap::new());
+                                    q.add_row(ValueMap::default());
                                 }
                             }
                         } else {
-                            q.add_row(IndexMap::new());
+                            q.add_row(ValueMap::default());
                         }
                         self.arg_ref_writeback = None;
                         return Ok(CfmlValue::Int(q.row_count() as i64));
@@ -8347,7 +8347,7 @@ impl CfmlVirtualMachine {
                     // matching Lucee/ACF. Falls back to {name:""} when no
                     // Application.cfc is active. WireBox's ScopeStorage reads
                     // `getApplicationMetadata().sessionManagement` here.
-                    let mut meta = IndexMap::new();
+                    let mut meta = ValueMap::default();
                     if let Some(CfmlValue::Struct(s)) = &self.app_cfc_template {
                         for (k, v) in s.snapshot() {
                             // Settings only — skip lifecycle methods + internals.
@@ -8366,10 +8366,10 @@ impl CfmlVirtualMachine {
                 "getcomponentmetadata" => {
                     // Helper: extract metadata from a component struct
                     fn extract_component_meta(
-                        s: &IndexMap<String, CfmlValue>,
+                        s: &ValueMap,
                         fallback_name: &str,
                     ) -> CfmlValue {
-                        let mut meta = IndexMap::new();
+                        let mut meta = ValueMap::default();
                         let name_val = s
                             .get("__name")
                             .cloned()
@@ -8388,7 +8388,7 @@ impl CfmlVirtualMachine {
                         for (k, v) in s {
                             if let CfmlValue::Function(f) = v {
                                 if !k.starts_with("__") {
-                                    let mut func_meta = IndexMap::new();
+                                    let mut func_meta = ValueMap::default();
                                     func_meta
                                         .insert("name".to_string(), CfmlValue::string(k.clone()));
                                     func_meta.insert(
@@ -8459,7 +8459,7 @@ impl CfmlVirtualMachine {
                             return Ok(resolved);
                         }
                     }
-                    return Ok(CfmlValue::strukt(IndexMap::new()));
+                    return Ok(CfmlValue::strukt(ValueMap::default()));
                 }
                 "createobject" => {
                     // Single-argument shorthand: createObject("comp.path") is
@@ -8770,8 +8770,8 @@ impl CfmlVirtualMachine {
                     if let Some(ref data) = self.http_request_data {
                         return Ok(data.clone());
                     }
-                    let mut empty = IndexMap::new();
-                    empty.insert("headers".to_string(), CfmlValue::strukt(IndexMap::new()));
+                    let mut empty = ValueMap::default();
+                    empty.insert("headers".to_string(), CfmlValue::strukt(ValueMap::default()));
                     empty.insert("content".to_string(), CfmlValue::string(String::new()));
                     empty.insert("method".to_string(), CfmlValue::string(String::new()));
                     empty.insert("protocol".to_string(), CfmlValue::string(String::new()));
@@ -8821,7 +8821,7 @@ impl CfmlVirtualMachine {
                         if let Some(func @ CfmlValue::Function(_)) = method_func {
                             let call_args = self.build_invoke_call_args(&func, invoke_args);
 
-                            let mut method_locals = IndexMap::new();
+                            let mut method_locals = ValueMap::default();
                             method_locals.insert("this".to_string(), component.clone());
                             // Inject __variables from component so unscoped references resolve
                             if let CfmlValue::Struct(ref cs) = component {
@@ -8847,9 +8847,9 @@ impl CfmlVirtualMachine {
                                 // keyed by name, mirroring the dot-call fallback).
                                 let missing_args = match invoke_args {
                                     s @ CfmlValue::Struct(_) => s,
-                                    _ => CfmlValue::strukt(IndexMap::new()),
+                                    _ => CfmlValue::strukt(ValueMap::default()),
                                 };
-                                let mut method_locals = IndexMap::new();
+                                let mut method_locals = ValueMap::default();
                                 method_locals.insert("this".to_string(), component.clone());
                                 if let CfmlValue::Struct(ref cs) = component {
                                     if let Some(vars) = cs.get("__variables") {
@@ -8930,7 +8930,7 @@ impl CfmlVirtualMachine {
                         if let Some(func @ CfmlValue::Function(_)) = method_func {
                             let call_args = self.build_invoke_call_args(&func, invoke_args);
 
-                            let mut method_locals = IndexMap::new();
+                            let mut method_locals = ValueMap::default();
                             method_locals.insert("this".to_string(), component.clone());
                             // Inject __variables from component so unscoped references resolve
                             if let CfmlValue::Struct(ref cs) = component {
@@ -8990,8 +8990,8 @@ impl CfmlVirtualMachine {
                     let mut return_type_opt: Option<String> = None;
                     if let Some(CfmlValue::Struct(opts)) = args.get(2) {
                         let snap = opts.snapshot();
-                        let mut attr_coll: Option<IndexMap<String, CfmlValue>> = None;
-                        let mut merged: IndexMap<String, CfmlValue> = IndexMap::new();
+                        let mut attr_coll: Option<ValueMap> = None;
+                        let mut merged: ValueMap = ValueMap::default();
                         for (k, v) in snap.into_iter() {
                             if k.eq_ignore_ascii_case("attributecollection") {
                                 if let CfmlValue::Struct(inner) = &v {
@@ -9150,7 +9150,7 @@ impl CfmlVirtualMachine {
                     if let Some(rn) = result_name {
                         let result_struct = match &ret {
                             CfmlValue::Query(q) => {
-                                let mut m = IndexMap::new();
+                                let mut m = ValueMap::default();
                                 m.insert(
                                     "recordCount".to_string(),
                                     CfmlValue::Int(q.row_count() as i64),
@@ -9174,7 +9174,7 @@ impl CfmlVirtualMachine {
                             // struct is independent of the returned one.
                             CfmlValue::Struct(s) => CfmlValue::strukt(s.snapshot()),
                             other => {
-                                let mut m = IndexMap::new();
+                                let mut m = ValueMap::default();
                                 if let CfmlValue::Array(a) = other {
                                     m.insert(
                                         "recordCount".to_string(),
@@ -9219,9 +9219,9 @@ impl CfmlVirtualMachine {
                     // query is delivered to the (possibly dotted) `name`
                     // variable via pending_result_writeback; the call itself
                     // returns null, like Lucee's tag.
-                    let mut attrs: IndexMap<String, CfmlValue> = match args.first() {
+                    let mut attrs: ValueMap = match args.first() {
                         Some(CfmlValue::Struct(s)) => s.snapshot(),
-                        _ => IndexMap::new(),
+                        _ => ValueMap::default(),
                     };
                     // Expand attributeCollection (explicit keys win).
                     let attr_coll = attrs
@@ -9593,7 +9593,7 @@ impl CfmlVirtualMachine {
                         .globals
                         .get("form")
                         .cloned()
-                        .unwrap_or(CfmlValue::strukt(IndexMap::new()));
+                        .unwrap_or(CfmlValue::strukt(ValueMap::default()));
 
                     if let CfmlValue::Struct(form) = form_scope {
                         let field_lower = form_field.to_lowercase();
@@ -9691,7 +9691,7 @@ impl CfmlVirtualMachine {
                         .globals
                         .get("form")
                         .cloned()
-                        .unwrap_or(CfmlValue::strukt(IndexMap::new()));
+                        .unwrap_or(CfmlValue::strukt(ValueMap::default()));
 
                     let mut results = Vec::new();
                     if let CfmlValue::Struct(form) = form_scope {
@@ -9789,7 +9789,7 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "sessiongetmetadata" => {
-                    let mut meta = IndexMap::new();
+                    let mut meta = ValueMap::default();
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
                     {
                         if let Some(session) = state.sessions.get(self.current_application_name.as_deref().unwrap_or(""), sid) {
@@ -9862,7 +9862,7 @@ impl CfmlVirtualMachine {
                         let now = now_epoch_secs();
                         let app = self.current_application_name.clone().unwrap_or_default();
                         let mut session = state.sessions.get(&app, sid).unwrap_or_else(|| SessionData {
-                            variables: IndexMap::new(),
+                            variables: ValueMap::default(),
                             created_secs: now,
                             last_accessed_secs: now,
                             auth_user: None,
@@ -9998,7 +9998,7 @@ impl CfmlVirtualMachine {
                 "throw" => {
                     // throw(message="...", type="...", detail="...", errorcode="...")
                     // Build exception struct from named args or positional
-                    let mut exception = IndexMap::new();
+                    let mut exception = ValueMap::default();
                     let message = args
                         .get(0)
                         .map(|v| v.as_string())
@@ -10127,7 +10127,7 @@ impl CfmlVirtualMachine {
                 }
                 "cachegetall" => {
                     let now = cfml_common::clock::Monotonic::now();
-                    let mut result = IndexMap::new();
+                    let mut result = ValueMap::default();
                     for (k, (v, exp)) in &self.cache {
                         if exp.map_or(true, |e| now <= e) {
                             result.insert(k.clone(), v.clone());
@@ -10210,7 +10210,7 @@ impl CfmlVirtualMachine {
                                         let stderr =
                                             String::from_utf8_lossy(&output.stderr).to_string();
                                         if has_variable {
-                                            let mut result = IndexMap::new();
+                                            let mut result = ValueMap::default();
                                             result.insert(
                                                 "output".to_string(),
                                                 CfmlValue::string(stdout),
@@ -10270,7 +10270,7 @@ impl CfmlVirtualMachine {
                         self.live_threads.insert(thread_name.to_lowercase(), handle);
                         // Pre-seed cfthread.NAME as RUNNING so reads before join
                         // see a live status rather than a missing key.
-                        let mut meta = IndexMap::new();
+                        let mut meta = ValueMap::default();
                         meta.insert(
                             "status".to_string(),
                             CfmlValue::string("RUNNING".to_string()),
@@ -10523,7 +10523,7 @@ impl CfmlVirtualMachine {
                         .skip(offset)
                         .take(max_frames)
                         .map(|f| {
-                            let mut s = IndexMap::new();
+                            let mut s = ValueMap::default();
                             s.insert("Function".to_string(), CfmlValue::string(f.function));
                             s.insert("Template".to_string(), CfmlValue::string(f.template));
                             s.insert("LineNumber".to_string(), CfmlValue::Int(f.line as i64));
@@ -10569,12 +10569,12 @@ impl CfmlVirtualMachine {
                     let attrs_val = Self::merge_attribute_collection(
                         args.get(1)
                             .cloned()
-                            .unwrap_or(CfmlValue::strukt(IndexMap::new())),
+                            .unwrap_or(CfmlValue::strukt(ValueMap::default())),
                     );
                     let run_end_phase = args.get(2).map(|v| v.is_true()).unwrap_or(false);
 
                     let resolved = self.resolve_custom_tag_path(&path_spec)?;
-                    let mut this_tag = IndexMap::new();
+                    let mut this_tag = ValueMap::default();
                     this_tag.insert(
                         "executionmode".to_string(),
                         CfmlValue::string("start".to_string()),
@@ -10586,7 +10586,7 @@ impl CfmlVirtualMachine {
                     );
 
                     let caller_snapshot = parent_locals.clone();
-                    let mut tag_locals = IndexMap::new();
+                    let mut tag_locals = ValueMap::default();
                     tag_locals.insert("attributes".to_string(), attrs_val.clone());
                     tag_locals.insert(
                         "caller".to_string(),
@@ -10615,7 +10615,7 @@ impl CfmlVirtualMachine {
                             caller_snapshot.clone()
                         };
 
-                        let mut this_tag = IndexMap::new();
+                        let mut this_tag = ValueMap::default();
                         this_tag.insert(
                             "executionmode".to_string(),
                             CfmlValue::string("end".to_string()),
@@ -10677,12 +10677,12 @@ impl CfmlVirtualMachine {
                     let attrs_val = Self::merge_attribute_collection(
                         args.get(1)
                             .cloned()
-                            .unwrap_or(CfmlValue::strukt(IndexMap::new())),
+                            .unwrap_or(CfmlValue::strukt(ValueMap::default())),
                     );
 
                     let resolved = self.resolve_custom_tag_path(&path_spec)?;
 
-                    let mut this_tag = IndexMap::new();
+                    let mut this_tag = ValueMap::default();
                     this_tag.insert(
                         "executionmode".to_string(),
                         CfmlValue::string("start".to_string()),
@@ -10694,7 +10694,7 @@ impl CfmlVirtualMachine {
                     );
 
                     let caller_snapshot = parent_locals.clone();
-                    let mut tag_locals = IndexMap::new();
+                    let mut tag_locals = ValueMap::default();
                     tag_locals.insert("attributes".to_string(), attrs_val.clone());
                     tag_locals.insert(
                         "caller".to_string(),
@@ -10759,7 +10759,7 @@ impl CfmlVirtualMachine {
                         return Ok(CfmlValue::Null);
                     }
 
-                    let mut this_tag = IndexMap::new();
+                    let mut this_tag = ValueMap::default();
                     this_tag.insert(
                         "executionmode".to_string(),
                         CfmlValue::string("end".to_string()),
@@ -10891,7 +10891,7 @@ impl CfmlVirtualMachine {
     fn scope_aware_load(
         &self,
         name: &str,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
     ) -> Option<CfmlValue> {
         let name_lower = name.to_lowercase();
         if name_lower == "local" {
@@ -10969,7 +10969,7 @@ impl CfmlVirtualMachine {
         &self,
         name: &str,
         name_lower: &str,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
     ) -> Option<CfmlValue> {
         // Bare `arguments` resolves to the scope stored under the reserved key
         // (independent of any user `local.arguments` var at the literal key).
@@ -11016,7 +11016,7 @@ impl CfmlVirtualMachine {
         &mut self,
         name: &str,
         val: CfmlValue,
-        locals: &mut IndexMap<String, CfmlValue>,
+        locals: &mut ValueMap,
     ) {
         let name_lower = name.to_lowercase();
         if name_lower == "local" {
@@ -11086,7 +11086,7 @@ impl CfmlVirtualMachine {
         &mut self,
         path: &str,
         value: CfmlValue,
-        locals: &mut IndexMap<String, CfmlValue>,
+        locals: &mut ValueMap,
     ) {
         // CFML null-assignment: storing Null through a scope path (a dynamic
         // `"variables.x" = voidFn()` LHS, or a null result-writeback delivery)
@@ -11100,13 +11100,13 @@ impl CfmlVirtualMachine {
             let scope = parts[0];
             let root = self
                 .scope_aware_load(scope, locals)
-                .unwrap_or_else(|| CfmlValue::strukt(IndexMap::new()));
+                .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()));
             let root = if matches!(root, CfmlValue::Struct(_)) {
                 root
             } else {
                 // Leading segment exists but isn't a struct — replace it,
                 // matching auto-vivification on a normal dotted assignment.
-                CfmlValue::strukt(IndexMap::new())
+                CfmlValue::strukt(ValueMap::default())
             };
             if let CfmlValue::Struct(ref s) = root {
                 // Walk/auto-vivify intermediate structs, set the leaf.
@@ -11132,7 +11132,7 @@ impl CfmlVirtualMachine {
     /// rather than materializing a null one). The bare-name case is handled
     /// inline in the `UnsetPath` opcode (it also clears globals + closure env);
     /// this covers `<scope>.leaf` and deeper `<scope>.a.b…leaf` paths.
-    fn delete_scope_path(&mut self, path: &str, locals: &mut IndexMap<String, CfmlValue>) {
+    fn delete_scope_path(&mut self, path: &str, locals: &mut ValueMap) {
         let parts: Vec<&str> = path.split('.').collect();
         if parts.len() < 2 {
             imap_remove_ci(locals, path);
@@ -11233,7 +11233,7 @@ impl CfmlVirtualMachine {
     /// `local.x` reads.
     fn apply_pending_result_writeback(
         &mut self,
-        locals: &mut IndexMap<String, CfmlValue>,
+        locals: &mut ValueMap,
         inherited_or_param_keys: &mut std::collections::HashSet<String>,
     ) {
         if let Some(sets) = self.pending_result_writeback.take() {
@@ -11523,10 +11523,10 @@ impl CfmlVirtualMachine {
     /// `__variables`, `__*` internals) and the `arguments` scope are also
     /// excluded.
     fn build_local_scope_view(
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
         inherited_or_param_keys: &std::collections::HashSet<String>,
-    ) -> IndexMap<String, CfmlValue> {
-        let mut out = IndexMap::new();
+    ) -> ValueMap {
+        let mut out = ValueMap::default();
         for (k, v) in locals {
             if inherited_or_param_keys.contains(k) {
                 continue;
@@ -11961,7 +11961,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let mapped =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -11981,7 +11981,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            let keep = self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            let keep = self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12004,7 +12004,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            acc = self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            acc = self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12022,7 +12022,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12039,7 +12039,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let result =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12060,7 +12060,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let result =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12119,7 +12119,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12130,7 +12130,7 @@ impl CfmlVirtualMachine {
                 "map" => {
                     // struct.map(callback) - callback(key, value, struct) returns new value
                     if let Some(callback) = extra_args.first().cloned() {
-                        let mut result = IndexMap::new();
+                        let mut result = ValueMap::default();
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
@@ -12138,7 +12138,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let mapped =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12151,14 +12151,14 @@ impl CfmlVirtualMachine {
                 "filter" => {
                     // struct.filter(callback) - callback(key, value, struct) returns boolean
                     if let Some(callback) = extra_args.first().cloned() {
-                        let mut result = IndexMap::new();
+                        let mut result = ValueMap::default();
                         for (k, v) in s.iter() {
                             let mut cb_args = Vec::with_capacity(3);
                             cb_args.push(CfmlValue::string(k.clone()));
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            let keep = self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            let keep = self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12179,7 +12179,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let result =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12200,7 +12200,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let result =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12227,7 +12227,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(v.clone());
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            acc = self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            acc = self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12257,7 +12257,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12276,7 +12276,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let mapped =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12299,7 +12299,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            let keep = self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            let keep = self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12321,7 +12321,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(CfmlValue::Int((i + 1) as i64));
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
-                            acc = self.call_function(&callback, cb_args, &IndexMap::new())?;
+                            acc = self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12341,7 +12341,7 @@ impl CfmlVirtualMachine {
                                 let cb_args = vec![a, b];
                                 self.closure_parent_writeback = None;
                                 let cmp =
-                                    self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                    self.call_function(&callback, cb_args, &ValueMap::default())?;
                                 if let Some(ref wb) = self.closure_parent_writeback {
                                     Self::write_back_to_captured_scope(&callback, wb);
                                 }
@@ -12373,7 +12373,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let result =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12394,7 +12394,7 @@ impl CfmlVirtualMachine {
                             cb_args.push(object.clone());
                             self.closure_parent_writeback = None;
                             let result =
-                                self.call_function(&callback, cb_args, &IndexMap::new())?;
+                                self.call_function(&callback, cb_args, &ValueMap::default())?;
                             if let Some(ref wb) = self.closure_parent_writeback {
                                 Self::write_back_to_captured_scope(&callback, wb);
                             }
@@ -12490,7 +12490,7 @@ impl CfmlVirtualMachine {
                 object,
                 CfmlValue::Struct(ref s) if s.contains_key("__variables") || s.contains_key("__name")
             );
-            let mut method_locals = IndexMap::new();
+            let mut method_locals = ValueMap::default();
             // While a CFC method runs, relative component resolution (bare
             // `createObject("component","Sibling")` / `new Sibling()`) must
             // search the package of the component that LEXICALLY DEFINES the
@@ -12640,7 +12640,7 @@ impl CfmlVirtualMachine {
                 // ACF/BoxLang all preserve names here; Wheels' dynamic query scopes
                 // read them by name (arguments.status) via onMissingMethod.
                 let names = arg_names.unwrap_or(&[]);
-                let mut missing_args: IndexMap<String, CfmlValue> = IndexMap::new();
+                let mut missing_args: ValueMap = ValueMap::default();
                 let mut positional = 0usize;
                 for (i, a) in args_array.into_iter().enumerate() {
                     let name = names.get(i).map(String::as_str).unwrap_or("");
@@ -12661,7 +12661,7 @@ impl CfmlVirtualMachine {
                         missing_args.insert(name.to_string(), a);
                     }
                 }
-                let mut method_locals = IndexMap::new();
+                let mut method_locals = ValueMap::default();
                 if let CfmlValue::Struct(ref s2) = object {
                     if let Some(vars) = s2.get("__variables") {
                         method_locals.insert("__variables".to_string(), vars.clone());
@@ -12706,7 +12706,7 @@ impl CfmlVirtualMachine {
 
     /// Check if a variable name (possibly dotted like "request.data.name") is defined
     /// by walking the scope chain: locals → request → application → server → globals
-    fn is_variable_defined(&self, var_name: &str, locals: &IndexMap<String, CfmlValue>) -> bool {
+    fn is_variable_defined(&self, var_name: &str, locals: &ValueMap) -> bool {
         let parts: Vec<&str> = var_name.split('.').collect();
         if parts.is_empty() {
             return false;
@@ -12732,7 +12732,7 @@ impl CfmlVirtualMachine {
             self.globals
                 .get("cookie")
                 .cloned()
-                .or(Some(CfmlValue::strukt(IndexMap::new())))
+                .or(Some(CfmlValue::strukt(ValueMap::default())))
         } else if root == "server" {
             Some(CfmlValue::strukt(build_server_scope()))
         } else {
@@ -12798,14 +12798,14 @@ impl CfmlVirtualMachine {
     }
 
     fn caller_writeback_from_captured(
-        captured: &IndexMap<String, CfmlValue>,
-        caller_snapshot: &IndexMap<String, CfmlValue>,
-    ) -> Option<IndexMap<String, CfmlValue>> {
+        captured: &ValueMap,
+        caller_snapshot: &ValueMap,
+    ) -> Option<ValueMap> {
         let Some(CfmlValue::Struct(modified_caller)) = captured.get("caller") else {
             return None;
         };
 
-        let mut writeback = IndexMap::new();
+        let mut writeback = ValueMap::default();
         for (key, value) in modified_caller.iter() {
             if let Some(original) = caller_snapshot.get(&key) {
                 if !Self::values_equal_shallow(&value, original) {
@@ -12881,7 +12881,7 @@ impl CfmlVirtualMachine {
     fn collect_arg_ref_writeback(
         &mut self,
         func: &BytecodeFunction,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
     ) {
         if func.params.is_empty() {
             self.arg_ref_writeback = None;
@@ -12914,7 +12914,7 @@ impl CfmlVirtualMachine {
 
     /// Write back mutations into a closure's shared Arc<RwLock> environment.
     /// Only updates variables that already exist in the captured scope (prevents pollution).
-    fn write_back_to_captured_scope(func_ref: &CfmlValue, writeback: &IndexMap<String, CfmlValue>) {
+    fn write_back_to_captured_scope(func_ref: &CfmlValue, writeback: &ValueMap) {
         if let CfmlValue::Function(ref f) = func_ref {
             if let Some(ref shared_env) = f.captured_scope {
                 let mut env = shared_env.write().unwrap();
@@ -12936,10 +12936,10 @@ impl CfmlVirtualMachine {
     /// Compares modified locals against original parent_locals and sets closure_parent_writeback.
     fn set_ho_final_writeback(
         &mut self,
-        modified: &IndexMap<String, CfmlValue>,
-        original: &IndexMap<String, CfmlValue>,
+        modified: &ValueMap,
+        original: &ValueMap,
     ) {
-        let mut final_wb = IndexMap::new();
+        let mut final_wb = ValueMap::default();
         for (k, v) in modified {
             match original.get(k) {
                 Some(pv) => {
@@ -13050,7 +13050,7 @@ impl CfmlVirtualMachine {
     fn get_or_create_cfthread_scope(&mut self) -> &mut CfmlValue {
         if !self.globals.contains_key("cfthread") {
             self.globals
-                .insert("cfthread".to_string(), CfmlValue::strukt(IndexMap::new()));
+                .insert("cfthread".to_string(), CfmlValue::strukt(ValueMap::default()));
         }
         self.globals.get_mut("cfthread").unwrap()
     }
@@ -13068,7 +13068,7 @@ impl CfmlVirtualMachine {
             Some(CfmlValue::Struct(ac)) => ac,
             _ => return attrs,
         };
-        let mut merged: IndexMap<String, CfmlValue> = ac.snapshot();
+        let mut merged: ValueMap = ac.snapshot();
         for (k, v) in s.snapshot() {
             if k.eq_ignore_ascii_case("attributeCollection") {
                 continue;
@@ -13199,7 +13199,7 @@ impl CfmlVirtualMachine {
     fn execute_custom_tag_template(
         &mut self,
         template_path: &str,
-        tag_locals: &IndexMap<String, CfmlValue>,
+        tag_locals: &ValueMap,
     ) -> Result<(), CfmlError> {
         let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
         let sub_program = compile_file_cached(template_path, cache, self.vfs.as_ref())?;
@@ -13356,7 +13356,7 @@ impl CfmlVirtualMachine {
     }
 
     /// Get default datasource from application scope or request scope
-    fn get_default_datasource(&self, parent_locals: &IndexMap<String, CfmlValue>) -> String {
+    fn get_default_datasource(&self, parent_locals: &ValueMap) -> String {
         // Per-application default datasource (this.datasource / cfconfig default)
         // takes precedence — already resolved to a URL.
         if let Some(ref url) = self.app_default_datasource {
@@ -13427,7 +13427,7 @@ impl CfmlVirtualMachine {
                 &app,
                 &sid,
                 SessionData {
-                    variables: IndexMap::new(),
+                    variables: ValueMap::default(),
                     created_secs: now,
                     last_accessed_secs: now,
                     auth_user: None,
@@ -13489,7 +13489,7 @@ impl CfmlVirtualMachine {
             // Create the record if missing so a write after sessionInvalidate
             // re-creates the session (matching the pre-cache set_session_* path).
             let mut session = state.sessions.get(&app, &sid).unwrap_or_else(|| SessionData {
-                variables: IndexMap::new(),
+                variables: ValueMap::default(),
                 created_secs: now,
                 last_accessed_secs: now,
                 auth_user: None,
@@ -13517,11 +13517,11 @@ impl CfmlVirtualMachine {
                 return CfmlValue::strukt(session.variables.clone());
             }
         }
-        CfmlValue::strukt(IndexMap::new())
+        CfmlValue::strukt(ValueMap::default())
     }
 
     /// Set the session scope for the current request (mutates the live scope).
-    fn set_session_scope(&mut self, vars: IndexMap<String, CfmlValue>) -> Result<(), CfmlError> {
+    fn set_session_scope(&mut self, vars: ValueMap) -> Result<(), CfmlError> {
         // Data-only gate at the write site (ergonomics): the common direct
         // case `session.x = new C()` fails here rather than at request end.
         // Validate BEFORE lazy-init so a rejected write mints no session.
@@ -13571,7 +13571,7 @@ impl CfmlVirtualMachine {
     fn resolve_component_template(
         &mut self,
         class_name: &str,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
     ) -> Option<CfmlValue> {
         // 1. Try locals
         if let Some(val) = locals.get(class_name) {
@@ -13744,23 +13744,23 @@ impl CfmlVirtualMachine {
                     }
                     _ => None,
                 });
-            let injected_scope: IndexMap<String, CfmlValue> = if let Some(pname) = parent_name {
+            let injected_scope: ValueMap = if let Some(pname) = parent_name {
                 if let Some(parent_template) = self.resolve_component_template(&pname, locals) {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals);
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         if let Some(CfmlValue::Struct(parent_vars)) = ps.get("__variables") {
                             parent_vars.snapshot()
                         } else {
-                            IndexMap::new()
+                            ValueMap::default()
                         }
                     } else {
-                        IndexMap::new()
+                        ValueMap::default()
                     }
                 } else {
-                    IndexMap::new()
+                    ValueMap::default()
                 }
             } else {
-                IndexMap::new()
+                ValueMap::default()
             };
 
             // Snapshot user_functions AFTER parent resolution (parent body may have
@@ -13902,7 +13902,7 @@ impl CfmlVirtualMachine {
             // In CFML, component methods live in the variables scope so
             // unqualified calls inside methods resolve via the normal scope chain.
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
-                let mut vars_scope: IndexMap<String, CfmlValue> = IndexMap::new();
+                let mut vars_scope: ValueMap = ValueMap::default();
                 // Add component body variables (non-function values from the
                 // pseudo-constructor). Function values carry stable global_ids
                 // (no index fixup needed); strip their captured_scope because CFC
@@ -13978,7 +13978,7 @@ impl CfmlVirtualMachine {
     fn resolve_interface_methods(
         &mut self,
         iface_name: &str,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
         visited: &mut std::collections::HashSet<String>,
     ) -> Result<Vec<String>, CfmlError> {
         let name_lower = iface_name.to_lowercase();
@@ -14070,7 +14070,7 @@ impl CfmlVirtualMachine {
     fn collect_transitive_interfaces(
         &mut self,
         iface_name: &str,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
         visited: &mut std::collections::HashSet<String>,
         result: &mut Vec<String>,
     ) {
@@ -14114,8 +14114,8 @@ impl CfmlVirtualMachine {
     /// Returns the full set of transitive interface names (for __implements_chain).
     fn validate_interface_implementation(
         &mut self,
-        component: &IndexMap<String, CfmlValue>,
-        locals: &IndexMap<String, CfmlValue>,
+        component: &ValueMap,
+        locals: &ValueMap,
     ) -> Result<Vec<String>, CfmlError> {
         let iface_names = match component.get("__implements") {
             Some(CfmlValue::Array(arr)) => arr.clone(),
@@ -14172,7 +14172,7 @@ impl CfmlVirtualMachine {
     fn attach_implements_chain(
         &mut self,
         instance: CfmlValue,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
     ) -> Result<CfmlValue, CfmlError> {
         if let CfmlValue::Struct(ref s) = instance {
             let all_ifaces = self.validate_interface_implementation(&s.snapshot(), locals)?;
@@ -14190,7 +14190,7 @@ impl CfmlVirtualMachine {
     fn resolve_inheritance(
         &mut self,
         template: CfmlValue,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
     ) -> CfmlValue {
         let s = match &template {
             CfmlValue::Struct(s) => s,
@@ -14216,7 +14216,7 @@ impl CfmlVirtualMachine {
         &mut self,
         child: CfmlValue,
         parent_name: &str,
-        locals: &IndexMap<String, CfmlValue>,
+        locals: &ValueMap,
         visited: &mut std::collections::HashSet<String>,
     ) -> CfmlValue {
         // Check circular
@@ -14298,13 +14298,13 @@ impl CfmlVirtualMachine {
         // Snapshot the parent into an owned map so the merge never mutates the
         // shared parent template (preserves the old `Arc::make_mut` copy-on-write
         // behaviour now that structs are reference-typed).
-        let mut parent_map: IndexMap<String, CfmlValue> = match parent {
+        let mut parent_map: ValueMap = match parent {
             CfmlValue::Struct(s) => s.snapshot(),
             _ => return CfmlValue::Struct(child_map),
         };
 
         // Collect parent methods for __super
-        let mut super_methods = IndexMap::new();
+        let mut super_methods = ValueMap::default();
         for (k, v) in parent_map.iter() {
             if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
                 super_methods.insert(k.clone(), v.clone());
@@ -14312,11 +14312,11 @@ impl CfmlVirtualMachine {
         }
 
         // Merge __variables from parent and child (child overrides parent)
-        let parent_vars: IndexMap<String, CfmlValue> = parent_map
+        let parent_vars: ValueMap = parent_map
             .get("__variables")
             .and_then(|v| v.as_struct())
             .unwrap_or_default();
-        let child_vars: IndexMap<String, CfmlValue> = child_map
+        let child_vars: ValueMap = child_map
             .get("__variables")
             .and_then(|v| v.as_struct())
             .unwrap_or_default();
@@ -14565,7 +14565,7 @@ impl CfmlVirtualMachine {
                 // Allow opening for read (returns handle struct), but the path must exist in VFS
                 let path = get_str(0);
                 if self.vfs.exists(&path) {
-                    let mut handle = IndexMap::new();
+                    let mut handle = ValueMap::default();
                     handle.insert("path".to_string(), CfmlValue::string(path));
                     handle.insert("isOpen".to_string(), CfmlValue::Bool(true));
                     handle.insert("line".to_string(), CfmlValue::Int(0));
@@ -14723,7 +14723,7 @@ impl CfmlVirtualMachine {
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| fallback_dir.to_string());
-            let mut row = IndexMap::new();
+            let mut row = ValueMap::default();
             row.insert("name".to_string(), CfmlValue::string(name.clone()));
             row.insert("size".to_string(), CfmlValue::Int(size));
             row.insert(
@@ -14823,7 +14823,7 @@ impl CfmlVirtualMachine {
         } else {
             0
         };
-        let mut info = IndexMap::new();
+        let mut info = ValueMap::default();
         info.insert("name".to_string(), CfmlValue::string(name));
         info.insert("path".to_string(), CfmlValue::string(path.to_string()));
         info.insert("size".to_string(), CfmlValue::Int(size));
@@ -14868,7 +14868,7 @@ impl CfmlVirtualMachine {
             .vfs
             .read_to_string(path)
             .map_err(|e| CfmlError::runtime(format!("getProfileSections: {}", e)))?;
-        let mut result = IndexMap::new();
+        let mut result = ValueMap::default();
         let mut current_section = String::new();
         let mut current_keys: Vec<String> = Vec::new();
         for line in content.lines() {
@@ -15216,7 +15216,7 @@ impl CfmlVirtualMachine {
         // (prevents globals leaking into `variables` via LoadLocal)
         let mut cfc_body = (*cfc_func).clone();
         cfc_body.name = "__cfc_body__".to_string();
-        let empty_locals = IndexMap::new();
+        let empty_locals = ValueMap::default();
         let exec_result =
             self.execute_function_with_args(&cfc_body, Vec::new(), Some(&empty_locals));
 
@@ -15293,7 +15293,7 @@ impl CfmlVirtualMachine {
             // instance every request in serve mode (PR #149). Skip any body
             // local whose backing store IS this component's.
             let self_ptr = template.as_cfml_struct().map(|s| s.backing_ptr());
-            let mut vars_scope: IndexMap<String, CfmlValue> = IndexMap::new();
+            let mut vars_scope: ValueMap = ValueMap::default();
             for (k, v) in &component_variables {
                 let k_lower = k.to_lowercase();
                 // Skip internal/meta keys and functions — keep only data variables
@@ -15349,7 +15349,7 @@ impl CfmlVirtualMachine {
         }
 
         // Resolve inheritance (e.g. extends="taffy.core.api")
-        let resolved = self.resolve_inheritance(template, &IndexMap::new());
+        let resolved = self.resolve_inheritance(template, &ValueMap::default());
         Ok(Some(resolved))
     }
 
@@ -15360,7 +15360,7 @@ impl CfmlVirtualMachine {
         template: &CfmlValue,
     ) -> (
         String,
-        IndexMap<String, CfmlValue>,
+        ValueMap,
         Vec<CfmlMapping>,
         bool,
         u64,
@@ -15374,7 +15374,7 @@ impl CfmlVirtualMachine {
             _ => {
                 return (
                     "default".to_string(),
-                    IndexMap::new(),
+                    ValueMap::default(),
                     Vec::new(),
                     false,
                     1800,
@@ -15396,7 +15396,7 @@ impl CfmlVirtualMachine {
             })
             .unwrap_or_else(|| "default".to_string());
 
-        let mut config = IndexMap::new();
+        let mut config = ValueMap::default();
         for (k, v) in s.iter() {
             if !k.starts_with("__") && !matches!(v, CfmlValue::Function(_)) {
                 config.insert(k.to_lowercase(), v.clone());
@@ -15625,7 +15625,7 @@ impl CfmlVirtualMachine {
         match func_val {
             Some(ref func @ CfmlValue::Function(_)) => {
                 // Bind `this` and __variables as a single struct (not expanded)
-                let mut parent_locals = IndexMap::new();
+                let mut parent_locals = ValueMap::default();
                 if let Some(vars) = s
                     .iter()
                     .find(|(k, _)| *k == "__variables")
@@ -15696,7 +15696,7 @@ impl CfmlVirtualMachine {
         };
 
         // Bind `this` and __variables exactly as call_lifecycle_method does.
-        let mut parent_locals = IndexMap::new();
+        let mut parent_locals = ValueMap::default();
         if let Some(vars) = s
             .iter()
             .find(|(k, _)| *k == "__variables")
@@ -15767,7 +15767,7 @@ impl CfmlVirtualMachine {
             .application_scope
             .as_ref()
             .map(|a| CfmlValue::strukt(a.snapshot()))
-            .unwrap_or_else(|| CfmlValue::strukt(IndexMap::new()));
+            .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()));
         if let Some(mut template) = self.app_cfc_template.take() {
             let _ = self.call_lifecycle_method(
                 &mut template,
@@ -15985,7 +15985,7 @@ impl CfmlVirtualMachine {
                 // New application
                 let app_state = ApplicationState {
                     name: app_name.clone(),
-                    variables: IndexMap::new(),
+                    variables: ValueMap::default(),
                     started: false,
                     config: config.clone(),
                     app_function_table: Vec::new(),
@@ -16104,7 +16104,7 @@ impl CfmlVirtualMachine {
                         &app_name,
                         &sid,
                         SessionData {
-                            variables: IndexMap::new(),
+                            variables: ValueMap::default(),
                             created_secs: now,
                             last_accessed_secs: now,
                             auth_user: None,
@@ -16300,7 +16300,7 @@ impl CfmlVirtualMachine {
                         .application_scope
                         .as_ref()
                         .map(|a| CfmlValue::strukt(a.snapshot()))
-                        .unwrap_or(CfmlValue::strukt(IndexMap::new()));
+                        .unwrap_or(CfmlValue::strukt(ValueMap::default()));
                     for session_vars in pending {
                         // Call onSessionEnd(sessionScope, applicationScope)
                         let _ = self.call_lifecycle_method(
@@ -16456,7 +16456,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// anything was removed. Direct-case first (the common path), then a scan —
 /// mirrors `CfmlStruct::remove_ci` for the plain-`IndexMap` scopes (locals/
 /// globals) used by CFML null-assignment deletion.
-fn imap_remove_ci(m: &mut IndexMap<String, CfmlValue>, key: &str) -> bool {
+fn imap_remove_ci(m: &mut ValueMap, key: &str) -> bool {
     if m.shift_remove(key).is_some() {
         return true;
     }
@@ -17032,8 +17032,8 @@ fn unwrap_query_param(v: &CfmlValue) -> CfmlValue {
 
 /// Map positional cell values to a query's columns (extra values dropped,
 /// missing ones filled with Null) — used by `queryAddRow` with array input.
-fn positional_row(columns: &[String], values: &[CfmlValue]) -> IndexMap<String, CfmlValue> {
-    let mut row = IndexMap::with_capacity(columns.len());
+fn positional_row(columns: &[String], values: &[CfmlValue]) -> ValueMap {
+    let mut row = ValueMap::with_capacity_and_hasher(columns.len(), Default::default());
     for (i, col) in columns.iter().enumerate() {
         row.insert(col.clone(), values.get(i).cloned().unwrap_or(CfmlValue::Null));
     }
@@ -17054,7 +17054,7 @@ fn convert_query_return(value: CfmlValue, return_type: &str, column_key: Option<
         }
         "struct" => {
             if let (CfmlValue::Query(query), Some(key)) = (&value, column_key) {
-                let mut out: IndexMap<String, CfmlValue> = IndexMap::new();
+                let mut out: ValueMap = ValueMap::default();
                 for r in query.rows() {
                     let k = r
                         .iter()

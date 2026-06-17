@@ -11,10 +11,9 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::Client;
 use cfml_common::{
-    dynamic::CfmlValue,
+    dynamic::{CfmlValue, ValueMap},
     vm::{CfmlError, CfmlErrorType, CfmlResult},
 };
-use indexmap::IndexMap;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -182,7 +181,7 @@ impl S3Config {
         inline_key: Option<&str>,
         inline_secret: Option<&str>,
         inline_host: Option<&str>,
-        app_s3: Option<&IndexMap<String, CfmlValue>>,
+        app_s3: Option<&ValueMap>,
     ) -> Result<Self, CfmlError> {
         let app_get = |k: &str| -> Option<String> {
             app_s3.and_then(|m| {
@@ -646,7 +645,7 @@ pub fn s3_get_metadata(
     client: &Client,
     bucket: &str,
     key: &str,
-) -> Result<IndexMap<String, CfmlValue>, CfmlError> {
+) -> Result<ValueMap, CfmlError> {
     block_on(async {
         let resp = client
             .head_object()
@@ -656,7 +655,7 @@ pub fn s3_get_metadata(
             .await
             .map_err(|e| err(format!("HeadObject {}/{} failed: {}", bucket, key, fmt_sdk_err(&e))))?;
 
-        let mut out = IndexMap::new();
+        let mut out = ValueMap::default();
         if let Some(ct) = resp.content_type() {
             out.insert("content_type".to_string(), CfmlValue::string(ct.to_string()));
         }
@@ -736,7 +735,7 @@ pub fn objects_to_query_struct(objects: Vec<S3Object>) -> CfmlValue {
     // Return as an array of structs (lighter weight than a real Query value).
     let mut arr = Vec::with_capacity(objects.len());
     for o in objects {
-        let mut s = IndexMap::new();
+        let mut s = ValueMap::default();
         s.insert("key".to_string(), CfmlValue::string(o.key));
         s.insert("size".to_string(), CfmlValue::Int(o.size));
         s.insert(
@@ -757,7 +756,7 @@ pub fn objects_to_query_struct(objects: Vec<S3Object>) -> CfmlValue {
 pub fn buckets_to_array(buckets: Vec<S3BucketInfo>) -> CfmlValue {
     let mut arr = Vec::with_capacity(buckets.len());
     for b in buckets {
-        let mut s = IndexMap::new();
+        let mut s = ValueMap::default();
         s.insert("bucketName".to_string(), CfmlValue::string(b.name));
         s.insert(
             "creationDate".to_string(),
@@ -773,14 +772,14 @@ pub fn buckets_to_array(buckets: Vec<S3BucketInfo>) -> CfmlValue {
 /// Snapshot of `this.s3` from Application.cfc, stored on the VM.
 #[derive(Debug, Clone, Default)]
 pub struct S3AppConfig {
-    pub settings: IndexMap<String, CfmlValue>,
+    pub settings: ValueMap,
 }
 
 impl S3AppConfig {
     pub fn from_value(v: &CfmlValue) -> Option<Self> {
         match v {
             CfmlValue::Struct(s) => {
-                let mut settings = IndexMap::new();
+                let mut settings = ValueMap::default();
                 for (k, v) in s.iter() {
                     settings.insert(k.clone(), v.clone());
                 }
@@ -790,11 +789,11 @@ impl S3AppConfig {
         }
     }
 
-    pub fn from_struct(s: &IndexMap<String, CfmlValue>) -> Self {
+    pub fn from_struct(s: &ValueMap) -> Self {
         Self { settings: s.clone() }
     }
 
-    pub fn as_map(&self) -> &IndexMap<String, CfmlValue> {
+    pub fn as_map(&self) -> &ValueMap {
         &self.settings
     }
 }

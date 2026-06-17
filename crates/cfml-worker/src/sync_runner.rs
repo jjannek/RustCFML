@@ -37,17 +37,16 @@
 #![cfg(target_arch = "wasm32")]
 
 use crate::handler::{run_cfml, ResponseData};
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::Vfs;
 use cfml_vm::ServerState;
-use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::sync::Arc;
 
 pub struct RunContext {
     pub file_path: String,
     pub vfs: Arc<dyn Vfs>,
-    pub extra_globals: IndexMap<String, CfmlValue>,
+    pub extra_globals: ValueMap,
     pub http_request_data: CfmlValue,
     pub server_state: ServerState,
     pub session_id: Option<String>,

@@ -2195,7 +2195,7 @@ mod tests {
         // isArray / isStruct / isSimpleValue / isNull discriminate.
         let arr_arg =
             boxed::box_value(CfmlValue::Array(CfmlArray::new(vec![CfmlValue::Int(1)]))) as i64;
-        let mut m = IndexMap::new();
+        let mut m = cfml_common::dynamic::ValueMap::default();
         m.insert("k".to_string(), CfmlValue::Int(1));
         let struct_arg = boxed::box_value(CfmlValue::Struct(CfmlStruct::new(m))) as i64;
         let null_arg = boxed::box_value(CfmlValue::Null) as i64;
@@ -2213,7 +2213,7 @@ mod tests {
         // arrayIsEmpty / structIsEmpty default true for non-collection types.
         let empty_arr = boxed::box_value(CfmlValue::Array(CfmlArray::new(Vec::new()))) as i64;
         let empty_struct =
-            boxed::box_value(CfmlValue::Struct(CfmlStruct::new(IndexMap::new()))) as i64;
+            boxed::box_value(CfmlValue::Struct(CfmlStruct::new(cfml_common::dynamic::ValueMap::default()))) as i64;
         assert!(extract_bool(cfml_array_is_empty_boxed(empty_arr)));
         assert!(!extract_bool(cfml_array_is_empty_boxed(arr_arg)));
         assert!(extract_bool(cfml_array_is_empty_boxed(int_arg)));
@@ -2224,7 +2224,7 @@ mod tests {
         assert_eq!(cfml_struct_count_boxed_i64(struct_arg), 1);
         assert_eq!(cfml_struct_count_boxed_i64(empty_struct), 0);
         assert_eq!(cfml_struct_count_boxed_i64(int_arg), 0);
-        let mut argscope = IndexMap::new();
+        let mut argscope = cfml_common::dynamic::ValueMap::default();
         argscope.insert("__arguments_scope".to_string(), CfmlValue::Bool(true));
         argscope.insert("__arguments_params".to_string(), CfmlValue::Bool(true));
         argscope.insert("a".to_string(), CfmlValue::Int(1));

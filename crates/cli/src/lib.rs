@@ -9,7 +9,7 @@ use std::process::exit;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use cfml_codegen::compiler::CfmlCompiler;
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::{self, Vfs};
 use cfml_config::{resolve, RustCfmlConfig};
 use cfml_compiler::lexer;
@@ -26,7 +26,7 @@ pub use cfml_common::vm::{CfmlError, CfmlResult};
 pub use cfml_vm::CfmlVirtualMachine as Vm;
 // QoQ function registration for native modules (`vm.register_native_qoq_fn`).
 pub use cfml_qoq::function::QoQFnKind;
-// Re-exported so module authors can construct `Value::strukt(IndexMap::new())`
+// Re-exported so module authors can construct `Value::strukt(ValueMap::default())`
 // without declaring indexmap as a separate dep.
 pub use indexmap::IndexMap;
 
@@ -473,7 +473,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
     let server_state = ServerState::with_config(false, cfconfig);
-    match compile_and_run(source, debug, source_file, IndexMap::new(), Some(&server_state), None, None, vfs::real_fs(), false, None, false) {
+    match compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, vfs::real_fs(), false, None, false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
@@ -495,7 +495,7 @@ fn compile_and_run_with_session(
     source: &str,
     debug: bool,
     source_file: Option<String>,
-    extra_globals: IndexMap<String, CfmlValue>,
+    extra_globals: ValueMap,
     server_state: Option<&ServerState>,
     http_request_data: Option<CfmlValue>,
     session_id: Option<String>,
@@ -516,7 +516,7 @@ fn compile_and_run_with_session(
 fn run_missing_template(
     would_be_path: String,
     target_page: String,
-    extra_globals: IndexMap<String, CfmlValue>,
+    extra_globals: ValueMap,
     server_state: Option<&ServerState>,
     http_request_data: Option<CfmlValue>,
     session_id: Option<String>,
@@ -570,7 +570,7 @@ fn spawn_cfthread(seed: ThreadSeed) -> ThreadHandle {
             let mut vm = CfmlVirtualMachine::new(seed.program.clone());
             register_vm_runtime(&mut vm);
             let (closure, attributes) = vm.apply_thread_seed(seed);
-            let result = vm.run_thread_body(&closure, attributes, &IndexMap::new());
+            let result = vm.run_thread_body(&closure, attributes, &ValueMap::default());
             // Receiver may be gone if the parent never joined; ignore.
             let _ = tx.send(result);
         })
@@ -611,7 +611,7 @@ fn compile_and_run(
     source: &str,
     debug: bool,
     source_file: Option<String>,
-    extra_globals: IndexMap<String, CfmlValue>,
+    extra_globals: ValueMap,
     server_state: Option<&ServerState>,
     http_request_data: Option<CfmlValue>,
     session_id: Option<String>,
@@ -733,9 +733,9 @@ fn compile_and_run(
     register_vm_runtime(&mut vm);
 
     // Ensure web scopes always exist (CFML guarantees url/cgi/form are always defined)
-    vm.globals.entry("url".to_string()).or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
-    vm.globals.entry("cgi".to_string()).or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
-    vm.globals.entry("form".to_string()).or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+    vm.globals.entry("url".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+    vm.globals.entry("cgi".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+    vm.globals.entry("form".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     // Inject extra globals (web scopes, etc.) — overrides defaults above in serve mode
     for (name, value) in extra_globals {
@@ -1805,7 +1805,7 @@ fn build_web_scopes(
     query_string: &str,
     port: u16,
     remote_addr: &str,
-) -> (IndexMap<String, CfmlValue>, CfmlValue) {
+) -> (ValueMap, CfmlValue) {
     cfml_vm::web::build_web_scopes(
         method, headers, body, script_name, path_info, query_string, port, remote_addr,
     )
@@ -1880,11 +1880,11 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
             state.doc_root.join(&dbg.error_template)
         };
         if let Ok(source) = fs::read_to_string(&template_path) {
-            let mut extra = IndexMap::new();
-            let mut err_struct = IndexMap::new();
+            let mut extra = ValueMap::default();
+            let mut err_struct = ValueMap::default();
             err_struct.insert("message".to_string(), CfmlValue::string(e.message.clone()));
             err_struct.insert("output".to_string(), CfmlValue::string(e.output.clone()));
-            let mut req = IndexMap::new();
+            let mut req = ValueMap::default();
             req.insert("_error".to_string(), CfmlValue::strukt(err_struct));
             extra.insert("request".to_string(), CfmlValue::strukt(req));
             if let Ok(resp) = compile_and_run(
@@ -2731,7 +2731,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
     //   --name value  → cli.name = "value"   (named)
     //   --flag        → cli.flag = true       (boolean flag)
     //   positional    → cli[1], cli[2], ...   (1-based numeric keys)
-    let mut cli_scope = IndexMap::new();
+    let mut cli_scope = ValueMap::default();
     let mut positional_idx: usize = 1;
     let mut i = 1;
     while i < cli_args.len() {
@@ -2779,7 +2779,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
         }
     }
 
-    let mut extra_globals = IndexMap::new();
+    let mut extra_globals = ValueMap::default();
     extra_globals.insert("cli".to_string(), CfmlValue::strukt(cli_scope));
 
     // Execute

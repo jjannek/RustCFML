@@ -4,7 +4,7 @@
 //! drives real lifecycle execution instead of testing the stdlib shim.
 
 use cfml_codegen::{compiler::CfmlCompiler, BytecodeProgram};
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::{EmbeddedFs, Vfs};
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
@@ -42,15 +42,15 @@ fn run_request(server_state: &ServerState, vfs: Arc<dyn Vfs>, page: &str, endlog
         vm.builtins.insert(name, func);
     }
     // Hand onApplicationEnd a path to record that it fired.
-    let mut url = IndexMap::new();
+    let mut url = ValueMap::default();
     url.insert("endlog".to_string(), CfmlValue::string(endlog.to_string()));
     vm.globals.insert("url".to_string(), CfmlValue::strukt(url));
     vm.globals
         .entry("cgi".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
     vm.globals
         .entry("form".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     vm.server_state = Some(server_state.clone());
 

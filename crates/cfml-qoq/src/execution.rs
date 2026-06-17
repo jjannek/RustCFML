@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use cfml_common::dynamic::{CfmlQuery, CfmlQueryData, CfmlValue};
+use cfml_common::dynamic::{CfmlQuery, CfmlQueryData, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 
@@ -47,7 +47,7 @@ pub struct QoQParams {
     /// Positional `?` parameters, in order.
     pub positional: Vec<CfmlValue>,
     /// Named `:name` parameters (matched case-insensitively).
-    pub named: IndexMap<String, CfmlValue>,
+    pub named: ValueMap,
 }
 
 impl QoQParams {

@@ -94,7 +94,7 @@ impl DoApplicationStore {
                 name: app_name.to_string(),
                 variables: snap.variables,
                 started: snap.started,
-                config: indexmap::IndexMap::new(),
+                config: cfml_common::dynamic::ValueMap::default(),
                 app_function_table: Vec::new(),
                 session_storage: None,
                 app_caches: indexmap::IndexMap::new(),
@@ -158,7 +158,7 @@ impl ApplicationStore for DoApplicationStore {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedApp {
-    variables: indexmap::IndexMap<String, cfml_common::dynamic::CfmlValue>,
+    variables: cfml_common::dynamic::ValueMap,
     #[serde(default)]
     started: bool,
 }

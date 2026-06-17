@@ -4,7 +4,7 @@
 //! methods receive web-root-relative paths such as `/_moopa.cfm`.
 
 use cfml_codegen::{compiler::CfmlCompiler, BytecodeProgram};
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vfs::{EmbeddedFs, Vfs};
 use cfml_compiler::{parser::Parser, tag_parser};
 use cfml_stdlib::builtins::{get_builtin_functions, get_builtins};
@@ -94,13 +94,13 @@ component {
     }
     vm.globals
         .entry("url".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
     vm.globals
         .entry("cgi".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
     vm.globals
         .entry("form".to_string())
-        .or_insert_with(|| CfmlValue::strukt(IndexMap::new()));
+        .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     vm.execute_with_lifecycle().unwrap();
 

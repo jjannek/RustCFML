@@ -24,9 +24,8 @@
 //! builds. See `JIT_DESIGN.md` for the full rationale and gotchas.
 
 use cfml_codegen::{BytecodeFunction, BytecodeOp};
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::CfmlResult;
-use indexmap::IndexMap;
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -667,8 +666,8 @@ impl JitEngine {
         func: &BytecodeFunction,
         region_start: usize,
         region_end_excl: usize,
-        locals: &mut IndexMap<String, CfmlValue>,
-        closure_env: Option<&Arc<RwLock<IndexMap<String, CfmlValue>>>>,
+        locals: &mut ValueMap,
+        closure_env: Option<&Arc<RwLock<ValueMap>>>,
         is_shadowed: &mut dyn FnMut(&str) -> bool,
         udf_lookup: &dyn Fn(&str) -> Option<UdfMeta>,
     ) -> Option<usize> {
@@ -791,7 +790,7 @@ fn build_caller_kinds(
     func: &BytecodeFunction,
     region_start: usize,
     region_end_excl: usize,
-    locals: &IndexMap<String, CfmlValue>,
+    locals: &ValueMap,
 ) -> HashMap<String, analysis::Kind> {
     let mut kinds: HashMap<String, analysis::Kind> = HashMap::new();
     for ip in region_start..region_end_excl {
@@ -842,8 +841,8 @@ fn build_caller_kinds(
 /// re-execute the body once more.
 fn run_osr_compiled(
     c: &OsrCompiled,
-    locals: &mut IndexMap<String, CfmlValue>,
-    closure_env: Option<&Arc<RwLock<IndexMap<String, CfmlValue>>>>,
+    locals: &mut ValueMap,
+    closure_env: Option<&Arc<RwLock<ValueMap>>>,
 ) -> Option<usize> {
     // v0.91.0 — install a per-call arena. Mid-body Boxed allocations
     // (`cfml_jit_concat_boxed`, `cfml_jit_box_int`, …) land here, and the

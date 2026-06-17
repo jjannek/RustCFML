@@ -1,8 +1,7 @@
 // Java shim handlers - to be inserted into lib.rs
 
-use cfml_common::dynamic::CfmlValue;
+use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
-use indexmap::IndexMap;
 
 pub fn handle_java_messagedigest(
     method: &str,
@@ -15,7 +14,7 @@ pub fn handle_java_messagedigest(
                 .first()
                 .map(|a| a.as_string().to_lowercase())
                 .unwrap_or_else(|| "sha-256".to_string());
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.security.messagedigest".to_string()),
@@ -84,7 +83,7 @@ pub fn handle_java_uuid(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue)
     match method {
         "init" | "randomuuid" => {
             let uuid = format!("{:032x}", rand_u128());
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.uuid".to_string()),
@@ -138,7 +137,7 @@ pub fn handle_java_date(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0),
             };
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.date".to_string()),
@@ -188,7 +187,7 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
     }
     match method {
         "init" | "currentthread" => {
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.lang.thread".to_string()),
@@ -207,7 +206,7 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
             }
         }
         "getthreadgroup" => {
-            let mut tg = IndexMap::new();
+            let mut tg = ValueMap::default();
             tg.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.lang.threadgroup".to_string()),
@@ -236,7 +235,7 @@ pub fn handle_java_inetaddress(
         // `createObject(...).getLocalHost()`); otherwise the receiver is null
         // and the chained call throws since v0.119.0.
         "init" => {
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.net.inetaddress".to_string()),
@@ -248,7 +247,7 @@ pub fn handle_java_inetaddress(
             let hostname = std::env::var("HOSTNAME")
                 .or_else(|_| std::env::var("HOST"))
                 .unwrap_or_else(|_| "localhost".to_string());
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.net.inetaddress".to_string()),
@@ -269,7 +268,7 @@ pub fn handle_java_inetaddress(
                 .first()
                 .map(|a| a.as_string())
                 .unwrap_or_else(|| "localhost".to_string());
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.net.inetaddress".to_string()),
@@ -307,7 +306,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
     match method {
         "init" => {
             let path = args.first().map(|a| a.as_string()).unwrap_or_default();
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.io.file".to_string()),
@@ -397,7 +396,7 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             // cleanly due to its String/varargs signature.
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(path) = shim.get("__path") {
-                    let mut ps = IndexMap::new();
+                    let mut ps = ValueMap::default();
                     ps.insert(
                         "__java_class".to_string(),
                         CfmlValue::string("java.nio.file.paths".to_string()),
@@ -418,14 +417,14 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
         "init" => {
             // java.lang.System is a static-only class in real Java, but we
             // return a shim struct so both init() and static-style access work.
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.lang.system".to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             // Expose `out` as a nested shim so `system.out.println(...)` works.
-            let mut out = IndexMap::new();
+            let mut out = ValueMap::default();
             out.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.lang.system.out".to_string()),
@@ -481,7 +480,7 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
             match key {
                 Some(k) => Ok(CfmlValue::string(std::env::var(k.as_str()).unwrap_or_default())),
                 None => {
-                    let mut env = IndexMap::new();
+                    let mut env = ValueMap::default();
                     for (k, v) in std::env::vars() {
                         env.insert(k, CfmlValue::string(v));
                     }
@@ -501,7 +500,7 @@ pub fn handle_java_stringbuilder(
     match method {
         "init" => {
             let init = args.first().map(|a| a.as_string()).unwrap_or_default();
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.lang.stringbuilder".to_string()),
@@ -564,7 +563,7 @@ pub fn handle_java_stringbuilder(
 pub fn handle_java_treemap(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     match method {
         "init" => {
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.treemap".to_string()),
@@ -652,7 +651,7 @@ pub fn handle_java_linkedhashmap(
 ) -> CfmlResult {
     match method {
         "init" => {
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.linkedhashmap".to_string()),
@@ -736,7 +735,7 @@ pub fn handle_java_concurrentlinkedqueue(
 ) -> CfmlResult {
     match method {
         "init" => {
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.concurrent.concurrentlinkedqueue".to_string()),
@@ -827,7 +826,7 @@ pub fn handle_java_concurrenthashmap(
 ) -> CfmlResult {
     match method {
         "init" => {
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.concurrent.concurrenthashmap".to_string()),
@@ -907,7 +906,7 @@ pub fn handle_java_concurrenthashmap(
         }
         "clear" => {
             if let CfmlValue::Struct(ref shim) = object {
-                let mut ns = IndexMap::new();
+                let mut ns = ValueMap::default();
                 for (k, v) in shim.iter() {
                     if k.starts_with("__") {
                         ns.insert(k.clone(), v.clone());
@@ -937,7 +936,7 @@ pub fn handle_java_collections(
         "init" => {
             // Collections is static-only; return a stub shim so static calls
             // dispatch through to this handler.
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.collections".to_string()),
@@ -955,7 +954,7 @@ pub fn handle_java_collections(
             }
         }
         "emptylist" | "emptyset" => Ok(CfmlValue::array(Vec::new())),
-        "emptymap" => Ok(CfmlValue::strukt(IndexMap::new())),
+        "emptymap" => Ok(CfmlValue::strukt(ValueMap::default())),
         "unmodifiablelist" | "unmodifiableset" | "synchronizedlist" | "synchronizedset" => {
             // No true immutability in CFML; behave as identity like Lucee.
             match args.into_iter().next() {
@@ -965,7 +964,7 @@ pub fn handle_java_collections(
         }
         "unmodifiablemap" | "synchronizedmap" => match args.into_iter().next() {
             Some(v) => Ok(v),
-            None => Ok(CfmlValue::strukt(IndexMap::new())),
+            None => Ok(CfmlValue::strukt(ValueMap::default())),
         },
         "sort" => {
             if let Some(CfmlValue::Array(a)) = args.into_iter().next() {
@@ -991,7 +990,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
         "init" => {
             // Paths is a static-only class; return a stub shim so that
             // the subsequent .get(path) static call dispatches here.
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.nio.file.paths".to_string()),
@@ -1001,7 +1000,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
         }
         "get" => {
             let path = args.first().map(|a| a.as_string()).unwrap_or_default();
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.nio.file.paths".to_string()),
@@ -1014,7 +1013,7 @@ pub fn handle_java_paths(method: &str, args: Vec<CfmlValue>, object: &CfmlValue)
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
                     if let Some(p) = std::path::Path::new(path.as_str()).parent() {
-                        let mut ps = IndexMap::new();
+                        let mut ps = ValueMap::default();
                         ps.insert(
                             "__java_class".to_string(),
                             CfmlValue::string("java.nio.file.paths".to_string()),
@@ -1119,7 +1118,7 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
     match method {
         // createObject(...) with no pattern yet — an uncompiled Pattern handle.
         "init" => {
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.regex.pattern".to_string()),
@@ -1131,7 +1130,7 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
         "compile" => {
             let regex_str = args.first().map(|a| a.as_string()).unwrap_or_default();
             compile(&regex_str)?; // validate up front
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.regex.pattern".to_string()),
@@ -1149,7 +1148,7 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             let input = args.first().map(|a| a.as_string()).unwrap_or_default();
             let re = compile(&regex_str)?;
             let group_count = re.captures_len() as i64 - 1;
-            let mut shim = IndexMap::new();
+            let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
                 CfmlValue::string("java.util.regex.matcher".to_string()),
@@ -1284,7 +1283,7 @@ pub const SERVLET_RESPONSE_CLASS: &str = "lucee.runtime.net.http.httpservletresp
 
 /// Build the `HttpServletRequest` shim returned by getPageContext().getRequest().
 /// `cgi` is the request's CGI scope (serve mode) or `None` in bare CLI.
-pub fn build_servlet_request_shim(cgi: Option<&IndexMap<String, CfmlValue>>) -> CfmlValue {
+pub fn build_servlet_request_shim(cgi: Option<&ValueMap>) -> CfmlValue {
     let nonempty = |k: &str| {
         cgi.and_then(|c| c.get(k))
             .map(|v| v.as_string())
@@ -1315,7 +1314,7 @@ pub fn build_servlet_request_shim(cgi: Option<&IndexMap<String, CfmlValue>>) -> 
     let request_url = format!("{}://{}{}{}", scheme, server_name, port_part, script);
     let content_type = nonempty("content_type");
 
-    let mut s = IndexMap::new();
+    let mut s = ValueMap::default();
     s.insert("__java_shim".to_string(), CfmlValue::Bool(true));
     s.insert(
         "__java_class".to_string(),
@@ -1346,7 +1345,7 @@ pub fn build_servlet_request_shim(cgi: Option<&IndexMap<String, CfmlValue>>) -> 
 /// (`response_status`/`response_headers`); the shim itself is just a marker
 /// dispatched in `lib.rs`.
 pub fn build_servlet_response_shim() -> CfmlValue {
-    let mut s = IndexMap::new();
+    let mut s = ValueMap::default();
     s.insert("__java_shim".to_string(), CfmlValue::Bool(true));
     s.insert(
         "__java_class".to_string(),
@@ -1356,8 +1355,8 @@ pub fn build_servlet_response_shim() -> CfmlValue {
 }
 
 /// Build the page-context shim returned by getPageContext().
-pub fn build_page_context_shim(cgi: Option<&IndexMap<String, CfmlValue>>) -> CfmlValue {
-    let mut s = IndexMap::new();
+pub fn build_page_context_shim(cgi: Option<&ValueMap>) -> CfmlValue {
+    let mut s = ValueMap::default();
     s.insert("__java_shim".to_string(), CfmlValue::Bool(true));
     s.insert(
         "__java_class".to_string(),

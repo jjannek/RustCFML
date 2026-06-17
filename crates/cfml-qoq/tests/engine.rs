@@ -1,7 +1,7 @@
 //! End-to-end engine tests: parse + execute over in-memory `CfmlQuery` sources,
 //! exercising the public API the VM uses.
 
-use cfml_common::dynamic::{CfmlQuery, CfmlValue};
+use cfml_common::dynamic::{CfmlQuery, CfmlValue, ValueMap};
 use cfml_qoq::{execute, parse, QoQFunctionRegistry, QoQParams};
 use indexmap::IndexMap;
 
@@ -15,7 +15,7 @@ fn s(v: &str) -> CfmlValue {
 fn query(cols: &[&str], rows: &[&[CfmlValue]]) -> CfmlQuery {
     let q = CfmlQuery::new(cols.iter().map(|c| c.to_string()).collect());
     for r in rows {
-        let mut m = IndexMap::new();
+        let mut m = ValueMap::default();
         for (idx, c) in cols.iter().enumerate() {
             m.insert(c.to_string(), r[idx].clone());
         }
@@ -160,7 +160,7 @@ fn positional_params() {
     let p = people();
     let params = QoQParams {
         positional: vec![i(30)],
-        named: IndexMap::new(),
+        named: ValueMap::default(),
     };
     let (_c, rows) = run_p("SELECT name FROM people WHERE age >= ? ORDER BY name", &[("people", &p)], params);
     assert_eq!(rows, vec![vec!["Alice".to_string()], vec!["Carol".to_string()], vec!["Dave".to_string()]]);
@@ -169,7 +169,7 @@ fn positional_params() {
 #[test]
 fn named_params() {
     let p = people();
-    let mut named = IndexMap::new();
+    let mut named = ValueMap::default();
     named.insert("minAge".to_string(), i(35));
     let params = QoQParams { positional: vec![], named };
     let (_c, rows) = run_p("SELECT name FROM people WHERE age >= :minAge ORDER BY name", &[("people", &p)], params);
@@ -283,7 +283,7 @@ fn parallel_filter_and_order_preserves_results() {
     // 15k rows: id = 1..=15000, name = "n{id}".
     let q = CfmlQuery::new(vec!["id".to_string(), "name".to_string()]);
     for n in 1..=15000i64 {
-        let mut m = IndexMap::new();
+        let mut m = ValueMap::default();
         m.insert("id".to_string(), CfmlValue::Int(n));
         m.insert("name".to_string(), CfmlValue::string(format!("n{}", n)));
         q.add_row(m);
@@ -309,7 +309,7 @@ fn parallel_filter_and_order_preserves_results() {
 fn parallel_filter_into_aggregate() {
     let q = CfmlQuery::new(vec!["id".to_string(), "bucket".to_string()]);
     for n in 1..=12000i64 {
-        let mut m = IndexMap::new();
+        let mut m = ValueMap::default();
         m.insert("id".to_string(), CfmlValue::Int(n));
         m.insert("bucket".to_string(), CfmlValue::Int(n % 3));
         q.add_row(m);
