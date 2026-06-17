@@ -5862,10 +5862,31 @@ fn fn_array_shift(args: Vec<CfmlValue>) -> CfmlResult {
 // ===============================================
 
 #[cfg(feature = "http")]
+/// Expand a top-level `attributeCollection` struct into the cfhttp options
+/// struct. Collection keys provide the base; any attribute also supplied
+/// explicitly (case-insensitively) wins, per Lucee/BoxLang semantics. No-op
+/// when `arg` isn't a struct or carries no `attributeCollection`.
+fn merge_cfhttp_attribute_collection(arg: CfmlValue) -> CfmlValue {
+    let CfmlValue::Struct(opts) = &arg else { return arg; };
+    let Some(CfmlValue::Struct(ac)) = opts.get_ci("attributeCollection") else { return arg; };
+    let mut merged: ValueMap = ac.snapshot();
+    for (k, v) in opts.iter() {
+        if k.eq_ignore_ascii_case("attributeCollection") { continue; }
+        // Explicit attribute wins: drop any same-named collection key first
+        // so a differing-case duplicate can't shadow it.
+        if let Some(existing) = merged.keys().find(|ek| ek.eq_ignore_ascii_case(&k)).cloned() {
+            merged.shift_remove(&existing);
+        }
+        merged.insert(k, v);
+    }
+    CfmlValue::Struct(CfmlStruct::new(merged))
+}
+
+#[cfg(feature = "http")]
 fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
     use std::collections::HashMap;
 
-    let arg = args.into_iter().next().unwrap_or(CfmlValue::Null);
+    let arg = merge_cfhttp_attribute_collection(args.into_iter().next().unwrap_or(CfmlValue::Null));
 
     // Parse arguments: either a URL string or an options struct
     let (mut url, method, headers, body, timeout_secs, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port) = match &arg {

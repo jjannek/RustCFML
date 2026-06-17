@@ -827,32 +827,29 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (prop_str, tag_end - start)
         }
         "cfhttp" => {
-            let url = attrs.get("url").cloned().unwrap_or_default();
-            let method = attrs.get("method").cloned().unwrap_or("GET".to_string());
             let result_var = attrs.get("result").cloned().unwrap_or("cfhttp".to_string());
-            let timeout = attrs.get("timeout").cloned();
-            let charset = attrs.get("charset").cloned();
-            let username = attrs.get("username").cloned();
-            let password = attrs.get("password").cloned();
-            let useragent = attrs.get("useragent").cloned();
-            let proxyserver = attrs.get("proxyserver").cloned();
-            let multipart = attrs.get("multipart").cloned();
 
             let mut opts = Vec::new();
+            // attributeCollection="#struct#" — a struct of cfhttp attributes
+            // (Lucee/BoxLang). fn_cfhttp merges it into the options struct with
+            // explicitly-supplied attributes winning. Pass it through verbatim;
+            // format_attr_value preserves the native struct type.
+            if let Some(ac) = attrs.get("attributecollection") {
+                opts.push(format!("attributeCollection: {}", format_attr_value(ac, quoted.contains("attributecollection"))));
+            }
+            // Emit only the attributes the author actually supplied so an
+            // attributeCollection can provide the rest (an unconditional
+            // `url: ""` would otherwise win the merge and blank the URL).
             // String attributes may carry #expr# interpolation inside an
             // otherwise-literal quoted value (e.g. url="#baseUrl##path#").
             // format_attr_value emits literal segments quoted and only evaluates
             // the #...# parts; strip_hashes would collapse the whole value into a
             // bare (mis-parsed) expression like `baseUrlpath`.
-            opts.push(format!("url: {}", format_attr_value(&url, quoted.contains("url"))));
-            opts.push(format!("method: {}", format_attr_value(&method, quoted.contains("method"))));
-            if let Some(t) = timeout { opts.push(format!("timeout: {}", format_attr_value(&t, quoted.contains("timeout")))); }
-            if let Some(c) = charset { opts.push(format!("charset: {}", format_attr_value(&c, quoted.contains("charset")))); }
-            if let Some(u) = username { opts.push(format!("username: {}", format_attr_value(&u, quoted.contains("username")))); }
-            if let Some(p) = password { opts.push(format!("password: {}", format_attr_value(&p, quoted.contains("password")))); }
-            if let Some(u) = useragent { opts.push(format!("useragent: {}", format_attr_value(&u, quoted.contains("useragent")))); }
-            if let Some(p) = proxyserver { opts.push(format!("proxyserver: {}", format_attr_value(&p, quoted.contains("proxyserver")))); }
-            if let Some(m) = multipart { opts.push(format!("multipart: {}", format_attr_value(&m, quoted.contains("multipart")))); }
+            for key in ["url", "method", "timeout", "charset", "username", "password", "useragent", "proxyserver", "multipart"] {
+                if let Some(v) = attrs.get(key) {
+                    opts.push(format!("{}: {}", key, format_attr_value(v, quoted.contains(key))));
+                }
+            }
 
             if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfhttp") {
                 let body: String = chars[tag_end..end_tag_pos].iter().collect();
