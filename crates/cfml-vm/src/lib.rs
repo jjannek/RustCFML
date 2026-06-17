@@ -14396,11 +14396,25 @@ impl CfmlVirtualMachine {
             if k == "__extends" || k == "__variables" || k == "__metadata" {
                 continue; // Already merged above; don't overwrite
             }
+            // CFML is case-insensitive: a child member overrides a parent member
+            // even when their casing differs (e.g. parent OnApplicationStart vs
+            // child onApplicationStart). A plain insert would leave BOTH casings
+            // in the map, so drop any differently-cased parent entry first so the
+            // child's definition is the sole winner.
+            if let Some(stale) = parent_map
+                .keys()
+                .find(|ek| ek.as_str() != k.as_str() && ek.eq_ignore_ascii_case(&k))
+                .cloned()
+            {
+                parent_map.shift_remove(&stale);
+            }
             parent_map.insert(k.clone(), v.clone());
             // Also update __variables when child overrides a method, so
             // unqualified calls within CFC methods resolve to the override
             if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
                 if let Some(vars) = parent_map.get_mut("__variables").and_then(|v| v.as_cfml_struct()) {
+                    // remove_ci drops any differently-cased parent entry too
+                    vars.remove_ci(&k);
                     vars.insert(k.clone(), v.clone());
                 }
             }
