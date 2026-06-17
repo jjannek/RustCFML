@@ -350,6 +350,25 @@ impl CfmlStruct {
         prev
     }
 
+    /// Merge every entry of `other` into `self` (insert-or-overwrite, with the
+    /// same case-insensitive overwrite semantics as [`insert`]).
+    ///
+    /// **Reference-identity fast path:** when `other` is the *same* backing
+    /// store as `self` (`ptr_eq`), this is a no-op — the entries are literally
+    /// already present, so there is nothing to copy. This is the common case
+    /// for CFC method `variables`-scope write-back: the method mutates the
+    /// instance's `__variables` through a shared `Arc`, so by the time we go to
+    /// "write it back" the data already landed. Avoids cloning the whole map on
+    /// every method return.
+    pub fn merge_from(&self, other: &CfmlStruct) {
+        if self.ptr_eq(other) {
+            return;
+        }
+        for (k, v) in other.snapshot() {
+            self.insert(k, v);
+        }
+    }
+
     /// Remove a key (case-sensitive), returning its value if present. Uses
     /// `shift_remove` to preserve insertion order of the remaining entries.
     /// v0.99.4 — shape_id bumps iff a key was actually removed.

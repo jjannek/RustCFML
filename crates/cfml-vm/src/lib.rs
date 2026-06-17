@@ -756,7 +756,7 @@ pub struct CfmlVirtualMachine {
     method_this_writeback: Option<CfmlValue>,
     /// After a component method executes, holds modified variables scope entries for
     /// write-back to the component's __variables. Enables `variables.x = y` to persist.
-    method_variables_writeback: Option<ValueMap>,
+    method_variables_writeback: Option<CfmlStruct>,
     /// After a closure executes, holds modified parent-scope variables for write-back
     /// to the caller's locals. Enables closures to mutate parent scope.
     closure_parent_writeback: Option<ValueMap>,
@@ -4361,7 +4361,11 @@ impl CfmlVirtualMachine {
                         // Save variables scope mutations for component write-back
                         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
                             if !vars.is_empty() {
-                                self.method_variables_writeback = Some(vars.snapshot());
+                                // Arc-handle clone, not a full map copy: the method
+                                // mutated this store in place, so the writeback site
+                                // (same backing store) skips via `merge_from`'s
+                                // ptr_eq fast path.
+                                self.method_variables_writeback = Some(vars.clone());
                             }
                         } else {
                             let mut vars_wb = ValueMap::default();
@@ -4378,7 +4382,8 @@ impl CfmlVirtualMachine {
                                 vars_wb.insert(k.clone(), v.clone());
                             }
                             if !vars_wb.is_empty() {
-                                self.method_variables_writeback = Some(vars_wb);
+                                self.method_variables_writeback =
+                                    Some(CfmlStruct::new(vars_wb));
                             }
                         }
                     }
@@ -5084,12 +5089,15 @@ impl CfmlVirtualMachine {
                                     } else {
                                         instance
                                     };
-                                    // Merge init()'s __variables mutations back into the component
+                                    // Merge init()'s __variables mutations back into the component.
+                                    // `vars` is the (Arc-shared) __variables the init frame
+                                    // mutated in place; storing the handle is an identity write
+                                    // when the component already shares that store.
                                     if let Some(vars) = vars_wb {
                                         if let Some(s) = final_obj.as_cfml_struct() {
                                             s.insert(
                                                 "__variables".to_string(),
-                                                CfmlValue::strukt(vars),
+                                                CfmlValue::Struct(vars),
                                             );
                                         }
                                     }
@@ -5781,9 +5789,7 @@ impl CfmlVirtualMachine {
                                     // clobbers the caller frame's real component scope.
                                     if s.contains_key("__name") {
                                         let vs = s.get_or_insert_struct("__variables");
-                                        for (k, v) in vars_wb {
-                                            vs.insert(k, v);
-                                        }
+                                        vs.merge_from(&vars_wb);
                                     }
                                 }
                                 // Store back
@@ -6265,9 +6271,10 @@ impl CfmlVirtualMachine {
             self.method_this_writeback = Some(this_val.clone());
             // Save variables scope mutations for component write-back
             if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
-                // With dedicated __variables scope, just pass it through
+                // Arc-handle clone (see Return path): the writeback site skips
+                // the copy when it's the same backing store.
                 if !vars.is_empty() {
-                    self.method_variables_writeback = Some(vars.snapshot());
+                    self.method_variables_writeback = Some(vars.clone());
                 }
             } else {
                 // Non-CFC or legacy path: collect from locals
@@ -6285,7 +6292,7 @@ impl CfmlVirtualMachine {
                     vars_wb.insert(k.clone(), v.clone());
                 }
                 if !vars_wb.is_empty() {
-                    self.method_variables_writeback = Some(vars_wb);
+                    self.method_variables_writeback = Some(CfmlStruct::new(vars_wb));
                 }
             }
         }
@@ -15640,9 +15647,7 @@ impl CfmlVirtualMachine {
                 if let Some(vars_wb) = self.method_variables_writeback.take() {
                     if let Some(ts) = template.as_cfml_struct() {
                         let vs = ts.get_or_insert_struct("__variables");
-                        for (k, v) in vars_wb {
-                            vs.insert(k, v);
-                        }
+                        vs.merge_from(&vars_wb);
                     }
                 }
 
@@ -15712,9 +15717,7 @@ impl CfmlVirtualMachine {
         if let Some(vars_wb) = self.method_variables_writeback.take() {
             if let Some(ts) = template.as_cfml_struct() {
                 let vs = ts.get_or_insert_struct("__variables");
-                for (k, v) in vars_wb {
-                    vs.insert(k, v);
-                }
+                vs.merge_from(&vars_wb);
             }
         }
         if let Some(modified_this) = self.method_this_writeback.take() {
