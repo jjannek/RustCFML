@@ -12724,6 +12724,15 @@ impl CfmlVirtualMachine {
         // Try to resolve the root variable from scope chain
         let root_val = if root == "local" || root == "variables" {
             Some(CfmlValue::strukt(locals.clone()))
+        } else if root == "arguments" {
+            // The arguments scope lives under the reserved ARGUMENTS_SCOPE_KEY,
+            // not under the literal "arguments" key — without this case a
+            // nested probe like `isDefined("arguments.md.properties")` would
+            // fall through to the regular-var branch, fail to find an
+            // "arguments" local, and wrongly return false (which made ColdBox's
+            // `param arguments.metadata.properties = []` clobber a populated
+            // array — the WireBox property-injection regression).
+            locals.get(ARGUMENTS_SCOPE_KEY).cloned()
         } else if root == "request" {
             Some(CfmlValue::strukt(self.request_scope.snapshot()))
         } else if root == "application" {

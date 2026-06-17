@@ -2278,6 +2278,16 @@ impl CfmlCompiler {
         let prev_fn_local_mode = self.current_fn_local_mode;
         self.current_fn_local_mode = declared_mode.or(prev_fn_local_mode);
 
+        // A nested function/closure is its own control-flow boundary: a `return`
+        // in its body must run only ITS finallys (none yet), never the enclosing
+        // function's, and a `break`/`continue` must not target an enclosing loop.
+        // Save/clear both stacks for the body, then restore. Without this, a
+        // closure defined inside `lock {}` / `try{}finally{}` would emit the
+        // enclosing finally inline into the closure body (the WireBox
+        // `produceMetadataUDF` regression).
+        let saved_finally = std::mem::take(&mut self.finally_stack);
+        let saved_loops = std::mem::take(&mut self.loop_stack);
+
         // Emit default parameter value preamble:
         // For each param with a default, if the arg is null, assign the default
         // and also update the arguments scope
@@ -2309,6 +2319,8 @@ impl CfmlCompiler {
 
         self.function_depth -= 1;
         self.current_fn_local_mode = prev_fn_local_mode;
+        self.finally_stack = saved_finally;
+        self.loop_stack = saved_loops;
 
         let bc_func = BytecodeFunction {
             name: func.name.clone(),
@@ -3331,6 +3343,11 @@ impl CfmlCompiler {
                 let prev_fn_local_mode = self.current_fn_local_mode;
                 self.current_fn_local_mode = effective_declared;
 
+                // Function boundary: isolate finally/loop stacks for the closure
+                // body (see compile_function_decl for why).
+                let saved_finally = std::mem::take(&mut self.finally_stack);
+                let saved_loops = std::mem::take(&mut self.loop_stack);
+
                 let mut func_instructions = Vec::new();
                 // Emit default parameter value preamble for closures
                 for param in &closure.params {
@@ -3354,6 +3371,8 @@ impl CfmlCompiler {
                 }
                 func_instructions.push(BytecodeOp::Null);
                 func_instructions.push(BytecodeOp::Return);
+                self.finally_stack = saved_finally;
+                self.loop_stack = saved_loops;
 
                 let func_name = format!("__closure_{}", self.program.functions.len());
                 let bc_func = BytecodeFunction {
@@ -3379,6 +3398,9 @@ impl CfmlCompiler {
                 let arrow_effective = self.current_fn_local_mode;
                 let prev_fn_local_mode = self.current_fn_local_mode;
                 self.current_fn_local_mode = arrow_effective;
+                // Function boundary: isolate finally/loop stacks for the body.
+                let saved_finally = std::mem::take(&mut self.finally_stack);
+                let saved_loops = std::mem::take(&mut self.loop_stack);
                 let mut func_instructions = Vec::new();
                 // Emit default parameter value preamble for arrow functions
                 for param in &arrow.params {
@@ -3399,6 +3421,8 @@ impl CfmlCompiler {
                 }
                 self.compile_expression(&arrow.body, &mut func_instructions);
                 func_instructions.push(BytecodeOp::Return);
+                self.finally_stack = saved_finally;
+                self.loop_stack = saved_loops;
 
                 let func_name = format!("__arrow_{}", self.program.functions.len());
                 let bc_func = BytecodeFunction {

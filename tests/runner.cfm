@@ -602,6 +602,7 @@ try { include "core/test_struct_key_case_parity.cfm"; } catch (any e) { writeOut
 //     for-in already do). A struct built via structAppend(s, arguments) otherwise
 //     leaks them into JSON; breaks Wheels helpers that serialize copied arg structs.
 try { include "core/test_serializejson_arguments_sentinels.cfm"; } catch (any e) { writeOutput("ERROR | core/test_serializejson_arguments_sentinels.cfm | " & e.message & chr(10)); }
+try { include "core/test_closure_finally_isolation.cfm"; } catch (any e) { writeOutput("ERROR | core/test_closure_finally_isolation.cfm | " & e.message & chr(10)); }
 //   - delegate annotation metadata: bare + arbitrary-named property annotations
 //     are captured, and component-level annotations surface top-level in
 //     getComponentMetadata (Lucee parity) — the surface WireBox delegation reads.
