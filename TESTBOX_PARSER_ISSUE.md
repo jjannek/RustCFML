@@ -168,6 +168,78 @@ return unfiltered results until the VFS path forwards the filter too.
 
 ---
 
+## Blocker #4 — `required` param with a default is still enforced as required  ✅ FIXED (v0.203.0)
+
+**Fix:** the required-parameter check in `crates/cfml-vm/src/lib.rs`
+(`execute_function_with_args`, ~line 2448) now also guards on `!has_default`. A
+param declared `required` BUT given a default is no longer enforced as required
+when the arg is omitted — the default satisfies it (Lucee/ACF/BoxLang parity).
+The existing default-application preamble fills the value. Regression test:
+`tests/core/test_required_param_with_default.cfm` (plain-required-still-throws,
+required+default-omitted, required+default-supplied, and a mixed-params case).
+Confirmed CLI + serve (cold/warm).
+
+With #1–#3 fixed, TestBox now **constructs, runs, and discovers specs** (the
+BDD bundle reports `totalSuites: 1, totalSpecs: 27`). It then aborts with a
+`globalException`, so the run reports `Pass: 0 Fail: 0 Errors: -1` and the suite
+status is `not executed`.
+
+### Symptom
+
+```
+globalException: The parameter [count] to function [incrementSuites] is required
+                 but was not passed in.
+  at BDDRunner.cfc:212  (testSuite)
+  at BDDRunner.cfc:105  (run)
+```
+
+`TestResult.cfc:141` declares:
+
+```cfc
+TestResult function incrementSuites( required count = 1 ){ ... }
+```
+
+i.e. a parameter that is **`required` AND has a default**. `BDDRunner.cfc:212`
+calls `incrementSuites()` with no argument, relying on the default `= 1`.
+
+Lucee/ACF/BoxLang: when a param has a default, the default satisfies it when the
+arg is omitted (the contradictory `required` is effectively ignored). RustCFML
+enforces `required` strictly and never applies the default → throws.
+
+### Minimal repro
+
+```cfc
+function f( required count = 1 ) { return count; }
+writeOutput( f() );   // EXPECTED: 1   ACTUAL: "parameter [count] ... is required"
+```
+
+### Where to fix
+
+`crates/cfml-vm/src/lib.rs`, the required-parameter check (~line 2445):
+
+```rust
+for (i, param_name) in func.params.iter().enumerate() {
+    if func.required_params.get(i).copied().unwrap_or(false) && args.get(i).is_none() {
+        return Err(... "is required but was not passed in" ...);
+    }
+}
+```
+
+It should NOT fire when the param has a default value. Add a "has default" guard
+(the same notion used a few lines up at ~2421, `if has_default { ... }`):
+
+```rust
+if required && args.get(i).is_none() && !param_has_default(i) {
+    return Err(...);
+}
+```
+
+Then ensure the default value is actually applied for the omitted arg (confirm the
+default-application path covers the `required + default` case, not just the plain
+optional case).
+
+---
+
 ## Blocker #2 (original notes, kept for reference) — ❌ OPEN → see FIXED above
 
 ### Symptom (running TestBox)
@@ -251,6 +323,7 @@ Rust stack trace was more accurate than the CFML `tagContext`.
 
 ## Status
 
-TestBox: **parser ✅ · modules installed ✅ · #2 method-ref resolution ✅ (v0.201.0)
-· #3 `directoryList` filter applies to dirs ✅ (v0.202.0).** Next: re-run the
-harness above (needs a fresh TestBox checkout + `box install`) to find blocker #4.
+TestBox: **parser ✅ · modules ✅ · #2 method-ref ✅ (v0.201.0) · #3 directoryList
+filter ✅ (v0.202.0) · #4 required+default param ✅ (v0.203.0).** All four known
+blockers cleared; the framework runs end-to-end. Re-run the harness to find the
+next blocker (if any) past actual spec execution.

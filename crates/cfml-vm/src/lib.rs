@@ -2440,9 +2440,17 @@ impl CfmlVirtualMachine {
                 arguments_map.insert((i + 1).to_string(), value);
             }
         }
-        // Check required parameters
+        // Check required parameters. A param declared `required` BUT also given
+        // a default is NOT enforced as required when the arg is omitted — the
+        // default satisfies it (Lucee/ACF/BoxLang treat the contradictory
+        // `required` as effectively ignored; TestBox's TestResult.cfc relies on
+        // `required count = 1`). The default-application preamble then fills it.
         for (i, param_name) in func.params.iter().enumerate() {
-            if func.required_params.get(i).copied().unwrap_or(false) && args.get(i).is_none() {
+            let has_default = func.has_default.get(i).copied().unwrap_or(false);
+            if func.required_params.get(i).copied().unwrap_or(false)
+                && args.get(i).is_none()
+                && !has_default
+            {
                 return Err(self.wrap_error(CfmlError::runtime(format!(
                     "The parameter [{}] to function [{}] is required but was not passed in.",
                     param_name, func.name
