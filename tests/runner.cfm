@@ -194,6 +194,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_component_method_builtin_name.cfm">
 <cf_runtest file="oop/test_component_return_type.cfm">
 <cf_runtest file="oop/test_inheritance.cfm">
+<cf_runtest file="oop/test_super_case_insensitive_this.cfm">
 <cf_runtest file="oop/test_inherited_helpers.cfm">
 <cf_runtest file="oop/test_interfaces.cfm">
 <cf_runtest file="oop/test_metadata.cfm">

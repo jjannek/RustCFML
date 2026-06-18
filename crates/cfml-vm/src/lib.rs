@@ -5625,8 +5625,12 @@ impl CfmlVirtualMachine {
                             Err(e)
                         } else if let CfmlValue::Struct(ref s) = object {
                             if s.contains_key("__is_super") {
-                                // Super dispatch — find the parent's function by stored index
-                                let prop = object.get(&method_name).unwrap_or(CfmlValue::Null);
+                                // Super dispatch — find the parent's function by stored index.
+                                // CFML method names are case-insensitive (incl. super calls),
+                                // so resolve the parent method case-insensitively. An exact-case
+                                // miss would fall through to generic struct dispatch, which calls
+                                // the parent without binding the child as `this`.
+                                let prop = s.get_ci(method_name.as_str()).unwrap_or(CfmlValue::Null);
                                 if let CfmlValue::Function(ref f) = &prop {
                                     // Extract the stored global_id from the body.
                                     let func_idx =
