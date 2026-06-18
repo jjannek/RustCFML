@@ -46,6 +46,7 @@ fn is_reserved_scope_name(name: &str) -> bool {
             | "caller"
             | "flash"
             | "thistag"
+            | "static"
     )
 }
 
@@ -258,6 +259,13 @@ pub enum BytecodeOp {
     GetIndex,            // Get array[index] or struct[key]
     SetIndex,            // Set array[index] = value or struct[key] = value
     GetProperty(String), // Get object.property
+    /// Push the static "holder" (a cached, lazily-built template instance whose
+    /// `__variables.__static` is the shared static scope) for a named component.
+    /// Used by the `::` operator to reach static members without instantiating.
+    LoadStaticHolder(String),
+    /// Pop a static holder (or any component value) and push the named member of
+    /// its static scope (`Component::member`). Pushes Null if absent.
+    GetStaticProperty(String),
     /// Fused LoadLocal(name) + GetProperty(member) — reads a struct field from a
     /// named local in one dispatch. Only emitted for non-null-safe accesses
     /// where the receiver is a plain identifier (the common `s.foo` pattern).
@@ -583,12 +591,26 @@ impl CfmlCompiler {
         false
     }
 
+    /// Extract a static component name from the left side of a `::` operator.
+    /// Handles a bare identifier (`A`) and a dotted identifier chain (`pkg.A`,
+    /// parsed as nested MemberAccess). Returns None for anything else (the
+    /// caller then evaluates the expression and uses its value as the holder).
+    fn static_class_name(expr: &Expression) -> Option<String> {
+        match expr {
+            Expression::Identifier(id) => Some(id.name.clone()),
+            Expression::MemberAccess(ma) if !ma.null_safe => {
+                Self::static_class_name(&ma.object).map(|base| format!("{}.{}", base, ma.member))
+            }
+            _ => None,
+        }
+    }
+
     /// Scope keywords that must never be treated as plain mutable variables.
     fn is_reserved_scope_name(name: &str) -> bool {
         matches!(name.to_lowercase().as_str(),
             "local" | "variables" | "arguments" | "this" | "super" | "request" |
             "application" | "session" | "server" | "cgi" | "url" | "form" |
-            "cookie" | "client" | "thread"
+            "cookie" | "client" | "thread" | "static"
         )
     }
 
@@ -604,7 +626,7 @@ impl CfmlCompiler {
     fn is_autoviv_scope_root(name: &str) -> bool {
         matches!(name.to_lowercase().as_str(),
             "local" | "variables" | "request" | "application" | "session" |
-            "server" | "cgi" | "url" | "form" | "cookie" | "client"
+            "server" | "cgi" | "url" | "form" | "cookie" | "client" | "static"
         )
     }
 
@@ -2690,6 +2712,37 @@ impl CfmlCompiler {
             instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
             instructions.push(BytecodeOp::StoreGlobal(component.name.clone()));
         }
+
+        // Compile the `static { ... }` initialization block into a standalone
+        // `__cfc_static_init__` function. The VM runs it once per component type
+        // (resolve_component_template), captures its locals, and freezes them into
+        // the shared `static` scope. Compiling at function depth so unscoped
+        // assignments inside the block (e.g. `GREETING = "x"`) lower to StoreLocal
+        // (a static-scope member, captured on return) rather than page globals,
+        // and `static.X` routes through the reserved-scope chain.
+        if !component.static_body.is_empty() {
+            let mut static_instrs = Vec::new();
+            let prev_depth = self.function_depth;
+            self.function_depth += 1;
+            for stmt in &component.static_body {
+                self.compile_statement(stmt, &mut static_instrs);
+            }
+            self.function_depth = prev_depth;
+            static_instrs.push(BytecodeOp::Null);
+            static_instrs.push(BytecodeOp::Return);
+            let static_func = BytecodeFunction {
+                name: "__cfc_static_init__".to_string(),
+                params: Vec::new(),
+                required_params: Vec::new(),
+                has_default: Vec::new(),
+                instructions: static_instrs,
+                source_file: self.source_file.clone(),
+                global_id: next_global_fn_id(),
+                declared_local_mode: None,
+                is_component_method: true,
+            };
+            self.program.functions.push(Arc::new(static_func));
+        }
     }
 
     /// Compile constructor arguments for a `new X(...)` expression (the class
@@ -3020,6 +3073,53 @@ impl CfmlCompiler {
                     instructions.push(BytecodeOp::Add); // [old, new]
                     self.emit_nested_writeback(&postfix.operand, instructions);
                     // The original value remains on the stack as the expression result.
+                }
+            }
+            Expression::StaticMember(sm) => {
+                // `Component::member` — read a static member without an instance.
+                if let Some(name) = Self::static_class_name(&sm.class) {
+                    instructions.push(BytecodeOp::LoadStaticHolder(name));
+                } else {
+                    self.compile_expression(&sm.class, instructions);
+                }
+                instructions.push(BytecodeOp::GetStaticProperty(sm.member.clone()));
+            }
+            Expression::StaticCall(sc) => {
+                // `Component::method(args)` — call a static method without an
+                // instance. The holder carries `__variables.__static`, so
+                // `static.X` inside the method resolves through the normal chain.
+                if let Some(name) = Self::static_class_name(&sc.class) {
+                    instructions.push(BytecodeOp::LoadStaticHolder(name));
+                } else {
+                    self.compile_expression(&sc.class, instructions);
+                }
+                let has_named = sc
+                    .arguments
+                    .iter()
+                    .any(|a| matches!(a, Expression::NamedArgument(_)));
+                let mut names = Vec::with_capacity(sc.arguments.len());
+                for arg in &sc.arguments {
+                    if let Expression::NamedArgument(named) = arg {
+                        names.push(named.name.clone());
+                        self.compile_expression(&named.value, instructions);
+                    } else {
+                        names.push(String::new());
+                        self.compile_expression(arg, instructions);
+                    }
+                }
+                if has_named {
+                    instructions.push(BytecodeOp::CallMethodNamed(
+                        sc.method.clone(),
+                        Box::new(names),
+                        sc.arguments.len(),
+                        None,
+                    ));
+                } else {
+                    instructions.push(BytecodeOp::CallMethod(
+                        sc.method.clone(),
+                        sc.arguments.len(),
+                        None,
+                    ));
                 }
             }
             Expression::MemberAccess(access) => {
@@ -3544,9 +3644,6 @@ impl CfmlCompiler {
                 self.compile_expression(inner, instructions);
             }
             Expression::Empty => {
-                instructions.push(BytecodeOp::Null);
-            }
-            _ => {
                 instructions.push(BytecodeOp::Null);
             }
         }

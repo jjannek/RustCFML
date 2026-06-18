@@ -59,6 +59,7 @@ pub enum Token {
     Dot,
     Semicolon,
     Colon,
+    ColonColon, // :: (static member access, e.g. Component::member)
     Question,
     QuestionDot,  // ?. (null-safe navigation)
     QuestionColon, // ?: (elvis operator)

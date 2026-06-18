@@ -21,6 +21,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_null_return_no_key.cfm">
 <cf_runtest file="core/test_bare_call_shadowing_semantics.cfm">
 <cf_runtest file="core/test_closure_env_leak.cfm">
+<cf_runtest file="core/test_struct_stored_closure_dotcall.cfm">
 <cf_runtest file="core/test_compound_assignment.cfm">
 <cf_runtest file="core/test_undeclared_named_args.cfm">
 <!--- - invoke_undeclared_keys: the argument struct of the positional BIF --->
@@ -199,6 +200,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_interfaces.cfm">
 <cf_runtest file="oop/test_metadata.cfm">
 <cf_runtest file="oop/test_dotted_function_names.cfm">
+<cf_runtest file="oop/test_static.cfm">
 <cf_runtest file="oop/test_soft_keyword_function_name.cfm">
 <cf_runtest file="oop/test_property_attributes.cfm">
 <cf_runtest file="oop/test_struct_method_dispatch.cfm">

@@ -1047,6 +1047,20 @@ pub struct CfmlVirtualMachine {
     /// execute loop aborts cooperatively. `None` on the main/parent VM, so the
     /// non-threaded hot path pays nothing.
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Shared `static` scope per component type, keyed by the component's source
+    /// file path. Populated lazily on first instantiation (running the
+    /// component's `static { ... }` block) and reused for every later instance,
+    /// so static members are shared per-type. Lives for the VM's lifetime (one
+    /// request in serve mode; the whole run in CLI mode).
+    pub static_stores: HashMap<String, CfmlStruct>,
+    /// Cached static "holder" per component name (lowercased) — a built template
+    /// instance whose `__variables.__static` is the shared static scope. Lets the
+    /// `::` operator reach static members/methods without re-instantiating.
+    pub static_holders: HashMap<String, CfmlValue>,
+    /// Stashed compile error from the most recent failed component load. Lets the
+    /// "Could not find the component" call sites surface the real parse/tag error
+    /// (with file + line) instead of a misleading missing-file message.
+    pub last_component_compile_error: Option<String>,
     /// Optional Cranelift JIT engine. `Some` only under `--features jit` on a
     /// native target when not disabled via `RUSTCFML_JIT=0`. Consulted at the
     /// top of `execute_function_with_args`; the interpreter is always the
@@ -1288,6 +1302,9 @@ impl CfmlVirtualMachine {
             thread_spawn_fn: None,
             live_threads: HashMap::new(),
             cancel_flag: None,
+            static_stores: HashMap::new(),
+            static_holders: HashMap::new(),
+            last_component_compile_error: None,
             #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
             jit: jit::JitEngine::maybe_new(),
         };
@@ -2368,7 +2385,9 @@ impl CfmlVirtualMachine {
         // (`__main__`) frame: its locals are the component's `variables` scope,
         // captured via `captured_locals`, and must never leak out as a closure
         // parent-scope writeback (see the two write-back sites below).
-        let is_template_frame = func.name == "__cfc_body__" || func.name == "__main__";
+        let is_template_frame = func.name == "__cfc_body__"
+            || func.name == "__main__"
+            || func.name == "__cfc_static_init__";
 
         // Copy parent scope variables (closures and nested functions see parent vars).
         // Skip Function values — they're immutable and already available via
@@ -2595,6 +2614,19 @@ impl CfmlVirtualMachine {
                         }
                     } else if name_lower == "request" {
                         CfmlValue::strukt(self.request_scope.snapshot())
+                    } else if name_lower == "static" {
+                        // The shared per-type static scope (see find_static_scope).
+                        // Falls back to an empty struct when no static block exists,
+                        // so a stray `static.x` read yields null rather than erroring.
+                        if let Some(h) = self.find_static_scope(&locals) {
+                            CfmlValue::Struct(h)
+                        } else {
+                            let mut scope = locals.clone();
+                            scope.retain(|k, _| {
+                                !k.starts_with("__") && k != ARGUMENTS_SCOPE_KEY
+                            });
+                            CfmlValue::strukt(scope)
+                        }
                     } else if name_lower == "thread" {
                         // `thread` is a SOFT scope (verified on Lucee 7): writable
                         // and readable even outside a cfthread. Resolution order:
@@ -4621,7 +4653,10 @@ impl CfmlVirtualMachine {
                     // __main__/__cfc_body__ template skips the capture, so a custom
                     // tag's start phase that mutates `attributes` then returns early
                     // loses those mutations for the end phase. See epilogue ~L4136.
-                    if func.name == "__main__" || func.name == "__cfc_body__" {
+                    if func.name == "__main__"
+                        || func.name == "__cfc_body__"
+                        || func.name == "__cfc_static_init__"
+                    {
                         for (_, v) in locals.iter_mut() {
                             if let CfmlValue::Function(ref mut f) = v {
                                 Arc::make_mut(f).captured_scope = None;
@@ -5077,6 +5112,18 @@ impl CfmlVirtualMachine {
                         stack.push(CfmlValue::Null);
                     }
                 }
+                BytecodeOp::LoadStaticHolder(name) => {
+                    let holder = self
+                        .resolve_static_holder(name, &locals)
+                        .unwrap_or(CfmlValue::Null);
+                    stack.push(holder);
+                }
+                BytecodeOp::GetStaticProperty(member) => {
+                    let holder = stack.pop().unwrap_or(CfmlValue::Null);
+                    let val = Self::read_static_member(&holder, member)
+                        .unwrap_or(CfmlValue::Null);
+                    stack.push(val);
+                }
                 BytecodeOp::SetProperty(name) => {
                     if let Some(value) = stack.pop() {
                         if let Some(mut obj) = stack.pop() {
@@ -5174,10 +5221,8 @@ impl CfmlVirtualMachine {
                                 // Unresolved component path: throw rather than
                                 // instantiate an empty struct (Lucee/ACF parity).
                                 None => {
-                                    return Err(self.wrap_error(CfmlError::runtime(format!(
-                                        "Could not find the component [{}].",
-                                        class_name
-                                    ))))
+                                    let err = self.component_load_error(&class_name);
+                                    return Err(self.wrap_error(err));
                                 }
                             }
                         };
@@ -6538,8 +6583,13 @@ impl CfmlVirtualMachine {
         // Pass-by-reference writeback: collect final values of complex-type params
         self.collect_arg_ref_writeback(func, &locals);
 
-        // Capture locals for component variables scope (for __main__ and __cfc_body__)
-        if func.name == "__main__" || func.name == "__cfc_body__" {
+        // Capture locals for component variables scope (for __main__ and
+        // __cfc_body__) and for the `static {}` init block (__cfc_static_init__),
+        // whose captured locals become the shared static scope.
+        if func.name == "__main__"
+            || func.name == "__cfc_body__"
+            || func.name == "__cfc_static_init__"
+        {
             // Strip captured_scope from any top-level Function values before
             // snapshotting — CFC methods resolve via __variables, not closures.
             for (_, v) in locals.iter_mut() {
@@ -6835,6 +6885,7 @@ impl CfmlVirtualMachine {
                 | "createobject"
                 | "getcurrenttemplatepath"
                 | "getcomponentmetadata"
+                | "getcomponentstaticscope"
                 | "getapplicationmetadata"
                 | "__cfheader"
                 | "__cfcontent"
@@ -8577,6 +8628,26 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::strukt(meta));
                 }
+                "getcomponentstaticscope" => {
+                    // Return the static scope of a component, given an instance,
+                    // a component template, or a component name (Lucee parity).
+                    let arg = args.get(0).cloned().unwrap_or(CfmlValue::Null);
+                    let holder = match &arg {
+                        CfmlValue::Struct(_) => Some(arg.clone()),
+                        CfmlValue::String(name) => {
+                            self.resolve_static_holder(name, &ValueMap::default())
+                        }
+                        _ => None,
+                    };
+                    if let Some(CfmlValue::Struct(s)) = holder {
+                        if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+                            if let Some(stat @ CfmlValue::Struct(_)) = vars.get("__static") {
+                                return Ok(stat);
+                            }
+                        }
+                    }
+                    return Ok(CfmlValue::strukt(ValueMap::default()));
+                }
                 "getcomponentmetadata" => {
                     // Helper: extract metadata from a component struct
                     fn extract_component_meta(
@@ -8719,10 +8790,7 @@ impl CfmlVirtualMachine {
                             }
                             // Unresolved component path: throw rather than return
                             // null silently (Lucee/ACF both raise here).
-                            return Err(CfmlError::runtime(format!(
-                                "Could not find the component [{}].",
-                                comp_name
-                            )));
+                            return Err(self.component_load_error(&comp_name));
                         } else if obj_type == "rust" {
                             let class_name = args[1].as_string();
                             let key = class_name.to_lowercase();
@@ -11174,6 +11242,70 @@ impl CfmlVirtualMachine {
     }
 
     /// Load a variable by name, checking locals, globals, and special scopes (application, request, local/variables).
+    /// Resolve the live `static` scope handle for the current frame. The shared
+    /// per-type store is injected as `__static` either directly into `locals`
+    /// (the `static {}` init frame) or into the instance's `__variables` (CFC
+    /// method frames). Returns a handle clone so member writes write through to
+    /// the shared backing.
+    /// Resolve (and cache) the static "holder" for a component name: a built
+    /// template instance whose `__variables.__static` is the shared static
+    /// scope. Used by the `::` operator so static members/methods are reachable
+    /// without an explicit `new`. Running the template resolves and caches the
+    /// static scope as a side effect; `init()` is intentionally NOT run.
+    fn resolve_static_holder(&mut self, name: &str, locals: &ValueMap) -> Option<CfmlValue> {
+        let key = name.to_lowercase();
+        if let Some(h) = self.static_holders.get(&key) {
+            return Some(h.clone());
+        }
+        let holder = self.resolve_component_template(name, locals)?;
+        self.static_holders.insert(key, holder.clone());
+        Some(holder)
+    }
+
+    /// Resolve a component's static scope handle by name (used for static
+    /// inheritance). Returns None if the component has no static scope.
+    fn resolve_static_scope_by_name(
+        &mut self,
+        name: &str,
+        locals: &ValueMap,
+    ) -> Option<CfmlStruct> {
+        let holder = self.resolve_static_holder(name, locals)?;
+        if let CfmlValue::Struct(s) = holder {
+            if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+                if let Some(CfmlValue::Struct(stat)) = vars.get("__static") {
+                    return Some(stat);
+                }
+            }
+        }
+        None
+    }
+
+    /// Read a member of a component value's static scope (`Component::member`).
+    /// Looks only in the `__static` scope (not instance variables), matching
+    /// Lucee/BoxLang `::` semantics. Case-insensitive.
+    fn read_static_member(holder: &CfmlValue, member: &str) -> Option<CfmlValue> {
+        if let CfmlValue::Struct(s) = holder {
+            if let Some(CfmlValue::Struct(vars)) = s.get("__variables") {
+                if let Some(CfmlValue::Struct(stat)) = vars.get("__static") {
+                    return stat.get_ci(member);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_static_scope(&self, locals: &ValueMap) -> Option<CfmlStruct> {
+        if let Some(CfmlValue::Struct(h)) = locals.get("__static") {
+            return Some(h.clone());
+        }
+        if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
+            if let Some(CfmlValue::Struct(h)) = vars.get("__static") {
+                return Some(h);
+            }
+        }
+        None
+    }
+
     fn scope_aware_load(
         &self,
         name: &str,
@@ -11200,6 +11332,19 @@ impl CfmlVirtualMachine {
                 return Some(CfmlValue::Struct(vars.clone()));
             }
             return Some(CfmlValue::strukt(locals.clone()));
+        }
+        if name_lower == "static" {
+            // When the shared `__static` handle is present (method frame, or the
+            // init frame once seeded) read through it. During the `static {}`
+            // init frame before seeding, the in-progress members live in
+            // `locals`, so fall back to a locals view (minus internals) — this
+            // keeps unscoped writes and `static.X` reads consistent within init.
+            if let Some(h) = self.find_static_scope(locals) {
+                return Some(CfmlValue::Struct(h));
+            }
+            let mut scope = locals.clone();
+            scope.retain(|k, _| !k.starts_with("__") && k != ARGUMENTS_SCOPE_KEY);
+            return Some(CfmlValue::strukt(scope));
         }
         if name_lower == "application" {
             if let Some(ref app_scope) = self.application_scope {
@@ -11377,6 +11522,27 @@ impl CfmlVirtualMachine {
             // walked + leaf-inserted, so a full snapshot replace is correct.
             if let CfmlValue::Struct(s) = &val {
                 let _ = self.set_session_scope(s.snapshot());
+            }
+        } else if name_lower == "static" {
+            if let CfmlValue::Struct(s) = val {
+                if let Some(h) = self.find_static_scope(locals) {
+                    // Shared handle present: commit back unless `s` IS the handle
+                    // (store_runtime_path already mutated the shared backing in
+                    // place via the handle clone returned by scope_aware_load).
+                    if !h.ptr_eq(&s) {
+                        let snap = s.snapshot();
+                        h.with_write(|m| *m = snap);
+                    }
+                } else {
+                    // Unseeded `static {}` init frame: members live in locals.
+                    let saved_vars = locals.get("__variables").cloned();
+                    for (k, v) in s.iter() {
+                        locals.insert(k.clone(), v.clone());
+                    }
+                    if let Some(v) = saved_vars {
+                        locals.insert("__variables".to_string(), v);
+                    }
+                }
             }
         } else if name_lower == "arguments" && locals.contains_key(ARGUMENTS_SCOPE_KEY) {
             // Write back the arguments scope under its reserved key (so an
@@ -12417,6 +12583,22 @@ impl CfmlVirtualMachine {
                 // method / onMissingMethod path below. (This matches Lucee, where
                 // struct member functions are not available on components.)
                 _ if s.contains_key("__variables") || s.contains_key("__name") => None,
+                // A closure/function stored at a struct key shadows the
+                // same-named struct member function. `st.filter(x)` where
+                // `st.filter` holds a closure must INVOKE that closure, not the
+                // built-in structFilter (Lucee/ACF/BoxLang all do this). Without
+                // this guard, keys colliding with a struct helper name
+                // (filter/map/each/find/append/...) were unreachable via
+                // dot-call. Falls through to the stored-function dispatch below.
+                _ if s
+                    .iter()
+                    .any(|(k, v)| {
+                        k.eq_ignore_ascii_case(&method_lower)
+                            && matches!(v, CfmlValue::Function(_))
+                    }) =>
+                {
+                    None
+                }
                 "count" | "len" | "size" => Some("structCount"),
                 "keyexists" => Some("structKeyExists"),
                 "keylist" => Some("structKeyList"),
@@ -13923,11 +14105,26 @@ impl CfmlVirtualMachine {
 
     /// Resolve a component template by name: tries locals, globals (exact + CI),
     /// then loads from a .cfc file on disk.
+    /// Build the error for a component that failed to load. If a parse/tag error
+    /// was stashed while compiling the (existing) target file, surface that —
+    /// it points at the real syntax problem with file + line. Otherwise the file
+    /// genuinely was not found, so report the missing-component message.
+    fn component_load_error(&mut self, class_name: &str) -> CfmlError {
+        if let Some(msg) = self.last_component_compile_error.take() {
+            CfmlError::runtime(msg)
+        } else {
+            CfmlError::runtime(format!("Could not find the component [{}].", class_name))
+        }
+    }
+
     fn resolve_component_template(
         &mut self,
         class_name: &str,
         locals: &ValueMap,
     ) -> Option<CfmlValue> {
+        // Reset any stashed compile error so a `None` return reflects THIS
+        // resolution (a parse error in the target file, or a genuine not-found).
+        self.last_component_compile_error = None;
         // 1. Try locals
         if let Some(val) = locals.get(class_name) {
             if matches!(val, CfmlValue::Struct(_)) {
@@ -14067,7 +14264,19 @@ impl CfmlVirtualMachine {
         };
 
         let cache = self.server_state.as_ref().map(|s| &s.bytecode_cache);
-        if let Ok(sub_program) = compile_file_cached(&cfc_path, cache, self.vfs.as_ref()) {
+        let compiled = compile_file_cached(&cfc_path, cache, self.vfs.as_ref());
+        // A parse/tag error inside an EXISTING component file must not be silently
+        // swallowed into the caller's "Could not find the component" message
+        // (which sends you hunting for a missing file/mapping). Stash the real
+        // error so the NewObject / createObject call sites can surface it. A plain
+        // missing-file ("Cannot read '...'") is left unstashed — that genuinely is
+        // a not-found and the component-name message is the right one.
+        if let Err(ref e) = compiled {
+            if !e.message.starts_with(&format!("Cannot read '{}'", cfc_path)) {
+                self.last_component_compile_error = Some(e.message.clone());
+            }
+        }
+        if let Ok(sub_program) = compiled {
             let old_program = self.push_program_swap(sub_program);
             // Set source_file to CFC path so parent resolution works relative to CFC
             let old_source_file = self.source_file.clone();
@@ -14099,8 +14308,8 @@ impl CfmlVirtualMachine {
                     }
                     _ => None,
                 });
-            let injected_scope: ValueMap = if let Some(pname) = parent_name {
-                if let Some(parent_template) = self.resolve_component_template(&pname, locals) {
+            let injected_scope: ValueMap = if let Some(ref pname) = parent_name {
+                if let Some(parent_template) = self.resolve_component_template(pname, locals) {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals);
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
                         if let Some(CfmlValue::Struct(parent_vars)) = ps.get("__variables") {
@@ -14117,6 +14326,74 @@ impl CfmlVirtualMachine {
             } else {
                 ValueMap::default()
             };
+
+            // Resolve the shared `static` scope for this component type. Keyed by
+            // source path so it is built once and reused across instances. On
+            // first load run the compiled `__cfc_static_init__` block (if any),
+            // capture its locals (minus engine internals), and freeze them into a
+            // shared CfmlStruct handle. Done BEFORE the pseudo-constructor so the
+            // body can read `static.X`.
+            let static_key = cfc_path.clone();
+            let static_handle: Option<CfmlStruct> =
+                if let Some(h) = self.static_stores.get(&static_key) {
+                    Some(h.clone())
+                } else {
+                    // Seed a fresh shared handle with the parent's static members
+                    // first (child declarations override). Reads of inherited
+                    // static work; struct/array members stay shared by-reference,
+                    // though scalar reassignment through the child does not
+                    // propagate back to the parent's own scope.
+                    let mut inherited = false;
+                    let h = CfmlStruct::new(ValueMap::default());
+                    if let Some(ref pname) = parent_name {
+                        if let Some(parent_static) =
+                            self.resolve_static_scope_by_name(pname, locals)
+                        {
+                            for (k, v) in parent_static.snapshot() {
+                                h.insert(k, v);
+                                inherited = true;
+                            }
+                        }
+                    }
+                    // Run the type's `static {}` block (if any) with the handle
+                    // seeded as `__static`, so BOTH scoped writes (`static.X = v`,
+                    // which mutate the shared handle in place) and unscoped writes
+                    // (`X = v`, captured from locals) land in the same scope.
+                    let has_own = if let Some(initfn) = self
+                        .program
+                        .functions
+                        .iter()
+                        .find(|f| f.name == "__cfc_static_init__")
+                        .cloned()
+                    {
+                        let mut seed: ValueMap = ValueMap::default();
+                        seed.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
+                        let _ = self.execute_function_with_args(&initfn, Vec::new(), Some(&seed));
+                        let caps = self.captured_locals.take().unwrap_or_default();
+                        for (k, v) in caps {
+                            if k.starts_with("__")
+                                || k.eq_ignore_ascii_case("this")
+                                || k == ARGUMENTS_SCOPE_KEY
+                            {
+                                continue;
+                            }
+                            h.insert(k, v);
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    if has_own || inherited {
+                        self.static_stores.insert(static_key.clone(), h.clone());
+                        Some(h)
+                    } else {
+                        None
+                    }
+                };
+            let mut injected_scope = injected_scope;
+            if let Some(ref h) = static_handle {
+                injected_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
+            }
 
             // Snapshot user_functions AFTER parent resolution (parent body may have
             // registered helper functions which should not be flagged as
@@ -14312,6 +14589,11 @@ impl CfmlVirtualMachine {
                             vars_scope.insert(k, v);
                         }
                     }
+                }
+                // Expose the shared `static` scope to method frames: a CFC method
+                // resolves `static` via its `__variables.__static` handle.
+                if let Some(ref h) = static_handle {
+                    vars_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
                 }
                 if !vars_scope.is_empty() {
                     s.insert("__variables".to_string(), CfmlValue::strukt(vars_scope));
@@ -17041,6 +17323,8 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::GetIndex => (1, 2),       // obj + key → value
         BytecodeOp::SetIndex => (0, 3),       // obj + key + value → (modifies in place)
         BytecodeOp::GetProperty(_) => (1, 1), // obj → value
+        BytecodeOp::LoadStaticHolder(_) => (0, 1), // → holder
+        BytecodeOp::GetStaticProperty(_) => (1, 1), // holder → value
         BytecodeOp::LoadLocalProperty(_, _) => (1, 0), // pushes value, reads nothing
         BytecodeOp::LoadLocalKey(_) => (1, 0), // pushes value, reads nothing
         BytecodeOp::StoreLocalProperty(_, _) => (0, 1), // pops 1 (value), pushes 0

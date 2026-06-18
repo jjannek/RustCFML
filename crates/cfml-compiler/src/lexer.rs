@@ -111,7 +111,13 @@ impl Lexer {
                 }
             }
             ';' => self.add_token(Token::Semicolon),
-            ':' => self.add_token(Token::Colon),
+            ':' => {
+                if self.match_char(':') {
+                    self.add_token(Token::ColonColon);
+                } else {
+                    self.add_token(Token::Colon);
+                }
+            }
             '^' => self.add_token(Token::Caret),
             '#' => self.add_token(Token::HashSign),
             '\\' => self.add_token(Token::Backslash),

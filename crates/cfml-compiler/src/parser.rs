@@ -3201,6 +3201,7 @@ impl Parser {
         let mut properties = Vec::new();
         let mut functions = Vec::new();
         let mut body = Vec::new();
+        let mut static_body = Vec::new();
 
         while !self.check(&Token::RBrace) && !self.is_at_end() {
             // Check for access modifiers — only consume if followed by function/property/static
@@ -3215,6 +3216,22 @@ impl Parser {
             };
 
             let is_static = self.match_token(&Token::Static);
+
+            // `static { ... }` class-initialization block (BoxLang/Lucee). The
+            // body runs once per component type to populate the shared `static`
+            // scope. Distinguished from `static function` / `static property`
+            // by the immediately-following `{`.
+            if is_static && self.check(&Token::LBrace) {
+                self.consume(&Token::LBrace)?;
+                while !self.check(&Token::RBrace) && !self.is_at_end() {
+                    let node = self.parse_statement()?;
+                    if let CfmlNode::Statement(s) = node {
+                        static_body.push(s);
+                    }
+                }
+                self.consume(&Token::RBrace)?;
+                continue;
+            }
 
             // Skip optional return type annotation (e.g. "array function ...",
             // "component function init()").
@@ -3252,6 +3269,7 @@ impl Parser {
             properties,
             functions,
             body,
+            static_body,
             location: loc,
             metadata,
             accessors,
@@ -4484,6 +4502,27 @@ impl Parser {
                     index,
                     location: self.current_location(),
                 }));
+            } else if self.match_token(&Token::ColonColon) {
+                // `::` static member access. `Component::member` reads a static
+                // member; `Component::method(args)` calls a static method —
+                // neither requires an instance.
+                let member = self.extract_property_name().unwrap_or_default();
+                if self.match_token(&Token::LParen) {
+                    let args = self.parse_arguments()?;
+                    self.consume(&Token::RParen)?;
+                    expr = Expression::StaticCall(Box::new(StaticCall {
+                        class: Box::new(expr),
+                        method: member,
+                        arguments: args,
+                        location: self.current_location(),
+                    }));
+                } else {
+                    expr = Expression::StaticMember(Box::new(StaticMember {
+                        class: Box::new(expr),
+                        member,
+                        location: self.current_location(),
+                    }));
+                }
             } else if self.match_token(&Token::QuestionDot) {
                 // Null-safe navigation: obj?.method() or obj?.property
                 let member = self.extract_property_name().unwrap_or_default();

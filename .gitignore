@@ -18,6 +18,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# Playwright MCP scratch output
+/.playwright-mcp/
+
 # Environment
 .env
 .env.*

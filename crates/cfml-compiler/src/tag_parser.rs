@@ -1317,6 +1317,19 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 (String::new(), tag_end - start)
             }
         }
+        "cfstatic" => {
+            // Static initialization block (tag form). Convert the body's tags to
+            // script and wrap it in a `static { ... }` block, which the parser
+            // collects into the component's static_body.
+            if let Some(end_tag_pos) = find_closing_tag(chars, tag_end, len, "cfstatic") {
+                let body: String = chars[tag_end..end_tag_pos].iter().collect();
+                let close_end = find_tag_end(chars, end_tag_pos, len);
+                let body_script = tags_to_script_impl(&body, imports);
+                (format!("static {{\n{}}}\n", body_script), close_end - start)
+            } else {
+                (String::new(), tag_end - start)
+            }
+        }
         "cfcookie" => {
             let mut parts = Vec::new();
             for (k, v) in &attrs {

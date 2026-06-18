@@ -33,6 +33,9 @@ pub struct Component {
     pub properties: Vec<Property>,
     pub functions: Vec<Function>,
     pub body: Vec<Statement>,
+    /// Statements inside a `static { ... }` initialization block. Executed once
+    /// per component type (on first load), populating the shared `static` scope.
+    pub static_body: Vec<Statement>,
     pub location: SourceLocation,
     pub metadata: Vec<(String, String)>,
     pub accessors: bool,
@@ -300,6 +303,7 @@ pub enum Expression {
     FunctionCall(Box<FunctionCall>),
     MethodCall(Box<MethodCall>),
     StaticCall(Box<StaticCall>),
+    StaticMember(Box<StaticMember>),
     MemberAccess(Box<MemberAccess>),
     ArrayAccess(Box<ArrayAccess>),
     UnaryOp(Box<UnaryOp>),
@@ -393,6 +397,16 @@ pub struct StaticCall {
     pub class: Box<Expression>,
     pub method: String,
     pub arguments: Vec<Expression>,
+    pub location: SourceLocation,
+}
+
+/// `Component::member` — read a static member of a component type without an
+/// instance (the `::` operator). The method-call form `Component::fn(...)` is
+/// `StaticCall`.
+#[derive(Debug, Clone)]
+pub struct StaticMember {
+    pub class: Box<Expression>,
+    pub member: String,
     pub location: SourceLocation,
 }
 

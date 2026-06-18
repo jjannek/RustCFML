@@ -460,6 +460,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("createObject".into(), fn_create_object);
     f.insert("getDirectoryFromPath".into(), fn_get_directory_from_path);
     f.insert("getComponentMetadata".into(), fn_get_component_metadata);
+    f.insert("getComponentStaticScope".into(), fn_get_component_static_scope);
     f.insert("createUUID".into(), fn_create_uuid);
     f.insert("createUniqueID".into(), fn_create_unique_id);
     f.insert("preserveSingleQuotes".into(), fn_preserve_single_quotes);
@@ -5534,6 +5535,11 @@ fn fn_get_current_template_path(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_get_component_metadata(_args: Vec<CfmlValue>) -> CfmlResult {
     // Stub — VM intercepts this call to resolve component metadata
+    Ok(CfmlValue::strukt(ValueMap::default()))
+}
+
+fn fn_get_component_static_scope(_args: Vec<CfmlValue>) -> CfmlResult {
+    // Stub — VM intercepts this call to resolve the component's static scope
     Ok(CfmlValue::strukt(ValueMap::default()))
 }
 
