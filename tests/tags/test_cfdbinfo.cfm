@@ -139,6 +139,22 @@ if (NOT dbiSkip) {
     assertTrue("wheels-shape: attributeCollection + local.rv",
         wheelsDbinfo(dbiDs) CONTAINS "SQLite");
 
+    // --- bare script-statement form (issue #172): `dbinfo type=.. name=..;`
+    //     must behave identically to cfdbinfo(...) / <cfdbinfo>, binding the
+    //     result query to the `name` variable (was a silent no-op). ---
+    dbinfo type="version" name="bareInfo" datasource="#dbiDs#";
+    assertTrue("bare-statement: name var is bound (not a no-op)", isDefined("bareInfo"));
+    assertTrue("bare-statement: result is a query", isQuery(bareInfo));
+    assert("bare-statement: database_productname", bareInfo.database_productname[1], "SQLite");
+    // dotted name + into a function-local scope, like Preside's bootstrap check
+    function bareDbinfo(required string ds) {
+        var info = "";
+        dbinfo type="version" name="local.info" datasource="#arguments.ds#";
+        return structKeyExists(local, "info") && isQuery(local.info)
+            ? local.info.database_productname[1] : "MISSING";
+    }
+    assert("bare-statement: dotted local.name binding", bareDbinfo(dbiDs), "SQLite");
+
     // --- tag form ---
     dbiTagOk = false;
 }

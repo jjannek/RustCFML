@@ -718,6 +718,10 @@ impl Parser {
         // setting requesttimeout="..."; → __cfsetting({...})
         // cookie name="..." value="..."; → __cfcookie({...})
         // log text="..." type="..."; → __cflog({...})
+        // dbinfo type="version" name="info" datasource="..."; → cfdbinfo({...})
+        //   (the VM intercept binds the result query to the `name` variable via
+        //    pending_result_writeback, exactly like the cfdbinfo(...)/<cfdbinfo>
+        //    forms — issue #172).
         {
             let tag_fn = if let Token::Identifier(ref s) = self.peek(0) {
                 match s.to_lowercase().as_str() {
@@ -727,6 +731,7 @@ impl Parser {
                     "setting" => Some("__cfsetting"),
                     "cookie" => Some("__cfcookie"),
                     "log" => Some("__cflog"),
+                    "dbinfo" | "cfdbinfo" => Some("cfdbinfo"),
                     _ => None,
                 }
             } else {
