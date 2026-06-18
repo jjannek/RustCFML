@@ -6698,7 +6698,7 @@ impl CfmlVirtualMachine {
     fn call_function(
         &mut self,
         func_ref: &CfmlValue,
-        args: Vec<CfmlValue>,
+        mut args: Vec<CfmlValue>,
         parent_locals: &ValueMap,
     ) -> CfmlResult {
         if let CfmlValue::Function(func) = func_ref {
@@ -7035,6 +7035,12 @@ impl CfmlVirtualMachine {
                             return result;
                         }
                     }
+                    // Resolve relative file/directory BIF paths against the
+                    // current template's dir (ExpandPath parity, GitHub #171)
+                    // before either the sandbox VFS path or the plain builtin
+                    // runs, so both agree on the base. Mutates in place; a
+                    // non-file BIF is left untouched.
+                    self.resolve_file_bif_paths(&name_lower, &mut args);
                     // Sandbox mode: intercept file operations
                     if self.sandbox {
                         if let Some(result) = self.sandbox_intercept(&name_lower, &args) {
@@ -15188,6 +15194,70 @@ impl CfmlVirtualMachine {
         let parent = ctor(Vec::new())?;
         s.insert("__super".to_string(), parent);
         Ok(CfmlValue::Struct(s))
+    }
+
+    // ---------------------------------------------------------------------------
+    // File-BIF relative-path resolution (GitHub #171)
+    // ---------------------------------------------------------------------------
+
+    /// Resolve a *relative* file/directory path against the directory of the
+    /// currently executing template, matching how `ExpandPath` already behaves.
+    /// Lucee/ACF resolve a relative file-BIF path against the calling
+    /// template's directory; RustCFML previously left it to the VFS, which
+    /// rebased against the process cwd / entry template — so `FileRead("./x")`
+    /// from a CFC disagreed with `ExpandPath("./x")` from the same CFC.
+    ///
+    /// Absolute OS paths, web-root/mapping paths (leading `/`), UNC/backslash
+    /// paths, Windows drive paths (`C:\`), and VFS schemes (`s3://`, …) are
+    /// left untouched — the VFS/builtin resolves those exactly as before, so
+    /// only a genuinely relative argument is rebased.
+    fn resolve_template_relative(&self, raw: &str) -> String {
+        if raw.is_empty() {
+            return raw.to_string();
+        }
+        let bytes = raw.as_bytes();
+        let is_absolute = raw.starts_with('/')
+            || raw.starts_with('\\')
+            || raw.contains("://")
+            || (bytes.len() >= 2 && bytes[1] == b':');
+        if is_absolute {
+            return raw.to_string();
+        }
+        match self
+            .source_file
+            .as_ref()
+            .and_then(|s| std::path::Path::new(s).parent())
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            Some(dir) => dir.join(raw).to_string_lossy().into_owned(),
+            None => raw.to_string(),
+        }
+    }
+
+    /// Rebase the path argument(s) of a file/directory BIF against the current
+    /// template's directory before dispatch (see `resolve_template_relative`).
+    /// Non-path BIFs pass through untouched. Applied uniformly so both the
+    /// sandbox (VFS) path and the plain builtin path agree with `ExpandPath`.
+    fn resolve_file_bif_paths(&self, name_lower: &str, args: &mut [CfmlValue]) {
+        // Which positional argument(s) carry a filesystem path.
+        let indices: &[usize] = match name_lower {
+            "fileread" | "filereadbinary" | "fileexists" | "fileopen" | "directoryexists"
+            | "directorylist" | "getfileinfo" | "getprofilestring" | "getprofilesections"
+            | "setprofilestring" | "filewrite" | "fileappend" | "filewriteline" | "filedelete"
+            | "directorycreate" | "directorydelete" | "filesetaccessmode" | "filesetattribute"
+            | "filesetlastmodified" => &[0],
+            "filecopy" | "filemove" | "directorycopy" | "directoryrename" => &[0, 1],
+            _ => return,
+        };
+        for &i in indices {
+            if let Some(CfmlValue::String(s)) = args.get(i) {
+                let cur = s.as_str();
+                let resolved = self.resolve_template_relative(cur);
+                if resolved.as_str() != cur {
+                    args[i] = CfmlValue::string(resolved);
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------
