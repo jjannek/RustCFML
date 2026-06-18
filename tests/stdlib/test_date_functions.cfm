@@ -48,8 +48,10 @@ assertTrue("getTickCount() > 0", getTickCount() > 0);
 // Single-quoted segments are emitted verbatim; '' yields a literal apostrophe.
 d = createDateTime(2026, 5, 3, 12, 34, 56);
 assert("quoted literal T in mask", dateTimeFormat(d, "yyyy-MM-dd'T'HH:nn:ss'Z'"), "2026-05-03T12:34:56Z");
-assert("quoted text segment", dateFormat(d, "yyyy' year:'mmmm"), "2026 year:May");
-assert("escaped apostrophe", dateFormat(d, "yyyy''mm"), "2026'05");
+// RustCFML extension: single-quote literals in dateFormat() masks. Lucee 7.0.4's
+// dateFormat does NOT honour them (it does for dateTimeFormat above) — RustCFML-only.
+if (isRustCFML()) assert("quoted text segment", dateFormat(d, "yyyy' year:'mmmm"), "2026 year:May");
+if (isRustCFML()) assert("escaped apostrophe", dateFormat(d, "yyyy''mm"), "2026'05");
 
 suiteEnd();
 </cfscript>

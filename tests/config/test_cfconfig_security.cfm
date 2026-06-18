@@ -16,12 +16,15 @@ try {
         blocked = true;
     }
 }
-assert("disallowedFunctions blocks listed name", blocked, true);
+// RustCFML-only: the disallowedFunctions security policy is enforced from
+// RustCFML's .cfconfig.json; the Lucee test server has no equivalent loaded.
+if (isRustCFML()) assert("disallowedFunctions blocks listed name", blocked, true);
 
 // CSRF is enabled in the fixture — token generation must succeed and produce
-// a 64-char hex string.
+// a token. Length is implementation-defined: RustCFML emits a 64-char hex
+// string, Lucee 7.0.4 a 40-char one — so the length assert is RustCFML-only.
 token = csrfGenerateToken();
-assert("csrf token length", len(token), 64);
+if (isRustCFML()) assert("csrf token length", len(token), 64);
 assert("csrf token verifies", csrfVerifyToken(token), true);
 
 suiteEnd();

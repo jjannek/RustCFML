@@ -4,19 +4,41 @@
 // ============================================================
 // State stored in request scope so it persists across includes.
 // Uses explicit assignment (no ++/+=) for RustCFML compatibility.
+//
+// Idempotent: the grand-total counters are initialised ONCE per request. This
+// lets the harness be re-included safely — e.g. inside the per-test isolation
+// custom tag (tests/runtest.cfm), which re-includes it to make assert()/
+// suiteBegin()/suiteEnd() visible in the tag's own (isolated) variables scope
+// without wiping the running totals. The first include (from runner.cfm) sets
+// them up; later includes skip the reset.
+if (!structKeyExists(request, "_test_totalPassed")) {
+    // Grand totals
+    request._test_totalPassed  = 0;
+    request._test_totalFailed  = 0;
+    request._test_totalSuites  = 0;
+    request._test_failedSuites = 0;
+    request._test_failures     = [];
 
-// Grand totals
-request._test_totalPassed  = 0;
-request._test_totalFailed  = 0;
-request._test_totalSuites  = 0;
-request._test_failedSuites = 0;
-request._test_failures     = [];
+    // Per-suite state
+    request._test_suiteName   = "";
+    request._test_suitePassed = 0;
+    request._test_suiteFailed = 0;
+    request._test_suiteFailures = [];
+}
 
-// Per-suite state
-request._test_suiteName   = "";
-request._test_suitePassed = 0;
-request._test_suiteFailed = 0;
-request._test_suiteFailures = [];
+// ---- isRustCFML() — engine detection for cross-engine (Lucee) runs ----
+// The same suite runs on Lucee 7.0.4 to verify compatibility. A handful of
+// assertions cover RustCFML-specific features, deliberate extensions, or
+// by-design deltas (ordered structs, dateFormat single-quote literals,
+// createUniqueID("counter"), cfconfig security policy + in-memory datasources).
+// Those are wrapped in `if (isRustCFML())` so they exercise RustCFML but are
+// skipped on Lucee, keeping a clean cross-engine bar. See
+// docs/lucee-differences.md for the catalogue and the one unresolved item.
+function isRustCFML() {
+    return structKeyExists(server, "coldfusion")
+        && structKeyExists(server.coldfusion, "productname")
+        && server.coldfusion.productname == "RustCFML";
+}
 
 // ---- suiteBegin(name) ----
 function suiteBegin(required string name) {

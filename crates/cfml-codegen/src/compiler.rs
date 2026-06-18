@@ -598,7 +598,9 @@ impl CfmlCompiler {
     /// scope is handled separately in `flatten_scope_path` (it parses to
     /// `Expression::This`, not an `Identifier`). Excludes
     /// `super`/`arguments`/`thread`, whose member chains keep their
-    /// established struct-receiver writeback semantics.
+    /// established struct-receiver writeback semantics (cfthread's thread.x
+    /// capture relies on this; the page-level `thread` soft-scope is committed
+    /// in the StoreLocal `thread` writeback arm instead).
     fn is_autoviv_scope_root(name: &str) -> bool {
         matches!(name.to_lowercase().as_str(),
             "local" | "variables" | "request" | "application" | "session" |
@@ -775,7 +777,7 @@ impl CfmlCompiler {
     /// For `s.a.b = val`, after SetProperty("b"), stack has [modified_a_struct].
     /// We need to: load s, swap, SetProperty("a"), StoreLocal("s").
     /// For deeper chains like `s.a.b.c = val`, we recurse up the chain.
-    fn emit_nested_writeback(obj: &Expression, instructions: &mut Vec<BytecodeOp>) {
+    fn emit_nested_writeback(&mut self, obj: &Expression, instructions: &mut Vec<BytecodeOp>) {
         match obj {
             Expression::Identifier(ident) => {
                 instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
@@ -786,18 +788,19 @@ impl CfmlCompiler {
             Expression::MemberAccess(access) => {
                 // Stack has modified child value. Load the parent, swap, set property.
                 // Then recurse to write back the parent.
-                Self::emit_load_for_writeback(&access.object, instructions);
+                self.emit_load_for_writeback(&access.object, instructions);
                 instructions.push(BytecodeOp::Swap);
                 instructions.push(BytecodeOp::SetProperty(access.member.clone()));
-                Self::emit_nested_writeback(&access.object, instructions);
+                self.emit_nested_writeback(&access.object, instructions);
             }
             Expression::ArrayAccess(access) => {
                 // Stack has [modified_value]. We need to write it back into the parent collection.
                 // Load the parent collection, then the index, then SetIndex, then recurse.
                 // e.g. for `a.b[0][1] = val`: after inner SetIndex, stack has modified inner array.
                 // We need to: load a.b[0], swap, push 0-index, SetIndex → modified a.b, then write back a.b.
-                Self::emit_load_for_writeback(&access.array, instructions);
-                Self::compile_expression_static(&access.index, instructions);
+                // Index uses the full compiler (complex/interpolated keys), matching the read path.
+                self.emit_load_for_writeback(&access.array, instructions);
+                self.compile_expression(&access.index, instructions);
                 // Stack: [modified_value, parent_collection, index]
                 // We need: [value_to_set, collection, index] for SetIndex
                 // Rearrange: rotate so modified_value goes under collection
@@ -805,7 +808,7 @@ impl CfmlCompiler {
                 // Current: [modified_value, parent_collection, index]
                 // That's already correct for SetIndex
                 instructions.push(BytecodeOp::SetIndex);
-                Self::emit_nested_writeback(&access.array, instructions);
+                self.emit_nested_writeback(&access.array, instructions);
             }
             _ => {
                 instructions.push(BytecodeOp::Pop);
@@ -814,7 +817,7 @@ impl CfmlCompiler {
     }
 
     /// Emit a load instruction for the given expression (used during write-back chain).
-    fn emit_load_for_writeback(expr: &Expression, instructions: &mut Vec<BytecodeOp>) {
+    fn emit_load_for_writeback(&mut self, expr: &Expression, instructions: &mut Vec<BytecodeOp>) {
         match expr {
             Expression::Identifier(ident) => {
                 instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
@@ -824,13 +827,16 @@ impl CfmlCompiler {
             }
             Expression::MemberAccess(access) => {
                 // For nested access like loading "s.a", we load s then get property a
-                Self::emit_load_for_writeback(&access.object, instructions);
+                self.emit_load_for_writeback(&access.object, instructions);
                 instructions.push(BytecodeOp::GetProperty(access.member.clone()));
             }
             Expression::ArrayAccess(access) => {
-                // For nested access like loading "s.a[0]", we load s.a then get index 0
-                Self::emit_load_for_writeback(&access.array, instructions);
-                Self::compile_expression_static(&access.index, instructions);
+                // For nested access like loading "s.a[0]", we load s.a then get index 0.
+                // The index must use the FULL expression compiler — a complex index
+                // (interpolation `"total#t#"`, concat, a call) would otherwise hit
+                // compile_expression_static's Null fallback and read the wrong cell.
+                self.emit_load_for_writeback(&access.array, instructions);
+                self.compile_expression(&access.index, instructions);
                 instructions.push(BytecodeOp::GetIndex);
             }
             _ => {
@@ -941,7 +947,7 @@ impl CfmlCompiler {
                                 // Nested: structAppend(local._taffy.settings, defaultConfig)
                                 // → compile call → emit_nested_writeback(local._taffy.settings)
                                 self.compile_expression(&expr_stmt.expr, instructions);
-                                Self::emit_nested_writeback(first_arg, instructions);
+                                self.emit_nested_writeback(first_arg, instructions);
                             }
                             _ => {
                                 // Can't write back — just pop
@@ -1078,7 +1084,7 @@ impl CfmlCompiler {
                         self.compile_expression(idx, instructions);
                         instructions.push(BytecodeOp::SetIndex);
                         // SetIndex leaves modified collection on stack; write it back
-                        Self::emit_nested_writeback(arr, instructions);
+                        self.emit_nested_writeback(arr, instructions);
                     }
                     AssignTarget::StructAccess(obj, member) => {
                         // Nested write to an undeclared scope-qualified container
@@ -1113,13 +1119,13 @@ impl CfmlCompiler {
                                 self.compile_expression(obj, instructions);
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetProperty(member.clone()));
-                                Self::emit_nested_writeback(obj, instructions);
+                                self.emit_nested_writeback(obj, instructions);
                             }
                         } else {
                             self.compile_expression(obj, instructions);
                             instructions.push(BytecodeOp::Swap);
                             instructions.push(BytecodeOp::SetProperty(member.clone()));
-                            Self::emit_nested_writeback(obj, instructions);
+                            self.emit_nested_writeback(obj, instructions);
                         }
                     }
                 }
@@ -1622,23 +1628,27 @@ impl CfmlCompiler {
         expr: &Expression,
         instructions: &mut Vec<BytecodeOp>,
     ) -> bool {
-        // Helper: emit `target op= 1` as a statement for any assignable expression.
-        fn emit_memberaccess_step(
+        // Helper: emit `target = target + delta` as a statement (no stack
+        // leftover) for any assignable member/index target. Reads via the normal
+        // expression path and writes via emit_nested_writeback, both of which
+        // already support MemberAccess (`obj.m`) AND ArrayAccess (`obj[k]`) —
+        // including nested chains like `variables.lookup[id]["totalPass"]`.
+        fn emit_assignable_step(
             this: &mut CfmlCompiler,
-            access: &MemberAccess,
+            operand: &Expression,
             delta: i64,
             instructions: &mut Vec<BytecodeOp>,
         ) {
-            // obj.member = obj.member + delta  (statement form: no stack leftover)
-            this.compile_expression(&access.object, instructions);
-            instructions.push(BytecodeOp::GetProperty(access.member.clone()));
+            this.compile_expression(operand, instructions); // read current value
             instructions.push(BytecodeOp::Integer(delta));
             instructions.push(BytecodeOp::Add);
-            // Store back via SetProperty + nested writeback
-            this.compile_expression(&access.object, instructions);
-            instructions.push(BytecodeOp::Swap);
-            instructions.push(BytecodeOp::SetProperty(access.member.clone()));
-            CfmlCompiler::emit_nested_writeback(&access.object, instructions);
+            this.emit_nested_writeback(operand, instructions); // write back
+        }
+
+        // True when an inc/dec target is an assignable member/index path that the
+        // step helper + writeback can handle (vs a bare identifier, handled above).
+        fn is_assignable_path(e: &Expression) -> bool {
+            matches!(e, Expression::MemberAccess(_) | Expression::ArrayAccess(_))
         }
 
         match expr {
@@ -1655,12 +1665,12 @@ impl CfmlCompiler {
                         }
                     }
                 }
-                if let Expression::MemberAccess(access) = &*postfix.operand {
+                if is_assignable_path(&postfix.operand) {
                     let delta = match postfix.operator {
                         PostfixOpType::Increment => 1,
                         PostfixOpType::Decrement => -1,
                     };
-                    emit_memberaccess_step(self, access, delta, instructions);
+                    emit_assignable_step(self, &postfix.operand, delta, instructions);
                     return true;
                 }
             }
@@ -1678,13 +1688,13 @@ impl CfmlCompiler {
                         _ => {}
                     }
                 }
-                if let Expression::MemberAccess(access) = &*unary.operand {
+                if is_assignable_path(&unary.operand) {
                     let delta = match unary.operator {
                         UnaryOpType::PrefixIncrement => 1,
                         UnaryOpType::PrefixDecrement => -1,
                         _ => return false,
                     };
-                    emit_memberaccess_step(self, access, delta, instructions);
+                    emit_assignable_step(self, &unary.operand, delta, instructions);
                     return true;
                 }
             }
@@ -2807,7 +2817,7 @@ impl CfmlCompiler {
                                     self.compile_expression(&access.object, instructions);
                                     instructions.push(BytecodeOp::Swap);
                                     instructions.push(BytecodeOp::SetProperty(access.member.clone()));
-                                    Self::emit_nested_writeback(&access.object, instructions);
+                                    self.emit_nested_writeback(&access.object, instructions);
                                 }
                             } else {
                                 // SetProperty needs [obj, value].
@@ -2815,7 +2825,7 @@ impl CfmlCompiler {
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetProperty(access.member.clone()));
                                 // Write back through nested chain
-                                Self::emit_nested_writeback(&access.object, instructions);
+                                self.emit_nested_writeback(&access.object, instructions);
                             }
                         }
                         Expression::ArrayAccess(access) => {
@@ -2823,7 +2833,7 @@ impl CfmlCompiler {
                             self.compile_expression(&access.index, instructions);
                             instructions.push(BytecodeOp::SetIndex);
                             // SetIndex leaves modified collection on stack; write it back
-                            Self::emit_nested_writeback(&access.array, instructions);
+                            self.emit_nested_writeback(&access.array, instructions);
                         }
                         _ => {}
                     }
@@ -2926,25 +2936,36 @@ impl CfmlCompiler {
                 match unary.operator {
                     UnaryOpType::PrefixIncrement | UnaryOpType::PrefixDecrement => {
                         // ++i / --i: increment/decrement and leave NEW value on stack
+                        let delta = if matches!(unary.operator, UnaryOpType::PrefixIncrement) {
+                            1
+                        } else {
+                            -1
+                        };
                         if let Expression::Identifier(ident) = &*unary.operand {
                             instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
-                            instructions.push(BytecodeOp::Integer(1));
-                            if matches!(unary.operator, UnaryOpType::PrefixIncrement) {
-                                instructions.push(BytecodeOp::Add);
-                            } else {
-                                instructions.push(BytecodeOp::Sub);
-                            }
+                            instructions.push(BytecodeOp::Integer(delta));
+                            instructions.push(BytecodeOp::Add);
                             instructions.push(BytecodeOp::Dup);
                             instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
+                        } else if matches!(
+                            &*unary.operand,
+                            Expression::MemberAccess(_) | Expression::ArrayAccess(_)
+                        ) {
+                            // `++obj.member` / `++obj[key]` (and `--`): write back AND
+                            // leave the NEW value (the old fallback computed the value
+                            // but never persisted the increment, and never handled
+                            // index targets at all).
+                            self.compile_expression(&unary.operand, instructions); // [old]
+                            instructions.push(BytecodeOp::Integer(delta));
+                            instructions.push(BytecodeOp::Add); // [new]
+                            instructions.push(BytecodeOp::Dup); // new value is the result
+                            self.emit_nested_writeback(&unary.operand, instructions);
+                            // New value remains on the stack as the expression result.
                         } else {
                             // Fallback: evaluate operand, add/subtract 1
                             self.compile_expression(&unary.operand, instructions);
-                            instructions.push(BytecodeOp::Integer(1));
-                            if matches!(unary.operator, UnaryOpType::PrefixIncrement) {
-                                instructions.push(BytecodeOp::Add);
-                            } else {
-                                instructions.push(BytecodeOp::Sub);
-                            }
+                            instructions.push(BytecodeOp::Integer(delta));
+                            instructions.push(BytecodeOp::Add);
                         }
                     }
                     _ => {
@@ -2978,6 +2999,27 @@ impl CfmlCompiler {
                             instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
                         }
                     }
+                } else if matches!(
+                    &*postfix.operand,
+                    Expression::MemberAccess(_) | Expression::ArrayAccess(_)
+                ) {
+                    // `obj.member++` / `obj[key]++` (and `--`) as an rvalue. The
+                    // identifier arm above never matched, so this previously emitted
+                    // NOTHING — leaving no value on the stack and silently shifting
+                    // any surrounding struct literal / arg list by one slot (TestBox's
+                    // `"order": this.$specOrderIndex++` spec literal), and making
+                    // `variables.lookup[id]["totalPass"]++` a no-op (stats stuck at 0).
+                    // Read the OLD value as the result, then write back old±1.
+                    let delta = match postfix.operator {
+                        PostfixOpType::Increment => 1,
+                        PostfixOpType::Decrement => -1,
+                    };
+                    self.compile_expression(&postfix.operand, instructions); // [old]
+                    instructions.push(BytecodeOp::Dup); // keep old value as result
+                    instructions.push(BytecodeOp::Integer(delta));
+                    instructions.push(BytecodeOp::Add); // [old, new]
+                    self.emit_nested_writeback(&postfix.operand, instructions);
+                    // The original value remains on the stack as the expression result.
                 }
             }
             Expression::MemberAccess(access) => {

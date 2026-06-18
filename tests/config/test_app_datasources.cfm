@@ -5,6 +5,11 @@ suiteBegin("cfconfig — per-application datasources (this.datasources)");
 // `this.datasources` must be resolved by queryExecute/cfquery for THIS
 // application, ahead of the process-global cfconfig registry. This is the
 // Lucee/BoxLang behaviour; previously RustCFML ignored this.datasources.
+//
+// RustCFML-only: these exercise RustCFML's in-memory sqlite datasources
+// (rc_app_mem / rc_app_mem_str / rc_app_bad) declared in tests/Application.cfc,
+// which don't exist on the Lucee test server. Skip the whole suite there.
+if (isRustCFML()) {
 
 // 1. Valid in-memory sqlite datasource (struct form) — a basic query works.
 ok = false;
@@ -39,6 +44,8 @@ assertThrows(
         queryExecute("SELECT 1 AS n", [], { datasource: "rc_app_bad" });
     }
 );
+
+} // end if (isRustCFML())
 
 suiteEnd();
 </cfscript>

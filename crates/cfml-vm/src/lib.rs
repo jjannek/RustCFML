@@ -775,6 +775,14 @@ pub struct CfmlVirtualMachine {
     /// request scope is shared across threads). Reads still return a snapshot;
     /// writes mutate the shared backing store in place.
     pub request_scope: CfmlStruct,
+    /// Page-level `thread` soft-scope, lives for one request (like request_scope).
+    /// CFML exposes a writable `thread` scope even outside a cfthread (TestBox's
+    /// BDDRunner stashes thread.testResults/target/suiteStats at page scope, and
+    /// `generateAroundEachClosuresStack` uses thread.* as cross-frame quasi-globals).
+    /// Kept SEPARATE from `globals["thread"]` (which cfthread owns transiently),
+    /// so the two never collide. Reads/writes route here only when NOT inside a
+    /// cfthread and no real local `thread` variable shadows it.
+    pub page_thread_scope: CfmlStruct,
     /// Application scope — backed by a shared `CfmlStruct` (`Arc<RwLock<IndexMap>>`)
     /// so that reading the `application` scope returns a LIVE reference (handle
     /// clone), not a snapshot. This makes the CFML "scope pointer" pattern
@@ -1208,6 +1216,7 @@ impl CfmlVirtualMachine {
             method_variables_writeback: None,
             closure_parent_writeback: None,
             request_scope: CfmlStruct::empty(),
+            page_thread_scope: CfmlStruct::empty(),
             application_scope: None,
             session_scope: None,
             current_application_name: None,
@@ -2587,24 +2596,58 @@ impl CfmlVirtualMachine {
                     } else if name_lower == "request" {
                         CfmlValue::strukt(self.request_scope.snapshot())
                     } else if name_lower == "thread" {
-                        // The `thread` scope always exists in CFML. Inside a
-                        // cfthread it's the per-thread scope seeded in
-                        // run_thread_body; at PAGE level it's a lazily-created
-                        // struct so `thread.x = y` works outside any cfthread
-                        // (TestBox's BDDRunner sets/reads thread.testResults,
-                        // thread.target, thread.suiteStats at page scope for its
-                        // "in case a suite is async" bookkeeping). Return the live
-                        // Arc-backed handle so member writes persist and read back.
-                        if !self.globals.contains_key("thread") {
-                            self.globals.insert(
-                                "thread".to_string(),
-                                CfmlValue::strukt(ValueMap::default()),
-                            );
+                        // `thread` is a SOFT scope (verified on Lucee 7): writable
+                        // and readable even outside a cfthread. Resolution order:
+                        //   1. a real local/variable named `thread` (e.g.
+                        //      `thread = createObject("java","java.lang.Thread")…`),
+                        //   2. the cfthread per-thread scope while inside a cfthread
+                        //      (lives in globals["thread"], owned by run_thread_body),
+                        //   3. the page-level `thread` soft-scope field otherwise.
+                        // Kept on a dedicated field so it never collides with
+                        // cfthread's transient globals["thread"].
+                        // A `thread` that is a BODY-declared local (`var thread` /
+                        // arg in THIS frame — i.e. present in locals but NOT inherited
+                        // from the parent) wins outright: the java.lang.Thread idiom.
+                        if locals.contains_key("thread")
+                            && !inherited_or_param_keys.contains("thread")
+                        {
+                            locals.get("thread").cloned().unwrap()
+                        } else if let Some(v) = self.globals.get("thread") {
+                            // Inside a cfthread the per-thread scope (owned by
+                            // run_thread_body) MUST shadow an INHERITED page-level
+                            // `thread` and `variables.thread`/page soft-scope — `thread`
+                            // IS the thread scope there. (An unscoped page write
+                            // `thread = "x"` lands in the page vars and is copied into
+                            // the thread body's inherited locals; without this it hid
+                            // the per-thread scope and `thread.x = y` writes were lost.)
+                            v.clone()
+                        } else if let Some(v) = locals.get("thread") {
+                            // Inherited page-level `thread` variable, no cfthread active.
+                            v.clone()
+                        } else if let Some(CfmlValue::Struct(vars)) =
+                            locals.get("__variables")
+                        {
+                            vars.get_ci("thread")
+                                .unwrap_or_else(|| CfmlValue::Struct(self.page_thread_scope.clone()))
+                        } else {
+                            // Live handle so `thread.x` member writes (routed via the
+                            // scope-aware path) read back through the same backing.
+                            CfmlValue::Struct(self.page_thread_scope.clone())
                         }
-                        self.globals
-                            .get("thread")
-                            .cloned()
-                            .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()))
+                    } else if name_lower == "attributes"
+                        && self.globals.contains_key("attributes")
+                        && !(locals.contains_key("attributes")
+                            && !inherited_or_param_keys.contains("attributes"))
+                    {
+                        // Inside a cfthread the thread's own `attributes` scope (seeded
+                        // by run_thread_body) must shadow an INHERITED/captured
+                        // `attributes` — e.g. when the cfthread is spawned inside a
+                        // custom tag, whose own `attributes` scope is captured by the
+                        // thread closure and would otherwise hide the thread's attrs.
+                        // A BODY-declared local `attributes` (present in locals but not
+                        // inherited) still wins, so a custom tag's own body reads its
+                        // own attributes normally (this arm is skipped for it).
+                        self.globals.get("attributes").cloned().unwrap()
                     } else if name_lower == "application" {
                         if let Some(ref app_scope) = self.application_scope {
                             // Live handle clone, not a snapshot, so `var p =
@@ -2861,6 +2904,25 @@ impl CfmlVirtualMachine {
                             }
                         } else if name_lower == "thread" && self.globals.contains_key("thread") {
                             self.globals.insert("thread".to_string(), val);
+                        } else if name_lower == "thread"
+                            && !declared_locals.contains("thread")
+                            && matches!(&val, CfmlValue::Struct(s) if self.page_thread_scope.ptr_eq(s))
+                        {
+                            // Page-level `thread` soft-scope MEMBER-write capture only
+                            // (`thread.x = y`, outside a cfthread, no `var thread`): the
+                            // Load returned the live page_thread_scope handle and
+                            // SetProperty already mutated its backing in place, so the
+                            // store-back is a no-op. (Copying it to itself would also
+                            // self-deadlock the non-reentrant RwLock.)
+                            //
+                            // A WHOLE-VALUE `thread = X` — struct, object (the
+                            // java.lang.Thread idiom), or scalar — is deliberately NOT
+                            // captured here: it falls through to the plain variable
+                            // store below so `thread` stays usable as an ordinary
+                            // variable (Lucee parity). Capturing whole structs here made
+                            // the write target (page_thread_scope) diverge from the read
+                            // target (a same-named plain var), so `thread = javaObj`
+                            // after a stray `thread = "s"` was silently dropped.
                         } else if name_lower == "arguments"
                             && is_inside_function
                             && !declared_locals.contains(name.as_str())
@@ -2893,15 +2955,31 @@ impl CfmlVirtualMachine {
                                     {
                                         continue;
                                     }
-                                    if matches!(
-                                        v,
-                                        CfmlValue::Struct(_)
-                                            | CfmlValue::Array(_)
-                                            | CfmlValue::Query(_)
-                                            | CfmlValue::Component(_)
-                                    ) {
-                                        locals.insert(k.clone(), v.clone());
+                                    // Numeric (positional overflow) keys are not
+                                    // named params — never materialize them as locals.
+                                    if k.bytes().all(|b| b.is_ascii_digit()) {
+                                        continue;
                                     }
+                                    // A key the frame explicitly declared local
+                                    // (`var k` / `local.k = …`) is a SEPARATE slot
+                                    // from the param — CFML keeps the two views
+                                    // independent, so an `arguments.k` write must not
+                                    // clobber the local (see
+                                    // tests/core/test_local_shadows_arguments.cfm #8).
+                                    if declared_locals.contains(k.as_str())
+                                        || declared_locals.contains(&k.to_lowercase())
+                                    {
+                                        continue;
+                                    }
+                                    // Sync the param value back to its named local so
+                                    // `arguments.p` and bare `p` stay aliased (CFML
+                                    // scope semantics). Previously only complex types
+                                    // synced (for by-ref nested writes); scalars did
+                                    // not, so `arguments.idx = 99` / `++arguments.idx`
+                                    // left bare `idx` stale (broke TestBox's
+                                    // generateAroundEachClosuresStack recursion guard
+                                    // `++arguments.closureIndex`).
+                                    locals.insert(k.clone(), v.clone());
                                 }
                             }
                             // The arguments scope lives under the reserved key, not
@@ -2933,9 +3011,12 @@ impl CfmlVirtualMachine {
                             if effective_local_mode_modern {
                                 inherited_or_param_keys.remove(name);
                             }
-                            // Bidirectional sync: when a function param is stored,
-                            // also update arguments[param] so `arguments.x` sees
-                            // the latest value (and vice versa, handled above for arguments).
+                            // Bidirectional sync: when a function param is stored by
+                            // its bare name, also update arguments[param] so a later
+                            // `arguments.x` read sees the latest value — Lucee aliases
+                            // the two fully (verified: bare `idx=5` makes
+                            // `arguments.idx` 5 too). Scalars sync as well as complex
+                            // types (the arguments->bare direction is handled above).
                             // PR #96: NOT for `var X` / `local.X` declarations — those
                             // create a separate local-scope slot; `arguments.X` must keep
                             // resolving to the passed value / declared default.
@@ -2943,13 +3024,6 @@ impl CfmlVirtualMachine {
                                 && !declared_locals.contains(name.as_str())
                                 && !declared_locals.contains(&name_lower)
                                 && func.params.iter().any(|p| p.eq_ignore_ascii_case(name))
-                                && matches!(
-                                    val,
-                                    CfmlValue::Struct(_)
-                                        | CfmlValue::Array(_)
-                                        | CfmlValue::Query(_)
-                                        | CfmlValue::Component(_)
-                                )
                             {
                                 if let Some(args) =
                                     locals.get_mut(ARGUMENTS_SCOPE_KEY).and_then(|v| v.as_cfml_struct())
@@ -3104,6 +3178,11 @@ impl CfmlVirtualMachine {
                     // visible (`variables.log` must return the variable, not the
                     // log() builtin).
                     let is_read_position = matches!(op, BytecodeOp::LoadVariablesKey(_));
+                    let is_builtin_name = self.builtins.contains_key(name.as_str())
+                        || self
+                            .builtins
+                            .keys()
+                            .any(|b| b.eq_ignore_ascii_case(&name_lower));
                     let local_hit_visible = match &local_hit {
                         None => false,
                         _ if is_read_position => true,
@@ -3113,14 +3192,19 @@ impl CfmlVirtualMachine {
                                 func.params.iter().any(|p| p.eq_ignore_ascii_case(k));
                             let inherited_data =
                                 inherited_or_param_keys.contains(k.as_str()) && !is_own_param;
-                            let is_builtin_name = self.builtins.contains_key(name.as_str())
-                                || self
-                                    .builtins
-                                    .keys()
-                                    .any(|b| b.eq_ignore_ascii_case(&name_lower));
                             !inherited_data && !is_builtin_name
                         }
                     };
+                    // A CFC method shadowing a builtin must NOT win a bare-call
+                    // resolution: Lucee binds builtin functions at compile time, so
+                    // a bare `isJSON(x)` inside a method named `isJSON` calls the
+                    // BIF, not the method (call the method via `this.`/`variables.`).
+                    // Skip the __variables (component-scope) hit below for builtin
+                    // names on a bare call, so it falls through to the builtin.
+                    // (TestBox Assertion.cfc's `isJSON`/`isXml`/… wrap the BIFs this
+                    // way; without this they recurse infinitely.) The explicit
+                    // `variables.foo` READ peephole keeps the method (is_read_position).
+                    let skip_variables_method = !is_read_position && is_builtin_name;
                     // 1. Check locals (exact, then CI)
                     if local_hit_visible {
                         // Move the already-cloned value out of `local_hit` rather
@@ -3129,7 +3213,7 @@ impl CfmlVirtualMachine {
                         // mutually-exclusive "restore the data" else-if below.
                         stack.push(local_hit.unwrap().1);
                     // 1b. Check __variables scope for CFC methods
-                    } else if let Some(val) = locals.get("__variables").and_then(|v| {
+                    } else if let Some(val) = locals.get("__variables").filter(|_| !skip_variables_method).and_then(|v| {
                         if let CfmlValue::Struct(vars) = v {
                             // get_ci does exact-then-CI under one read lock and
                             // clones only the matched value — never snapshots the
@@ -11122,6 +11206,17 @@ impl CfmlVirtualMachine {
         if name_lower == "request" {
             return Some(CfmlValue::strukt(self.request_scope.snapshot()));
         }
+        if name_lower == "thread" {
+            // `thread.x = y` routes here (autoviv scope root). A real local var or
+            // the cfthread scope wins; otherwise the page-level soft-scope field.
+            if let Some(v) = locals.get("thread") {
+                return Some(v.clone());
+            }
+            if let Some(v) = self.globals.get("thread") {
+                return Some(v.clone());
+            }
+            return Some(CfmlValue::Struct(self.page_thread_scope.clone()));
+        }
         if name_lower == "session" {
             // Session must resolve to the live/persisted scope, not a stray
             // `session` local — otherwise a nested write (`session.a.b = v`,
@@ -11252,6 +11347,24 @@ impl CfmlVirtualMachine {
         } else if name_lower == "request" {
             if let CfmlValue::Struct(s) = &val {
                 self.request_scope.with_write(|m| *m = s.snapshot());
+            }
+        } else if name_lower == "thread" {
+            // `thread.x = y` writeback. A real local var or the cfthread scope
+            // (globals["thread"]) wins; otherwise commit to the page-level soft
+            // scope field. Keeps cfthread's transient globals["thread"] separate.
+            if locals.contains_key("thread") {
+                locals.insert("thread".to_string(), val);
+            } else if self.globals.contains_key("thread") {
+                self.globals.insert("thread".to_string(), val);
+            } else if let CfmlValue::Struct(s) = &val {
+                // See the StoreLocal `thread` arm: when `s` IS the live
+                // page_thread_scope handle the backing is already mutated, and
+                // copying it to itself self-deadlocks the non-reentrant RwLock.
+                // Skip the same-Arc case; snapshot before the write otherwise.
+                if !self.page_thread_scope.ptr_eq(s) {
+                    let snap = s.snapshot();
+                    self.page_thread_scope.with_write(|m| *m = snap);
+                }
             }
         } else if name_lower == "session" {
             // Commit the (whole) session scope back so nested writes routed
