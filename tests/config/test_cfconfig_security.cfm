@@ -27,5 +27,29 @@ token = csrfGenerateToken();
 if (isRustCFML()) assert("csrf token length", len(token), 64);
 assert("csrf token verifies", csrfVerifyToken(token), true);
 
+// Issue #157: a never-generated, syntactically-valid 64-hex string must NOT
+// verify (the bug accepted ANY 64-hex token, defeating CSRF protection).
+forged = repeatString("a", 64);
+assert("forged 64-hex token rejected", csrfVerifyToken(forged), false);
+// Obviously-wrong shapes stay rejected too.
+assert("short token rejected", csrfVerifyToken(repeatString("a", 32)), false);
+assert("non-hex token rejected", csrfVerifyToken(repeatString("z", 64)), false);
+assert("empty token rejected", csrfVerifyToken(""), false);
+
+// Tokens are namespaced by key: a token issued for one key must not verify
+// under a different key.
+tokenA = csrfGenerateToken("keyA");
+tokenB = csrfGenerateToken("keyB");
+assert("keyed token verifies under its key", csrfVerifyToken(tokenA, "keyA"), true);
+assert("keyed token rejected under other key", csrfVerifyToken(tokenA, "keyB"), false);
+assert("keyA and keyB tokens differ", tokenA != tokenB, true);
+
+// Default behaviour reuses the same token per key; forceNew mints a new one.
+again = csrfGenerateToken("keyA");
+assert("default reuses the per-key token", again, tokenA);
+fresh = csrfGenerateToken("keyA", true);
+if (isRustCFML()) assert("forceNew mints a new token", fresh != tokenA, true);
+assert("forceNew token verifies", csrfVerifyToken(fresh, "keyA"), true);
+
 suiteEnd();
 </cfscript>

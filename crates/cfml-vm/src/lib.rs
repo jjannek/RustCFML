@@ -1026,6 +1026,10 @@ pub struct CfmlVirtualMachine {
     /// Resolved client timeout in seconds (default 604800).
     pub client_timeout_secs: u64,
 
+    /// `security.csrfEnabled` — when false, `csrfGenerateToken` /
+    /// `csrfVerifyToken` refuse with a runtime error. Default true.
+    pub csrf_enabled: bool,
+
     /// `security.disallowedFunctions` — lower-cased BIF names that are
     /// refused before dispatch. A call to a banned name raises a runtime
     /// error rather than executing the implementation.
@@ -1129,6 +1133,7 @@ pub struct ThreadSeed {
     pub session_timeout_secs: u64,
     pub application_timeout_secs: u64,
     pub client_timeout_secs: u64,
+    pub csrf_enabled: bool,
     pub disallowed_functions: std::collections::HashSet<String>,
     pub disallowed_imports: Vec<regex::Regex>,
     /// The thread body (a `function(){...}` closure) to invoke.
@@ -1297,6 +1302,7 @@ impl CfmlVirtualMachine {
             session_timeout_secs: 1800,
             application_timeout_secs: 86_400,
             client_timeout_secs: 604_800,
+            csrf_enabled: true,
             disallowed_functions: std::collections::HashSet::new(),
             disallowed_imports: Vec::new(),
             thread_spawn_fn: None,
@@ -1563,6 +1569,8 @@ impl CfmlVirtualMachine {
         if cfg.security.sandbox {
             self.sandbox = true;
         }
+        // security.csrfEnabled: gate CSRF token generation/verification.
+        self.csrf_enabled = cfg.security.csrf_enabled;
         // security.disallowedFunctions: lower-case all names once for cheap
         // case-insensitive matching at call time.
         self.disallowed_functions = cfg
@@ -1637,6 +1645,7 @@ impl CfmlVirtualMachine {
             session_timeout_secs: self.session_timeout_secs,
             application_timeout_secs: self.application_timeout_secs,
             client_timeout_secs: self.client_timeout_secs,
+            csrf_enabled: self.csrf_enabled,
             disallowed_functions: self.disallowed_functions.clone(),
             disallowed_imports: self.disallowed_imports.clone(),
             closure: body,
@@ -1674,6 +1683,7 @@ impl CfmlVirtualMachine {
         self.session_timeout_secs = seed.session_timeout_secs;
         self.application_timeout_secs = seed.application_timeout_secs;
         self.client_timeout_secs = seed.client_timeout_secs;
+        self.csrf_enabled = seed.csrf_enabled;
         self.disallowed_functions = seed.disallowed_functions;
         self.disallowed_imports = seed.disallowed_imports;
         self.cancel_flag = Some(seed.cancel_flag);
@@ -6992,6 +7002,8 @@ impl CfmlVirtualMachine {
                 | "sessiongetmetadata"
                 | "applicationstop"
                 | "getauthuser"
+                | "csrfgeneratetoken"
+                | "csrfverifytoken"
                 | "isuserinrole"
                 | "isuserloggedin"
                 | "__cfloginuser"
@@ -10183,6 +10195,109 @@ impl CfmlVirtualMachine {
                         }
                     }
                     return Ok(CfmlValue::string(String::new()));
+                }
+                "csrfgeneratetoken" => {
+                    // csrfGenerateToken([key="default", forceNew=false])
+                    // Mint (or reuse) a per-session CSRF token. Tokens are stored
+                    // in the session under `__csrf_tokens` keyed by `key`, so
+                    // csrfVerifyToken can confirm membership rather than just
+                    // structural shape (issue #157).
+                    if !self.csrf_enabled {
+                        return Err(CfmlError::runtime(
+                            "csrfGenerateToken is disabled by security.csrfEnabled".to_string(),
+                        ));
+                    }
+                    let key = {
+                        let k = args.first().map(|v| v.as_string()).unwrap_or_default();
+                        if k.is_empty() { "default".to_string() } else { k }
+                    }
+                    .to_lowercase();
+                    let force_new = args.get(1).map(|v| v.is_true()).unwrap_or(false);
+
+                    self.attach_session_scope();
+                    let mut store: ValueMap = match self.get_session_scope() {
+                        CfmlValue::Struct(s) => match s.get("__csrf_tokens") {
+                            Some(CfmlValue::Struct(m)) => m.snapshot(),
+                            _ => ValueMap::default(),
+                        },
+                        _ => ValueMap::default(),
+                    };
+                    let mut list: Vec<CfmlValue> = match store.get(&key) {
+                        Some(CfmlValue::Array(a)) => a.snapshot(),
+                        _ => Vec::new(),
+                    };
+
+                    // Default Lucee behaviour: one stable token per key per
+                    // session — reuse the latest unless forceNew is set.
+                    if !force_new {
+                        if let Some(last) = list.last() {
+                            return Ok(CfmlValue::string(last.as_string()));
+                        }
+                    }
+
+                    // 64-hex (32-byte) token from two random v4 UUIDs.
+                    let token = format!(
+                        "{}{}",
+                        uuid::Uuid::new_v4().simple(),
+                        uuid::Uuid::new_v4().simple()
+                    );
+                    list.push(CfmlValue::string(token.clone()));
+                    // Bound per-key history so a long-lived session can't grow
+                    // unboundedly when forceNew is used repeatedly.
+                    const MAX_TOKENS_PER_KEY: usize = 100;
+                    if list.len() > MAX_TOKENS_PER_KEY {
+                        let drop = list.len() - MAX_TOKENS_PER_KEY;
+                        list.drain(0..drop);
+                    }
+                    store.insert(key, CfmlValue::array(list));
+                    self.set_session_variable(
+                        "__csrf_tokens",
+                        CfmlValue::strukt(store),
+                    )?;
+                    return Ok(CfmlValue::string(token));
+                }
+                "csrfverifytoken" => {
+                    // csrfVerifyToken(token [, key="default"])
+                    // True only when `token` was actually issued for `key` in
+                    // the current session (issue #157 — was accepting any
+                    // 64-hex string).
+                    if !self.csrf_enabled {
+                        return Err(CfmlError::runtime(
+                            "csrfVerifyToken is disabled by security.csrfEnabled".to_string(),
+                        ));
+                    }
+                    let token = match args.first() {
+                        Some(v) => v.as_string(),
+                        None => {
+                            return Err(CfmlError::runtime(
+                                "csrfVerifyToken requires at least 1 argument: token"
+                                    .to_string(),
+                            ))
+                        }
+                    };
+                    if token.is_empty() {
+                        return Ok(CfmlValue::Bool(false));
+                    }
+                    let key = {
+                        let k = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+                        if k.is_empty() { "default".to_string() } else { k }
+                    }
+                    .to_lowercase();
+
+                    let found = match self.get_session_scope() {
+                        CfmlValue::Struct(s) => match s.get("__csrf_tokens") {
+                            Some(CfmlValue::Struct(m)) => match m.get(&key) {
+                                Some(CfmlValue::Array(a)) => a
+                                    .snapshot()
+                                    .iter()
+                                    .any(|t| t.as_string() == token),
+                                _ => false,
+                            },
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    return Ok(CfmlValue::Bool(found));
                 }
                 "isuserloggedin" => {
                     if let (Some(ref state), Some(ref sid)) = (&self.server_state, &self.session_id)
