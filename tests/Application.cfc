@@ -32,9 +32,12 @@ component {
     //                     resolved through this.datasources (a non-sqlite driver
     //                     must throw, not silently fall through to the sqlite
     //                     catch-all that an unresolved bare name would hit)
+    //   rc_app_type     — declared the Lucee way with `type` instead of `driver`
+    //                     (GitHub #173); must resolve to the same sqlite driver
     this.datasources = {
         "rc_app_mem"     : { driver: "sqlite", database: ":memory:" },
         "rc_app_mem_str" : "sqlite://:memory:",
+        "rc_app_type"    : { type: "sqlite", database: ":memory:" },
         "rc_app_bad"     : { driver: "postgresql", host: "127.0.0.1", port: "1", database: "definitely_absent", username: "x", password: "y" }
     };
 

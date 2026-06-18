@@ -16041,7 +16041,18 @@ impl CfmlVirtualMachine {
                         .unwrap_or_default()
                 };
                 let mut ds = cfml_config::DatasourceCfg::default();
-                ds.driver = get("driver");
+                // `driver` is RustCFML's native key; `type`/`dbdriver` are the
+                // Lucee/ACF aliases (Preside et al. declare `{ type:"MySQL" }`).
+                ds.driver = {
+                    let d = get("driver");
+                    if !d.is_empty() {
+                        d
+                    } else {
+                        let t = get("type");
+                        if t.is_empty() { get("dbdriver") } else { t }
+                    }
+                };
+                ds.class = get("class");
                 ds.host = get("host");
                 ds.port = get("port");
                 ds.database = get("database");

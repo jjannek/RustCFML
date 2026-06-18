@@ -45,6 +45,29 @@ assertThrows(
     }
 );
 
+// 4. Lucee `type` key (GitHub #173) — Lucee/ACF/Preside declare the driver as
+//    `type:"MySQL"` rather than RustCFML's native `driver` key. It must be
+//    accepted as an alias; rc_app_type uses { type:"sqlite", … } and should
+//    resolve and query exactly like the `driver`-keyed form.
+okType = false;
+try {
+    rT = queryExecute("SELECT 4 AS n", [], { datasource: "rc_app_type" });
+    okType = (rT.n[1] == 4);
+} catch (any e) {
+    okType = false;
+}
+assert("this.datasources `type` key is accepted as a driver alias (GitHub 173)", okType, true);
+
+// 5. SAFETY (GitHub #173): an undefined datasource name must raise a clear
+//    error, NOT silently fall back to a throwaway in-memory SQLite db (which
+//    used to make config typos "work" against the wrong database).
+assertThrows(
+    "undefined datasource name errors instead of silently using sqlite (GitHub 173)",
+    function() {
+        queryExecute("SELECT 1 AS n", [], { datasource: "rc_app_undefined_xyz" });
+    }
+);
+
 } // end if (isRustCFML())
 
 suiteEnd();

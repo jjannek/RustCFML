@@ -215,7 +215,16 @@ impl Default for SessionCfg {
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct DatasourceCfg {
+    /// Native driver id (`mysql`, `postgresql`, `mssql`, `sqlite`, …). Also
+    /// accepts the Lucee/ACF `type` and `dbdriver` keys as aliases, so a
+    /// standard `this.datasources` / `.cfconfig.json` entry declared the Lucee
+    /// way (`{ type: "MySQL", … }`) resolves to the right driver.
+    #[serde(alias = "type", alias = "dbdriver")]
     pub driver: String,
+    /// JDBC driver class name (e.g. `com.mysql.cj.jdbc.Driver`). Used as a
+    /// fallback when `driver`/`type` is absent.
+    #[serde(default)]
+    pub class: String,
     pub host: String,
     pub port: String,
     pub database: String,
@@ -242,7 +251,7 @@ impl DatasourceCfg {
         if !self.connection_string.is_empty() {
             return Some(self.connection_string.clone());
         }
-        let driver = self.driver.to_ascii_lowercase();
+        let driver = self.canonical_driver();
         let creds = if self.username.is_empty() && self.password.is_empty() {
             String::new()
         } else if self.password.is_empty() {
@@ -270,6 +279,31 @@ impl DatasourceCfg {
             )),
             "sqlite" => Some(format!("sqlite://{}", self.database)),
             _ => None,
+        }
+    }
+
+    /// Resolve the canonical lowercase driver id from the `driver` key (also
+    /// aliased from Lucee's `type`/`dbdriver`) or, failing that, a JDBC `class`
+    /// name. Lucee/ACF apps declare drivers as `type:"MySQL"` or via the JDBC
+    /// driver class; both normalise to the same ids the URL builder understands.
+    pub fn canonical_driver(&self) -> String {
+        let raw = if !self.driver.is_empty() {
+            &self.driver
+        } else {
+            &self.class
+        };
+        let lc = raw.trim().to_ascii_lowercase();
+        match lc.as_str() {
+            // JDBC driver class names (cfconfig `class` / Lucee `class`).
+            "com.mysql.cj.jdbc.driver" | "com.mysql.jdbc.driver" => "mysql".to_string(),
+            "org.mariadb.jdbc.driver" => "mariadb".to_string(),
+            "org.postgresql.driver" => "postgresql".to_string(),
+            "com.microsoft.sqlserver.jdbc.sqlserverdriver"
+            | "net.sourceforge.jtds.jdbc.driver" => "mssql".to_string(),
+            "org.sqlite.jdbc" => "sqlite".to_string(),
+            // Otherwise treat it as a driver id / Lucee `type` (e.g. "MySQL",
+            // "PostgreSQL", "MSSQL") — the URL builder match handles the rest.
+            other => other.to_string(),
         }
     }
 }
@@ -686,6 +720,47 @@ mod tests {
         let ds = cfg.datasources.get("myDSN").expect("missing dsn");
         assert_eq!(ds.driver, "mysql");
         assert!(ds.default);
+    }
+
+    #[test]
+    fn datasource_lucee_type_key_is_accepted_as_driver_alias() {
+        // GitHub #173: Lucee/ACF/Preside declare datasources with `type` rather
+        // than RustCFML's `driver`. It must alias onto `driver`.
+        let json = r#"{
+            "datasources": {
+                "ds": {
+                    "type": "MySQL",
+                    "host": "127.0.0.1",
+                    "port": "3309",
+                    "database": "preside_test",
+                    "username": "root",
+                    "password": "password"
+                }
+            }
+        }"#;
+        let cfg: RustCfmlConfig = serde_json::from_str(json).unwrap();
+        let ds = cfg.datasources.get("ds").unwrap();
+        assert_eq!(ds.driver, "MySQL");
+        assert_eq!(ds.canonical_driver(), "mysql");
+        assert_eq!(
+            ds.connection_url().unwrap(),
+            "mysql://root:password@127.0.0.1:3309/preside_test"
+        );
+    }
+
+    #[test]
+    fn datasource_dbdriver_alias_and_jdbc_class_normalise() {
+        // `dbdriver` is another Lucee alias for the driver id.
+        let mut ds = DatasourceCfg::default();
+        ds.driver = "PostgreSQL".into();
+        assert_eq!(ds.canonical_driver(), "postgresql");
+
+        // A JDBC `class` name resolves when no driver/type is given.
+        let json = r#"{
+            "datasources": { "ds": { "class": "com.mysql.cj.jdbc.Driver", "database": "x" } }
+        }"#;
+        let cfg: RustCfmlConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.datasources.get("ds").unwrap().canonical_driver(), "mysql");
     }
 
     #[test]

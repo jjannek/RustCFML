@@ -166,6 +166,8 @@ Map of name → driver config. The name becomes the value used in
 "datasources": {
   "myDSN": {
     "driver":   "mysql",          // mysql | mariadb | postgresql | postgres | mssql | sqlserver | sqlite
+                                  // Lucee aliases also accepted: "type" / "dbdriver" (e.g. "type": "MySQL"),
+                                  // or a JDBC "class" (e.g. "com.mysql.cj.jdbc.Driver").
     "host":     "localhost",
     "port":     "3306",
     "database": "mydb",
@@ -178,6 +180,13 @@ Map of name → driver config. The name becomes the value used in
 ```
 
 `Application.cfc this.datasources` overrides global entries at application scope.
+The same `type` / `dbdriver` / `class` aliases work there too, so a standard
+Lucee declaration — `this.datasources["x"] = { type:"MySQL", host:…, … }` —
+resolves to the right driver.
+
+A datasource name that resolves to none of: a registered datasource, a dynamic
+driver, or an explicit connection string raises an error rather than silently
+falling back to an in-memory SQLite database.
 
 ### `mappings`
 

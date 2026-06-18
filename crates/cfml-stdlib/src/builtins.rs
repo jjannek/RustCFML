@@ -6391,6 +6391,43 @@ pub(crate) fn parse_datasource(ds: &str) -> DbDriver {
     }
 }
 
+/// Does `s` look like an explicit connection string (rather than a bare
+/// logical datasource name)? Used to decide whether an unresolved datasource
+/// is a misconfiguration or a literal connection the caller passed inline.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn looks_like_connection_string(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains("://")
+        || l.starts_with("jdbc:")
+        || l.contains(":memory:")
+        || l.contains('/')
+        || l.contains('\\')
+        || l.ends_with(".db")
+        || l.ends_with(".sqlite")
+}
+
+/// Resolve a datasource *name* to a connection string, erroring instead of
+/// silently substituting a throwaway in-memory SQLite database when the name
+/// maps to no registered datasource, dynamic driver, or explicit connection
+/// string. Without this guard a config typo (or an unrecognised driver key)
+/// "works" against the wrong database — see GitHub #173.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub(crate) fn resolve_query_datasource(name: &str) -> Result<String, CfmlError> {
+    // Dynamic drivers (e.g. Cloudflare D1) own their own name resolution.
+    if crate::db_driver::lookup_dynamic_datasource(name).is_some() {
+        return Ok(name.to_string());
+    }
+    let resolved = resolve_datasource(name);
+    // `resolve_datasource` returns the name unchanged when it is not registered.
+    if resolved.eq_ignore_ascii_case(name) && !looks_like_connection_string(&resolved) {
+        return Err(CfmlError::runtime(format!(
+            "datasource [{}] could not be found. Define it in this.datasources or .cfconfig.json, or pass a connection string.",
+            name
+        )));
+    }
+    Ok(resolved)
+}
+
 // -----------------------------------------------
 // Datasource Registry
 // -----------------------------------------------
@@ -7586,8 +7623,8 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
         .as_deref()
         .and_then(crate::db_driver::lookup_dynamic_datasource);
 
-    let datasource = match datasource_attr {
-        Some(name) => resolve_datasource(&name),
+    let datasource = match &datasource_attr {
+        Some(name) => resolve_query_datasource(name)?,
         None => default_datasource().unwrap_or_else(|| ":memory:".to_string()),
     };
 

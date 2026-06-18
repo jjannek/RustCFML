@@ -23,7 +23,7 @@ use cfml_common::vm::{CfmlError, CfmlResult};
 use indexmap::IndexMap;
 
 use crate::builtins::{
-    default_datasource, fn_query_execute, parse_datasource, resolve_datasource, DbDriver,
+    default_datasource, fn_query_execute, parse_datasource, resolve_query_datasource, DbDriver,
 };
 
 /// Entry point, registered as the `__dbinfo_impl` builtin. Takes a single
@@ -50,7 +50,7 @@ pub fn fn_dbinfo_impl(args: Vec<CfmlValue>) -> CfmlResult {
         .to_lowercase();
 
     let ds = match attr("datasource") {
-        Some(name) => resolve_datasource(&name),
+        Some(name) => resolve_query_datasource(&name)?,
         None => default_datasource().ok_or_else(|| {
             CfmlError::runtime(
                 "cfdbinfo: attribute [datasource] is required when no default datasource is defined"
