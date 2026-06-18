@@ -5015,6 +5015,39 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
+                BytecodeOp::LoadSuper => {
+                    // `super` resolves relative to the DEFINING class of the
+                    // currently-executing method, not the leaf instance. During
+                    // method execution `self.source_file` is the defining class's
+                    // path, so look up `this.__super_map[<that source>]` — the
+                    // parent-method struct for THIS level of the inheritance
+                    // chain. Falls back to the flat `__super` (2-level CFCs and
+                    // rust-parent objects, which carry no map).
+                    let mut pushed = false;
+                    if let Some(CfmlValue::Struct(s)) = locals.get("this") {
+                        if let (Some(src), Some(CfmlValue::Struct(map))) =
+                            (self.source_file.as_ref(), s.get_ci("__super_map"))
+                        {
+                            if let Some(sup) = map.get(src.as_str()).or_else(|| {
+                                map.iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case(src))
+                                    .map(|(_, v)| v.clone())
+                            }) {
+                                stack.push(sup);
+                                pushed = true;
+                            }
+                        }
+                        if !pushed {
+                            if let Some(sup) = s.get_ci("__super") {
+                                stack.push(sup);
+                                pushed = true;
+                            }
+                        }
+                    }
+                    if !pushed {
+                        stack.push(CfmlValue::Null);
+                    }
+                }
                 BytecodeOp::GetProperty(name) => {
                     if let Some(obj) = stack.pop() {
                         match &obj {
@@ -5726,6 +5759,18 @@ impl CfmlVirtualMachine {
                                     // of the active program.
                                     self.closure_parent_writeback = None;
                                     let parent_func = func_idx.and_then(|i| self.resolve_fn(i));
+                                    // Make the parent method's defining source
+                                    // active for the duration of the call so any
+                                    // further `super.x()` inside it resolves one
+                                    // level deeper (LoadSuper keys on source_file).
+                                    let saved_super_source = parent_func
+                                        .as_ref()
+                                        .and_then(|pf| pf.source_file.clone())
+                                        .map(|src| {
+                                            let prev = self.source_file.clone();
+                                            self.source_file = Some(src);
+                                            prev
+                                        });
                                     let call_result = if let Some(parent_func) = parent_func {
                                         self.execute_function_with_args(
                                             &parent_func,
@@ -5735,6 +5780,9 @@ impl CfmlVirtualMachine {
                                     } else {
                                         self.call_function(&prop, args, &method_locals)
                                     };
+                                    if let Some(prev) = saved_super_source {
+                                        self.source_file = prev;
+                                    }
                                     // Write back closure mutations to shared environment
                                     if let Ok(ref _val) = call_result {
                                         if let Some(ref wb) = self.closure_parent_writeback {
@@ -15013,7 +15061,48 @@ impl CfmlVirtualMachine {
         // Add __super struct with marker for dispatch detection
         if !super_methods.is_empty() {
             super_methods.insert("__is_super".to_string(), CfmlValue::Bool(true));
-            parent_map.insert("__super".to_string(), CfmlValue::strukt(super_methods));
+            let super_struct = CfmlValue::strukt(super_methods);
+
+            // Per-class super map: multi-level `super.method()` must resolve to
+            // each method's OWN parent, not the leaf instance's. Key by the
+            // child class's source file (the same `source_file` the dispatcher
+            // makes active while a method of that class runs — see
+            // `defining_source` in call_member_function), and carry forward the
+            // parent's map so grandparent+ levels remain reachable. The flat
+            // `__super` stays as a fallback for 2-level CFCs and rust parents.
+            let mut super_map: ValueMap = parent_map
+                .get("__super_map")
+                .and_then(|v| v.as_struct())
+                .unwrap_or_default();
+            // Defining source of the child class: prefer a child-defined
+            // method's BytecodeFunction.source_file (matches dispatch exactly),
+            // falling back to the struct's recorded __source_file.
+            let child_src = child_map
+                .iter()
+                .find_map(|(k, v)| {
+                    if k.starts_with("__") {
+                        return None;
+                    }
+                    if let CfmlValue::Function(f) = v {
+                        if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) =
+                            f.body
+                        {
+                            if let CfmlValue::Int(idx) = body.as_ref() {
+                                return self.resolve_fn(*idx).and_then(|bf| bf.source_file.clone());
+                            }
+                        }
+                    }
+                    None
+                })
+                .or_else(|| child_map.get("__source_file").map(|v| v.as_string()));
+            if let Some(src) = child_src {
+                super_map.insert(src, super_struct.clone());
+            }
+            if !super_map.is_empty() {
+                parent_map.insert("__super_map".to_string(), CfmlValue::strukt(super_map));
+            }
+
+            parent_map.insert("__super".to_string(), super_struct);
         }
 
         // Build __extends_chain for isInstanceOf
@@ -17274,6 +17363,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::LoadLocal(_)
         | BytecodeOp::LoadGlobal(_)
         | BytecodeOp::LoadVariablesKey(_)
+        | BytecodeOp::LoadSuper
         | BytecodeOp::TryLoadLocal(_) => (1, 0),
         // Variable stores: push 0, pop 1
         BytecodeOp::StoreLocal(_) | BytecodeOp::StoreGlobal(_) => (0, 1),

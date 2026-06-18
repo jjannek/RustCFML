@@ -275,28 +275,13 @@ impl Lexer {
                     }
                 }
                 if self.current() == '\\' {
-                    // CFML: only \n, \t, \r, \\, \# are recognized escape sequences.
-                    // \" is NOT an escape — CFML uses "" for embedded quotes.
-                    let next = self.peek(1);
-                    match next {
-                        'n' | 't' | 'r' | '\\' | '#' => {
-                            self.advance(); // skip backslash
-                            match self.current() {
-                                'n' => current_str.push('\n'),
-                                't' => current_str.push('\t'),
-                                'r' => current_str.push('\r'),
-                                '\\' => current_str.push('\\'),
-                                '#' => current_str.push('#'),
-                                _ => unreachable!(),
-                            }
-                            self.advance(); // skip escape char
-                        }
-                        _ => {
-                            // Backslash is literal
-                            current_str.push('\\');
-                            self.advance(); // skip just the backslash
-                        }
-                    }
+                    // CFML does NOT use backslash escape sequences in string
+                    // literals — a backslash is always a literal backslash.
+                    // (Quotes are escaped by doubling: "" / ''; hashes by ##.)
+                    // This matches Lucee/ACF/BoxLang, and lets regex patterns
+                    // like "tests(\\|/)$" and Windows paths survive verbatim.
+                    current_str.push('\\');
+                    self.advance(); // consume the backslash only
                 } else if self.current() == '#' && self.peek(1) == '#' {
                     // ## is an escaped # literal
                     current_str.push('#');

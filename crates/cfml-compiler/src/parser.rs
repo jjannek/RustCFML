@@ -2957,10 +2957,21 @@ impl Parser {
         // output="false", hint="..."). Accepts both identifiers and keyword tokens as keys.
         let mut metadata = Vec::new();
         loop {
-            let is_attr_key = matches!(self.peek(1), Token::Equal)
-                && (matches!(self.peek(0), Token::Identifier(_))
-                    || self.token_as_string(&self.peek(0).clone()).is_some());
-            if !is_attr_key {
+            let head_is_keyish = matches!(self.peek(0), Token::Identifier(_))
+                || self.token_as_string(&self.peek(0).clone()).is_some();
+            if !head_is_keyish {
+                break;
+            }
+            let is_attr_key = matches!(self.peek(1), Token::Equal);
+            // Bare boolean attribute: `function foo() skip { … }` — an attribute
+            // with no `="value"`, equivalent to `skip="true"`. Recognised when the
+            // next token ends the header (`{`) or begins another attribute key.
+            // TestBox uses these (`skip`, `output`) on spec methods; Lucee/ACF/
+            // BoxLang accept them too. Without this, the bare attr was left before
+            // the `{`, so the body never parsed.
+            let is_bare_bool = !is_attr_key
+                && matches!(self.peek(1), Token::LBrace | Token::Identifier(_));
+            if !is_attr_key && !is_bare_bool {
                 break;
             }
             let key = if let Token::Identifier(ref s) = self.peek(0) {
@@ -2973,6 +2984,10 @@ impl Parser {
             } else {
                 break;
             };
+            if is_bare_bool {
+                metadata.push((key, "true".to_string()));
+                continue;
+            }
             self.consume(&Token::Equal)?;
             // Attribute values may be quoted OR unquoted (e.g. `output=true`),
             // matching component/interface headers.
@@ -3037,11 +3052,15 @@ impl Parser {
         let mut implements = Vec::new();
 
         if self.match_token(&Token::Extends) {
-            // Handle both `extends Animal` and `extends="Animal"` syntax
+            // Handle `extends Animal`, `extends="Animal"`, and the unquoted
+            // dotted form `extends=testbox.system.BaseSpec` (TestBox specs use
+            // this; Lucee/ACF/BoxLang accept an unquoted dotted path here).
             if self.match_token(&Token::Equal) {
                 if let Token::String(val) = self.peek(0).clone() {
                     self.advance();
                     extends = Some(val);
+                } else {
+                    extends = self.extract_dotted_identifier().ok();
                 }
             } else {
                 extends = self.extract_dotted_identifier().ok();
@@ -3058,6 +3077,18 @@ impl Parser {
                         let trimmed = iface.trim().to_string();
                         if !trimmed.is_empty() {
                             implements.push(trimmed);
+                        }
+                    }
+                } else {
+                    // Unquoted dotted form: `implements=foo.IBar`
+                    loop {
+                        if let Ok(iface) = self.extract_dotted_identifier() {
+                            implements.push(iface);
+                        } else {
+                            break;
+                        }
+                        if !self.match_token(&Token::Comma) {
+                            break;
                         }
                     }
                 }

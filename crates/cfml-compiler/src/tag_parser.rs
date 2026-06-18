@@ -293,7 +293,11 @@ fn tags_to_script_inner(source: &str, imports: &mut std::collections::HashMap<St
                 // via cfprocessingdirective or cfsetting enableCFOutputOnly.
                 // Outside <cfoutput>: use __writeText (suppressible by enableCFOutputOnly).
                 let fn_name = if in_cfoutput { "writeOutput" } else { "__writeText" };
-                let mut escaped = text.replace('\\', "\\\\").replace('"', "\"\"").replace('\n', "\\n").replace('\r', "\\r");
+                // CFML string literals don't use backslash escapes and may span
+                // multiple lines, so only the double-quote needs escaping (by
+                // doubling). Backslashes and real newlines pass through verbatim;
+                // the script lexer reads them literally.
+                let mut escaped = text.replace('"', "\"\"");
                 // Outside <cfoutput>, `#` is literal in template text — but the
                 // lexer interpolates `#expr#` inside string literals. Double the
                 // hashes to CFML's literal-hash escape so e.g. `#f3f4f6;` from a
@@ -480,9 +484,6 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 body
             };
             let body = strip_hashes(body);
-            // CFML tags don't use backslash escaping, but the script parser does.
-            // Escape backslashes in string literals so they survive script parsing.
-            let body = escape_backslashes_in_tag_strings(&body);
             let result = match tag_lower.as_str() {
                 "cfset" => format!("{};\n", body),
                 "cfif" => format!("if ({}) {{\n", body),
@@ -1520,7 +1521,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 let close_end = find_tag_end(chars, end_tag_pos, len);
                 let body_trimmed = body.trim();
                 if !body_trimmed.is_empty() {
-                    opts.push(format!("body: \"{}\"", body_trimmed.replace('"', "\"\"").replace('\n', "\\n")));
+                    opts.push(format!("body: \"{}\"", body_trimmed.replace('"', "\"\"")));
                 }
                 if let Some(ref var) = variable {
                     let mut result = format!("__cfexec_tmp = __cfexecute({{ {} }});\n", opts.join(", "));
@@ -1591,7 +1592,7 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
                 // Use remaining body (after stripping child tags) as body text
                 let body_text = remaining_body.trim();
                 if !body_text.is_empty() {
-                    opts.push(format!("body: \"{}\"", body_text.replace('"', "\"\"").replace('\n', "\\n")));
+                    opts.push(format!("body: \"{}\"", body_text.replace('"', "\"\"")));
                 }
 
                 (format!("__cfmail({{ {} }});\n", opts.join(", ")), close_end - start)
@@ -2228,54 +2229,6 @@ fn quote_if_needed(s: &str) -> String {
     // Otherwise, quote it. Embedded quotes are doubled (CFML escape), not
     // backslash-escaped — the script lexer ends a string at a lone `"`.
     format!("\"{}\"", escape_for_string_literal(s))
-}
-
-/// Escape backslashes inside string literals in tag body expressions.
-/// CFML tag-based code doesn't use backslash escaping, but the script parser does.
-/// This converts `\` to `\\` inside string literals so the script parser
-/// correctly interprets them as literal backslashes.
-fn escape_backslashes_in_tag_strings(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut result = String::new();
-    let mut i = 0;
-
-    while i < len {
-        if chars[i] == '"' || chars[i] == '\'' {
-            let quote = chars[i];
-            result.push(quote); // opening quote
-            i += 1;
-            while i < len {
-                if chars[i] == quote {
-                    // Check for doubled quote (CFML escape: "" or '')
-                    if i + 1 < len && chars[i + 1] == quote {
-                        result.push(quote);
-                        result.push(quote);
-                        i += 2;
-                    } else {
-                        // End of string
-                        break;
-                    }
-                } else if chars[i] == '\\' {
-                    result.push('\\');
-                    result.push('\\');
-                    i += 1;
-                } else {
-                    result.push(chars[i]);
-                    i += 1;
-                }
-            }
-            if i < len {
-                result.push(chars[i]); // closing quote
-                i += 1;
-            }
-        } else {
-            result.push(chars[i]);
-            i += 1;
-        }
-    }
-
-    result
 }
 
 fn strip_hashes(s: &str) -> String {
@@ -3389,7 +3342,7 @@ fn parse_cfmailpart_tags(body: &str) -> (Vec<String>, String) {
                                 part_parts.push(format!("charset: \"{}\"", c));
                             }
                             let content_trimmed = content.trim();
-                            part_parts.push(format!("body: \"{}\"", content_trimmed.replace('"', "\"\"").replace('\n', "\\n")));
+                            part_parts.push(format!("body: \"{}\"", content_trimmed.replace('"', "\"\"")));
                             parts.push(format!("{{ {} }}", part_parts.join(", ")));
 
                             i += close_len;

@@ -259,6 +259,12 @@ pub enum BytecodeOp {
     GetIndex,            // Get array[index] or struct[key]
     SetIndex,            // Set array[index] = value or struct[key] = value
     GetProperty(String), // Get object.property
+    /// Push the `super` receiver for the CURRENTLY EXECUTING method, resolved
+    /// relative to that method's defining class (not the leaf instance). Reads
+    /// `this.__super_map[<defining source>]` keyed by the active `source_file`,
+    /// falling back to `this.__super`. Fixes multi-level `super.method()` so an
+    /// intermediate class's method reaches ITS parent rather than recursing.
+    LoadSuper,
     /// Push the static "holder" (a cached, lazily-built template instance whose
     /// `__variables.__static` is the shared static scope) for a named component.
     /// Used by the `::` operator to reach static members without instantiating.
@@ -3588,8 +3594,7 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::LoadLocal("this".to_string()));
             }
             Expression::Super(_) => {
-                instructions.push(BytecodeOp::LoadLocal("this".to_string()));
-                instructions.push(BytecodeOp::GetProperty("__super".to_string()));
+                instructions.push(BytecodeOp::LoadSuper);
             }
             Expression::StringInterpolation(interp) => {
                 if interp.parts.is_empty() {
