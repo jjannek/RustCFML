@@ -2552,6 +2552,17 @@ impl CfmlVirtualMachine {
         // hoisted out of the per-op dispatch loop.
         let is_inside_function = func.name != "__main__";
 
+        // Try-handler stack depth at frame entry. A `return` (or `cfexit`/run-off-end)
+        // from *inside* an open `try` block jumps straight to the Return/epilogue
+        // without ever reaching the matching `TryEnd`, so the handler pushed by
+        // `TryStart` would otherwise be left dangling on `self.try_stack`. A later
+        // `throw` in an unrelated frame would then be misrouted to that stale
+        // handler's `catch_ip`, re-executing code and looping (e.g. TestBox's
+        // `isFRLoaded()` which `return`s from inside a try, then a failing
+        // assertion throws). Truncating back to this depth on every exit path
+        // discards any handlers this frame leaked.
+        let entry_try_depth = self.try_stack.len();
+
         loop {
             // `cfexit` unwind: a pending exit signal terminates the current
             // function as if it had run off its end (the epilogue below captures
@@ -4669,6 +4680,9 @@ impl CfmlVirtualMachine {
                     }
                     // Pop call frame before early return (matches push at function entry)
                     self.call_stack.pop();
+                    // Discard any try-handlers this frame leaked by returning from
+                    // inside an open try block (see entry_try_depth comment).
+                    self.try_stack.truncate(entry_try_depth);
                     debug_assert_eq!(
                         stack.len(),
                         1,
@@ -6557,6 +6571,9 @@ impl CfmlVirtualMachine {
 
         // Pop call frame on function exit
         self.call_stack.pop();
+        // Discard any try-handlers this frame leaked by returning from inside an
+        // open try block, or via cfexit/running off the end (see entry_try_depth).
+        self.try_stack.truncate(entry_try_depth);
 
         // Save modified 'this' and variables scope for component method write-back
         if let Some(this_val) = locals.get("this") {

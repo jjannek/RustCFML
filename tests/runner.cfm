@@ -548,6 +548,10 @@ include "harness.cfm";
 <!--- Multi-catch must select exactly ONE clause by declared type (was: every --->
 <!--- clause body ran unconditionally, type ignored); unmatched types propagate. --->
 <cf_runtest file="core/test_multi_catch_type_dispatch.cfm">
+<!--- A `return` from inside an open try block must not leak its handler onto --->
+<!--- the VM try-stack (a later throw was misrouted to it and looped — the --->
+<!--- TestBox CoverageServiceTest fatal recursion). --->
+<cf_runtest file="core/test_return_inside_try_handler_leak.cfm">
 <!--- - chained_compound_assignment: `a = b &= c` (compound assignment as the RHS --->
 <!--- of an assignment); switch_braced_case: a compound-assignment statement --->
 <!--- inside a braced `case`/`default` body. Both surfaced while booting Wheels. --->
