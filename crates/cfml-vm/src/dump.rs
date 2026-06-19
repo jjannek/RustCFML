@@ -180,6 +180,27 @@ fn render_html(
         CfmlValue::Struct(s) => {
             let ptr = s.backing_ptr();
             let snap = s.snapshot();
+            // A Java shim object (e.g. java.util.Date) is a struct carrying
+            // `__java_shim`/`__java_class` markers plus `__`-prefixed data —
+            // render it as a "Java <class>" box with cleaned-up field names
+            // instead of leaking the internal markers as a plain struct.
+            if let Some((class, entries)) = java_shim_view(&snap) {
+                box_open(out, "k-comp", &format!("Java {}", esc(&class)), &entries.len().to_string(), opts.expand);
+                if entries.is_empty() {
+                    out.push_str("<div class=\"rcf-empty\">[no fields]</div></div>");
+                    return;
+                }
+                out.push_str("<table>");
+                for (k, v) in &entries {
+                    out.push_str("<tr><td class=\"rcf-k\">");
+                    out.push_str(&esc(k));
+                    out.push_str("</td><td>");
+                    render_child(v, opts, depth, out, visited);
+                    out.push_str("</td></tr>");
+                }
+                out.push_str("</table></div>");
+                return;
+            }
             let component = component_view(&snap);
             if let Some((name, entries)) = component {
                 box_open(out, "k-comp", &format!("Component {}", esc(&name)), &entries.len().to_string(), opts.expand);
@@ -391,11 +412,14 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
             }
             visited.push(ptr);
             let snap = s.snapshot();
-            let comp = component_view(&snap);
-            let (label, entries): (String, Vec<(String, CfmlValue)>) = match comp {
-                Some((name, e)) => (format!("Component {}", name), e),
-                None => ("Struct".into(), snap.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-            };
+            let (label, entries): (String, Vec<(String, CfmlValue)>) =
+                if let Some((class, e)) = java_shim_view(&snap) {
+                    (format!("Java {}", class), e)
+                } else if let Some((name, e)) = component_view(&snap) {
+                    (format!("Component {}", name), e)
+                } else {
+                    ("Struct".into(), snap.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                };
             out.push_str(&format!("{} ({})\n", label, entries.len()));
             for (k, v) in &entries {
                 out.push_str(&format!("{}  {} = ", pad, k));
@@ -438,17 +462,15 @@ fn render_text_child(value: &CfmlValue, indent: usize, out: &mut String, visited
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A CFC instance is materialised as a struct carrying `__variables` plus
-/// `this`/`__name`. Surface its public members: the keys of the `this` scope
-/// (data + methods), minus engine-internal `__*` markers. Returns the
+/// A CFC instance is materialised as a struct carrying `__variables`/`__name`
+/// with its public members (data + methods) stored at the TOP LEVEL alongside
+/// engine-internal `__*` markers and a self-referential `this`. Surface the
+/// public members in declaration order, minus the markers. Returns the
 /// component's name and its public entries, or None if not a component struct.
 fn component_view(snap: &cfml_common::dynamic::ValueMap) -> Option<(String, Vec<(String, CfmlValue)>)> {
     let has_vars = snap.keys().any(|k| k.eq_ignore_ascii_case("__variables"));
-    if !has_vars {
-        return None;
-    }
-    let this = snap.iter().find(|(k, _)| k.eq_ignore_ascii_case("this")).map(|(_, v)| v);
-    if this.is_none() && !snap.keys().any(|k| k.eq_ignore_ascii_case("__name")) {
+    let has_name = snap.keys().any(|k| k.eq_ignore_ascii_case("__name"));
+    if !has_vars || !has_name {
         return None;
     }
     let name = snap
@@ -457,15 +479,40 @@ fn component_view(snap: &cfml_common::dynamic::ValueMap) -> Option<(String, Vec<
         .map(|(_, v)| value_string(v))
         .unwrap_or_default();
     let mut entries = Vec::new();
-    if let Some(CfmlValue::Struct(this_s)) = this {
-        for (k, v) in this_s.snapshot().iter() {
-            if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
-                continue;
-            }
-            entries.push((k.clone(), v.clone()));
+    for (k, v) in snap.iter() {
+        if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+            continue;
         }
+        entries.push((k.clone(), v.clone()));
     }
     Some((name, entries))
+}
+
+/// A Java shim object is a struct flagged with `__java_shim`. Surface its
+/// class name and its data fields with the engine-internal `__` prefix
+/// stripped (e.g. `__millis` → `millis`), dropping the `__java_shim` /
+/// `__java_class` markers themselves. Returns None if not a Java shim.
+fn java_shim_view(snap: &cfml_common::dynamic::ValueMap) -> Option<(String, Vec<(String, CfmlValue)>)> {
+    let is_shim = snap
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("__java_shim") && v.is_true());
+    if !is_shim {
+        return None;
+    }
+    let class = snap
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("__java_class"))
+        .map(|(_, v)| value_string(v))
+        .unwrap_or_else(|| "object".to_string());
+    let mut entries = Vec::new();
+    for (k, v) in snap.iter() {
+        if k.eq_ignore_ascii_case("__java_shim") || k.eq_ignore_ascii_case("__java_class") {
+            continue;
+        }
+        let field = k.trim_start_matches('_');
+        entries.push((field.to_string(), v.clone()));
+    }
+    Some((class, entries))
 }
 
 fn fn_signature(f: &cfml_common::dynamic::CfmlFunction) -> String {

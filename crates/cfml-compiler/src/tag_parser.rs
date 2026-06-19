@@ -666,9 +666,30 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             (format!("include \"{}\";\n", template), tag_end - start)
         }
         "cfdump" => {
+            // Forward var plus the common option attributes (label/expand/top)
+            // as named args so writeDump's intercept honours them — matches the
+            // script form writeDump(var=…, label=…, expand=…, top=…).
+            let attr_expr = |key: &str| -> Option<String> {
+                attrs.get(key).map(|raw| {
+                    if quoted.contains(key) {
+                        match single_hash_expr(raw) {
+                            Some(expr) => format!("({})", expr),
+                            None => format_attr_value(raw, true),
+                        }
+                    } else {
+                        format_attr_value(raw, false)
+                    }
+                })
+            };
             let var = attrs.get("var").cloned().unwrap_or("\"\"".to_string());
             let var = strip_hashes(&var);
-            (format!("writeDump({});\n", var), tag_end - start)
+            let mut call_args = format!("var={}", var);
+            for key in ["label", "expand", "top"] {
+                if let Some(expr) = attr_expr(key) {
+                    call_args.push_str(&format!(", {}={}", key, expr));
+                }
+            }
+            (format!("writeDump({});\n", call_args), tag_end - start)
         }
         "cfthrow" => {
             // Route each attribute value through format_attr_value so `#...#`

@@ -257,6 +257,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_inherited_bare_component_via_child_method.cfm">
 
 <!--- --- Tags --- --->
+<cf_runtest file="tags/test_cfdump_tag.cfm">
 <cf_runtest file="tags/test_tags_basic.cfm">
 <cf_runtest file="tags/test_tags_control.cfm">
 <cf_runtest file="tags/test_tags_include.cfm">
