@@ -33,6 +33,7 @@ Serve these with `rustcfml --serve examples/<dir>`:
 | Directory | Shows |
 |---|---|
 | `miniapp/` | A small multi-page web app — `Application.cfc`, includes (header/footer), and templates |
+| `dumpdemo/` | The `writeDump`/`<cfdump>` renderer — structs, arrays, queries (with execution-time metainfo), components, Java shims, an inline `group_concat` QoQ aggregate UDF, collapsing, and depth limiting |
 | `taffytest/` | A [Taffy](https://github.com/atuttle/Taffy) REST API with `urlrewrite.xml` routing |
 | `interactivejs/` | A browser front-end (`index.html`) driving the WASM build |
 
