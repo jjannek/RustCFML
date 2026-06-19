@@ -66,6 +66,8 @@ const DUMP_ASSETS: &str = r#"<style>
 .rcf-dump .rcf-v-null{color:var(--rcf-null);font-style:italic}
 .rcf-dump .rcf-v-fn{color:var(--rcf-fn)}
 .rcf-dump .rcf-empty{padding:4px 10px;color:var(--rcf-null);font-style:italic;background:var(--rcf-bg)}
+.rcf-dump .rcf-qmeta{padding:3px 10px;background:var(--rcf-key-bg);color:var(--rcf-key);font-size:11px;border-top:1px solid var(--rcf-line)}
+.rcf-dump .rcf-qsql{margin-top:2px;color:var(--rcf-ink);opacity:.8;white-space:pre-wrap;word-break:break-word}
 @media (prefers-color-scheme:dark){.rcf-dump{
   --rcf-ink:#e8ddd3;--rcf-bg:#231a14;--rcf-cell:#231a14;--rcf-line:#4a382c;
   --rcf-key-bg:#33261d;--rcf-key:#f0a878;--rcf-str:#8fd07a;--rcf-num:#67b0e8;--rcf-null:#8a7b6f;--rcf-fn:#b596e8}}
@@ -289,7 +291,23 @@ fn render_html(
                 }
                 out.push_str("</tr>");
             }
-            out.push_str("</table></div>");
+            out.push_str("</table>");
+            // Metadata footer (Lucee metainfo parity): record count, execution
+            // time, and originating SQL when available.
+            out.push_str("<div class=\"rcf-qmeta\">");
+            out.push_str(&format!("Records: {}", rows));
+            if let Some(ms) = data.execution_time {
+                out.push_str(&format!(" \u{2022} Execution time: {} ms", ms));
+            }
+            if let Some(ref sql) = data.sql {
+                let sql = sql.trim();
+                if !sql.is_empty() {
+                    out.push_str("<div class=\"rcf-qsql\">");
+                    out.push_str(&esc(sql));
+                    out.push_str("</div>");
+                }
+            }
+            out.push_str("</div></div>");
         }
     }
 }
@@ -429,7 +447,8 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
         }
         CfmlValue::Query(q) => {
             let data = q.with_read(|d| d.clone());
-            out.push_str(&format!("Query ({} rows x {} cols) [{}]\n", data.row_count(), data.columns.len(), data.columns.join(", ")));
+            let timing = data.execution_time.map(|ms| format!(", {} ms", ms)).unwrap_or_default();
+            out.push_str(&format!("Query ({} rows x {} cols{}) [{}]\n", data.row_count(), data.columns.len(), timing, data.columns.join(", ")));
             for r in 0..data.row_count() {
                 out.push_str(&format!("{}  row {}: ", pad, r + 1));
                 let cells: Vec<String> = (0..data.columns.len())
@@ -437,6 +456,12 @@ fn render_text(value: &CfmlValue, indent: usize, out: &mut String, visited: &mut
                     .collect();
                 out.push_str(&cells.join(", "));
                 out.push('\n');
+            }
+            if let Some(ref sql) = data.sql {
+                let sql = sql.trim();
+                if !sql.is_empty() {
+                    out.push_str(&format!("{}  SQL: {}\n", pad, sql));
+                }
             }
         }
         _ => {

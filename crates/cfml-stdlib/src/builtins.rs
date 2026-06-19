@@ -11582,7 +11582,7 @@ fn fn_query_slice(args: Vec<CfmlValue>) -> CfmlResult {
                 } else {
                     d.columns.iter().map(|_| std::sync::Arc::new(Vec::new())).collect()
                 };
-                CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None }
+                CfmlQueryData { columns: d.columns.clone(), data: new_data, sql: None, execution_time: None }
             });
             Ok(CfmlValue::Query(CfmlQuery::from_data(sliced)))
         }

@@ -2584,6 +2584,7 @@ fn build_query(
         columns,
         data,
         sql: None,
+        execution_time: None,
     }
 }
 

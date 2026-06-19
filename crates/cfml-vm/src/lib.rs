@@ -9562,6 +9562,17 @@ impl CfmlVirtualMachine {
                     #[cfg(target_arch = "wasm32")]
                     let exec_ms = 0i64;
 
+                    // Record execution time (and the originating SQL, if the
+                    // driver/QoQ path didn't already) on the Query itself so
+                    // writeDump can surface them (Lucee metainfo parity) even
+                    // when no `result=` struct was requested.
+                    if let CfmlValue::Query(q) = &ret {
+                        q.set_execution_time(Some(exec_ms));
+                        if q.sql().is_none() && !sql_text.is_empty() {
+                            q.set_sql(Some(sql_text.clone()));
+                        }
+                    }
+
                     // Patch the measured time into a mutation-result struct that
                     // the driver built with a placeholder 0 (INSERT/UPDATE/DELETE
                     // return this struct directly). SELECT/QoQ return a Query (or

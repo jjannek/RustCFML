@@ -932,7 +932,7 @@ impl CfmlValue {
                     })
                     .collect();
                 visited.pop();
-                CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql }))
+                CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql, execution_time: None }))
             }
             other => other.clone(),
         }
@@ -1104,13 +1104,17 @@ pub struct CfmlQueryData {
     /// otherwise.
     pub data: Vec<Arc<Vec<CfmlValue>>>,
     pub sql: Option<String>,
+    /// Wall-clock execution time in milliseconds, recorded when the query was
+    /// run via `queryExecute`/`cfquery`. `None` for queries built in memory
+    /// (queryNew, QoQ before timing). Surfaced in `writeDump`'s query metadata.
+    pub execution_time: Option<i64>,
 }
 
 impl CfmlQueryData {
     /// Empty data block with the given columns.
     pub fn new(columns: Vec<String>) -> Self {
         let n = columns.len();
-        Self { columns, data: (0..n).map(|_| Arc::new(Vec::new())).collect(), sql: None }
+        Self { columns, data: (0..n).map(|_| Arc::new(Vec::new())).collect(), sql: None, execution_time: None }
     }
 
     /// Build from columns + already-row-shaped rows (the legacy IndexMap shape).
@@ -1520,6 +1524,14 @@ impl CfmlQuery {
 
     pub fn set_sql(&self, sql: Option<String>) {
         self.0.write().sql = sql;
+    }
+
+    pub fn execution_time(&self) -> Option<i64> {
+        self.0.read().execution_time
+    }
+
+    pub fn set_execution_time(&self, ms: Option<i64>) {
+        self.0.write().execution_time = ms;
     }
 
     /// Run a closure with shared (read) access to the backing data. MUST NOT

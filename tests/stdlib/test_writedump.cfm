@@ -35,5 +35,20 @@ assertTrue("java shim labelled Java", findNoCase("Java", shimdump) GT 0);
 assertTrue("java shim shows class", findNoCase("java.util.date", shimdump) GT 0);
 assertFalse("java shim hides __java_shim marker", findNoCase("__java_shim", shimdump) GT 0);
 
+// Query dump shows columns, rows, and (for executed queries) timing + SQL.
+qn = queryNew("id,name", "integer,varchar");
+queryAddRow(qn); querySetCell(qn, "id", 1); querySetCell(qn, "name", "Ada");
+r = queryExecute("SELECT id, name FROM qn ORDER BY id", [], { dbtype: "query" });
+savecontent variable="qdump" {
+    writeDump(r);
+}
+assertTrue("query dump labelled Query", findNoCase("Query", qdump) GT 0);
+assertTrue("query dump shows column", findNoCase("name", qdump) GT 0);
+assertTrue("query dump shows record count", findNoCase("1 row", qdump) GT 0 OR findNoCase("Records: 1", qdump) GT 0);
+// Executed (QoQ) queries carry an execution time, surfaced as "ms".
+assertTrue("query dump shows execution time", findNoCase(" ms", qdump) GT 0);
+// And the originating SQL.
+assertTrue("query dump shows SQL", findNoCase("SELECT id, name", qdump) GT 0);
+
 suiteEnd();
 </cfscript>
