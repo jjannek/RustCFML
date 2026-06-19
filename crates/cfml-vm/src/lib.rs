@@ -5074,13 +5074,38 @@ impl CfmlVirtualMachine {
                                 )));
                             }
                         } else {
-                            // Auto-vivification: assigning to a member path of a
-                            // variable that does not yet exist creates that variable
-                            // as a struct, matching Lucee/ACF/BoxLang. e.g.
-                            // `initArgs.path = "x"` where initArgs was never declared.
-                            let mut s = ValueMap::default();
-                            s.insert(prop_name.clone(), value);
-                            locals.insert(local_name.clone(), CfmlValue::strukt(s));
+                            // The name isn't a frame local (or named param). Before
+                            // auto-vivifying a brand-new local, mirror how unscoped
+                            // READS resolve and look for an existing same-named
+                            // container in the variables scope (`__variables`, present
+                            // in CFC methods / templates included into a CFC). An
+                            // unscoped compound write `instance.newkey = v` where
+                            // `variables.instance` already exists must mutate THAT
+                            // struct — NOT fork a phantom `local.instance` that is
+                            // silently discarded when the method returns. This is the
+                            // classic ColdBox `instance` struct pattern. (GitHub #180)
+                            let existing_var = if let Some(CfmlValue::Struct(vars)) =
+                                locals.get("__variables")
+                            {
+                                vars.get_ci(local_name)
+                                    .filter(|v| v.as_cfml_struct().is_some())
+                            } else {
+                                None
+                            };
+                            if let Some(existing) = existing_var {
+                                // `existing` is a clone of the variables-scope value;
+                                // for a Struct that shares the same Arc-backed store,
+                                // so this insert is visible through `variables.<name>`.
+                                existing.as_cfml_struct().unwrap().insert(prop_name.clone(), value);
+                            } else {
+                                // Auto-vivification: assigning to a member path of a
+                                // variable that does not yet exist creates that variable
+                                // as a struct, matching Lucee/ACF/BoxLang. e.g.
+                                // `initArgs.path = "x"` where initArgs was never declared.
+                                let mut s = ValueMap::default();
+                                s.insert(prop_name.clone(), value);
+                                locals.insert(local_name.clone(), CfmlValue::strukt(s));
+                            }
                         }
                     }
                 }
