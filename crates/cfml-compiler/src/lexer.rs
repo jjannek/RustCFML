@@ -293,6 +293,8 @@ impl Lexer {
                     self.advance();
                 } else if self.current() == '#' {
                     // Start of interpolation expression
+                    let hash_line = self.line;
+                    let hash_column = self.column;
                     has_interpolation = true;
                     if !current_str.is_empty() {
                         parts.push((false, current_str.clone()));
@@ -301,15 +303,44 @@ impl Lexer {
                     self.advance(); // skip opening #
                     let mut expr_str = String::new();
                     let mut depth = 0;
+                    // Scan to the matching (depth-0) '#'. A lone, unbalanced '#'
+                    // must NOT run past the end of the string literal: if we reach
+                    // the closing quote (at depth <= 0, i.e. not inside a nested
+                    // call) the interpolation was never terminated. Report it at
+                    // the opening '#', not at some far-off EOF (GitHub #181).
                     while !self.is_at_end() && !(self.current() == '#' && depth == 0) {
                         if self.current() == '(' { depth += 1; }
                         if self.current() == ')' { depth -= 1; }
+                        if self.current() == quote && depth <= 0 {
+                            self.tokens.push(TokenWithLoc {
+                                token: Token::Error(format!(
+                                    "Unterminated '#' interpolation in string: a '#' opened an interpolation that was never closed before the end of the string literal. Escape a literal hash as '##'."
+                                )),
+                                location: SourceLocation::new(
+                                    Position::new(hash_line, hash_column),
+                                    Position::new(self.line, self.column),
+                                ),
+                            });
+                            self.advance(); // consume the closing quote
+                            return;
+                        }
                         expr_str.push(self.current());
                         self.advance();
                     }
-                    if !self.is_at_end() {
-                        self.advance(); // skip closing #
+                    if self.is_at_end() {
+                        // Ran to EOF without a closing '#'.
+                        self.tokens.push(TokenWithLoc {
+                            token: Token::Error(format!(
+                                "Unterminated '#' interpolation in string: a '#' opened an interpolation that was never closed before end of file. Escape a literal hash as '##'."
+                            )),
+                            location: SourceLocation::new(
+                                Position::new(hash_line, hash_column),
+                                Position::new(self.line, self.column),
+                            ),
+                        });
+                        return;
                     }
+                    self.advance(); // skip closing #
                     if !expr_str.is_empty() {
                         parts.push((true, expr_str));
                     }
@@ -469,4 +500,50 @@ impl Lexer {
 pub fn tokenize(source: String) -> Vec<TokenWithLoc> {
     let mut lexer = Lexer::new(source);
     lexer.tokenize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lone_hash_error(toks: &[TokenWithLoc]) -> Option<&TokenWithLoc> {
+        toks.iter().find(|t| matches!(t.token, Token::Error(_)))
+    }
+
+    #[test]
+    fn lone_hash_in_string_is_bounded_error_not_run_to_eof() {
+        // GitHub #181: a lone '#' must NOT scan past the closing quote.
+        let toks = tokenize(r#"foo("a label (GitHub #180)"); bar(1, 2);"#.to_string());
+        let err = lone_hash_error(&toks).expect("expected a lexer Error token");
+        // Reported at the opening '#', not at EOF.
+        assert_eq!(err.location.start.line, 1);
+        assert_eq!(err.location.start.column, 22);
+        // It must not have devoured the trailing bar(...) call.
+        assert!(
+            toks.iter().any(|t| matches!(&t.token, Token::Identifier(s) if s == "bar")),
+            "interpolation ran past the string and swallowed later tokens"
+        );
+    }
+
+    #[test]
+    fn lone_hash_running_to_eof_is_error() {
+        let toks = tokenize(r#"x = "GitHub #180 issue"#.to_string());
+        assert!(lone_hash_error(&toks).is_some());
+    }
+
+    #[test]
+    fn escaped_and_valid_interpolation_do_not_error() {
+        // Escaped ## literal, normal #var#, and same-quote nested interpolation.
+        for src in [
+            r#""escaped ##180 ok""#,
+            r#""y is #y# done""#,
+            r#""val=#ucase("ab")#!""#,
+        ] {
+            let toks = tokenize(src.to_string());
+            assert!(
+                lone_hash_error(&toks).is_none(),
+                "valid string wrongly flagged: {src}"
+            );
+        }
+    }
 }

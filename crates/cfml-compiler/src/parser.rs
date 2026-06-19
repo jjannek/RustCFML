@@ -25,6 +25,19 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Program, ParseError> {
+        // Surface any lexer error token at its own (correct) location before
+        // the grammar trips over it and reports a misleading downstream error
+        // (e.g. an unterminated '#' interpolation that ran to EOF — GitHub #181).
+        for tok in &self.tokens {
+            if let Token::Error(msg) = &tok.token {
+                return Err(ParseError {
+                    message: msg.clone(),
+                    line: tok.location.start.line,
+                    column: tok.location.start.column,
+                });
+            }
+        }
+
         let mut statements = Vec::new();
 
         while !self.is_at_end() {

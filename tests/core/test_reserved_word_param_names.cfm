@@ -4,7 +4,7 @@
 // tag form. ColdBox's coldbox.system.core.util.Util.cfc declares
 // `<cfargument name="in" type="array">`, so a parse failure here blocks the
 // whole Preside/CacheBox boot chain.
-suiteBegin("Reserved-word parameter names (Issue #179)");
+suiteBegin("Reserved-word parameter names (Issue ##179)");
 
 // Script form, untyped
 function p_in( in )   { return arguments.in; }
@@ -39,7 +39,7 @@ suiteEnd();
     <cfreturn arguments.in[ arguments.for ]/>
 </cffunction>
 <cfscript>
-suiteBegin("Reserved-word parameter names — tag form (Issue #179)");
+suiteBegin("Reserved-word parameter names — tag form (Issue ##179)");
 assert("tag-form params 'in'/'for'", tagReserved(["x","y","z"], 2), "y");
 suiteEnd();
 </cfscript>
