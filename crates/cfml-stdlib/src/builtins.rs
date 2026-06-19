@@ -7572,7 +7572,64 @@ fn postgres_returns_rows(sql: &str) -> bool {
         && sql_has_top_level_keyword(trimmed, "RETURNING")
 }
 
-#[cfg(feature = "postgres_db")]
+/// SQL Server returns rows from DML statements carrying a top-level `OUTPUT`
+/// clause (`INSERT/UPDATE/DELETE/MERGE ... OUTPUT inserted.*`). Like Postgres
+/// `RETURNING`, those must run through `query`, not `execute`: tiberius'
+/// `execute()` silently discards the result set, so the OUTPUT rows would be
+/// lost and the caller would see a bare mutation result instead. The `OUTPUT
+/// ... INTO @tbl` form does NOT stream rows back to the client, so it must be
+/// treated as a plain mutation (detected by an `INTO` following `OUTPUT`).
+#[cfg(feature = "mssql_db")]
+fn mssql_returns_rows(sql: &str) -> bool {
+    let trimmed = strip_leading_sql_noise(sql);
+    let kw_len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    let kw = trimmed[..kw_len].to_ascii_uppercase();
+
+    if matches!(
+        kw.as_str(),
+        "SELECT" | "WITH" | "CALL" | "EXEC" | "EXECUTE" | "VALUES" | "SHOW" | "PRAGMA"
+            | "EXPLAIN" | "DESCRIBE" | "DESC"
+    ) {
+        return true;
+    }
+
+    matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+        && sql_has_top_level_keyword(trimmed, "OUTPUT")
+        && !sql_has_top_level_keyword(trimmed, "INTO")
+}
+
+/// MariaDB (10.5+) returns rows from `INSERT ... RETURNING` and
+/// `DELETE ... RETURNING`. Stock MySQL has no RETURNING (the server rejects it
+/// as a syntax error regardless of routing). Where the server does support it,
+/// `exec_drop` silently discards the rows, so those statements must run through
+/// the row-returning `exec` path instead.
+#[cfg(feature = "mysql_db")]
+fn mysql_returns_rows(sql: &str) -> bool {
+    let trimmed = strip_leading_sql_noise(sql);
+    let kw_len = trimmed
+        .as_bytes()
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    let kw = trimmed[..kw_len].to_ascii_uppercase();
+
+    if matches!(
+        kw.as_str(),
+        "SELECT" | "WITH" | "CALL" | "EXEC" | "EXECUTE" | "VALUES" | "SHOW" | "PRAGMA"
+            | "EXPLAIN" | "DESCRIBE" | "DESC"
+    ) {
+        return true;
+    }
+
+    matches!(kw.as_str(), "INSERT" | "DELETE")
+        && sql_has_top_level_keyword(trimmed, "RETURNING")
+}
+
+#[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
 fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
     let chars: Vec<char> = sql.chars().collect();
     let mut i = 0usize;
@@ -7639,7 +7696,7 @@ fn sql_has_top_level_keyword(sql: &str, target: &str) -> bool {
     false
 }
 
-#[cfg(feature = "postgres_db")]
+#[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
 fn skip_sql_quoted(chars: &[char], start: usize, quote: char) -> usize {
     let mut i = start + 1;
     while i < chars.len() {
@@ -7655,7 +7712,7 @@ fn skip_sql_quoted(chars: &[char], start: usize, quote: char) -> usize {
     chars.len()
 }
 
-#[cfg(feature = "postgres_db")]
+#[cfg(any(feature = "postgres_db", feature = "mssql_db", feature = "mysql_db"))]
 fn skip_postgres_dollar_quote(chars: &[char], start: usize) -> Option<usize> {
     let mut tag_end = start + 1;
     while tag_end < chars.len() && (chars[tag_end].is_ascii_alphanumeric() || chars[tag_end] == '_') {
@@ -7987,7 +8044,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
         _ => Params::Empty,
     };
 
-    if is_select_query(sql) {
+    if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
             .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL query error: {}", e)))?;
 
@@ -8978,7 +9035,7 @@ fn run_mssql_statement(
 ) -> Result<CfmlValue, MssqlRunError> {
     let bound = mssql_bind_params(params);
     let rewritten = mssql_rewrite_placeholders(sql);
-    let is_select = is_select_query(sql);
+    let is_select = mssql_returns_rows(sql);
 
     mssql_runtime().block_on(async move {
         let param_refs: Vec<&dyn tiberius::ToSql> =
@@ -9439,7 +9496,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
         _ => Params::Empty,
     };
 
-    if is_select_query(sql) {
+    if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
             .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL query error: {}", e)))?;
         let columns: Vec<String> = if let Some(first_row) = result.first() {

@@ -297,6 +297,10 @@ include "harness.cfm";
 <!--- PostgreSQL DML with RETURNING returns rows and must use the query path, --->
 <!--- not the execute path. Lucee supports atomic UPDATE ... RETURNING patterns. --->
 <cf_runtest file="tags/test_pg_dml_returning.cfm">
+<!--- SQL Server OUTPUT and MariaDB RETURNING are the same class of bug: DML --->
+<!--- that returns rows must use the query path, else the rows are silently lost. --->
+<cf_runtest file="tags/test_mssql_dml_output.cfm">
+<cf_runtest file="tags/test_mysql_dml_returning.cfm">
 <cf_runtest file="tags/test_pg_extended_param_binds.cfm">
 <cf_runtest file="tags/test_pg_pool_checkout_validation.cfm">
 <cf_runtest file="tags/test_pg_pool_stale_connection_retry.cfm">
