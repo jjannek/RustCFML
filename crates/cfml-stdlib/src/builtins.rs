@@ -6998,6 +6998,12 @@ fn connect_postgres(url: &str) -> Result<postgres::Client, PgConnError> {
     config.connect(tls).map_err(PgConnError::from)
 }
 
+/// Maximum pooled PostgreSQL connections. Also bounds `execute_postgres`'s
+/// stale-connection retry loop: draining at most this many dead connections
+/// guarantees a fresh one.
+#[cfg(feature = "postgres_db")]
+const PG_POOL_MAX_SIZE: u32 = 10;
+
 #[cfg(feature = "postgres_db")]
 fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>, CfmlError> {
     let mut manager = get_pool_manager().lock().unwrap();
@@ -7009,7 +7015,7 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
     }
     let mgr = PostgresConnectionManager { url: url.to_string() };
     let pool = r2d2::Pool::builder()
-        .max_size(10)
+        .max_size(PG_POOL_MAX_SIZE)
         .min_idle(Some(1))
         .connection_timeout(std::time::Duration::from_secs(30))
         // Do NOT ping `SELECT 1` on every checkout (Lucee parity / remote-DB
@@ -7026,6 +7032,11 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
 // -----------------------------------------------
 // MSSQL connection pool (tiberius)
 // -----------------------------------------------
+
+/// Maximum pooled MSSQL connections. Also bounds `execute_mssql`'s stale-connection
+/// retry loop: draining at most this many dead connections guarantees a fresh one.
+#[cfg(feature = "mssql_db")]
+const MSSQL_POOL_MAX_SIZE: u32 = 10;
 
 /// Concrete tiberius client type over a tokio TcpStream (the `compat` adapter
 /// bridges tokio's AsyncRead/Write to the futures traits tiberius expects).
@@ -7197,7 +7208,7 @@ fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlE
     let (config, addr) = mssql_config_from_url(url)?;
     let mgr = MssqlConnectionManager { config, addr };
     let pool = r2d2::Pool::builder()
-        .max_size(10)
+        .max_size(MSSQL_POOL_MAX_SIZE)
         .min_idle(Some(1))
         .connection_timeout(std::time::Duration::from_secs(30))
         // No per-checkout ping (Lucee parity / remote-DB perf): rely on
@@ -7914,19 +7925,33 @@ fn mysql_value_to_cfml(val: mysql::Value) -> CfmlValue {
 #[cfg(feature = "postgres_db")]
 fn execute_postgres(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     let pool = get_postgres_pool(url)?;
-    let mut conn = pool.get()
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL connection error: {}", e)))?;
-    match run_postgres_on_conn(&mut conn, sql, params_arg, return_type) {
-        Ok(value) => Ok(value),
-        Err(err) if err.retry_safe => {
-            drop(conn);
-            let mut retry_conn = pool.get()
-                .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL connection error: {}", e)))?;
-            run_postgres_on_conn(&mut retry_conn, sql, params_arg, return_type)
-                .map_err(|retry_err| retry_err.error)
+
+    // The pool does not ping on checkout (Lucee parity / remote-DB perf), so a
+    // server-closed idle connection (Neon scale-to-zero / suspend-resume,
+    // failover, network drop) is handed back out and only surfaces here. When the
+    // server drops MANY idle sessions at once the pool can hold several dead
+    // connections, and r2d2 establishes their replacements asynchronously — so an
+    // immediate retry may draw a *second* stale connection before a fresh one is
+    // ready. Retry the (retry-safe) statement, discarding each broken connection
+    // so r2d2 evicts it, until a live connection runs it or the attempt budget is
+    // spent. Bounded by the pool size so a statement that genuinely keeps failing
+    // connection-level can't loop forever.
+    let mut last_err: Option<CfmlError> = None;
+    for _ in 0..=PG_POOL_MAX_SIZE {
+        let mut conn = pool.get()
+            .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL connection error: {}", e)))?;
+        match run_postgres_on_conn(&mut conn, sql, params_arg, return_type) {
+            Ok(value) => return Ok(value),
+            Err(err) if err.retry_safe => {
+                drop(conn);
+                last_err = Some(err.error);
+            }
+            Err(err) => return Err(err.error),
         }
-        Err(err) => Err(err.error),
     }
+    Err(last_err.unwrap_or_else(|| {
+        CfmlError::runtime("queryExecute: PostgreSQL connection error: exhausted pool retries".to_string())
+    }))
 }
 
 #[cfg(feature = "postgres_db")]
@@ -7990,12 +8015,43 @@ impl PgRunError {
     }
 
     fn from_postgres(context: &str, e: postgres::Error, retry_safe: bool) -> Self {
-        let connection_broken = e.is_closed();
+        let connection_broken = pg_error_is_connection_fatal(&e);
         Self {
             error: CfmlError::runtime(format_pg_error(context, &e)),
             connection_broken,
             retry_safe: connection_broken && retry_safe,
         }
+    }
+}
+
+/// True when a `postgres` error means the pooled connection is no longer usable.
+///
+/// `is_closed()` only flips once the socket is observed closed (e.g. Neon proxy
+/// dropping an idle TCP connection). A server-side FATAL — `pg_terminate_backend`,
+/// a smart/fast shutdown, or a failover — instead sends an error message that
+/// terminates the session while `is_closed()` is still false, so it must be
+/// recognised by its SqlState. We treat operator-intervention (class 57P0x) and
+/// connection-exception (class 08) states as connection-fatal; ordinary SQL
+/// errors (syntax, constraint, etc.) are NOT, so genuine failures still surface
+/// immediately rather than being retried.
+#[cfg(feature = "postgres_db")]
+fn pg_error_is_connection_fatal(e: &postgres::Error) -> bool {
+    if e.is_closed() {
+        return true;
+    }
+    match e.code() {
+        Some(code) => matches!(
+            code.code(),
+            "57P01"   // admin_shutdown — "terminating connection due to administrator command"
+                | "57P02" // crash_shutdown
+                | "57P03" // cannot_connect_now
+                | "08000" // connection_exception
+                | "08001" // sqlclient_unable_to_establish_sqlconnection
+                | "08003" // connection_does_not_exist
+                | "08004" // sqlserver_rejected_establishment_of_sqlconnection
+                | "08006" // connection_failure
+        ),
+        None => false,
     }
 }
 
@@ -8595,13 +8651,55 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
     // Normalize params before touching the pool.
     let (effective_params, _type_hints) = normalize_query_params(params_arg);
 
-    // Checkout a pooled connection (sync; may establish one on the shared
-    // runtime internally). The actual query runs on that same shared runtime.
     let pool = get_mssql_pool(url)?;
-    let mut conn = pool.get()
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL connection error: {}", e)))?;
-    let mssql = &mut *conn;
-    run_mssql_statement(&mut mssql.client, &mut mssql.broken, sql, &effective_params, return_type)
+
+    // The pool does not ping on checkout (Lucee parity / remote-DB perf), so a
+    // server-closed idle connection (Azure SQL idle eviction, failover, network
+    // drop, serverless scale-to-zero) is handed back out and only surfaces here.
+    // When the server drops MANY idle sessions at once the pool can hold several
+    // dead connections, and r2d2 establishes their replacements asynchronously —
+    // so an immediate retry may draw a *second* stale connection before a fresh
+    // one is ready. Retry the (retry-safe) statement, discarding each broken
+    // connection so r2d2 evicts it, until a live connection runs it or the
+    // attempt budget is spent. The budget is bounded by the pool size so a
+    // statement that genuinely keeps failing connection-level can't loop forever.
+    let mut last_err: Option<CfmlError> = None;
+    for _ in 0..=MSSQL_POOL_MAX_SIZE {
+        let mut conn = pool.get()
+            .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL connection error: {}", e)))?;
+        match run_mssql_on_conn(&mut conn, sql, &effective_params, return_type) {
+            Ok(value) => return Ok(value),
+            // Connection-level failure on a replayable statement: drop the broken
+            // connection (so r2d2 discards it) and try the next pooled connection.
+            Err(err) if err.retry_safe => {
+                drop(conn);
+                last_err = Some(err.error);
+            }
+            Err(err) => return Err(err.error),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        CfmlError::runtime("queryExecute: MSSQL connection error: exhausted pool retries".to_string())
+    }))
+}
+
+/// Run one statement against a pooled MSSQL connection, flagging the connection
+/// `broken` (so r2d2 evicts it on return) when the failure is connection-level.
+/// Returns the rich `MssqlRunError` so the caller can decide whether to retry.
+#[cfg(feature = "mssql_db")]
+fn run_mssql_on_conn(
+    conn: &mut MssqlConn,
+    sql: &str,
+    params: &[CfmlValue],
+    return_type: &str,
+) -> Result<CfmlValue, MssqlRunError> {
+    let result = run_mssql_statement(&mut conn.client, sql, params, return_type);
+    if let Err(err) = &result {
+        if err.connection_broken {
+            conn.broken = true;
+        }
+    }
+    result
 }
 
 /// A bound MSSQL parameter. We own the value so its `ColumnData` (which borrows
@@ -8686,19 +8784,51 @@ fn mssql_rewrite_placeholders(sql: &str) -> String {
     result
 }
 
+/// A failed MSSQL statement run, carrying enough context for the caller to
+/// decide whether the connection should be evicted and whether the statement is
+/// safe to retry on a fresh connection. Mirrors the PostgreSQL `PgRunError`.
+#[cfg(feature = "mssql_db")]
+struct MssqlRunError {
+    error: CfmlError,
+    connection_broken: bool,
+    retry_safe: bool,
+}
+
+#[cfg(feature = "mssql_db")]
+impl MssqlRunError {
+    fn from_cfml(error: CfmlError) -> Self {
+        Self { error, connection_broken: false, retry_safe: false }
+    }
+
+    fn from_tiberius(ctx: &str, e: tiberius::error::Error, retry_safe: bool) -> Self {
+        let connection_broken = is_mssql_connection_error(&e);
+        Self {
+            error: CfmlError::runtime(format!("queryExecute: MSSQL {}: {}", ctx, e)),
+            connection_broken,
+            // Only retry connection-level failures, and only when the caller says
+            // the statement is replayable. SELECTs are side-effect free, so they
+            // always replay. Mutations are NOT retried: tiberius fuses prepare
+            // and execute into one sp_executesql round-trip, so a failure can't be
+            // proven to predate any side effect (and a multi-statement batch may
+            // be partially applied) — retrying risks double-applying a write.
+            retry_safe: connection_broken && retry_safe,
+        }
+    }
+}
+
 /// Run one MSSQL statement (SELECT → rows, otherwise → affected count) against
 /// an already-checked-out connection on the shared runtime, binding `params` as
 /// real typed parameters. Shared by the pooled (`execute_mssql`) and
-/// transaction (`execute_with_transaction`) paths. Flags `broken` on
-/// connection-level failures so r2d2 evicts the connection on return.
+/// transaction (`execute_with_transaction`) paths. Connection-level failures are
+/// reported via `MssqlRunError::connection_broken` so the caller can evict the
+/// connection; SELECT failures are additionally flagged `retry_safe`.
 #[cfg(feature = "mssql_db")]
 fn run_mssql_statement(
     client: &mut MssqlClient,
-    broken: &mut bool,
     sql: &str,
     params: &[CfmlValue],
     return_type: &str,
-) -> CfmlResult {
+) -> Result<CfmlValue, MssqlRunError> {
     let bound = mssql_bind_params(params);
     let rewritten = mssql_rewrite_placeholders(sql);
     let is_select = is_select_query(sql);
@@ -8707,24 +8837,11 @@ fn run_mssql_statement(
         let param_refs: Vec<&dyn tiberius::ToSql> =
             bound.iter().map(|p| p as &dyn tiberius::ToSql).collect();
 
-        // Map a tiberius error → CfmlError, flagging the connection broken so
-        // r2d2 evicts it on return when the failure is connection-level.
-        let to_err = |broken: &mut bool, ctx: &str, e: tiberius::error::Error| {
-            if is_mssql_connection_error(&e) {
-                *broken = true;
-            }
-            CfmlError::runtime(format!("queryExecute: MSSQL {}: {}", ctx, e))
-        };
-
         if is_select {
-            let stream = match client.query(rewritten.as_str(), &param_refs).await {
-                Ok(s) => s,
-                Err(e) => return Err(to_err(broken, "query error", e)),
-            };
-            let result = match stream.into_first_result().await {
-                Ok(r) => r,
-                Err(e) => return Err(to_err(broken, "result error", e)),
-            };
+            let stream = client.query(rewritten.as_str(), &param_refs).await
+                .map_err(|e| MssqlRunError::from_tiberius("query error", e, true))?;
+            let result = stream.into_first_result().await
+                .map_err(|e| MssqlRunError::from_tiberius("result error", e, true))?;
 
             let columns: Vec<String> = if let Some(first_row) = result.first() {
                 first_row.columns().iter()
@@ -8744,15 +8861,13 @@ fn run_mssql_statement(
                 rows.push(row_map);
             }
 
-            build_query_result(columns, rows, sql, return_type)
+            build_query_result(columns, rows, sql, return_type).map_err(MssqlRunError::from_cfml)
         } else {
             // execute() returns the real rows-affected total (the previous
             // simple_query path mis-reported INSERT/UPDATE as 0 rows).
-            let result = match client.execute(rewritten.as_str(), &param_refs).await {
-                Ok(r) => r,
-                Err(e) => return Err(to_err(broken, "error", e)),
-            };
-            build_mutation_result(result.total() as i64, 0, sql)
+            let result = client.execute(rewritten.as_str(), &param_refs).await
+                .map_err(|e| MssqlRunError::from_tiberius("error", e, false))?;
+            build_mutation_result(result.total() as i64, 0, sql).map_err(MssqlRunError::from_cfml)
         }
     })
 }
@@ -9109,9 +9224,11 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
         }
         #[cfg(feature = "mssql_db")]
         TransactionConn::Mssql(c) => {
+            // Transaction path: do not retry inside a transaction, but still mark
+            // a closed connection as broken so the pool discards it on return.
             let (effective_params, _type_hints) = normalize_query_params(params_arg);
-            let m = &mut **c;
-            run_mssql_statement(&mut m.client, &mut m.broken, sql, &effective_params, return_type)
+            run_mssql_on_conn(&mut **c, sql, &effective_params, return_type)
+                .map_err(|err| err.error)
         }
         #[allow(unreachable_patterns)]
         _ => Err(CfmlError::runtime("Transaction: unsupported driver".to_string())),
