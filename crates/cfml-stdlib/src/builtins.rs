@@ -4254,7 +4254,8 @@ fn fn_list_filter(_args: Vec<CfmlValue>) -> CfmlResult {
 // ===============================================
 
 fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
-    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null));
+    let mut visited: Vec<usize> = Vec::new();
+    let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited);
     let flags = security_flags();
     if flags.secure_json && !flags.secure_json_prefix.is_empty() {
         Ok(CfmlValue::string(format!("{}{}", flags.secure_json_prefix, body)))
@@ -4263,7 +4264,15 @@ fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
-fn serialize_value(val: &CfmlValue) -> String {
+/// Serialize a value to JSON. `visited` tracks the backing-Arc pointers of the
+/// containers currently on the recursion path: reference-typed arrays/structs
+/// (and components, which materialise as marker-bearing structs) can alias and
+/// form cycles — e.g. a TestBox mock holds `this.mockBox`, whose generator holds
+/// the mock back. Without this guard such a cycle recurses until the native
+/// stack overflows and aborts the whole process (uncatchable SIGABRT). On
+/// revisiting a container we emit `null` to break the cycle, mirroring
+/// `as_string_guarded`/`deep_copy_guarded`.
+fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
     match val {
         CfmlValue::Null => "null".to_string(),
         CfmlValue::Bool(b) => b.to_string(),
@@ -4271,42 +4280,24 @@ fn serialize_value(val: &CfmlValue) -> String {
         CfmlValue::Double(d) => d.to_string(),
         CfmlValue::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")),
         CfmlValue::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(|v| serialize_value(&v)).collect();
+            let ptr = arr.backing_ptr();
+            if visited.contains(&ptr) {
+                return "null".to_string();
+            }
+            visited.push(ptr);
+            let items: Vec<String> = arr.iter().map(|v| serialize_value(&v, visited)).collect();
+            visited.pop();
             format!("[{}]", items.join(","))
         }
         CfmlValue::Struct(s) => {
-            // A struct carrying CFC instance markers (`__variables` plus a
-            // `this`/`__name` marker) is a component instance — this engine
-            // materialises CFCs as marker-bearing structs. Lucee/ACF serialize
-            // only a component's data members, never engine internals (`__*`),
-            // the `this` scope, or its methods (UDFs). Filter those out so REST
-            // serialization and framework model inspection see only data.
-            let is_cfc = s.contains_key("__variables")
-                && (s.contains_key("this") || s.contains_key("__name"));
-            // An arguments-derived struct carries private sentinel markers.
-            // structKeyList/Count/Exists/for-in already hide these; serializeJSON
-            // must too, or a struct built via structAppend(s, arguments) leaks
-            // them into the JSON (Lucee has no such keys).
-            let is_args = s.contains_key("__arguments_scope");
-            let items: Vec<String> = s
-                .iter()
-                .filter(|(k, _)| {
-                    !is_args
-                        || (k.as_str() != "__arguments_scope"
-                            && k.as_str() != "__arguments_params")
-                })
-                .filter(|(k, v)| {
-                    if !is_cfc {
-                        return true;
-                    }
-                    if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
-                        return false;
-                    }
-                    !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
-                })
-                .map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(&v)))
-                .collect();
-            format!("{{{}}}", items.join(","))
+            let ptr = s.backing_ptr();
+            if visited.contains(&ptr) {
+                return "null".to_string();
+            }
+            visited.push(ptr);
+            let out = serialize_struct(s, visited);
+            visited.pop();
+            out
         }
         CfmlValue::Query(q) => {
             q.with_read(|d| {
@@ -4314,7 +4305,7 @@ fn serialize_value(val: &CfmlValue) -> String {
                 let rows: Vec<String> = (0..row_count).map(|r| {
                     let fields: Vec<String> = d.columns.iter().enumerate().map(|(ci, col)| {
                         let val = &d.data[ci][r];
-                        format!("\"{}\":{}", col.replace('"', "\\\""), serialize_value(val))
+                        format!("\"{}\":{}", col.replace('"', "\\\""), serialize_value(val, visited))
                     }).collect();
                     format!("{{{}}}", fields.join(","))
                 }).collect();
@@ -4335,10 +4326,45 @@ fn serialize_value(val: &CfmlValue) -> String {
             // first-row scalar in scalar contexts. Serializing a struct/array
             // holding a query cell must emit the value, not drop it to null
             // (Lucee/ACF/BoxLang treat a query cell as a simple value).
-            serialize_value(val.query_column_scalar())
+            serialize_value(val.query_column_scalar(), visited)
         }
         _ => "null".to_string(),
     }
+}
+
+fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
+    // A struct carrying CFC instance markers (`__variables` plus a
+    // `this`/`__name` marker) is a component instance — this engine
+    // materialises CFCs as marker-bearing structs. Lucee/ACF serialize
+    // only a component's data members, never engine internals (`__*`),
+    // the `this` scope, or its methods (UDFs). Filter those out so REST
+    // serialization and framework model inspection see only data.
+    let is_cfc = s.contains_key("__variables")
+        && (s.contains_key("this") || s.contains_key("__name"));
+    // An arguments-derived struct carries private sentinel markers.
+    // structKeyList/Count/Exists/for-in already hide these; serializeJSON
+    // must too, or a struct built via structAppend(s, arguments) leaks
+    // them into the JSON (Lucee has no such keys).
+    let is_args = s.contains_key("__arguments_scope");
+    let items: Vec<String> = s
+        .iter()
+        .filter(|(k, _)| {
+            !is_args
+                || (k.as_str() != "__arguments_scope"
+                    && k.as_str() != "__arguments_params")
+        })
+        .filter(|(k, v)| {
+            if !is_cfc {
+                return true;
+            }
+            if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+                return false;
+            }
+            !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
+        })
+        .map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(&v, visited)))
+        .collect();
+    format!("{{{}}}", items.join(","))
 }
 
 fn fn_deserialize_json(args: Vec<CfmlValue>) -> CfmlResult {

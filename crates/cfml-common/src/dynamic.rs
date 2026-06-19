@@ -587,6 +587,15 @@ pub enum CfmlValue {
     NativeObject(Arc<RwLock<dyn CfmlNative>>),
 }
 
+thread_local! {
+    /// Backing-Arc pointers of the containers currently being Debug-formatted.
+    /// Reference-typed arrays/structs can alias and form cycles (e.g. a TestBox
+    /// mock holds `this.mockBox`, whose generator holds the mock back); without
+    /// this guard `{:?}` — used by writeDump and logging — recurses until the
+    /// native stack overflows and aborts the whole process (uncatchable SIGABRT).
+    static DEBUG_VISITED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Hand-rolled Debug elides the Arc<_> wrapper on Array/Struct so log diffs
 /// and test output remain byte-identical to the pre-Arc-flip representation.
 impl fmt::Debug for CfmlValue {
@@ -597,9 +606,27 @@ impl fmt::Debug for CfmlValue {
             CfmlValue::Int(i) => f.debug_tuple("Int").field(i).finish(),
             CfmlValue::Double(d) => f.debug_tuple("Double").field(d).finish(),
             CfmlValue::String(s) => f.debug_tuple("String").field(s).finish(),
-            CfmlValue::Array(a) => f.debug_tuple("Array").field(&a.snapshot()).finish(),
+            CfmlValue::Array(a) => {
+                let ptr = a.backing_ptr();
+                if DEBUG_VISITED.with(|v| v.borrow().contains(&ptr)) {
+                    return f.write_str("Array(<recursive>)");
+                }
+                DEBUG_VISITED.with(|v| v.borrow_mut().push(ptr));
+                let r = f.debug_tuple("Array").field(&a.snapshot()).finish();
+                DEBUG_VISITED.with(|v| { v.borrow_mut().pop(); });
+                r
+            }
             CfmlValue::QueryColumn(a) => f.debug_tuple("QueryColumn").field(&**a).finish(),
-            CfmlValue::Struct(s) => f.debug_tuple("Struct").field(&s.snapshot()).finish(),
+            CfmlValue::Struct(s) => {
+                let ptr = s.backing_ptr();
+                if DEBUG_VISITED.with(|v| v.borrow().contains(&ptr)) {
+                    return f.write_str("Struct(<recursive>)");
+                }
+                DEBUG_VISITED.with(|v| v.borrow_mut().push(ptr));
+                let r = f.debug_tuple("Struct").field(&s.snapshot()).finish();
+                DEBUG_VISITED.with(|v| { v.borrow_mut().pop(); });
+                r
+            }
             CfmlValue::Closure(c) => f.debug_tuple("Closure").field(c).finish(),
             CfmlValue::Component(c) => f.debug_tuple("Component").field(c).finish(),
             CfmlValue::Function(fun) => f.debug_tuple("Function").field(fun).finish(),
