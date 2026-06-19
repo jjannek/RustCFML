@@ -3618,17 +3618,20 @@ impl Parser {
 
             // The leading token(s) are EITHER the parameter name, OR a type
             // annotation followed by the name. A type may be a dotted FQN
-            // (`wheels.system.TestResult`), so parse it as a dotted identifier;
-            // the name itself is always a single identifier.
+            // (`wheels.system.TestResult`), so parse it as a dotted word; the
+            // name itself is always a single word. Both are keyword-tolerant:
+            // CFML allows reserved words (`in`, `do`, `for`, `eq`, `is`, …) as
+            // parameter names on Lucee/ACF/BoxLang (e.g. ColdBox Util.cfc's
+            // `arrayToStruct(in)`), so extract_param_word accepts them.
             let first = self
-                .extract_dotted_identifier()
+                .extract_param_word()
                 .unwrap_or_else(|_| "arg".to_string());
 
-            // If next is also an identifier (or soft keyword usable as identifier),
-            // then first was the type annotation and next is the param name.
-            let name = if self.is_identifier_like() {
+            // If next is also a word (identifier, soft keyword, or reserved
+            // word), then first was the type annotation and next is the name.
+            let name = if self.is_param_word_at(0) {
                 param_type = Some(first);
-                self.extract_identifier()
+                self.extract_param_word()
                     .unwrap_or_else(|_| "arg".to_string())
             } else {
                 first
@@ -3674,7 +3677,7 @@ impl Parser {
                 if self.check(&Token::RParen) || self.is_at_end() {
                     break;
                 }
-                if !(self.is_identifier_like() || self.check(&Token::Required)) {
+                if !(self.is_param_word_at(0) || self.check(&Token::Required)) {
                     break;
                 }
                 // otherwise fall through and parse the next param
@@ -3985,6 +3988,38 @@ impl Parser {
             path.push_str(&next);
         }
         Ok(path)
+    }
+
+    /// Extract a (possibly dotted) word in a function parameter list. Unlike
+    /// extract_dotted_identifier, the leading segment is keyword-tolerant:
+    /// CFML accepts reserved words (`in`, `do`, `for`, `eq`, `is`, …) as
+    /// parameter names on Lucee/Adobe CF/BoxLang. extract_property_name already
+    /// accepts identifiers, soft keywords, and the full reserved-word set.
+    fn extract_param_word(&mut self) -> Result<String, ParseError> {
+        let mut path = self.extract_property_name()?;
+        while self.match_token(&Token::Dot) {
+            let next = self.extract_property_name()?;
+            path.push('.');
+            path.push_str(&next);
+        }
+        Ok(path)
+    }
+
+    /// Whether the token at `offset` can begin a parameter name. Mirrors the
+    /// keyword set extract_param_word / extract_property_name accept, so a
+    /// reserved word used as a parameter name is recognised both as the name
+    /// itself and when disambiguating `type name` from a lone `name`.
+    fn is_param_word_at(&self, offset: usize) -> bool {
+        self.is_identifier_like_at(offset)
+            || matches!(self.peek(offset),
+                Token::If | Token::Else | Token::ElseIf | Token::For | Token::In
+                | Token::While | Token::Do | Token::Break | Token::Continue
+                | Token::Return | Token::Switch | Token::Case | Token::Try
+                | Token::Catch | Token::Finally | Token::Rethrow | Token::New
+                | Token::This | Token::Super | Token::True | Token::False | Token::Null
+                | Token::Contains | Token::NotKeyword | Token::AndKeyword | Token::OrKeyword
+                | Token::EqKeyword | Token::NeqKeyword | Token::GtKeyword | Token::GteKeyword
+                | Token::LtKeyword | Token::LteKeyword | Token::ModKeyword | Token::IsKeyword)
     }
 
     fn consume(&mut self, token: &Token) -> Result<(), ParseError> {
