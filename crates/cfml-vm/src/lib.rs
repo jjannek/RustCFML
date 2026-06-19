@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 pub mod application_store;
 pub mod async_kernel;
+pub mod dump;
 mod java_shims;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
 /// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
@@ -811,6 +812,16 @@ pub struct CfmlVirtualMachine {
     pub response_status: Option<(u16, String)>,
     /// Content type set by cfcontent
     pub response_content_type: Option<String>,
+    /// True when executing a web request (serve mode): `writeDump` emits the
+    /// HTML widget instead of a plain-text tree.
+    pub web_context: bool,
+    /// Whether the one-time `writeDump` CSS/JS preamble has been emitted this
+    /// request (so multiple dumps share a single stylesheet + toggle script).
+    pub dump_assets_emitted: bool,
+    /// Named args captured for the next `writeDump`/`dump` call (label/expand/
+    /// top). Builtins normally drop arg names, so the CallNamed handler stashes
+    /// them here when dispatching writeDump; the intercept reads + clears them.
+    pending_dump_named: Option<Vec<(String, CfmlValue)>>,
     /// Body override set by cfcontent (variable/file)
     pub response_body: Option<CfmlValue>,
     /// Redirect URL set by cflocation
@@ -1244,6 +1255,9 @@ impl CfmlVirtualMachine {
             response_headers: Vec::new(),
             response_status: None,
             response_content_type: None,
+            web_context: false,
+            dump_assets_emitted: false,
+            pending_dump_named: None,
             response_body: None,
             redirect_url: None,
             http_request_data: None,
@@ -4288,6 +4302,24 @@ impl CfmlVirtualMachine {
                                 .push(named_values.get(i).cloned().unwrap_or(CfmlValue::Null));
                         }
 
+                        // writeDump/dump: builtins drop arg names downstream, so
+                        // stash the named pairs (label/expand/top/var) here for
+                        // the intercept to read. A purely positional call goes
+                        // through the CallFunction op and leaves this None.
+                        if matches!(&func_ref, CfmlValue::Function(f)
+                            if f.name.eq_ignore_ascii_case("writedump")
+                                || f.name.eq_ignore_ascii_case("dump"))
+                        {
+                            let named: Vec<(String, CfmlValue)> = expanded_names
+                                .iter()
+                                .zip(expanded_values.iter())
+                                .filter(|(n, _)| !n.is_empty())
+                                .map(|(n, v)| (n.clone(), v.clone()))
+                                .collect();
+                            self.pending_dump_named =
+                                if named.is_empty() { None } else { Some(named) };
+                        }
+
                         // Tag-call builtins (e.g. `cfdirectory(action=..., name=...)`)
                         // take a single struct-of-options at the bytecode level —
                         // bundle the named args into one struct here. `name`/
@@ -6832,9 +6864,35 @@ impl CfmlVirtualMachine {
                 return Ok(CfmlValue::Null);
             }
             if name_lower == "writedump" || name_lower == "dump" {
-                for arg in &args {
-                    self.output_buffer.push_str(&format!("{:?}\n", arg));
+                let named = self.pending_dump_named.take();
+                // Resolve the value to dump and the options. Named args (when
+                // present) take precedence; otherwise fall back to positional
+                // (var is the first positional arg).
+                let mut opts = dump::DumpOptions::default();
+                let mut var: Option<CfmlValue> = None;
+                if let Some(pairs) = &named {
+                    for (k, v) in pairs {
+                        match k.to_lowercase().as_str() {
+                            "var" => var = Some(v.clone()),
+                            "label" => opts.label = Some(v.as_string()),
+                            "expand" => opts.expand = v.is_true(),
+                            "top" => {
+                                let n = v.as_string().parse::<i64>().unwrap_or(0);
+                                if n > 0 {
+                                    opts.top = Some(n as usize);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
+                let value = var.or_else(|| args.into_iter().next()).unwrap_or(CfmlValue::Null);
+                let include_assets = self.web_context && !self.dump_assets_emitted;
+                let rendered = dump::render(&value, &opts, self.web_context, include_assets);
+                if include_assets {
+                    self.dump_assets_emitted = true;
+                }
+                self.output_buffer.push_str(&rendered);
                 return Ok(CfmlValue::Null);
             }
 

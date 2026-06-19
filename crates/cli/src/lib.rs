@@ -473,7 +473,7 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
     let server_state = ServerState::with_config(false, cfconfig);
-    match compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, vfs::real_fs(), false, None, false) {
+    match compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, vfs::real_fs(), false, None, false, false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
@@ -502,7 +502,7 @@ fn compile_and_run_with_session(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true)
+    compile_and_run(source, debug, source_file, extra_globals, server_state, http_request_data, session_id, vfs, sandbox, None, true, true)
 }
 
 /// Run the Application.cfc lifecycle for a requested template that does NOT
@@ -523,7 +523,7 @@ fn run_missing_template(
     vfs: Arc<dyn Vfs>,
     sandbox: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
-    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true)
+    compile_and_run("", false, Some(would_be_path), extra_globals, server_state, http_request_data, session_id, vfs, sandbox, Some(target_page), true, true)
 }
 
 /// Register the standard runtime fixtures onto a fresh VM: builtins, builtin
@@ -619,6 +619,7 @@ fn compile_and_run(
     sandbox: bool,
     missing_template: Option<String>,
     persist_jit: bool,
+    web_context: bool,
 ) -> Result<CfmlResponse, CfmlRunError> {
     // onMissingTemplate path: there is no target page to compile, so use an
     // empty program. execute_with_lifecycle never runs it — it dispatches to
@@ -741,6 +742,10 @@ fn compile_and_run(
     for (name, value) in extra_globals {
         vm.globals.insert(name, value);
     }
+
+    // Web request (serve mode) → writeDump emits its HTML widget; CLI runs
+    // emit a plain-text tree.
+    vm.web_context = web_context;
 
     // Wire up server state if provided (for --serve mode)
     if let Some(ss) = server_state {
@@ -1899,6 +1904,7 @@ fn render_error_response(state: &Arc<AppState>, e: &CfmlRunError) -> axum::respo
                 state.sandbox,
                 None,
                 true,
+                true,
             ) {
                 let (content_type, emit_headers) = cfml_vm::web::resolve_response_headers(
                     resp.response_content_type.as_deref(),
@@ -2783,7 +2789,7 @@ fn run_embedded_cli(vfs: Arc<dyn Vfs>, base_dir: &str, entry: &str, file_count: 
     extra_globals.insert("cli".to_string(), CfmlValue::strukt(cli_scope));
 
     // Execute
-    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false) {
+    match compile_and_run(&source, false, Some(entry_path), extra_globals, None, None, None, vfs, sandbox, None, false, false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
