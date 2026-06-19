@@ -347,6 +347,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("nowServer".into(), fn_now_server);
     f.insert("getTickCount".into(), fn_get_tick_count);
     f.insert("getFunctionList".into(), fn_get_function_list);
+    f.insert("getTagData".into(), fn_get_tag_data);
     f.insert("getFunctionCalledName".into(), fn_get_function_called_name);
     f.insert("getContextRoot".into(), fn_get_context_root);
     f.insert("GetContextRoot".into(), fn_get_context_root);
@@ -2272,6 +2273,55 @@ fn fn_is_empty(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_struct_new(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::strukt(ValueMap::default()))
+}
+
+/// getTagData( library, tag ) — returns metadata about a CFML tag, notably a
+/// `.attributes` struct keyed by the attribute names the tag actually supports.
+/// Used for runtime feature-detection (e.g. Preside's `DbInfoService` checks
+/// `structKeyExists( getTagData("CF","DBINFO").attributes, "filter" )` to pick
+/// the modern dbinfo path). The metadata describes RustCFML's *real* tag
+/// capabilities rather than mirroring a particular Lucee version, so the
+/// feature-detect resolves correctly on this engine. Unknown libraries/tags
+/// return null, matching Lucee for tags it doesn't know.
+fn fn_get_tag_data(args: Vec<CfmlValue>) -> CfmlResult {
+    let library = args.first().map(|v| v.as_string()).unwrap_or_default();
+    let tag = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+
+    // Only the standard CFML tag library ("CF") is described.
+    if !library.eq_ignore_ascii_case("cf") {
+        return Ok(CfmlValue::Null);
+    }
+
+    // (attribute name, type, required) for each supported attribute.
+    let attrs: &[(&str, &str, bool)] = match tag.to_lowercase().as_str() {
+        // Mirrors the attributes honoured by crate::dbinfo::fn_dbinfo_impl and
+        // the cfdbinfo VM intercept. `filter` and the `columns_minimal` type
+        // are both supported, so Preside's modern dbinfo path activates.
+        "dbinfo" => &[
+            ("type", "string", true),
+            ("name", "variableName", true),
+            ("datasource", "string", false),
+            ("table", "string", false),
+            ("pattern", "string", false),
+            ("filter", "string", false),
+            ("procedure", "string", false),
+        ],
+        _ => return Ok(CfmlValue::Null),
+    };
+
+    let mut attributes = ValueMap::default();
+    for (name, ty, required) in attrs {
+        let mut entry = ValueMap::default();
+        entry.insert("name".into(), CfmlValue::string((*name).to_string()));
+        entry.insert("type".into(), CfmlValue::string((*ty).to_string()));
+        entry.insert("required".into(), CfmlValue::Bool(*required));
+        attributes.insert((*name).to_string(), CfmlValue::strukt(entry));
+    }
+
+    let mut result = ValueMap::default();
+    result.insert("name".into(), CfmlValue::string(tag.to_lowercase()));
+    result.insert("attributes".into(), CfmlValue::strukt(attributes));
+    Ok(CfmlValue::strukt(result))
 }
 
 /// The `arguments` scope carries two private markers (`__arguments_scope` +
