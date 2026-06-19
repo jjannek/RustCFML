@@ -2620,16 +2620,29 @@ impl CfmlVirtualMachine {
                         ))
                     } else if name_lower == "variables"
                     {
-                        // Return a struct representing the variables scope
-                        if !is_inside_function {
+                        // Return a struct representing the variables scope.
+                        // A `__variables` key means we're running in a component
+                        // scope — either a CFC method, OR a template `include`d
+                        // *into* a CFC method (the MockBox mixin idiom: the mock
+                        // method is generated into a .cfm that the target object
+                        // `include`s, so its `variables[...]` reads and function
+                        // declarations must resolve against the component scope,
+                        // not the page globals). The included `__main__` has
+                        // `is_inside_function == false`, so check `__variables`
+                        // FIRST — otherwise it falls into the page-scope branch
+                        // below and `variables` materializes as globals+builtins,
+                        // diverging from where unscoped stores actually land (the
+                        // StoreLocal `__variables` branch). This matches the two
+                        // other `variables` read paths (the LoadGlobal scope arm
+                        // and scope_aware_load). (GitHub #177)
+                        if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
+                            CfmlValue::Struct(vars.clone())
+                        } else if !is_inside_function {
                             let mut merged = self.globals.clone();
                             for (k, v) in &locals {
                                 merged.insert(k.clone(), v.clone());
                             }
                             CfmlValue::strukt(merged)
-                        } else if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
-                            // CFC method: variables scope IS the __variables struct.
-                            CfmlValue::Struct(vars.clone())
                         } else {
                             CfmlValue::strukt(locals.clone())
                         }

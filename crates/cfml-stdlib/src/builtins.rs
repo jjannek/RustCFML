@@ -2504,6 +2504,28 @@ fn struct_find_value_recursive(
 fn fn_struct_clear(args: Vec<CfmlValue>) -> CfmlResult {
     // Empty the shared handle in place (Lucee reference semantics).
     if let Some(CfmlValue::Struct(s)) = args.first() {
+        // A CFC instance is represented as a Struct carrying engine-internal
+        // sentinel keys (`__variables`, `__name`, `__source_file`, `__super`,
+        // `__metadata`, `__properties`). Clearing those destroys the object's
+        // identity and private scope, so a method invoked afterwards can no
+        // longer bind `this` ("Variable 'this' is undefined"). Lucee clears the
+        // public THIS scope of a component but keeps it a usable object — so
+        // when the target is a component, preserve the `__`-prefixed sentinels
+        // and drop only the user-facing public members (which is exactly what
+        // MockBox's clearMethods=true relies on). (GitHub #177)
+        let is_component =
+            s.contains_key_ci("__variables") && (s.contains_key_ci("__name") || s.contains_key_ci("this"));
+        if is_component {
+            let preserved: Vec<(String, CfmlValue)> = s
+                .iter()
+                .filter(|(k, _)| k.starts_with("__"))
+                .collect();
+            s.clear();
+            for (k, v) in preserved {
+                s.insert(k, v);
+            }
+            return Ok(CfmlValue::Struct(s.clone()));
+        }
         s.clear();
         return Ok(CfmlValue::Struct(s.clone()));
     }

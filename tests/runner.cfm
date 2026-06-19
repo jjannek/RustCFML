@@ -202,6 +202,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_inherited_helpers.cfm">
 <cf_runtest file="oop/test_interfaces.cfm">
 <cf_runtest file="oop/test_metadata.cfm">
+<cf_runtest file="oop/test_mock_mixin_injection.cfm">
 <cf_runtest file="oop/test_dotted_function_names.cfm">
 <cf_runtest file="oop/test_static.cfm">
 <cf_runtest file="oop/test_soft_keyword_function_name.cfm">
