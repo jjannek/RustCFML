@@ -944,6 +944,47 @@ impl Parser {
             })));
         }
 
+        // Handle bare `silent { body }` keyword form in CFScript (script
+        // equivalent of <cfsilent>). Lower to a savecontent capture whose
+        // result is discarded — suppressing the body's output. Only treat as a
+        // block when an LBrace immediately follows, so `silent = x;`,
+        // `silent.foo`, `silent()` etc. stay ordinary identifiers.
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.eq_ignore_ascii_case("silent"))
+            && matches!(self.peek(1), Token::LBrace)
+        {
+            self.advance(); // consume 'silent'
+            let body = self.parse_block()?;
+            let mut stmts = Vec::new();
+            stmts.push(Statement::Expression(ExpressionStatement {
+                expr: Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier {
+                        name: "__cfsavecontent_start".to_string(),
+                        location: stmt_loc.clone(),
+                    })),
+                    arguments: vec![],
+                    location: stmt_loc.clone(),
+                })),
+                location: stmt_loc.clone(),
+            }));
+            stmts.extend(body);
+            // Discard the captured output (no assignment).
+            stmts.push(Statement::Expression(ExpressionStatement {
+                expr: Expression::FunctionCall(Box::new(FunctionCall {
+                    name: Box::new(Expression::Identifier(Identifier {
+                        name: "__cfsavecontent_end".to_string(),
+                        location: stmt_loc.clone(),
+                    })),
+                    arguments: vec![],
+                    location: stmt_loc.clone(),
+                })),
+                location: stmt_loc.clone(),
+            }));
+            return Ok(CfmlNode::Statement(Statement::Output(Output {
+                body: stmts,
+                location: stmt_loc,
+            })));
+        }
+
         // Handle script-call-with-body forms for body-block tags:
         //   cfsavecontent(variable="x") { body }
         //   cflock(name="x", type="exclusive", timeout=10) { body }

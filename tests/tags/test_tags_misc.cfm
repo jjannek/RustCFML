@@ -10,6 +10,22 @@
 <!--- Variable set inside cfsilent is still accessible --->
 <cfscript>assert("cfsilent var accessible", silentVar, "set inside silent");</cfscript>
 
+<!--- Script-form `silent { ... }` block (GitHub #176) suppresses output --->
+<cfsavecontent variable="silentScriptOutput"><cfscript>
+silent {
+    silentScriptVar = 42;
+    writeOutput("HIDDEN");
+}
+writeOutput("SHOWN");
+</cfscript></cfsavecontent>
+<cfscript>
+assert("script silent suppresses body output", trim(silentScriptOutput), "SHOWN");
+assert("script silent var accessible", silentScriptVar, 42);
+// `silent` as an ordinary identifier still works (not a block keyword).
+silent = "plain";
+assert("silent as identifier unaffected", silent, "plain");
+</cfscript>
+
 <!--- cfthrow throws an exception (via assertThrows) --->
 <cfscript>
 assertThrows("cfthrow throws", function() {
