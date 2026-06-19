@@ -3311,10 +3311,8 @@ impl Parser {
             }
 
             // Skip optional return type annotation (e.g. "array function ...",
-            // "component function init()").
-            if self.is_return_type_token(0) && matches!(self.peek(1), Token::Function) {
-                self.advance(); // skip return type
-            }
+            // "component function init()", or a dotted component-path type).
+            self.skip_dotted_return_type_before_function();
 
             if self.match_token(&Token::Property) {
                 properties.push(self.parse_property()?);
@@ -3457,10 +3455,8 @@ impl Parser {
                 AccessModifier::Public
             };
 
-            // Skip optional return type annotation
-            if self.is_return_type_token(0) && matches!(self.peek(1), Token::Function) {
-                self.advance();
-            }
+            // Skip optional return type annotation (incl. dotted component-path)
+            self.skip_dotted_return_type_before_function();
 
             if self.match_token(&Token::Function) {
                 let mut func = self.parse_function()?;
@@ -3730,6 +3726,33 @@ impl Parser {
             self.peek(offset),
             Token::Identifier(_) | Token::Component | Token::Interface
         )
+    }
+
+    /// If the current token begins a (possibly dotted) return-type annotation
+    /// that is immediately followed by `function`, advance past the whole
+    /// annotation so `function` becomes the current token. Returns whether it
+    /// skipped one. A single-token check (`type function`) misses dotted
+    /// component-path return types like
+    /// `testbox.system.mockutils.MockGenerator function getMockGenerator()`
+    /// (MockBox / any CFC returning a typed object) — silently dropping the
+    /// whole method declaration. (GitHub #177)
+    fn skip_dotted_return_type_before_function(&mut self) -> bool {
+        if !self.is_return_type_token(0) {
+            return false;
+        }
+        let mut lookahead = 1;
+        while matches!(self.peek(lookahead), Token::Dot)
+            && matches!(self.peek(lookahead + 1), Token::Identifier(_))
+        {
+            lookahead += 2;
+        }
+        if matches!(self.peek(lookahead), Token::Function) {
+            for _ in 0..lookahead {
+                self.advance();
+            }
+            return true;
+        }
+        false
     }
 
     fn is_access_modifier_for_function(&self) -> bool {

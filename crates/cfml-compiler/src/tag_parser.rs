@@ -2363,10 +2363,17 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
         while i < len && chars[i].is_whitespace() {
             i += 1;
         }
-        // Check if we hit a <cfargument
-        if i + 12 < len && chars[i] == '<' {
-            let tag: String = chars[i..i + 12].iter().collect();
-            if tag.to_lowercase() == "<cfargument " || tag.to_lowercase() == "<cfargument>" {
+        // Check if we hit a <cfargument. The tag name must be followed by a
+        // word boundary — ANY whitespace (space, newline, tab) or `>` — not just
+        // a literal space: MockBox-style multi-line `<cfargument\n  name="..."/>`
+        // declarations put a newline after the name, and a space-only check
+        // silently dropped them from the generated parameter list (GitHub #177).
+        if i + 11 <= len && chars[i] == '<' {
+            let tag: String = chars[i..i + 11].iter().collect();
+            let boundary = chars
+                .get(i + 11)
+                .is_some_and(|c| c.is_whitespace() || *c == '>' || *c == '/');
+            if tag.eq_ignore_ascii_case("<cfargument") && boundary {
                 // Parse the tag's attributes
                 let name_start = i + 1; // skip <
                 let mut j = name_start;

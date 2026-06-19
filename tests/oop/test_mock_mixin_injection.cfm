@@ -33,5 +33,13 @@ host = new oop.MockMixinTarget();
 host.runInclude( "mock_mixin_generated.cfm" );
 assert("injected method is callable (public this)", host.injected(), "INJECTED-RESULT");
 
+// --- 4) tag-based <cffunction> parsing (TestBox 5.4.0 / MockBox) -----------
+tagcfc = new oop.TagArgCFC();
+// (a) a multi-line <cfargument> must bind as the first positional parameter.
+assert("multi-line cfargument binds positionally", tagcfc.cm( "Plain" ), "Plain");
+// (b) a <cffunction> with a dotted component-path returntype must not be
+//     dropped from the component (this was silently swallowed at parse time).
+assert("dotted-returntype method is callable", tagcfc.getHelper().tag(), "HELPER");
+
 suiteEnd();
 </cfscript>
