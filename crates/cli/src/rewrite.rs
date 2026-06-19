@@ -483,6 +483,12 @@ pub fn apply_rewrite_rules(
                         new_path = new_path.replace(&format!("${}", i), m.as_str());
                     }
                 }
+                // Tuckey built-in variable: `%{context-path}` is the servlet
+                // context path. A root-deployed CFML app (the only deployment
+                // model here) has an empty context path, so the token resolves
+                // to "". Without this, Preside's `%{context-path}/index.cfm`
+                // rewrite produced a literal, unservable path.
+                new_path = new_path.replace("%{context-path}", "");
 
                 last_result = Some(RewriteResult {
                     new_path: new_path.clone(),

@@ -5811,6 +5811,20 @@ impl CfmlVirtualMachine {
                                 || s.contains_key("__java_shim")
                     );
 
+                    // A `super.method(...)` call (receiver is the `__is_super`
+                    // dispatch struct) operates on the existing `this` in place —
+                    // there is no separate receiver variable to reassign from the
+                    // return value. The result/this write-back below must be
+                    // skipped, or a parent method whose name merely starts with
+                    // "set" (e.g. `super.setupApplication()`, classified as a
+                    // setter by is_mutating_method) would overwrite the caller's
+                    // `this` with its return value — destroying the component
+                    // struct mid-construction (no methods/__name survive).
+                    let is_super_call = matches!(
+                        &object,
+                        CfmlValue::Struct(ref s) if s.contains_key("__is_super")
+                    );
+
                     // Clear method-writeback state before the call. Both fields must
                     // be cleared — leaving `method_variables_writeback` set from an
                     // earlier method call leaks the previous receiver's variables
@@ -5971,6 +5985,8 @@ impl CfmlVirtualMachine {
 
                     // Write-back: emulate CFML pass-by-reference semantics for mutating methods.
                     // The compiler encodes a path vec: ["var"], ["var", "prop"], ["a", "b", "c"], etc.
+                    // Skipped for super.method() — see is_super_call.
+                    let write_back = if is_super_call { &None } else { write_back };
                     if let Some(ref path) = write_back {
                         if path.len() == 1 {
                             // Direct variable write-back: var.method(args)
@@ -17369,6 +17385,15 @@ impl CfmlVirtualMachine {
             }
             Err(e) if e.message == "__cflocation_redirect" => {
                 return Ok(CfmlValue::Null);
+            }
+            // An uncaught exception in onRequestStart aborts the request and is
+            // routed to onError (Lucee/ACF parity). Previously this fell through
+            // to onRequest / the target page, silently swallowing the error and
+            // emitting an empty 200 — which masked the real failure for any
+            // framework (Preside, ColdBox) whose request bootstrap lives in
+            // onRequestStart.
+            Err(e) => {
+                return self.run_on_error(&mut template, e, "onRequestStart");
             }
             _ => {}
         }
