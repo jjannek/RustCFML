@@ -94,6 +94,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("writeOutput".into(), write_output);
     f.insert("writeDump".into(), write_dump);
     f.insert("dump".into(), write_dump);
+    // `cfdump(var=…)` — the cf-prefixed script-call form of <cfdump>/writeDump.
+    f.insert("cfdump".into(), write_dump);
 
     // ---- String functions ----
     f.insert("len".into(), fn_len);

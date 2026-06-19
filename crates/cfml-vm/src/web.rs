@@ -126,6 +126,7 @@ pub fn build_web_scopes(
 
     let mut content_type = String::new();
     let mut server_name = "127.0.0.1".to_string();
+    let mut host_header = String::new();
     // The CLI server is HTTP-only and sits behind a TLS-terminating proxy, so
     // the only honest "is this request secure" signal is `X-Forwarded-Proto`.
     let mut is_https = false;
@@ -137,6 +138,7 @@ pub fn build_web_scopes(
         }
         if lower == "host" {
             server_name = value.split(':').next().unwrap_or(value).to_string();
+            host_header = value.clone();
         }
         if lower == "x-forwarded-proto" && value.eq_ignore_ascii_case("https") {
             is_https = true;
@@ -144,13 +146,37 @@ pub fn build_web_scopes(
         let cgi_key = format!("http_{}", lower.replace('-', "_"));
         cgi.insert(cgi_key, CfmlValue::string(value.clone()));
     }
-    cgi.insert("server_name".to_string(), CfmlValue::string(server_name));
+    cgi.insert("server_name".to_string(), CfmlValue::string(server_name.clone()));
     // Mirror the secure-transport view into the standard CGI variable
     // (`on`/`off`), matching CFML convention. Previously absent entirely.
     cgi.insert(
         "https".to_string(),
         CfmlValue::string(if is_https { "on" } else { "off" }.to_string()),
     );
+
+    // Standard CGI variables that frameworks (Preside, ColdBox, FW/1) rely on.
+    // `server_protocol`/`server_port_secure` were absent entirely; `request_url`
+    // (the full URL of the current request) is what Preside's Bootstrap._getUrl
+    // falls back to, so its absence aborted app bootstrap with an "undefined"
+    // error on every request.
+    let scheme = if is_https { "https" } else { "http" };
+    cgi.insert(
+        "server_protocol".to_string(),
+        CfmlValue::string("HTTP/1.1".to_string()),
+    );
+    cgi.insert(
+        "server_port_secure".to_string(),
+        CfmlValue::string(if is_https { "1" } else { "0" }.to_string()),
+    );
+    let authority = if !host_header.is_empty() {
+        host_header.clone()
+    } else if port == 80 || port == 443 {
+        server_name.clone()
+    } else {
+        format!("{}:{}", server_name, port)
+    };
+    let request_url = format!("{}://{}{}", scheme, authority, script_name);
+    cgi.insert("request_url".to_string(), CfmlValue::string(request_url));
 
     globals.insert("cgi".to_string(), CfmlValue::strukt(cgi));
 

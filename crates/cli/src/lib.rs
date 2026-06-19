@@ -1432,7 +1432,7 @@ async fn handle_request(
             header_map.insert(name.clone(), value.clone());
         }
 
-        if let Some(result) = rewrite::apply_rewrite_rules(&state.rewrite_rules, &path, &method, state.port, &header_map) {
+        if let Some(result) = rewrite::apply_rewrite_rules(&state.rewrite_rules, &path, &method, state.port, &header_map, original_qs, &remote_addr) {
             match result.rewrite_type {
                 rewrite::RewriteType::PermanentRedirect => {
                     log::debug!("  -> 301 redirect to {}", result.new_path);

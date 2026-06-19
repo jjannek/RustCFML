@@ -31,6 +31,16 @@ enum ConditionType {
     Method,
     Port,
     Header(String),
+    /// The raw request query string (without the leading `?`).
+    QueryString,
+    /// The client's remote IP address.
+    RemoteAddr,
+    /// A condition type we don't understand. A rule carrying one of these can
+    /// never be safely evaluated, so it must NOT match — otherwise dropping the
+    /// condition would silently make the rule fire on every request (this is
+    /// exactly what produced an infinite 301 loop with Preside's
+    /// query-string/remote-addr guard rules).
+    Unsupported,
 }
 
 #[derive(Debug, Clone)]
@@ -272,10 +282,9 @@ fn parse_conditions(block: &str) -> Vec<RewriteCondition> {
                 let header_name = get_xml_attr(tag, "name").unwrap_or_default();
                 ConditionType::Header(header_name)
             }
-            _ => {
-                search_from = tag_end + 1;
-                continue;
-            }
+            Some("query-string") => ConditionType::QueryString,
+            Some("remote-addr") => ConditionType::RemoteAddr,
+            _ => ConditionType::Unsupported,
         };
 
         let operator = match get_xml_attr(tag, "operator").as_deref() {
@@ -355,6 +364,8 @@ fn check_condition(
     method: &str,
     port: u16,
     headers: &HashMap<String, String>,
+    query_string: &str,
+    remote_addr: &str,
 ) -> bool {
     let actual = match &cond.cond_type {
         ConditionType::Method => method.to_string(),
@@ -367,6 +378,30 @@ fn check_condition(
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         }
+        // tuckey treats these condition values as regex patterns matched
+        // against the actual value: `equal` => the pattern is found,
+        // `notequal` => it is not. This is NOT plain string equality.
+        ConditionType::QueryString | ConditionType::RemoteAddr => {
+            let actual = if matches!(cond.cond_type, ConditionType::QueryString) {
+                query_string
+            } else {
+                remote_addr
+            };
+            let pattern = if cond.case_sensitive {
+                Regex::new(&cond.value)
+            } else {
+                Regex::new(&format!("(?i){}", cond.value))
+            };
+            let found = pattern.map(|re| re.is_match(actual)).unwrap_or(false);
+            return match cond.operator {
+                ConditionOp::NotEqual => !found,
+                // equal (and any other operator we don't model for regex
+                // conditions) means "the pattern matched".
+                _ => found,
+            };
+        }
+        // Never match — see ConditionType::Unsupported.
+        ConditionType::Unsupported => return false,
     };
 
     let (actual_cmp, value_cmp) = if cond.case_sensitive {
@@ -396,6 +431,8 @@ pub fn apply_rewrite_rules(
     method: &str,
     port: u16,
     headers: &HashMap<String, String>,
+    query_string: &str,
+    remote_addr: &str,
 ) -> Option<RewriteResult> {
     let mut current_path = url_path.to_string();
     let mut last_result: Option<RewriteResult> = None;
@@ -409,7 +446,7 @@ pub fn apply_rewrite_rules(
         let conditions_pass = rule
             .conditions
             .iter()
-            .all(|c| check_condition(c, method, port, headers));
+            .all(|c| check_condition(c, method, port, headers, query_string, remote_addr));
         if !conditions_pass {
             continue;
         }

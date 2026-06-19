@@ -764,6 +764,15 @@ pub struct CfmlVirtualMachine {
     /// After a component method executes, holds the modified `this` for write-back
     /// to the caller's object variable. Set by execute_function_with_args.
     method_this_writeback: Option<CfmlValue>,
+    /// Stack of `super` receivers active during a component pseudo-constructor
+    /// (`__cfc_body__`) body. CFML exposes `super` throughout the component body
+    /// (e.g. Preside's Application.cfc calls `super.setupApplication(...)` at body
+    /// level), but at that point the instance's `this.__super` isn't assembled yet,
+    /// so the normal `LoadSuper` lookup finds nothing. The component-resolution
+    /// code pushes the parent's `__is_super` method struct here before running the
+    /// body and pops it after; `LoadSuper` falls back to the top entry. A stack
+    /// (not an Option) keeps nested instantiation correct.
+    pseudo_ctor_super: Vec<CfmlValue>,
     /// After a component method executes, holds modified variables scope entries for
     /// write-back to the component's __variables. Enables `variables.x = y` to persist.
     method_variables_writeback: Option<CfmlStruct>,
@@ -1243,6 +1252,7 @@ impl CfmlVirtualMachine {
             current_line: 0,
             current_column: 0,
             method_this_writeback: None,
+            pseudo_ctor_super: Vec::new(),
             method_variables_writeback: None,
             closure_parent_writeback: None,
             request_scope: CfmlStruct::empty(),
@@ -4308,7 +4318,8 @@ impl CfmlVirtualMachine {
                         // through the CallFunction op and leaves this None.
                         if matches!(&func_ref, CfmlValue::Function(f)
                             if f.name.eq_ignore_ascii_case("writedump")
-                                || f.name.eq_ignore_ascii_case("dump"))
+                                || f.name.eq_ignore_ascii_case("dump")
+                                || f.name.eq_ignore_ascii_case("cfdump"))
                         {
                             let named: Vec<(String, CfmlValue)> = expanded_names
                                 .iter()
@@ -5138,6 +5149,16 @@ impl CfmlVirtualMachine {
                             }
                         }
                     }
+                    // Fallback for a `super.x()` reference inside a component
+                    // pseudo-constructor, where `this.__super` isn't assembled
+                    // yet (the instance is still being built). See
+                    // `pseudo_ctor_super`.
+                    if !pushed {
+                        if let Some(sup) = self.pseudo_ctor_super.last() {
+                            stack.push(sup.clone());
+                            pushed = true;
+                        }
+                    }
                     if !pushed {
                         stack.push(CfmlValue::Null);
                     }
@@ -5670,9 +5691,26 @@ impl CfmlVirtualMachine {
                     self.try_stack.pop();
                 }
                 BytecodeOp::Throw => {
-                    let error_val = stack
+                    let raw = stack
                         .pop()
                         .unwrap_or(CfmlValue::string("Unknown error".to_string()));
+                    // The bare statement form `throw "msg";` (and `throw expr;`)
+                    // pushes a simple value. Wrap any non-struct value into a
+                    // proper exception struct so `cfcatch.message`/`.type` resolve
+                    // — mirroring the throw(...) function-call form. A struct value
+                    // (re-throw of a caught exception) is preserved verbatim.
+                    let error_val = match raw {
+                        CfmlValue::Struct(_) => raw,
+                        other => {
+                            let mut m = ValueMap::default();
+                            m.insert("message".to_string(), CfmlValue::string(other.as_string()));
+                            m.insert("type".to_string(), CfmlValue::string("Application".to_string()));
+                            m.insert("detail".to_string(), CfmlValue::string(String::new()));
+                            m.insert("tagcontext".to_string(), self.build_tag_context());
+                            Self::add_root_cause(&mut m);
+                            CfmlValue::strukt(m)
+                        }
+                    };
                     self.last_exception = Some(error_val.clone());
                     if let Some(handler) = self.try_stack.pop() {
                         // Unwind stack
@@ -6888,7 +6926,7 @@ impl CfmlVirtualMachine {
                 }
                 return Ok(CfmlValue::Null);
             }
-            if name_lower == "writedump" || name_lower == "dump" {
+            if name_lower == "writedump" || name_lower == "dump" || name_lower == "cfdump" {
                 let named = self.pending_dump_named.take();
                 // Resolve the value to dump and the options. Named args (when
                 // present) take precedence; otherwise fall back to positional
@@ -12066,6 +12104,7 @@ impl CfmlVirtualMachine {
             "cfdirectory"
                 | "__cfdirectory"
                 | "cffile"
+                | "cfzip"
                 | "cfhttp"
                 | "cfmail"
                 | "__cfmail"
@@ -14601,10 +14640,33 @@ impl CfmlVirtualMachine {
                     }
                     _ => None,
                 });
+            // Also build the `super` object so `super.method(...)` calls inside
+            // the pseudo-constructor resolve to the parent's methods. CFML makes
+            // `super` available throughout the component body (e.g. Preside's
+            // Application.cfc calls `super.setupApplication(...)` at body level).
+            // It is a `__is_super`-marked struct of the parent's public+private
+            // methods; super-dispatch binds `this` from the body's `this` (which
+            // is live and whose writes persist onto the instance), so a parent
+            // method's `this.X = ...` writes land on the child being built.
+            // Injecting it under the dedicated `super` key (NOT as plain unscoped
+            // values) keeps it reachable only via `super.x()` dispatch, avoiding
+            // the unqualified-call recursion the note above warns about.
+            let mut super_value: Option<CfmlValue> = None;
             let injected_scope: ValueMap = if let Some(ref pname) = parent_name {
                 if let Some(parent_template) = self.resolve_component_template(pname, locals) {
                     let resolved_parent = self.resolve_inheritance(parent_template, locals);
                     if let CfmlValue::Struct(ref ps) = resolved_parent {
+                        let mut super_methods = ValueMap::default();
+                        for (k, v) in ps.iter() {
+                            if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+                                super_methods.insert(k.clone(), v.clone());
+                            }
+                        }
+                        if !super_methods.is_empty() {
+                            super_methods
+                                .insert("__is_super".to_string(), CfmlValue::Bool(true));
+                            super_value = Some(CfmlValue::strukt(super_methods));
+                        }
                         if let Some(CfmlValue::Struct(parent_vars)) = ps.get("__variables") {
                             parent_vars.snapshot()
                         } else {
@@ -14699,7 +14761,16 @@ impl CfmlVirtualMachine {
             // (prevents globals leaking into `variables` via LoadLocal).
             let mut cfc_body = (*cfc_func).clone();
             cfc_body.name = "__cfc_body__".to_string();
+            // Expose `super` to the body so `super.method(...)` calls in the
+            // pseudo-constructor resolve to the parent (see pseudo_ctor_super).
+            let pushed_super = super_value.is_some();
+            if let Some(sup) = super_value {
+                self.pseudo_ctor_super.push(sup);
+            }
             let _ = self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
+            if pushed_super {
+                self.pseudo_ctor_super.pop();
+            }
             self.source_file = old_source_file;
             // Capture component body variables
             let component_variables = self.captured_locals.take().unwrap_or_default();
@@ -14834,7 +14905,11 @@ impl CfmlVirtualMachine {
                 // methods resolve via __variables, not closures.
                 for (k, v) in &component_variables {
                     let k_lower = k.to_lowercase();
-                    if k_lower == "this" || k_lower == "arguments" || k.starts_with("__") {
+                    if k_lower == "this"
+                        || k_lower == "arguments"
+                        || k_lower == "super"
+                        || k.starts_with("__")
+                    {
                         continue;
                     }
                     if let CfmlValue::Function(ref f) = v {
@@ -16283,9 +16358,47 @@ impl CfmlVirtualMachine {
         // (prevents globals leaking into `variables` via LoadLocal)
         let mut cfc_body = (*cfc_func).clone();
         cfc_body.name = "__cfc_body__".to_string();
+
+        // Application.cfc commonly extends a framework Bootstrap and calls
+        // `super.setupApplication(...)` at body level (Preside, FW/1, ColdBox).
+        // Resolve the parent and expose it as `super` for the duration of the
+        // pseudo-constructor (see pseudo_ctor_super). The instance's own
+        // `this.__super` isn't assembled until inheritance merges later, so the
+        // normal LoadSuper lookup would otherwise find nothing here.
+        let parent_name: Option<String> =
+            cfc_func.instructions.windows(2).find_map(|w| match w {
+                [BytecodeOp::String(s1), BytecodeOp::String(s2)] if s1 == "__extends" => {
+                    Some(s2.clone())
+                }
+                _ => None,
+            });
         let empty_locals = ValueMap::default();
+        let mut pushed_super = false;
+        if let Some(ref pname) = parent_name {
+            if let Some(parent_template) =
+                self.resolve_component_template(pname, &empty_locals)
+            {
+                let resolved_parent = self.resolve_inheritance(parent_template, &empty_locals);
+                if let CfmlValue::Struct(ref ps) = resolved_parent {
+                    let mut super_methods = ValueMap::default();
+                    for (k, v) in ps.iter() {
+                        if matches!(v, CfmlValue::Function(_)) && !k.starts_with("__") {
+                            super_methods.insert(k.clone(), v.clone());
+                        }
+                    }
+                    if !super_methods.is_empty() {
+                        super_methods.insert("__is_super".to_string(), CfmlValue::Bool(true));
+                        self.pseudo_ctor_super.push(CfmlValue::strukt(super_methods));
+                        pushed_super = true;
+                    }
+                }
+            }
+        }
         let exec_result =
             self.execute_function_with_args(&cfc_body, Vec::new(), Some(&empty_locals));
+        if pushed_super {
+            self.pseudo_ctor_super.pop();
+        }
 
         // Capture component body locals as the variables scope
         let component_variables = self.captured_locals.take().unwrap_or_default();

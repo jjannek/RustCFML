@@ -131,5 +131,70 @@ if (serverPort == "" || serverPort == "0") {
         && findNoCase("redirect-target", locResult.responseheader["Location"]) > 0);
 }
 
+// ============================================================
+// throw — keyword statement, attribute statement, and call forms.
+// All forms must populate cfcatch.message/.type (Lucee/ACF/BoxLang parity).
+// ============================================================
+
+// Bare keyword form: message is the string, type defaults to Application.
+try {
+    throw "bare message";
+    assertTrue("throw bare should not reach here", false);
+} catch (any e) {
+    assert("throw bare string message", e.message, "bare message");
+    assert("throw bare string default type", e.type, "Application");
+}
+
+// NB: the bare attribute statement form `throw message=... type=...;` is NOT
+// portable — Lucee/ACF/BoxLang reject it (throw is a reserved keyword). Use the
+// parenthesized call form below instead.
+
+// Parenthesized call form (named): regression guard + portable attribute form.
+try {
+    throw(message="call msg", type="CallType");
+    assertTrue("throw() should not reach here", false);
+} catch (any e) {
+    assert("throw() named message", e.message, "call msg");
+    assert("throw() named type", e.type, "CallType");
+}
+
+// ============================================================
+// cfparam — statement form, cf-prefixed call form, and type validation
+// must stay in sync.
+// ============================================================
+
+param name="pStmt" default="stmt-default";
+assert("param statement default applied", pStmt, "stmt-default");
+
+cfparam(name="pCall", default="call-default");
+assert("cfparam() call default applied", pCall, "call-default");
+
+pExisting = "kept";
+cfparam(name="pExisting", default="ignored");
+assert("cfparam() preserves existing value", pExisting, "kept");
+
+cfparam(name="pNum", default="42", type="numeric");
+assert("cfparam() typed numeric default", pNum, "42");
+
+threw = false;
+try {
+    cfparam(name="pBad", default="notnum", type="numeric");
+} catch (any e) {
+    threw = true;
+}
+assertTrue("cfparam() type validation rejects bad default", threw);
+
+// ============================================================
+// dump — both the bare statement (`dump var=...`, where `var` is also a
+// keyword) and the cf-prefixed call form must parse and run without error.
+// Output is captured/discarded; we only assert no exception is thrown.
+// ============================================================
+
+savecontent variable="__dumpSink" {
+    dump var="dump statement form";
+    cfdump(var="dump call form");
+}
+assertTrue("dump statement + cfdump() call forms run", len(__dumpSink) >= 0);
+
 suiteEnd();
 </cfscript>

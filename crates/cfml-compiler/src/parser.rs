@@ -234,49 +234,8 @@ impl Parser {
 
                 let arguments = if is_named {
                     // Parse named args like throw(message="oops", type="custom") or throw(message : "oops", type : "custom")
-                    // Convert to positional: throw("oops", "custom", "", "")
-                    let mut named: Vec<(String, Expression)> = Vec::new();
-                    loop {
-                        let key = self.extract_identifier()?.to_lowercase();
-                        // Consume either = or :
-                        if !self.match_token(&Token::Equal) {
-                            self.consume(&Token::Colon)?;
-                        }
-                        let value = self.parse_expression()?;
-                        named.push((key, value));
-                        if !self.match_token(&Token::Comma) {
-                            break;
-                        }
-                        // Check if next arg is also named
-                        if !matches!(self.peek(0), Token::Identifier(_)) || !(matches!(self.peek(1), Token::Equal | Token::Colon)) {
-                            break;
-                        }
-                    }
-                    // Map to positional: message, type, detail, errorcode,
-                    // extendedinfo, object. `extendedinfo` and `object` were
-                    // previously dropped here — that silently discarded the
-                    // re-throw idiom `throw(object=caughtException)` (CF/Lucee/
-                    // BoxLang `cfthrow object=`) and any `extendedInfo` passed by
-                    // the throw(...) call form. Wheels' `Throw(object=...)` and
-                    // `$throwErrorOrShow404Page(... extendedInfo=...)` both relied
-                    // on these (GitHub issue #158).
-                    let get_arg = |name: &str| -> Expression {
-                        named.iter()
-                            .find(|(k, _)| k == name)
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or(Expression::Literal(Literal {
-                                value: LiteralValue::String(String::new()),
-                                location: stmt_loc,
-                            }))
-                    };
-                    vec![
-                        get_arg("message"),
-                        get_arg("type"),
-                        get_arg("detail"),
-                        get_arg("errorcode"),
-                        get_arg("extendedinfo"),
-                        get_arg("object"),
-                    ]
+                    let named = self.parse_throw_named_attrs(true)?;
+                    self.throw_named_to_positional(named, stmt_loc)
                 } else {
                     self.parse_arguments()?
                 };
@@ -284,20 +243,17 @@ impl Parser {
                 self.consume(&Token::RParen)?;
                 self.match_token(&Token::Semicolon);
 
-                let throw_ident = Expression::Identifier(Identifier {
-                    name: "throw".to_string(),
-                    location: stmt_loc,
-                });
-                let call_expr = Expression::FunctionCall(Box::new(FunctionCall {
-                    name: Box::new(throw_ident),
-                    arguments,
-                    location: stmt_loc,
-                }));
-                return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
-                    expr: call_expr,
-                    location: stmt_loc,
-                })));
+                return Ok(self.build_throw_call(arguments, stmt_loc));
             }
+
+            // NB: the bare attribute statement form `throw message="…" type="…";`
+            // is deliberately NOT supported — Lucee/ACF/BoxLang all reject it
+            // ("throw" is a reserved keyword that cannot take the tag "migration"
+            // syntax; see docs.lucee.org/recipes/tag-syntax.html). The portable
+            // forms are `throw(message=…)` / `cfthrow(message=…)` (handled above)
+            // and the bare expression form `throw "msg";` / `throw structVar;`
+            // (handled below — the VM wraps a non-struct value into a proper
+            // cfcatch struct so `.message`/`.type` resolve).
             return Ok(CfmlNode::Statement(Statement::Throw(self.parse_throw()?)));
         }
 
@@ -387,7 +343,21 @@ impl Parser {
         // `param` as a for-in loop var with `param['default'] = ...` in the body.
         if matches!(self.peek(0), Token::Param) && self.is_identifier_like_at(1) {
             self.advance(); // consume `param`
-            return self.parse_param_statement(stmt_loc);
+            return self.parse_param_statement(stmt_loc, false);
+        }
+
+        // `cfparam(name="x", default="y", type="…")` — the cf-prefixed function
+        // call form of <cfparam>/`param name=…`. Lowers through the identical
+        // param machinery (default-assign + type validation) so all three forms
+        // stay in sync. Only the unambiguous `cf`-prefixed name is matched here;
+        // bare `param(` stays an ordinary identifier (Wheels uses `param` as a
+        // variable name).
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.eq_ignore_ascii_case("cfparam"))
+            && matches!(self.peek(1), Token::LParen)
+        {
+            self.advance(); // consume `cfparam`
+            self.consume(&Token::LParen)?;
+            return self.parse_param_statement(stmt_loc, true);
         }
 
         // cfscript lock block: lock name="x" type="exclusive" timeout="5" { body }
@@ -735,52 +705,110 @@ impl Parser {
         //   (the VM intercept binds the result query to the `name` variable via
         //    pending_result_writeback, exactly like the cfdbinfo(...)/<cfdbinfo>
         //    forms — issue #172).
+        // Statement ("migration") form of tags in cfscript — `tag attr="v" …;`.
+        // Recognized for any supported tag with OR without the `cf` prefix, and
+        // only when the tag keyword is immediately followed by `attr=` so it can
+        // never shadow a normal expression or assignment. All forms lower to the
+        // SAME call the function form `cfTag(attr=…)` produces, so both share one
+        // tested code path (struct-bundling + result write-back) in the VM —
+        // this is what keeps the two syntaxes from drifting out of sync.
         {
-            let tag_fn = if let Token::Identifier(ref s) = self.peek(0) {
-                match s.to_lowercase().as_str() {
-                    "content" => Some("__cfcontent"),
-                    "header" => Some("__cfheader"),
-                    "location" => Some("__cflocation"),
-                    "setting" => Some("__cfsetting"),
-                    "cookie" => Some("__cfcookie"),
-                    "log" => Some("__cflog"),
-                    "dbinfo" | "cfdbinfo" => Some("cfdbinfo"),
+            // How each tag lowers:
+            //   StructArg(fn) → fn({ attrs })          (VM intercept takes one struct)
+            //   NamedCall(fn) → fn(attr=…, …)          (flows through is_tag_call_builtin)
+            //   Dump          → writeDump(attr=…, …)
+            enum TagStmt {
+                StructArg(&'static str),
+                NamedCall(&'static str),
+                Dump,
+            }
+            let strategy = if let Token::Identifier(ref s) = self.peek(0) {
+                let lower = s.to_lowercase();
+                // Accept the tag name with or without the `cf` prefix.
+                let bare = lower.strip_prefix("cf").unwrap_or(lower.as_str());
+                match bare {
+                    "content" => Some(TagStmt::StructArg("__cfcontent")),
+                    "header" => Some(TagStmt::StructArg("__cfheader")),
+                    "location" => Some(TagStmt::StructArg("__cflocation")),
+                    "setting" => Some(TagStmt::StructArg("__cfsetting")),
+                    "cookie" => Some(TagStmt::StructArg("__cfcookie")),
+                    "log" => Some(TagStmt::StructArg("__cflog")),
+                    "htmlhead" => Some(TagStmt::StructArg("__cfhtmlhead")),
+                    "htmlbody" => Some(TagStmt::StructArg("__cfhtmlbody")),
+                    "dbinfo" => Some(TagStmt::StructArg("cfdbinfo")),
+                    "directory" => Some(TagStmt::NamedCall("cfdirectory")),
+                    "file" => Some(TagStmt::NamedCall("cffile")),
+                    "zip" => Some(TagStmt::NamedCall("cfzip")),
+                    "dump" => Some(TagStmt::Dump),
                     _ => None,
                 }
             } else {
                 None
             };
-            if let Some(func_name) = tag_fn {
+            if let Some(strategy) = strategy {
                 if self.is_identifier_like_at(1) && matches!(self.peek(2), Token::Equal) {
-                    self.advance(); // consume keyword
-                    let mut struct_pairs: Vec<(Expression, Expression)> = Vec::new();
+                    self.advance(); // consume the tag keyword
+                    let mut attrs: Vec<(String, Expression)> = Vec::new();
                     while !self.check(&Token::Semicolon) && !self.is_at_end() {
                         if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
-                            let attr_name = self.extract_identifier()?;
+                            let attr_name = self.extract_identifier()?.to_lowercase();
                             self.advance(); // consume =
                             let attr_value = self.parse_expression()?;
-                            struct_pairs.push((
-                                Expression::Literal(Literal {
-                                    value: LiteralValue::String(attr_name.to_lowercase()),
-                                    location: stmt_loc.clone(),
-                                }),
-                                attr_value,
-                            ));
+                            attrs.push((attr_name, attr_value));
                         } else {
                             break;
                         }
                     }
                     self.match_token(&Token::Semicolon);
+
+                    let (func_name, arguments) = match strategy {
+                        TagStmt::StructArg(func) => {
+                            let pairs = attrs
+                                .into_iter()
+                                .map(|(k, v)| {
+                                    (
+                                        Expression::Literal(Literal {
+                                            value: LiteralValue::String(k),
+                                            location: stmt_loc.clone(),
+                                        }),
+                                        v,
+                                    )
+                                })
+                                .collect();
+                            (
+                                func,
+                                vec![Expression::Struct(Struct {
+                                    pairs,
+                                    ordered: false,
+                                    location: stmt_loc.clone(),
+                                })],
+                            )
+                        }
+                        TagStmt::NamedCall(_) | TagStmt::Dump => {
+                            let func = match strategy {
+                                TagStmt::NamedCall(f) => f,
+                                _ => "writeDump",
+                            };
+                            let args = attrs
+                                .into_iter()
+                                .map(|(k, v)| {
+                                    Expression::NamedArgument(Box::new(NamedArgument {
+                                        name: k,
+                                        value: Box::new(v),
+                                        location: stmt_loc.clone(),
+                                    }))
+                                })
+                                .collect();
+                            (func, args)
+                        }
+                    };
+
                     let call = Expression::FunctionCall(Box::new(FunctionCall {
                         name: Box::new(Expression::Identifier(Identifier {
                             name: func_name.to_string(),
                             location: stmt_loc.clone(),
                         })),
-                        arguments: vec![Expression::Struct(Struct {
-                            pairs: struct_pairs,
-                            ordered: false,
-                            location: stmt_loc.clone(),
-                        })],
+                        arguments,
                         location: stmt_loc.clone(),
                     }));
                     return Ok(CfmlNode::Statement(Statement::Expression(ExpressionStatement {
@@ -1907,7 +1935,7 @@ impl Parser {
     ///   param varName = defaultValue;
     ///   param a.b.c = defaultValue;   (dotted lvalue shorthand)
     /// Converts to: if (!isDefined("varName")) varName = defaultValue;
-    fn parse_param_statement(&mut self, loc: SourceLocation) -> Result<CfmlNode, ParseError> {
+    fn parse_param_statement(&mut self, loc: SourceLocation, in_parens: bool) -> Result<CfmlNode, ParseError> {
         // Check if it's the named-attribute form: param name="..." default="..."
         let is_named_form = matches!(self.peek(0), Token::Identifier(ref s) if s.to_lowercase() == "name")
             && matches!(self.peek(1), Token::Equal);
@@ -1944,6 +1972,14 @@ impl Parser {
                     "pattern" => pattern_expr = Some(attr_value),
                     _ => {}
                 }
+                // Paren call form `cfparam(name=…, default=…)` separates
+                // attributes with commas; the statement form does not.
+                if in_parens {
+                    self.match_token(&Token::Comma);
+                }
+            }
+            if in_parens {
+                self.consume(&Token::RParen)?;
             }
             self.match_token(&Token::Semicolon);
 
@@ -2941,6 +2977,81 @@ impl Parser {
         });
 
         Ok(CfmlNode::Statement(output))
+    }
+
+    /// Parse `key=value` / `key:value` pairs for a `throw` call. When
+    /// `comma_separated` is true (paren form) pairs are separated by commas;
+    /// otherwise (bare statement form) they are whitespace-separated and the
+    /// list ends at the first token that isn't `identifier =`.
+    fn parse_throw_named_attrs(
+        &mut self,
+        comma_separated: bool,
+    ) -> Result<Vec<(String, Expression)>, ParseError> {
+        let mut named: Vec<(String, Expression)> = Vec::new();
+        loop {
+            let key = self.extract_identifier()?.to_lowercase();
+            if !self.match_token(&Token::Equal) {
+                self.consume(&Token::Colon)?;
+            }
+            let value = self.parse_expression()?;
+            named.push((key, value));
+            if comma_separated && !self.match_token(&Token::Comma) {
+                break;
+            }
+            // Continue only while another `identifier =/:` pair follows.
+            if !(matches!(self.peek(0), Token::Identifier(_))
+                && matches!(self.peek(1), Token::Equal | Token::Colon))
+            {
+                break;
+            }
+        }
+        Ok(named)
+    }
+
+    /// Map named `throw` attributes to the fixed positional order the VM's
+    /// throw intercept expects: message, type, detail, errorcode, extendedinfo,
+    /// object. Missing attributes become empty strings. (`extendedinfo`/`object`
+    /// matter for the re-throw idiom `throw(object=e)` — GitHub issue #158.)
+    fn throw_named_to_positional(
+        &self,
+        named: Vec<(String, Expression)>,
+        loc: SourceLocation,
+    ) -> Vec<Expression> {
+        let get_arg = |name: &str| -> Expression {
+            named
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Expression::Literal(Literal {
+                    value: LiteralValue::String(String::new()),
+                    location: loc,
+                }))
+        };
+        vec![
+            get_arg("message"),
+            get_arg("type"),
+            get_arg("detail"),
+            get_arg("errorcode"),
+            get_arg("extendedinfo"),
+            get_arg("object"),
+        ]
+    }
+
+    /// Build a `throw(...)` function-call statement (VM-intercepted).
+    fn build_throw_call(&self, arguments: Vec<Expression>, loc: SourceLocation) -> CfmlNode {
+        let throw_ident = Expression::Identifier(Identifier {
+            name: "throw".to_string(),
+            location: loc,
+        });
+        let call_expr = Expression::FunctionCall(Box::new(FunctionCall {
+            name: Box::new(throw_ident),
+            arguments,
+            location: loc,
+        }));
+        CfmlNode::Statement(Statement::Expression(ExpressionStatement {
+            expr: call_expr,
+            location: loc,
+        }))
     }
 
     fn parse_throw(&mut self) -> Result<Throw, ParseError> {
