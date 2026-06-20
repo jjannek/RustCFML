@@ -246,14 +246,28 @@ impl Parser {
                 return Ok(self.build_throw_call(arguments, stmt_loc));
             }
 
-            // NB: the bare attribute statement form `throw message="…" type="…";`
-            // is deliberately NOT supported — Lucee/ACF/BoxLang all reject it
-            // ("throw" is a reserved keyword that cannot take the tag "migration"
-            // syntax; see docs.lucee.org/recipes/tag-syntax.html). The portable
-            // forms are `throw(message=…)` / `cfthrow(message=…)` (handled above)
-            // and the bare expression form `throw "msg";` / `throw structVar;`
-            // (handled below — the VM wraps a non-struct value into a proper
-            // cfcatch struct so `.message`/`.type` resolve).
+            // Single bare-attribute statement form `throw object=expr;` /
+            // `throw message="…";`. Lucee compiles the SINGLE-attribute tag
+            // statement (its `_singleAttrStatement` path) — Preside's
+            // `Bootstrap.onError` relies on `throw object=arguments.exception;`.
+            // (Lucee rejects the MULTI-attribute form `throw message=… type=…;`,
+            // but accepting it here is a harmless superset.) Gated on a known
+            // throw attribute name so a stray `throw x=…` isn't mis-routed.
+            let is_attr_form = matches!(self.peek(0), Token::Identifier(n)
+                if matches!(n.to_lowercase().as_str(),
+                    "message" | "type" | "detail" | "errorcode" | "extendedinfo" | "object"))
+                && matches!(self.peek(1), Token::Equal | Token::Colon);
+            if is_attr_form {
+                let named = self.parse_throw_named_attrs(false)?;
+                let arguments = self.throw_named_to_positional(named, stmt_loc);
+                self.match_token(&Token::Semicolon);
+                return Ok(self.build_throw_call(arguments, stmt_loc));
+            }
+
+            // Bare expression form `throw "msg";` / `throw structVar;` — the VM
+            // wraps a non-struct value into a proper cfcatch struct so
+            // `.message`/`.type` resolve. (`throw(message=…)` / `cfthrow(…)`
+            // are handled above.)
             return Ok(CfmlNode::Statement(Statement::Throw(self.parse_throw()?)));
         }
 
@@ -4043,7 +4057,7 @@ impl Parser {
             Token::Remote => "remote", Token::Package => "package",
             Token::True => "true", Token::False => "false", Token::Null => "null",
             Token::Contains => "contains", Token::NotKeyword => "not",
-            Token::AndKeyword => "and", Token::OrKeyword => "or",
+            Token::AndKeyword => "and", Token::OrKeyword => "or", Token::XorKeyword => "xor",
             Token::EqKeyword => "eq", Token::NeqKeyword => "neq",
             Token::GtKeyword => "gt", Token::GteKeyword => "gte",
             Token::LtKeyword => "lt", Token::LteKeyword => "lte",

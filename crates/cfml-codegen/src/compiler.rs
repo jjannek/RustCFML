@@ -96,6 +96,13 @@ pub struct CfmlCompiler {
     /// DefineFunction op skips the builtin-collision guard for methods. Lucee
     /// allows `obj.canonicalize()` etc.
     in_component_method: bool,
+    /// True while compiling an assignment that appears in VALUE position — i.e.
+    /// the RHS of an enclosing assignment (`a = b = c`), so the assignment must
+    /// leave its assigned value on the stack for the outer store to consume. A
+    /// statement-level assignment leaves it false: the consuming store ops emit
+    /// NO extra `Dup`, keeping the exact bytecode the JIT admission analyzer
+    /// accepts (a stray `Dup` in a hot setter disqualified the function).
+    need_assign_value: bool,
     /// Source file path this program is being compiled from, stamped onto every
     /// `BytecodeFunction` so app-scope functions carry a stable, serializable
     /// identity. `None` for in-memory/CLI direct compiles.
@@ -412,6 +419,7 @@ impl CfmlCompiler {
             function_depth: 0,
             current_fn_local_mode: None,
             in_component_method: false,
+            need_assign_value: false,
             source_file: None,
         }
     }
@@ -2303,7 +2311,14 @@ impl CfmlCompiler {
         }
     }
 
-    fn compile_function_decl(&mut self, func: &Function, instructions: &mut Vec<BytecodeOp>) {
+    /// Compile a function declaration, emitting `DefineFunction` + `StoreLocal`
+    /// so the function is bound in the current scope. Returns the function's
+    /// process-stable `global_id` so a caller (e.g. compile_component) can
+    /// re-emit `DefineFunction` to obtain a fresh reference WITHOUT a
+    /// `LoadLocal(name)` round-trip — essential when the method name is a
+    /// reserved scope word (`local`, `arguments`, …) where `LoadLocal` would
+    /// load the scope itself rather than the just-defined function.
+    fn compile_function_decl(&mut self, func: &Function, instructions: &mut Vec<BytecodeOp>) -> usize {
         // Compile the function body into a separate BytecodeFunction
         let mut func_instructions = Vec::new();
 
@@ -2379,6 +2394,7 @@ impl CfmlCompiler {
         // process-stable global_id, resolved by the VM through its registry.
         instructions.push(BytecodeOp::DefineFunction(global_id));
         instructions.push(BytecodeOp::StoreLocal(func.name.clone()));
+        global_id
     }
 
     fn compile_interface(&mut self, interface: &Interface, instructions: &mut Vec<BytecodeOp>) {
@@ -2516,16 +2532,22 @@ impl CfmlCompiler {
         // Include property defaults here
         if component.accessors || !component.properties.is_empty() {
             instructions.push(BytecodeOp::String("__variables".to_string()));
-            // Build __variables struct with property defaults
+            // Build __variables struct with property defaults. Only properties
+            // that declare a `default` are seeded here — an unset property is
+            // NOT a key in the variables scope until assigned (Lucee/ACF: a
+            // declared-but-unset `property name="x"` makes `structKeyExists(
+            // variables,"x")` false, and getters return null via the
+            // missing-key fallback). Seeding them as Null instead put a
+            // null-valued key into the scope, which then leaked through
+            // `variables.filter(...)`/structEach as an undefined closure arg —
+            // ColdBox RequestContext.getMemento crashed on it.
             let mut vars_count = 0;
             for prop in &component.properties {
-                instructions.push(BytecodeOp::String(prop.name.clone()));
                 if let Some(default) = &prop.default {
+                    instructions.push(BytecodeOp::String(prop.name.clone()));
                     self.compile_expression(default, instructions);
-                } else {
-                    instructions.push(BytecodeOp::Null);
+                    vars_count += 1;
                 }
-                vars_count += 1;
             }
             instructions.push(BytecodeOp::BuildStruct(vars_count));
             prop_count += 1;
@@ -2636,11 +2658,15 @@ impl CfmlCompiler {
         let prev_in_method = self.in_component_method;
         self.in_component_method = true;
         for func in &component.functions {
-            self.compile_function_decl(func, instructions);
-            // SetProperty needs: stack = [object, value]
-            // Load the component struct, then load the function ref
+            let gid = self.compile_function_decl(func, instructions);
+            // SetProperty needs: stack = [object, value]. Load the component
+            // struct, then push a fresh function reference via DefineFunction.
+            // Re-emitting DefineFunction (rather than LoadLocal(func.name))
+            // avoids loading the local *scope* when the method name is a
+            // reserved scope word like `local` (Preside Config.cfc environment
+            // methods: `function local(){}`).
             instructions.push(BytecodeOp::LoadLocal(component.name.clone()));
-            instructions.push(BytecodeOp::LoadLocal(func.name.clone()));
+            instructions.push(BytecodeOp::DefineFunction(gid));
             instructions.push(BytecodeOp::SetProperty(func.name.clone()));
             instructions.push(BytecodeOp::StoreLocal(component.name.clone()));
         }
@@ -2794,10 +2820,19 @@ impl CfmlCompiler {
             }
             Expression::BinaryOp(binop) => {
                 if binop.operator == BinaryOpType::Assign {
+                    // Does THIS assignment need to leave its value on the stack?
+                    // True only when it is in value position (the RHS of an
+                    // enclosing assignment). Captured-and-reset here so the
+                    // recursive RHS compile below starts from a clean slate.
+                    let want_value = self.need_assign_value;
+                    self.need_assign_value = false;
+
                     // Dynamic/quoted-string LHS: `"variables.x" = v` (literal) or
                     // `"#scope#.#prop#" = v` (interpolated). CFML treats a
                     // string-valued lvalue as a runtime scope path. Push
                     // [pathString, value] and resolve the target at runtime.
+                    // SetDynamicVar already pushes the value back, so this path
+                    // satisfies `want_value` either way.
                     if matches!(
                         &*binop.left,
                         Expression::Literal(Literal { value: LiteralValue::String(_), .. })
@@ -2809,7 +2844,14 @@ impl CfmlCompiler {
                         return;
                     }
 
+                    // A chained RHS (`b = c` in `a = b = c`) must itself leave a
+                    // value for this assignment's store to consume.
+                    self.need_assign_value = matches!(
+                        &*binop.right,
+                        Expression::BinaryOp(b) if b.operator == BinaryOpType::Assign
+                    );
                     self.compile_expression(&binop.right, instructions);
+                    self.need_assign_value = false;
 
                     // CFML null-assignment semantics: `x = voidFn()` (a Null RHS)
                     // must DELETE the target, not materialize a null-valued key.
@@ -2833,8 +2875,25 @@ impl CfmlCompiler {
                         }
                     }
 
+                    // This is assignment in EXPRESSION position (e.g. the RHS of
+                    // a chained assignment `a = b = expr`, or an assignment used
+                    // as a value). Such an expression must LEAVE its assigned
+                    // value on the stack for the enclosing context. The
+                    // value-consuming store ops below (StoreLocal/
+                    // StoreLocalProperty) would otherwise leave nothing, so the
+                    // outer assignment got no value (Preside Config.cfc:
+                    // `settings.x = application.x = expr` left `settings.x`
+                    // unset). A `Dup` before each consuming store keeps one copy.
+                    // (The SetDynamicVar paths above already push the value back,
+                    // so they are intentionally left untouched.)
                     match &*binop.left {
                         Expression::Identifier(ident) => {
+                            // `Dup` only when the value is needed (chained
+                            // assignment); a statement-level store leaves the
+                            // bytecode JIT-admissible (no stray Dup).
+                            if want_value {
+                                instructions.push(BytecodeOp::Dup);
+                            }
                             instructions.push(BytecodeOp::StoreLocal(ident.name.clone()));
                         }
                         Expression::MemberAccess(access) => {
@@ -2851,6 +2910,22 @@ impl CfmlCompiler {
                                 instructions.push(BytecodeOp::String(path));
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetDynamicVar);
+                            } else if want_value
+                                && matches!(&*access.object, Expression::Identifier(id) if is_reserved_scope_name(&id.name))
+                            {
+                                // Single-level reserved-scope member in VALUE
+                                // position (`x = application.y = v`): the normal
+                                // SetProperty+writeback path consumes the value
+                                // without leaving it. Route through SetDynamicVar
+                                // (`scope.member` path), which writes the scope
+                                // AND pushes the value back for the outer store.
+                                let id = match &*access.object {
+                                    Expression::Identifier(id) => id.name.clone(),
+                                    _ => unreachable!(),
+                                };
+                                instructions.push(BytecodeOp::String(format!("{}.{}", id, access.member)));
+                                instructions.push(BytecodeOp::Swap);
+                                instructions.push(BytecodeOp::SetDynamicVar);
                             } else if let Expression::Identifier(ref ident) = *access.object {
                                 // Stack has [value]. When the object is a bare,
                                 // non-scope identifier, use the fused
@@ -2860,6 +2935,9 @@ impl CfmlCompiler {
                                 // directly would throw "Variable 'x' is undefined"
                                 // for an undeclared base.
                                 if !is_reserved_scope_name(&ident.name) {
+                                    if want_value {
+                                        instructions.push(BytecodeOp::Dup);
+                                    }
                                     instructions.push(BytecodeOp::StoreLocalProperty(
                                         ident.name.clone(),
                                         access.member.clone(),
@@ -2869,6 +2947,9 @@ impl CfmlCompiler {
                                     // function-frame scope, must NOT propagate to
                                     // caller at return. Same fix as the
                                     // Statement::Assignment path above.
+                                    if want_value {
+                                        instructions.push(BytecodeOp::Dup);
+                                    }
                                     instructions.push(BytecodeOp::DeclareLocal(access.member.clone()));
                                     instructions.push(BytecodeOp::StoreLocal(access.member.clone()));
                                 } else {

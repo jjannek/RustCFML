@@ -5195,7 +5195,45 @@ impl CfmlVirtualMachine {
                                     })
                                     ;
                                 let val = match val {
-                                    Some(v) => v,
+                                    Some(v) => {
+                                        // A component method extracted as a VALUE
+                                        // (e.g. `var f = this.method;` or
+                                        // `filter=this._filterServices`) must carry
+                                        // its owning component's scope so that when
+                                        // it is later invoked elsewhere — bare, or
+                                        // via another struct member like
+                                        // `arguments.filter(x)` — its unscoped
+                                        // references still resolve against the
+                                        // component's `variables`/`this` (ColdBox
+                                        // Binder.mapDirectory passes a bound method
+                                        // as its `filter`). Mirrors the bare-name
+                                        // bind (Bug #9). Only bind genuine, unbound
+                                        // component methods on a component receiver.
+                                        if let CfmlValue::Function(ref f) = v {
+                                            if f.captured_scope.is_none()
+                                                && (s.contains_key("__variables")
+                                                    || s.contains_key("__name"))
+                                            {
+                                                let mut bound: ValueMap = ValueMap::default();
+                                                bound.insert("this".to_string(), obj.clone());
+                                                if let Some(vars) = s.get("__variables") {
+                                                    bound.insert("__variables".to_string(), vars.clone());
+                                                    bound.insert("variables".to_string(), vars.clone());
+                                                }
+                                                if let Some(sup) = s.get("__super") {
+                                                    bound.insert("super".to_string(), sup.clone());
+                                                }
+                                                let mut bound_fn = (**f).clone();
+                                                bound_fn.captured_scope =
+                                                    Some(Arc::new(std::sync::RwLock::new(bound)));
+                                                CfmlValue::Function(Arc::new(bound_fn))
+                                            } else {
+                                                v
+                                            }
+                                        } else {
+                                            v
+                                        }
+                                    }
                                     None => {
                                         // Fall through to a Rust-backed parent if attached.
                                         if let Some(CfmlValue::NativeObject(parent)) =
@@ -5725,13 +5763,15 @@ impl CfmlVirtualMachine {
                         // struct) so resolve_catch_error_val matches last_exception
                         // and reuses the full cfcatch struct — preserving the
                         // error's `type`/`detail` across the frame boundary.
-                        return Err(CfmlError::runtime(match &error_val {
+                        let mut err = CfmlError::runtime(match &error_val {
                             CfmlValue::Struct(s) => s
                                 .get("message")
                                 .map(|m| m.as_string())
                                 .unwrap_or_else(|| error_val.as_string()),
                             _ => error_val.as_string(),
-                        }));
+                        });
+                        err.stack_trace = self.build_stack_trace();
+                        return Err(err);
                     }
                 }
                 BytecodeOp::Rethrow => {
@@ -5751,13 +5791,15 @@ impl CfmlVirtualMachine {
                         // struct) so resolve_catch_error_val matches last_exception
                         // and reuses the full cfcatch struct — preserving the
                         // error's `type`/`detail` across the frame boundary.
-                        return Err(CfmlError::runtime(match &error_val {
+                        let mut err = CfmlError::runtime(match &error_val {
                             CfmlValue::Struct(s) => s
                                 .get("message")
                                 .map(|m| m.as_string())
                                 .unwrap_or_else(|| error_val.as_string()),
                             _ => error_val.as_string(),
-                        }));
+                        });
+                        err.stack_trace = self.build_stack_trace();
+                        return Err(err);
                     }
                 }
 
@@ -9455,10 +9497,12 @@ impl CfmlVirtualMachine {
                             }
                             return self.call_function(&func, call_args, &method_locals);
                         } else {
-                            return Err(CfmlError::runtime(format!(
+                            let mut err = CfmlError::runtime(format!(
                                 "Method '{}' not found on component",
                                 method_name
-                            )));
+                            ));
+                            err.stack_trace = self.build_stack_trace();
+                            return Err(err);
                         }
                     } else {
                         return Err(CfmlError::runtime(
@@ -12183,14 +12227,30 @@ impl CfmlVirtualMachine {
             return (arg_values, Vec::new());
         };
 
-        // Expand argumentCollection structs into individual named arguments.
-        let mut expanded_names = Vec::with_capacity(arg_names.len());
+        // Expand argumentCollection structs into individual arguments. A struct
+        // key that is a positive integer is a POSITIONAL argument (Lucee/ACF/
+        // BoxLang: `argumentCollection={1:a,2:b}` is the same as calling with
+        // `(a, b)` positionally) — emit it with an EMPTY name so the binding
+        // loop below places it into the right param slot (and thus binds the
+        // param LOCAL, not just an arguments-scope key). A paramless caller
+        // forwarding `argumentCollection=arguments` (numeric keys) through
+        // `super.init(...)` relies on this. Non-numeric keys stay named.
+        let mut expanded_names: Vec<String> = Vec::with_capacity(arg_names.len());
         let mut expanded_values = Vec::with_capacity(arg_names.len());
+        // Positional args expanded from a numeric-keyed argumentCollection are
+        // placed by their 1-based key rather than appended in iteration order.
+        let mut numeric_positional: Vec<(usize, CfmlValue)> = Vec::new();
         for (i, name) in arg_names.iter().enumerate() {
             let value = arg_values.get(i).cloned().unwrap_or(CfmlValue::Null);
             if name.eq_ignore_ascii_case("argumentcollection") {
                 if let CfmlValue::Struct(s) = &value {
                     for (k, v) in s.iter() {
+                        if let Ok(pos) = k.parse::<usize>() {
+                            if pos >= 1 {
+                                numeric_positional.push((pos - 1, v.clone()));
+                                continue;
+                            }
+                        }
                         expanded_names.push(k.clone());
                         expanded_values.push(v.clone());
                     }
@@ -12207,6 +12267,18 @@ impl CfmlVirtualMachine {
         // keys when a paramless function was called purely by name.
         let mut positional = vec![CfmlValue::Null; func.params.len()];
         let mut extras: Vec<(usize, String)> = Vec::new();
+        // Place positional args expanded from a numeric-keyed argumentCollection
+        // at their declared slot (growing past the declared params if needed).
+        for (idx, value) in numeric_positional {
+            if idx < positional.len() {
+                positional[idx] = value;
+            } else {
+                while positional.len() < idx {
+                    positional.push(CfmlValue::Null);
+                }
+                positional.push(value);
+            }
+        }
         for (i, name) in expanded_names.iter().enumerate() {
             let value = expanded_values.get(i).cloned().unwrap_or(CfmlValue::Null);
             if name.is_empty() {
@@ -12396,7 +12468,9 @@ impl CfmlVirtualMachine {
             // Response-side forwards (BoxLang exposes these on the page context).
             "getstatus" | "setstatus" | "getcontenttype" | "setcontenttype"
             | "addheader" | "setheader" | "containsheader" | "iscommitted"
-            | "getcharacterencoding" | "encodeurl" | "encoderedirecturl"
+            | "getcharacterencoding" | "setcharacterencoding" | "encodeurl"
+            | "encoderedirecturl" | "getheaders" | "getheadernames"
+            | "getlocale" | "setlocale"
             | "sendredirect" | "reset" | "resethtmlhead" => {
                 // Forward to the response handler; pass the page context itself
                 // as the receiver so a setter's write-back stays an identity
@@ -12474,6 +12548,34 @@ impl CfmlVirtualMachine {
                 let name = args.first().map(|a| a.as_string()).unwrap_or_default();
                 CfmlValue::Bool(header_get(&name).is_some())
             }
+            // HttpServletResponse.getHeaders(name): Collection<String> of every
+            // value set for that header (faithful — multi-valued, e.g. the
+            // Set-Cookie list Preside's Bootstrap iterates). A CFML array stands
+            // in for the Java Collection; for-in and ArrayLen both work on it.
+            "getheaders" => {
+                let name = args.first().map(|a| a.as_string()).unwrap_or_default();
+                let vals: Vec<CfmlValue> = self
+                    .response_headers
+                    .iter()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(&name))
+                    .map(|(_, v)| CfmlValue::string(v.clone()))
+                    .collect();
+                CfmlValue::array(vals)
+            }
+            // HttpServletResponse.getHeaderNames(): the distinct header names.
+            // Preside calls .getHeaderNames().toArray() — a CFML array satisfies
+            // both the Collection contract and the .toArray() no-op.
+            "getheadernames" => {
+                let mut names: Vec<CfmlValue> = Vec::new();
+                for (k, _) in &self.response_headers {
+                    if !names.iter().any(|n| n.as_string().eq_ignore_ascii_case(k)) {
+                        names.push(CfmlValue::string(k.clone()));
+                    }
+                }
+                CfmlValue::array(names)
+            }
+            "getlocale" => CfmlValue::string("en_US".to_string()),
+            "setlocale" | "setcharacterencoding" => receiver.clone(),
             "sendredirect" => {
                 let url = args.first().map(|a| a.as_string()).unwrap_or_default();
                 self.response_headers.push(("Location".to_string(), url));
@@ -12504,10 +12606,12 @@ impl CfmlVirtualMachine {
         // success (the Wheels create() failure mode). Null-safe `?.` calls never
         // reach here — codegen jumps over the CallMethod op on a null receiver.
         if matches!(object, CfmlValue::Null) {
-            return Err(CfmlError::new(
+            let mut err = CfmlError::new(
                 format!("cannot call method [{}] on a null value", method),
                 CfmlErrorType::Expression,
-            ));
+            );
+            err.stack_trace = self.build_stack_trace();
+            return Err(err);
         }
 
         // Native-object dispatch short-circuits the rest of the function.
@@ -13326,7 +13430,7 @@ impl CfmlVirtualMachine {
             object.get(method).unwrap_or(CfmlValue::Null)
         };
         if let CfmlValue::Function(ref _fdata) = &prop {
-            let func_ref = prop.clone();
+            let mut func_ref = prop.clone();
             let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
             let (args, extras) =
                 Self::reorder_named_args_with_extras(&prop, arg_names, raw_args);
@@ -13342,6 +13446,42 @@ impl CfmlVirtualMachine {
                 object,
                 CfmlValue::Struct(ref s) if s.contains_key("__variables") || s.contains_key("__name")
             );
+            // Invoking a function as a METHOD on a component (`comp.method()`)
+            // runs it with the COMPONENT's `this`/`variables` — even when the
+            // function value carries a `captured_scope` binding it to some other
+            // object (e.g. a method extracted via `other.method` and re-stored,
+            // i.e. a mixin: ColdBox injects `cfg.getPropertyMixin =
+            // mixerUtil.getPropertyMixin` then calls `cfg.getPropertyMixin(...)`
+            // expecting it to read `cfg`'s variables). Strip the scope-binding
+            // keys from this dispatch's copy so the component's method_locals
+            // win; any genuinely closed-over LOCAL variables are preserved. This
+            // is the mirror of the bound-method case (`arguments.fn()`), where
+            // the receiver is NOT a component and the captured binding stands.
+            if receiver_is_cfc {
+                if let CfmlValue::Function(f) = &func_ref {
+                    if let Some(ref cap) = f.captured_scope {
+                        let cleaned: ValueMap = {
+                            let g = cap.read().unwrap();
+                            g.iter()
+                                .filter(|(k, _)| !matches!(
+                                    k.to_lowercase().as_str(),
+                                    "this" | "variables" | "__variables" | "super"
+                                ))
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect()
+                        };
+                        if cleaned.len() != cap.read().unwrap().len() {
+                            let mut nf = (**f).clone();
+                            nf.captured_scope = if cleaned.is_empty() {
+                                None
+                            } else {
+                                Some(Arc::new(std::sync::RwLock::new(cleaned)))
+                            };
+                            func_ref = CfmlValue::Function(Arc::new(nf));
+                        }
+                    }
+                }
+            }
             let mut method_locals = ValueMap::default();
             // While a CFC method runs, relative component resolution (bare
             // `createObject("component","Sibling")` / `new Sibling()`) must
@@ -16360,6 +16500,60 @@ impl CfmlVirtualMachine {
             Ok(p) => p,
             Err(e) => return Err(e),
         };
+
+        // Seed the static .cfconfig.json CFMappings into self.mappings BEFORE
+        // running the pseudo-constructor below. Application.cfc bodies that
+        // extend a framework Bootstrap (Preside, ColdBox, FW/1) call
+        // `super.setupApplication()` at body level, which derives further
+        // mappings via `ExpandPath("/<configured-mapping>")` (e.g. Preside's
+        // `_getPresideRoot()` = `ExpandPath("/preside")`). Those lookups must
+        // already see the configured CFMappings or they fall through to the "/"
+        // mapping and resolve against the running template's directory — e.g.
+        // `/preside` → `<presideDir>/preside`, cascading wrong paths into every
+        // derived mapping. The authoritative this.mappings extraction + full
+        // cfconfig merge still runs later (it overrides these on conflict).
+        {
+            let mut existing: Vec<String> =
+                self.mappings.iter().map(|m| m.name.to_lowercase()).collect();
+            if let Some(ref ss) = self.server_state {
+                let cfg = ss.cfconfig.clone();
+                for (raw_name, raw_path) in cfg.mappings.iter() {
+                    let mut name = raw_name.clone();
+                    if !name.starts_with('/') {
+                        name = format!("/{}", name);
+                    }
+                    if !name.ends_with('/') {
+                        name = format!("{}/", name);
+                    }
+                    if existing.contains(&name.to_lowercase()) {
+                        continue;
+                    }
+                    existing.push(name.to_lowercase());
+                    self.mappings.push(CfmlMapping {
+                        name,
+                        path: raw_path.clone(),
+                    });
+                }
+            }
+            // The webroot "/" mapping. _setupMappings-style bodies also call
+            // ExpandPath("/") (e.g. Preside's `_getApplicationRoot()`); without a
+            // "/" mapping it resolves against the *running template's* directory
+            // — i.e. the framework Bootstrap's dir, not the webroot. Map "/" to
+            // the Application.cfc's directory (same as the later authoritative
+            // pass at the bottom of this function).
+            if !existing.iter().any(|n| n == "/") {
+                let app_dir = std::path::Path::new(path)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_string_lossy()
+                    .to_string();
+                self.mappings.push(CfmlMapping {
+                    name: "/".to_string(),
+                    path: app_dir,
+                });
+            }
+            self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+        }
 
         // Save current program, swap in sub-program
         let old_program = self.push_program_swap(sub_program);

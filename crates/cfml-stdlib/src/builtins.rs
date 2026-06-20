@@ -483,6 +483,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getFileFromPath".into(), fn_get_file_from_path);
     f.insert("getCanonicalPath".into(), fn_get_canonical_path);
     f.insert("systemOutput".into(), fn_system_output);
+    f.insert("systemCacheClear".into(), fn_system_cache_clear);
     f.insert("getEnvironmentVariable".into(), fn_get_environment_variable);
     f.insert("readLine".into(), fn_read_line);
     f.insert("getTemplatePath".into(), fn_get_current_template_path);  // alias
@@ -5522,7 +5523,17 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
         Ok(results)
     }
 
-    match list_dir(&path, recurse, &filter, &list_info) {
+    // Lucee/ACF return an empty result for a non-existent directory rather
+    // than throwing (ColdBox/Preside scan optional module locations like
+    // `/app/extensions_app` that may not exist). Only a genuine I/O failure
+    // (permissions, etc.) still surfaces as an error.
+    let listing = match list_dir(&path, recurse, &filter, &list_info) {
+        Ok(entries) => Ok(entries),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    };
+
+    match listing {
         Ok(entries) => {
             if list_info == "query" {
                 let columns = vec![
@@ -11758,6 +11769,15 @@ fn fn_system_output(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         eprint!("{}", msg);
     }
+    Ok(CfmlValue::Null)
+}
+
+/// Lucee `SystemCacheClear([cacheName])` — flushes an engine-level cache
+/// (template/page, object, query, …). RustCFML has no Lucee-style template
+/// page cache to invalidate (serve mode rebuilds the bytecode cache on
+/// fwreinit anyway), so this is a no-op that exists so framework reload paths
+/// — e.g. Preside's `Bootstrap._clearExistingApplication` — resolve it.
+fn fn_system_cache_clear(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Null)
 }
 

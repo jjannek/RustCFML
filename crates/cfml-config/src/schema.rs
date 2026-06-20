@@ -23,6 +23,11 @@ pub struct RustCfmlConfig {
     pub server: ServerCfg,
     pub runtime: RuntimeCfg,
     pub datasources: IndexMap<String, DatasourceCfg>,
+    /// Component/path mappings (virtual prefix → physical directory). Accepts
+    /// both RustCFML's native `mappings` key and the CommandBox/cfconfig
+    /// `CFMappings` alias, and per-value either a plain string path or the
+    /// cfconfig object form `{ "physical": "/path", "primary": "physical" }`.
+    #[serde(alias = "CFMappings", deserialize_with = "de_mappings", default)]
     pub mappings: IndexMap<String, String>,
     #[serde(rename = "customTagPaths")]
     pub custom_tag_paths: Vec<String>,
@@ -42,6 +47,38 @@ pub struct RustCfmlConfig {
     /// was synthesised from defaults (no file found) or parsed from a string.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+}
+
+/// Deserialize a mappings map whose values are either a plain string path or
+/// the cfconfig object form `{ "physical": "/path", "primary": "physical" }`.
+/// (CommandBox/cfconfig writes the object form; RustCFML's own files use the
+/// string form.) Either way the resolved value is the physical directory.
+fn de_mappings<'de, D>(d: D) -> Result<IndexMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MapVal {
+        Path(String),
+        Detailed {
+            #[serde(default)]
+            physical: String,
+        },
+    }
+    let raw: IndexMap<String, MapVal> = IndexMap::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k,
+                match v {
+                    MapVal::Path(s) => s,
+                    MapVal::Detailed { physical } => physical,
+                },
+            )
+        })
+        .collect())
 }
 
 // ─────────────────────────────────────────────

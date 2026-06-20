@@ -309,8 +309,8 @@ impl Lexer {
                     // call) the interpolation was never terminated. Report it at
                     // the opening '#', not at some far-off EOF (GitHub #181).
                     while !self.is_at_end() && !(self.current() == '#' && depth == 0) {
-                        if self.current() == '(' { depth += 1; }
-                        if self.current() == ')' { depth -= 1; }
+                        if self.current() == '(' || self.current() == '[' { depth += 1; }
+                        if self.current() == ')' || self.current() == ']' { depth -= 1; }
                         if self.current() == quote && depth <= 0 {
                             self.tokens.push(TokenWithLoc {
                                 token: Token::Error(format!(
@@ -538,6 +538,9 @@ mod tests {
             r#""escaped ##180 ok""#,
             r#""y is #y# done""#,
             r#""val=#ucase("ab")#!""#,
+            // Same-quote nested string inside a bracket subscript in an
+            // interpolation — ColdBox RoutingService.cfc:966.
+            r#""^#results[ "scriptName" ]#\/""#,
         ] {
             let toks = tokenize(src.to_string());
             assert!(

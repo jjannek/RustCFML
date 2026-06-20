@@ -102,6 +102,33 @@ impl RustCfmlConfig {
     ) -> Result<Self, ConfigError> {
         if let Some(obj) = app_json.as_object_mut() {
             obj.remove("server");
+            // The baseline serialises every datasource with its canonical
+            // `driver` key. If the app overlay declares the same datasource the
+            // Lucee way (`dbdriver`/`type`), the post-merge object would carry
+            // BOTH `driver` (from the baseline) and the alias — which serde
+            // rejects as a duplicate field. Fold the alias onto `driver` here so
+            // the overlay value wins and only one key survives the merge.
+            // The baseline serialises mappings under the canonical `mappings`
+            // key. If the app overlay uses the `CFMappings` alias, the merged
+            // object would carry BOTH keys → serde alias duplicate. Fold the
+            // alias into `mappings` (alias values win on per-key conflict).
+            if let Some(cf) = obj.remove("CFMappings") {
+                let slot = obj
+                    .entry("mappings".to_string())
+                    .or_insert(serde_json::Value::Object(Default::default()));
+                deep_merge(slot, &cf);
+            }
+            if let Some(datasources) = obj.get_mut("datasources").and_then(|d| d.as_object_mut()) {
+                for (_, ds) in datasources.iter_mut() {
+                    if let Some(ds_obj) = ds.as_object_mut() {
+                        for alias in ["dbdriver", "type"] {
+                            if let Some(v) = ds_obj.remove(alias) {
+                                ds_obj.entry("driver").or_insert(v);
+                            }
+                        }
+                    }
+                }
+            }
         }
         let mut base_json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         deep_merge(&mut base_json, &app_json);
