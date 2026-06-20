@@ -27,9 +27,9 @@ pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_class, handle_java_collections, handle_java_concurrenthashmap,
     handle_java_concurrentlinkedqueue, handle_java_date, handle_java_file, handle_java_inetaddress,
-    handle_java_linkedhashmap, handle_java_messagedigest, handle_java_paths, handle_java_pattern,
-    handle_java_stringbuilder, handle_java_system, handle_java_thread, handle_java_treemap,
-    handle_java_uuid,
+    handle_java_linkedhashmap, handle_java_map_entry, handle_java_messagedigest, handle_java_paths,
+    handle_java_pattern, handle_java_stringbuilder, handle_java_system, handle_java_thread,
+    handle_java_treemap, handle_java_uuid,
 };
 
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
@@ -12952,6 +12952,7 @@ impl CfmlVirtualMachine {
                         handle_java_pattern(&m, all_args, object)
                     }
                     "java.lang.class" => handle_java_class(&m, all_args, object),
+                    "java.util.map.entry" => handle_java_map_entry(&m, all_args, object),
                     _ => Ok(CfmlValue::Null),
                 };
                 match result {

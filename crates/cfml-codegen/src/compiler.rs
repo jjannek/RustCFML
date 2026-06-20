@@ -2974,6 +2974,17 @@ impl CfmlCompiler {
                                     self.emit_nested_writeback(&access.object, instructions);
                                 }
                             } else {
+                                // Object is `this` (Expression::This) or another
+                                // non-identifier base. In VALUE position
+                                // (`variables.x = this.y = v`) the result of this
+                                // inner assignment must remain for the outer store;
+                                // SetProperty + the This/nested writeback consume
+                                // [obj,value] and leave nothing, so Dup the value
+                                // first. The Dup'd copy sits beneath [obj,value] and
+                                // survives the writeback as this expression's result.
+                                if want_value {
+                                    instructions.push(BytecodeOp::Dup);
+                                }
                                 // SetProperty needs [obj, value].
                                 self.compile_expression(&access.object, instructions);
                                 instructions.push(BytecodeOp::Swap);

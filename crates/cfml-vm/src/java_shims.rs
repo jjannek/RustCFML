@@ -904,6 +904,31 @@ pub fn handle_java_concurrenthashmap(
             }
             Ok(CfmlValue::array(Vec::new()))
         }
+        "entryset" => {
+            // entrySet() returns a Set<Map.Entry>. Callers do
+            // `map.entrySet().toArray()` then iterate calling entry.getKey()/
+            // getValue() (e.g. Wheels Channel.publish). Return a CFML Array of
+            // Map.Entry shims; .toArray() on a CFML array is the existing no-op.
+            if let CfmlValue::Struct(ref shim) = object {
+                let entries: Vec<CfmlValue> = shim
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("__"))
+                    .map(|(k, v)| {
+                        let mut e = ValueMap::default();
+                        e.insert(
+                            "__java_class".to_string(),
+                            CfmlValue::string("java.util.map.entry".to_string()),
+                        );
+                        e.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                        e.insert("__entry_key".to_string(), CfmlValue::string(k.clone()));
+                        e.insert("__entry_value".to_string(), v.clone());
+                        CfmlValue::strukt(e)
+                    })
+                    .collect();
+                return Ok(CfmlValue::array(entries));
+            }
+            Ok(CfmlValue::array(Vec::new()))
+        }
         "clear" => {
             if let CfmlValue::Struct(ref shim) = object {
                 let mut ns = ValueMap::default();
@@ -942,6 +967,23 @@ pub fn handle_java_class(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue
         "tostring" => Ok(CfmlValue::string(format!("class {}", class_name))),
         _ => Ok(CfmlValue::Null),
     }
+}
+
+// ---- java.util.Map.Entry (yielded by ConcurrentHashMap.entrySet()) ----
+pub fn handle_java_map_entry(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    if let CfmlValue::Struct(ref e) = object {
+        match method {
+            "getkey" => return Ok(e.get("__entry_key").unwrap_or(CfmlValue::Null)),
+            "getvalue" => return Ok(e.get("__entry_value").unwrap_or(CfmlValue::Null)),
+            "tostring" => {
+                let k = e.get("__entry_key").map(|v| v.as_string()).unwrap_or_default();
+                let v = e.get("__entry_value").map(|v| v.as_string()).unwrap_or_default();
+                return Ok(CfmlValue::string(format!("{}={}", k, v)));
+            }
+            _ => {}
+        }
+    }
+    Ok(CfmlValue::Null)
 }
 
 // ---- Collections (static utility class) ----
