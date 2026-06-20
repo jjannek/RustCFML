@@ -2308,7 +2308,36 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Run a function body, guaranteeing the call-stack depth is restored on EVERY
+    /// exit path. The inner body (`execute_function_body`) pushes a `CallFrame` and
+    /// pops it on the normal-exit and `Return`-op paths, but the many scattered
+    /// `return Err(…)` / `?` error-propagation paths do NOT pop. An exception
+    /// unwinding across N frames therefore left N frames behind — harmless for a
+    /// stray error, but the TestBox suite throws on thousands of `expect().toThrow()`
+    /// assertions, so call-stack depth crept up ~9 per spec until the whole run
+    /// crawled (and would eventually trip the depth-2500 recursion guard). Capping
+    /// the stack back to its pre-call depth here reclaims any leaked frame on the
+    /// error path; on a clean exit the body already balanced the push/pop, so the
+    /// `truncate` is a no-op.
     fn execute_function_with_args(
+        &mut self,
+        func: &BytecodeFunction,
+        args: Vec<CfmlValue>,
+        parent_scope: Option<&ValueMap>,
+    ) -> CfmlResult {
+        let call_depth_before = self.call_stack.len();
+        let try_depth_before = self.try_stack.len();
+        let result = self.execute_function_body(func, args, parent_scope);
+        // Never grow past where we started: a complete call must leave the
+        // call/try stacks exactly as it found them. truncate() only shrinks, so a
+        // balanced clean exit (len == before) and __main__'s unconditional pop
+        // (len < before) are both untouched; only a leaked frame is reclaimed.
+        self.call_stack.truncate(call_depth_before);
+        self.try_stack.truncate(try_depth_before);
+        result
+    }
+
+    fn execute_function_body(
         &mut self,
         func: &BytecodeFunction,
         args: Vec<CfmlValue>,
