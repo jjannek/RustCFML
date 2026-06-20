@@ -13903,6 +13903,19 @@ impl CfmlVirtualMachine {
             }
         }
 
+        // Lucee parity: `toString()` on any non-component value returns a string
+        // representation (the java.lang.Object.toString equivalent — e.g.
+        // `{}.toString()` -> "{A: 1}", `[1,2].toString()` -> "[1, 2]"). Structs,
+        // arrays, queries and binary were silently returning Null here, and
+        // `x = obj.toString()` then hit the null-delete assignment guard (PR #112),
+        // which DELETED the pre-existing local — surfacing later as the misleading
+        // "Variable X is undefined" (Wheels Assertion.getStringName, ~110 specs).
+        // Components are handled above (they throw "has no function"); strings and
+        // numbers handle `tostring` in their own member-dispatch arms.
+        if method_lower == "tostring" {
+            return Ok(CfmlValue::string(object.as_string()));
+        }
+
         Ok(CfmlValue::Null)
     }
 
