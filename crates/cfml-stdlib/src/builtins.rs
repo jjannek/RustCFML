@@ -9492,6 +9492,109 @@ fn transaction_rollback(conn: &mut TransactionConn) -> Result<(), CfmlError> {
     }
 }
 
+/// Create a savepoint on an existing transaction conn (type-erased)
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub fn txn_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
+    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
+        transaction_savepoint(tc, SavepointOp::Create, name)
+    } else {
+        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
+    }
+}
+
+/// Release a savepoint on an existing transaction conn (type-erased)
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub fn txn_release_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
+    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
+        transaction_savepoint(tc, SavepointOp::Release, name)
+    } else {
+        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
+    }
+}
+
+/// Rollback to a savepoint on an existing transaction conn (type-erased)
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+pub fn txn_rollback_to_savepoint_boxed(conn: &mut Box<dyn std::any::Any>, name: &str) -> Result<(), CfmlError> {
+    if let Some(tc) = conn.downcast_mut::<TransactionConn>() {
+        transaction_savepoint(tc, SavepointOp::RollbackTo, name)
+    } else {
+        Err(CfmlError::runtime("cftransaction: invalid transaction connection".to_string()))
+    }
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+enum SavepointOp {
+    Create,
+    Release,
+    RollbackTo,
+}
+
+/// Issue a SAVEPOINT / RELEASE / ROLLBACK TO statement on a transaction conn.
+/// SQL dialects differ: ANSI engines use `SAVEPOINT`/`RELEASE SAVEPOINT`/
+/// `ROLLBACK TO SAVEPOINT`; SQL Server uses `SAVE TRANSACTION` and
+/// `ROLLBACK TRANSACTION <name>` and has no explicit release (a savepoint is
+/// simply freed when the enclosing transaction commits), so Release is a no-op.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn transaction_savepoint(conn: &mut TransactionConn, op: SavepointOp, name: &str) -> Result<(), CfmlError> {
+    match conn {
+        #[cfg(feature = "sqlite")]
+        TransactionConn::Sqlite(c) => {
+            let sql = match op {
+                SavepointOp::Create => format!("SAVEPOINT {}", name),
+                SavepointOp::Release => format!("RELEASE {}", name),
+                SavepointOp::RollbackTo => format!("ROLLBACK TO {}", name),
+            };
+            c.execute_batch(&sql)
+                .map_err(|e| CfmlError::runtime(format!("cftransaction: savepoint error: {}", e)))
+        }
+        #[cfg(feature = "mysql_db")]
+        TransactionConn::Mysql(c) => {
+            use mysql::prelude::Queryable;
+            let sql = match op {
+                SavepointOp::Create => format!("SAVEPOINT {}", name),
+                SavepointOp::Release => format!("RELEASE SAVEPOINT {}", name),
+                SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", name),
+            };
+            c.query_drop(&sql)
+                .map_err(|e| CfmlError::runtime(format!("cftransaction: savepoint error: {}", e)))
+        }
+        #[cfg(feature = "postgres_db")]
+        TransactionConn::Postgres(c) => {
+            let sql = match op {
+                SavepointOp::Create => format!("SAVEPOINT {}", name),
+                SavepointOp::Release => format!("RELEASE SAVEPOINT {}", name),
+                SavepointOp::RollbackTo => format!("ROLLBACK TO SAVEPOINT {}", name),
+            };
+            let pg = &mut **c;
+            match pg.client.simple_query(&sql) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if e.is_closed() {
+                        pg.broken = true;
+                    }
+                    Err(CfmlError::runtime(format!("cftransaction: savepoint error: {}", e)))
+                }
+            }
+        }
+        #[cfg(feature = "mssql_db")]
+        TransactionConn::Mssql(c) => {
+            let m = &mut **c;
+            match op {
+                SavepointOp::Create => {
+                    mssql_txn_control(&mut m.client, &mut m.broken, &format!("SAVE TRANSACTION {}", name), "SAVEPOINT")
+                }
+                // SQL Server frees savepoints implicitly at commit — nothing to do.
+                SavepointOp::Release => Ok(()),
+                SavepointOp::RollbackTo => {
+                    mssql_txn_control(&mut m.client, &mut m.broken, &format!("ROLLBACK TRANSACTION {}", name), "ROLLBACK TO SAVEPOINT")
+                }
+            }
+        }
+        #[allow(unreachable_patterns)]
+        _ => Ok(()),
+    }
+}
+
 /// Execute a query using an existing transaction connection
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {

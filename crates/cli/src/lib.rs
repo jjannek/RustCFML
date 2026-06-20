@@ -543,6 +543,9 @@ fn register_vm_runtime(vm: &mut CfmlVirtualMachine) {
     vm.txn_begin = Some(cfml_stdlib::builtins::txn_begin_boxed);
     vm.txn_commit = Some(cfml_stdlib::builtins::txn_commit_boxed);
     vm.txn_rollback = Some(cfml_stdlib::builtins::txn_rollback_boxed);
+    vm.txn_savepoint = Some(cfml_stdlib::builtins::txn_savepoint_boxed);
+    vm.txn_release_savepoint = Some(cfml_stdlib::builtins::txn_release_savepoint_boxed);
+    vm.txn_rollback_to_savepoint = Some(cfml_stdlib::builtins::txn_rollback_to_savepoint_boxed);
     vm.txn_execute = Some(cfml_stdlib::builtins::txn_execute_boxed);
     vm.query_execute_fn = Some(cfml_stdlib::builtins::fn_query_execute);
     // Real-OS-thread cfthread spawner. The VM only uses this when its
