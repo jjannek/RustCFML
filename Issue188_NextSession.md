@@ -60,7 +60,34 @@ exit path (robust to `?` and every `return Err`). Verified: `runSpec`-entry
 depth now bounded at **6** (was 614+). Gates green (workspace/JIT 76/76, runner
 4322, wasm, serve cold+warm 4356). No regressions.
 
-## STILL OPEN — closure loop-var reset (4th bug): suite stalls on ONE spec
+## FOLLOW-ON #2 — closure loop-var no-op (4th bug) — FIXED (v0.236.0)
+
+**RESULT: the full Wheels TestBox suite now COMPLETES** — 2756 specs in ~40s
+(2181 pass / 201 fail / 358 error / 16 skip on sqlite), HTTP 417 (TestBox's normal
+"has failures" code). Was a permanent hang. Remaining failures are separate
+db/compat gaps (RustCFML on sqlite vs Lucee on H2 — Lucee can't load the sqlite
+driver), not the hang.
+
+**Root cause:** in a CFC method under classic localmode an unscoped write
+(`i = 1`) lands in the component scope `__variables` (not `locals`), and
+`LoadLocal` reads it back from there — but the fused numeric ops
+`Increment`/`Decrement`/`AddLocalConst`/`MulLocalConst` only looked at
+`locals.get(name)`, so `i++` / `i += k` / `i--` **silently no-opped** when the
+var lived in `__variables`. So `for (i = 1; i lte n; i++)` in a CFC-method
+closure looped forever. The spec was `view.assetsSpec` "returns same domain for
+asset" (assetsSpec.cfc:48-56) — found via `#SPECNAME` logging + samply (100% in
+that loop) + a loop probe showing `i` stuck at 1 + RSS climbing ~90 KB/s.
+
+**Fix:** new `apply_numeric_delta()` helper (cfml-vm/src/lib.rs) that resolves the
+var the same way Load/StoreLocal do — fast path `locals`, fallback to the
+`__variables` component scope (CfmlStruct mutates via `&self`, so an immutable
+`locals` borrow suffices; `get_ci` keeps case-insensitivity). All four fused ops
+route through it. Regression test: `tests/core/test_closure_loopvar_in_cfc.cfm`
+(+ `ClosureLoopVarFixture.cfc`), green on RustCFML and Lucee 7. Gates all green.
+
+(Historical context below — the diagnosis path that led here.)
+
+## (earlier) closure loop-var reset (4th bug): suite stalls on ONE spec
 
 With the frame leak fixed the suite PROGRESSES (depth flat at 6, ~73–140 specs/s
 ≈ 2–4× Lucee — normal interpreter overhead, NOT a regression) but never finishes:

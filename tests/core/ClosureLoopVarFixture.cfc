@@ -1,0 +1,55 @@
+/*
+ * Regression fixture: a closure defined in a CFC method, whose for-loop uses an
+ * UNSCOPED counter `i`. In a CFC method under classic localmode an unscoped write
+ * lands in the component scope (`__variables`), and `i++` must still increment it.
+ * Before the fix, the fused Increment/Decrement/+=/*= ops only looked at `locals`,
+ * so `i++` silently no-opped and the loop ran forever (Wheels view.assetsSpec hang).
+ */
+component {
+	function trigger() {
+		return true;
+	}
+
+	// Mirrors the assetsSpec shape: a sibling closure sets a shared (unscoped)
+	// object, the body closure loops with an unscoped counter and calls a method
+	// each iteration. `cnt` is var-declared (reliable guard); `i`/`iEnd`/`obj` are
+	// unscoped (land in the component scope).
+	function runLoop() {
+		setup = () => {
+			obj = this;
+		};
+		body = () => {
+			var cnt = 0;
+			iEnd = 5;
+			for (i = 1; i lte iEnd; i++) {
+				cnt = cnt + 1;
+				if (cnt gt 100) {
+					return "RUNAWAY-i-not-incrementing";
+				}
+				obj.trigger();
+			}
+			return "i=" & i & ",cnt=" & cnt;
+		};
+		setup();
+		return body();
+	}
+
+	// Same, but exercise `+=` (AddLocalConst) and `--` (Decrement) on unscoped
+	// component-scope vars too.
+	function runDelta() {
+		body = () => {
+			var iters = 0;
+			n = 0;
+			down = 6;
+			for (i = 0; i lt 10; i += 2) {
+				iters = iters + 1;
+				down--;
+				if (iters gt 100) {
+					return "RUNAWAY-delta";
+				}
+			}
+			return "i=" & i & ",iters=" & iters & ",down=" & down;
+		};
+		return body();
+	}
+}

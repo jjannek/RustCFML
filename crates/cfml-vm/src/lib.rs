@@ -2308,6 +2308,44 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Apply an in-place numeric mutation (`x++`, `x--`, `x += k`, `x *= k`) to a
+    /// bare variable, resolving it the SAME way `LoadLocal`/`StoreLocal` do. The
+    /// fast path is a value held directly in this frame's `locals`. The fallback
+    /// is the component scope `__variables`: in a CFC method under classic
+    /// localmode, an unscoped write (`x = 1`) lands in `__variables`, not `locals`
+    /// — and `LoadLocal` reads it back from there. Without this fallback the
+    /// fused mutation ops only looked at `locals`, so `x++` etc. silently no-opped
+    /// when `x` lived in the component scope, and `for (x = 1; x lte n; x++)` in a
+    /// CFC-method closure looped forever (the Wheels view.assetsSpec hang).
+    fn apply_numeric_delta(
+        locals: &mut ValueMap,
+        closure_env: Option<&Arc<std::sync::RwLock<ValueMap>>>,
+        name: &str,
+        op: impl Fn(&CfmlValue) -> CfmlValue,
+    ) {
+        if let Some(val) = locals.get(name) {
+            let new_val = op(val);
+            locals.insert(name.to_string(), new_val.clone());
+            // Sync to the shared closure env so sibling closures see the update
+            // (only when the key already lives there — don't pollute with new keys).
+            if let Some(env) = closure_env {
+                let mut m = env.write().unwrap();
+                if m.contains_key(name) {
+                    m.insert(name.to_string(), new_val);
+                }
+            }
+            return;
+        }
+        // Fallback: unscoped var in the CFC component scope (`__variables`).
+        // CfmlStruct mutates through `&self` (interior RwLock), so an immutable
+        // borrow of `locals` suffices. get_ci keeps CFML's case-insensitivity.
+        if let Some(vars) = locals.get("__variables").and_then(|v| v.as_cfml_struct()) {
+            if let Some(cur) = vars.get_ci(name) {
+                vars.insert(name.to_string(), op(&cur));
+            }
+        }
+    }
+
     /// Run a function body, guaranteeing the call-stack depth is restored on EVERY
     /// exit path. The inner body (`execute_function_body`) pushes a `CallFrame` and
     /// pops it on the normal-exit and `Return`-op paths, but the many scattered
@@ -5748,69 +5786,40 @@ impl CfmlVirtualMachine {
                 }
 
                 BytecodeOp::Increment(name) => {
-                    if let Some(val) = locals.get(name.as_str()) {
-                        let new_val = match val {
+                    Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
+                        match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i + 1),
                             CfmlValue::Double(d) => CfmlValue::Double(d + 1.0),
                             _ => CfmlValue::Int(1),
-                        };
-                        locals.insert(name.clone(), new_val.clone());
-                        if let Some(ref env) = closure_env {
-                            let mut m = env.write().unwrap();
-                            if m.contains_key(name.as_str()) {
-                                m.insert(name.clone(), new_val);
-                            }
                         }
-                    }
+                    });
                 }
                 BytecodeOp::AddLocalConst(name, k) => {
-                    if let Some(val) = locals.get(name.as_str()) {
-                        let new_val = match val {
+                    Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
+                        match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i + *k),
                             CfmlValue::Double(d) => CfmlValue::Double(d + *k as f64),
                             _ => CfmlValue::Int(*k),
-                        };
-                        locals.insert(name.clone(), new_val.clone());
-                        if let Some(ref env) = closure_env {
-                            let mut m = env.write().unwrap();
-                            if m.contains_key(name.as_str()) {
-                                m.insert(name.clone(), new_val);
-                            }
                         }
-                    }
+                    });
                 }
                 BytecodeOp::MulLocalConst(name, k) => {
-                    if let Some(val) = locals.get(name.as_str()) {
-                        let new_val = match val {
+                    Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
+                        match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i * *k),
                             CfmlValue::Double(d) => CfmlValue::Double(d * *k as f64),
                             _ => CfmlValue::Int(*k),
-                        };
-                        locals.insert(name.clone(), new_val.clone());
-                        if let Some(ref env) = closure_env {
-                            let mut m = env.write().unwrap();
-                            if m.contains_key(name.as_str()) {
-                                m.insert(name.clone(), new_val);
-                            }
                         }
-                    }
+                    });
                 }
                 BytecodeOp::Decrement(name) => {
-                    if let Some(val) = locals.get(name.as_str()) {
-                        let new_val = match val {
+                    Self::apply_numeric_delta(&mut locals, closure_env.as_ref(), name, |val| {
+                        match val {
                             CfmlValue::Int(i) => CfmlValue::Int(i - 1),
                             CfmlValue::Double(d) => CfmlValue::Double(d - 1.0),
                             _ => CfmlValue::Int(-1),
-                        };
-                        locals.insert(name.clone(), new_val.clone());
-                        // Sync to shared closure env so closures see updated value
-                        if let Some(ref env) = closure_env {
-                            let mut m = env.write().unwrap();
-                            if m.contains_key(name.as_str()) {
-                                m.insert(name.clone(), new_val);
-                            }
                         }
-                    }
+                    });
                 }
 
                 // Exception handling
