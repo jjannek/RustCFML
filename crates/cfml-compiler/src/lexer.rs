@@ -308,7 +308,38 @@ impl Lexer {
                     // the closing quote (at depth <= 0, i.e. not inside a nested
                     // call) the interpolation was never terminated. Report it at
                     // the opening '#', not at some far-off EOF (GitHub #181).
+                    //
+                    // Quoted literals inside the interpolation expression are still
+                    // part of that expression, even when they use the same quote as
+                    // the outer string (e.g. "#flag ? "YES" : ""#"). Consume them
+                    // whole so a nested string can't be mistaken for the outer
+                    // string's closing quote (GitHub #189).
                     while !self.is_at_end() && !(self.current() == '#' && depth == 0) {
+                        if (self.current() == '"' || self.current() == '\'')
+                            && self.can_start_interpolation_string_literal(&expr_str)
+                        {
+                            let nested_quote = self.current();
+                            expr_str.push(nested_quote);
+                            self.advance();
+
+                            while !self.is_at_end() {
+                                let c = self.current();
+                                expr_str.push(c);
+                                self.advance();
+
+                                if c == nested_quote {
+                                    // A doubled quote is an escaped quote, not the
+                                    // end of the nested string.
+                                    if !self.is_at_end() && self.current() == nested_quote {
+                                        expr_str.push(self.current());
+                                        self.advance();
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         if self.current() == '(' || self.current() == '[' { depth += 1; }
                         if self.current() == ')' || self.current() == ']' { depth -= 1; }
                         if self.current() == quote && depth <= 0 {
@@ -403,6 +434,73 @@ impl Lexer {
                 });
             }
         }
+    }
+
+    /// Decide whether a quote character encountered while scanning an
+    /// interpolation expression begins a nested string literal (rather than
+    /// closing the outer string). It does when the preceding non-space token
+    /// is something a string can legally follow: an open bracket/paren/brace,
+    /// a separator, an operator, or a keyword operator (EQ, AND, ...). If the
+    /// preceding char is a value-terminator (identifier/number/closing
+    /// bracket with no operator between), the quote is treated as the outer
+    /// string's closing quote instead. (GitHub #189)
+    fn can_start_interpolation_string_literal(&self, expr_str: &str) -> bool {
+        let trimmed = expr_str.trim_end();
+        let Some(previous) = trimmed.chars().last() else {
+            return true;
+        };
+
+        if matches!(
+            previous,
+            '(' | '['
+                | '{'
+                | ','
+                | ':'
+                | '?'
+                | '='
+                | '!'
+                | '<'
+                | '>'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '%'
+                | '&'
+                | '|'
+                | '^'
+        ) {
+            return true;
+        }
+
+        if previous.is_ascii_alphanumeric() || previous == '_' || previous == '$' {
+            let word = trimmed
+                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            return matches!(
+                word.as_str(),
+                "and"
+                    | "or"
+                    | "xor"
+                    | "eq"
+                    | "neq"
+                    | "ne"
+                    | "gt"
+                    | "gte"
+                    | "lt"
+                    | "lte"
+                    | "contains"
+                    | "is"
+                    | "mod"
+                    | "eqv"
+                    | "imp"
+            );
+        }
+
+        false
     }
 
     fn number(&mut self, first: char) {
@@ -546,6 +644,24 @@ mod tests {
             assert!(
                 lone_hash_error(&toks).is_none(),
                 "valid string wrongly flagged: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_quote_string_literals_inside_interpolation_do_not_error() {
+        for src in [
+            r###""value=#flag ? "YES" : ""#""###,
+            r###""statement=#flag ? "UNIQUE" : ""# INDEX #name#""###,
+            r###""enabled=#status EQ "active" ? "yes" : "no"#""###,
+            r###""quoted=#flag ? "A ""quoted"" value" : "fallback"#""###,
+            r###""hash=#replace("a##b", "##", "-")#""###,
+            r###"'value=#flag ? 'YES' : ''#'"###,
+        ] {
+            let toks = tokenize(src.to_string());
+            assert!(
+                lone_hash_error(&toks).is_none(),
+                "valid same-quote interpolation wrongly flagged: {src}"
             );
         }
     }
