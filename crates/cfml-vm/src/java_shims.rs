@@ -922,6 +922,28 @@ pub fn handle_java_concurrenthashmap(
     }
 }
 
+// ---- java.lang.Class (returned by value.getClass()) ----
+// A minimal Class reflection shim. The carried `__class_name` is the runtime
+// class name picked at getClass() time; getName()/getSimpleName() let TestBox's
+// instanceOf matcher and Wheels' toXML read a type string off a non-component
+// value (boolean/string/array/struct/...).
+pub fn handle_java_class(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    let class_name = if let CfmlValue::Struct(ref shim) = object {
+        shim.get("__class_name").map(|v| v.as_string()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    match method {
+        "getname" | "getcanonicalname" | "gettypename" => Ok(CfmlValue::string(class_name)),
+        "getsimplename" => {
+            let simple = class_name.rsplit('.').next().unwrap_or(&class_name).to_string();
+            Ok(CfmlValue::string(simple))
+        }
+        "tostring" => Ok(CfmlValue::string(format!("class {}", class_name))),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
 // ---- Collections (static utility class) ----
 // Preside/ColdBox use-case: Collections.list(map.keys()) converts a legacy
 // Enumeration into an ArrayList. Since our ConcurrentHashMap.keys() already

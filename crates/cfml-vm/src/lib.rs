@@ -25,10 +25,11 @@ pub mod web;
 pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
-    handle_java_collections, handle_java_concurrenthashmap, handle_java_concurrentlinkedqueue,
-    handle_java_date, handle_java_file, handle_java_inetaddress, handle_java_linkedhashmap,
-    handle_java_messagedigest, handle_java_paths, handle_java_pattern, handle_java_stringbuilder,
-    handle_java_system, handle_java_thread, handle_java_treemap, handle_java_uuid,
+    handle_java_class, handle_java_collections, handle_java_concurrenthashmap,
+    handle_java_concurrentlinkedqueue, handle_java_date, handle_java_file, handle_java_inetaddress,
+    handle_java_linkedhashmap, handle_java_messagedigest, handle_java_paths, handle_java_pattern,
+    handle_java_stringbuilder, handle_java_system, handle_java_thread, handle_java_treemap,
+    handle_java_uuid,
 };
 
 pub type BuiltinFunction = fn(Vec<CfmlValue>) -> CfmlResult;
@@ -12950,6 +12951,7 @@ impl CfmlVirtualMachine {
                     "java.util.regex.pattern" | "java.util.regex.matcher" => {
                         handle_java_pattern(&m, all_args, object)
                     }
+                    "java.lang.class" => handle_java_class(&m, all_args, object),
                     _ => Ok(CfmlValue::Null),
                 };
                 match result {
@@ -13901,6 +13903,36 @@ impl CfmlVirtualMachine {
                     CfmlErrorType::Expression,
                 ));
             }
+        }
+
+        // Lucee parity: `getClass()` on any non-component value returns a
+        // java.lang.Class-like shim whose getName()/getSimpleName() yield the
+        // runtime class name. TestBox's instanceOf/notInstanceOf matchers and
+        // Wheels' toXML.cfc fall back to `actual.getClass().getName()` for
+        // non-component actuals (e.g. a boolean `false` from findOne()); this
+        // returned Null, so the chained `.getName()` threw "cannot call method
+        // [getName] on a null value". (Components are handled above — TestBox
+        // uses getMetadata().name for those.)
+        if method_lower == "getclass" {
+            let class_name = match &object {
+                CfmlValue::Bool(_) => "java.lang.Boolean",
+                CfmlValue::Int(_) => "java.lang.Integer",
+                CfmlValue::Double(_) => "java.lang.Double",
+                CfmlValue::String(_) => "java.lang.String",
+                CfmlValue::Array(_) => "lucee.runtime.type.ArrayImpl",
+                CfmlValue::Struct(_) => "lucee.runtime.type.StructImpl",
+                CfmlValue::Query(_) => "lucee.runtime.type.QueryImpl",
+                CfmlValue::Binary(_) => "[B",
+                _ => "java.lang.Object",
+            };
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.lang.class".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__class_name".to_string(), CfmlValue::string(class_name.to_string()));
+            return Ok(CfmlValue::strukt(shim));
         }
 
         // Lucee parity: `toString()` on any non-component value returns a string

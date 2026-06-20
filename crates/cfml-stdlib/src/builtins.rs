@@ -250,6 +250,9 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("isDate".into(), fn_is_date);
     f.insert("isQuery".into(), fn_is_query);
     f.insert("isObject".into(), fn_is_object);
+    f.insert("isImageFile".into(), fn_is_image_file);
+    f.insert("getReadableImageFormats".into(), fn_get_readable_image_formats);
+    f.insert("getWriteableImageFormats".into(), fn_get_readable_image_formats);
     f.insert("isBinary".into(), fn_is_binary);
     f.insert("isCustomFunction".into(), fn_is_custom_function);
     f.insert("isClosure".into(), fn_is_closure);
@@ -2795,6 +2798,47 @@ fn fn_is_object(args: Vec<CfmlValue>) -> CfmlResult {
         Some(CfmlValue::NativeObject(_)) => true,
         _ => false,
     }))
+}
+
+/// IsImageFile(path) — true only if the file exists AND its content is a
+/// recognized raster/vector image (Lucee checks content, not extension: a
+/// text file renamed `.png` returns false). Magic-byte sniff of the common
+/// formats ImageIO/Lucee can read.
+fn fn_is_image_file(args: Vec<CfmlValue>) -> CfmlResult {
+    let path = get_str(&args, 0);
+    if path.is_empty() {
+        return Ok(CfmlValue::Bool(false));
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Ok(CfmlValue::Bool(false)),
+    };
+    let b: &[u8] = bytes.as_slice();
+    let is_img = b.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) // PNG
+        || b.starts_with(&[0xFF, 0xD8, 0xFF])           // JPEG
+        || b.starts_with(b"GIF87a")
+        || b.starts_with(b"GIF89a")
+        || b.starts_with(b"BM")                          // BMP
+        || b.starts_with(&[0x49, 0x49, 0x2A, 0x00])     // TIFF little-endian
+        || b.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])     // TIFF big-endian
+        || b.starts_with(&[0x00, 0x00, 0x01, 0x00])     // ICO
+        || b.starts_with(b"8BPS")                        // PSD
+        || (b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP")
+        // SVG: an XML/text vector image — sniff for an <svg root within the head
+        || {
+            let head = String::from_utf8_lossy(&b[..b.len().min(512)]).to_lowercase();
+            head.contains("<svg")
+        };
+    Ok(CfmlValue::Bool(is_img))
+}
+
+/// GetReadableImageFormats() / GetWriteableImageFormats() — comma list of the
+/// image formats the engine can read. Wheels only requires a non-empty simple
+/// value; the set mirrors Lucee/ImageIO.
+fn fn_get_readable_image_formats(_args: Vec<CfmlValue>) -> CfmlResult {
+    Ok(CfmlValue::string(
+        "BMP,GIF,JPEG,JPG,PNG,PSD,TIF,TIFF,WBMP,WEBP".to_string(),
+    ))
 }
 
 fn fn_is_binary(args: Vec<CfmlValue>) -> CfmlResult {

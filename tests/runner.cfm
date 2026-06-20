@@ -72,6 +72,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_required_param_with_default.cfm">
 <cf_runtest file="core/test_member_index_incdec.cfm">
 <cf_runtest file="core/test_member_tostring.cfm">
+<cf_runtest file="core/test_getclass_and_image.cfm">
 <cf_runtest file="core/test_thread_scope_page.cfm">
 <cf_runtest file="core/test_bif_shadow_and_arg_alias.cfm">
 <cf_runtest file="core/test_arguments_writeback.cfm">
