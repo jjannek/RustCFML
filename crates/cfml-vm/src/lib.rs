@@ -14872,18 +14872,37 @@ impl CfmlVirtualMachine {
                 // Only fall back to treating it as a literal filesystem path when
                 // none of those produce an existing file (preserving the case
                 // where a genuinely OS-absolute .cfc is passed).
-                let with_ext = if class_name.to_lowercase().ends_with(".cfc") {
+                //
+                // Lucee treats BOTH '/' and '.' as path separators after the
+                // leading slash, so a slash-rooted *dotted* component path
+                // ("/wheels/tests/_assets/plugins/cat.Plugin.Plugin") maps to
+                // ".../plugins/cat/Plugin/Plugin.cfc". The literal form is tried
+                // first (a genuinely slash-only path like "/oop/Widget", or an
+                // OS-absolute .cfc, keeps its existing behavior); the
+                // dot-normalized form is the fallback. (Wheels' plugin loader
+                // builds exactly this slash-rooted dotted path — fixes ~64 specs.)
+                let ends_cfc = class_name.to_lowercase().ends_with(".cfc");
+                let literal = if ends_cfc {
                     class_name.to_string()
                 } else {
                     format!("{}.cfc", class_name)
                 };
-                if self.vfs.exists(&with_ext) {
-                    with_ext
-                } else if let Some(resolved) = self.resolve_leading_slash_include(&with_ext) {
-                    resolved
-                } else {
-                    with_ext
+                let mut candidates = vec![literal.clone()];
+                if !ends_cfc && class_name[1..].contains('.') {
+                    let body = class_name.trim_start_matches('/').replace('.', "/");
+                    candidates.push(format!("/{}.cfc", body));
                 }
+                let mut resolved_path = None;
+                for cand in &candidates {
+                    if self.vfs.exists(cand) {
+                        resolved_path = Some(cand.clone());
+                        break;
+                    } else if let Some(resolved) = self.resolve_leading_slash_include(cand) {
+                        resolved_path = Some(resolved);
+                        break;
+                    }
+                }
+                resolved_path.unwrap_or(literal)
             } else if as_path.is_absolute() || class_name.to_lowercase().ends_with(".cfc") {
                 let p = if class_name.to_lowercase().ends_with(".cfc") {
                     class_name.to_string()

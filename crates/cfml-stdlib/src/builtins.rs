@@ -5464,11 +5464,14 @@ fn fn_directory_delete(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
-    // directoryList(path [, recurse [, listInfo [, filter]]])
+    // directoryList(path [, recurse [, listInfo [, filter [, sort [, type]]]]])
     let path = get_str(&args, 0);
     let recurse = if args.len() >= 2 { args[1].is_true() } else { false };
     let list_info = if args.len() >= 3 { get_str(&args, 2).to_lowercase() } else { "path".to_string() };
     let filter = if args.len() >= 4 { get_str(&args, 3) } else { String::new() };
+    // 6th arg `type` (dir|file|all, default all) — Lucee parity. Wheels' plugin
+    // loader uses directoryList(..., "dir") to enumerate only sub-directories.
+    let type_filter = if args.len() >= 6 { get_str(&args, 5).to_lowercase() } else { "all".to_string() };
 
     fn matches_filter(filename: &str, filter: &str) -> bool {
         if filter.is_empty() { return true; }
@@ -5489,7 +5492,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
         Row { name: String, directory: String, size: u64, is_dir: bool },
     }
 
-    fn list_dir(path: &str, recurse: bool, filter: &str, list_info: &str) -> Result<Vec<Entry>, std::io::Error> {
+    fn list_dir(path: &str, recurse: bool, filter: &str, list_info: &str, type_filter: &str) -> Result<Vec<Entry>, std::io::Error> {
         let mut results = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
@@ -5502,8 +5505,15 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
 
             // The name filter applies to BOTH files and directories (Lucee/ACF
             // behavior); directories are still always recursed into below
-            // regardless of whether their own name matches the filter.
-            if (is_file || is_dir) && matches_filter(&file_name, filter) {
+            // regardless of whether their own name matches the filter. The type
+            // filter (dir|file|all) gates which entries are emitted but never
+            // suppresses recursion.
+            let type_ok = match type_filter {
+                "dir" => is_dir,
+                "file" => is_file,
+                _ => true,
+            };
+            if (is_file || is_dir) && type_ok && matches_filter(&file_name, filter) {
                 match list_info {
                     "query" => {
                         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -5517,7 +5527,7 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
                 };
             }
             if recurse && is_dir {
-                results.extend(list_dir(&full_path, true, filter, list_info)?);
+                results.extend(list_dir(&full_path, true, filter, list_info, type_filter)?);
             }
         }
         Ok(results)
@@ -5527,9 +5537,14 @@ fn fn_directory_list(args: Vec<CfmlValue>) -> CfmlResult {
     // than throwing (ColdBox/Preside scan optional module locations like
     // `/app/extensions_app` that may not exist). Only a genuine I/O failure
     // (permissions, etc.) still surfaces as an error.
-    let listing = match list_dir(&path, recurse, &filter, &list_info) {
+    let listing = match list_dir(&path, recurse, &filter, &list_info, &type_filter) {
         Ok(entries) => Ok(entries),
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        // A path that exists but is a FILE yields ENOTDIR (os error 20). Lucee
+        // returns an empty listing for directoryList() on a file rather than
+        // throwing. (ErrorKind::NotADirectory is unstable on the pinned
+        // toolchain, so match the raw errno instead.)
+        Err(ref e) if e.raw_os_error() == Some(20) => Ok(Vec::new()),
         Err(e) => Err(e),
     };
 
@@ -9961,6 +9976,13 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                     _ => false,
                 })
                 .unwrap_or(false);
+            // type filter (Lucee: "dir" | "file" | "all", default "all"). Wheels'
+            // $folders() relies on type="dir" to list only plugin sub-directories;
+            // ignoring it returned stray sibling files as folders, which then made
+            // directoryList() fail on a file (ENOTDIR).
+            let type_filter = get_ci(opts, "type")
+                .map(|v| v.as_string().to_lowercase())
+                .unwrap_or_else(|| "all".into());
 
             let columns = vec![
                 "name".to_string(),
@@ -9985,6 +10007,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
             fn list_dir(
                 dir: &Path,
                 filter: &str,
+                type_filter: &str,
                 recurse: bool,
                 rows: &mut Vec<ValueMap>,
                 visited: &mut std::collections::HashSet<std::path::PathBuf>,
@@ -10020,7 +10043,12 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                         })
                         .unwrap_or_default();
 
-                    let should_include = is_dir || matches_glob(&name, filter);
+                    let should_include = match type_filter {
+                        "dir" => is_dir,
+                        "file" => !is_dir && matches_glob(&name, filter),
+                        // "all" (default) — original behavior unchanged
+                        _ => is_dir || matches_glob(&name, filter),
+                    };
 
                     if should_include {
                         let mut row = ValueMap::default();
@@ -10044,7 +10072,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
                         let canon = fs::canonicalize(entry.path())
                             .unwrap_or_else(|_| entry.path());
                         if visited.insert(canon.clone()) {
-                            list_dir(&entry.path(), filter, recurse, rows, visited)?;
+                            list_dir(&entry.path(), filter, type_filter, recurse, rows, visited)?;
                             visited.remove(&canon);
                         }
                     }
@@ -10056,7 +10084,7 @@ fn fn_cfdirectory(args: Vec<CfmlValue>) -> CfmlResult {
             if let Ok(canon) = fs::canonicalize(&directory) {
                 visited.insert(canon);
             }
-            list_dir(Path::new(&directory), &filter, recurse, &mut rows, &mut visited)?;
+            list_dir(Path::new(&directory), &filter, &type_filter, recurse, &mut rows, &mut visited)?;
 
             Ok(CfmlValue::Query(CfmlQuery::from_parts(columns, rows)))
         }
