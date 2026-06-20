@@ -1001,7 +1001,21 @@ impl CfmlCompiler {
                 }
             }
             Statement::Var(var) => {
-                instructions.push(BytecodeOp::DeclareLocal(var.name.clone()));
+                // `var local.X` is identical to `var X` — X already lives in the
+                // local scope, so the `local.` prefix is redundant. Strip it so the
+                // declare/store target the local key `X`. Without this, the name
+                // reached `StoreLocal("local.X")`, which matches no scope branch and
+                // lands under a flat `"local.X"` key that reads of `local.X` never
+                // see — the initializer was silently dropped and a
+                // `for (var local.i = 1; …)` counter started empty, lagged, and
+                // over-ran (Lucee runs it fine). Only a single-segment key is
+                // normalized; deeper paths (`var local.a.b`, `var foo.bar`) are left
+                // untouched.
+                let name = match var.name.to_lowercase().strip_prefix("local.") {
+                    Some(rest) if !rest.contains('.') => var.name[6..].to_string(),
+                    _ => var.name.clone(),
+                };
+                instructions.push(BytecodeOp::DeclareLocal(name.clone()));
                 if let Some(value) = &var.value {
                     self.compile_expression(value, instructions);
                     // `var x = voidFn()` — a Null initialiser must NOT create the
@@ -1010,18 +1024,18 @@ impl CfmlCompiler {
                         instructions.push(BytecodeOp::JumpIfNotNull(0)); // -> store (patched)
                         let guard_idx = instructions.len() - 1;
                         instructions.push(BytecodeOp::Pop); // drop the Null
-                        instructions.push(BytecodeOp::UnsetPath(var.name.clone()));
+                        instructions.push(BytecodeOp::UnsetPath(name.clone()));
                         instructions.push(BytecodeOp::Jump(0)); // -> end (patched)
                         let end_idx = instructions.len() - 1;
                         instructions[guard_idx] = BytecodeOp::JumpIfNotNull(instructions.len());
-                        instructions.push(BytecodeOp::StoreLocal(var.name.clone()));
+                        instructions.push(BytecodeOp::StoreLocal(name.clone()));
                         instructions[end_idx] = BytecodeOp::Jump(instructions.len());
                     } else {
-                        instructions.push(BytecodeOp::StoreLocal(var.name.clone()));
+                        instructions.push(BytecodeOp::StoreLocal(name.clone()));
                     }
                 } else {
                     instructions.push(BytecodeOp::Null);
-                    instructions.push(BytecodeOp::StoreLocal(var.name.clone()));
+                    instructions.push(BytecodeOp::StoreLocal(name.clone()));
                 }
             }
             Statement::Assignment(assign) => {

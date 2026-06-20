@@ -2652,7 +2652,6 @@ impl CfmlVirtualMachine {
             if ip >= func.instructions.len() {
                 break;
             }
-
             let op = &func.instructions[ip];
             ip += 1;
 
@@ -4338,13 +4337,32 @@ impl CfmlVirtualMachine {
                             }
                             continue;
                         }
-                        // Expand argumentCollection: unpack struct keys as named args
+                        // Expand argumentCollection: unpack struct keys as named args.
+                        // Explicit named arguments take precedence over keys supplied
+                        // through `argumentCollection`, REGARDLESS of their order at the
+                        // call site (Lucee/ACF/BoxLang). Collect the explicit named-arg
+                        // names up front and drop any colliding argumentCollection key —
+                        // otherwise a spread landing after the explicit arg clobbers it
+                        // via the last-wins binding below. Wheels' recursive
+                        // `resource(name=local.names[i], argumentCollection=arguments)`
+                        // relies on this: `arguments.name` is the original comma-list, so
+                        // letting it win leaves `name` a list forever → infinite recursion.
+                        let explicit_named: std::collections::HashSet<String> = names
+                            .iter()
+                            .filter(|n| {
+                                !n.is_empty() && !n.eq_ignore_ascii_case("argumentcollection")
+                            })
+                            .map(|n| n.to_lowercase())
+                            .collect();
                         let mut expanded_names = Vec::new();
                         let mut expanded_values = Vec::new();
                         for (i, name) in names.iter().enumerate() {
                             if name.eq_ignore_ascii_case("argumentcollection") {
                                 if let Some(CfmlValue::Struct(s)) = named_values.get(i) {
                                     for (k, v) in s.iter() {
+                                        if explicit_named.contains(&k.to_lowercase()) {
+                                            continue; // explicit named arg wins
+                                        }
                                         expanded_names.push(k.clone());
                                         expanded_values.push(v.clone());
                                     }
@@ -12370,6 +12388,16 @@ impl CfmlVirtualMachine {
         // Positional args expanded from a numeric-keyed argumentCollection are
         // placed by their 1-based key rather than appended in iteration order.
         let mut numeric_positional: Vec<(usize, CfmlValue)> = Vec::new();
+        // Explicit named args win over argumentCollection keys regardless of
+        // call-site order (Lucee/ACF/BoxLang). Drop colliding argumentCollection
+        // keys so a spread can't clobber an explicit arg via the last-wins
+        // binding below — see the CallNamed handler for the rationale (Wheels
+        // recursive `resource(name=…, argumentCollection=arguments)`).
+        let explicit_named: std::collections::HashSet<String> = arg_names
+            .iter()
+            .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("argumentcollection"))
+            .map(|n| n.to_lowercase())
+            .collect();
         for (i, name) in arg_names.iter().enumerate() {
             let value = arg_values.get(i).cloned().unwrap_or(CfmlValue::Null);
             if name.eq_ignore_ascii_case("argumentcollection") {
@@ -12380,6 +12408,9 @@ impl CfmlVirtualMachine {
                                 numeric_positional.push((pos - 1, v.clone()));
                                 continue;
                             }
+                        }
+                        if explicit_named.contains(&k.to_lowercase()) {
+                            continue; // explicit named arg wins
                         }
                         expanded_names.push(k.clone());
                         expanded_values.push(v.clone());
@@ -13762,6 +13793,14 @@ impl CfmlVirtualMachine {
                 // ACF/BoxLang all preserve names here; Wheels' dynamic query scopes
                 // read them by name (arguments.status) via onMissingMethod.
                 let names = arg_names.unwrap_or(&[]);
+                // Explicit named args win over argumentCollection keys regardless
+                // of call-site order (Lucee/ACF/BoxLang) — drop colliding spread
+                // keys so they can't clobber an explicit arg inserted earlier.
+                let explicit_named: std::collections::HashSet<String> = names
+                    .iter()
+                    .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("argumentcollection"))
+                    .map(|n| n.to_lowercase())
+                    .collect();
                 let mut missing_args: ValueMap = ValueMap::default();
                 let mut positional = 0usize;
                 for (i, a) in args_array.into_iter().enumerate() {
@@ -13771,6 +13810,9 @@ impl CfmlVirtualMachine {
                         // mirroring reorder_named_args_with_extras.
                         if let CfmlValue::Struct(ref s) = a {
                             for (k, v) in s.iter() {
+                                if explicit_named.contains(&k.to_lowercase()) {
+                                    continue; // explicit named arg wins
+                                }
                                 missing_args.insert(k.clone(), v.clone());
                             }
                             continue;

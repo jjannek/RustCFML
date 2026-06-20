@@ -2578,11 +2578,22 @@ fn parse_cfloop_tag(
         // dynamic) step, matching Lucee. Hoist step into a temp so it is
         // evaluated once rather than per-iteration.
         let step_var = format!("__cfloop_step_{}", consumed);
+        // A C-style `for (var X = …; …)` declaration only accepts a SIMPLE
+        // name. When the index is scope-qualified (e.g. `index="local.i"`,
+        // common in Wheels), emitting `var local.i = 1` mis-parses — the
+        // initializer is dropped, so the counter starts empty, lags by one,
+        // and over-runs (in nested loops this corrupts the `local` scope and
+        // spins forever, issue #188). Lucee never emits `var` for a scoped
+        // index — it just assigns to that scope. Mirror that: drop `var` when
+        // the index carries a scope prefix. (for-in forms below tolerate
+        // `var local.x` fine, so only this C-style branch needs the guard.)
+        let var_kw = if index.contains('.') { "" } else { "var " };
         (
             format!(
-                "var {sv} = {step};\nfor (var {i} = {from}; ({sv} < 0 ? {i} >= {to} : {i} <= {to}); {i} = {i} + {sv}) {{\n",
+                "var {sv} = {step};\nfor ({vk}{i} = {from}; ({sv} < 0 ? {i} >= {to} : {i} <= {to}); {i} = {i} + {sv}) {{\n",
                 sv = step_var,
                 step = step,
+                vk = var_kw,
                 i = index,
                 from = from,
                 to = to
