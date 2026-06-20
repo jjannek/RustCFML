@@ -41,5 +41,23 @@ mapped = items.map((it) => {
 assertTrue("block-body arrow multi-statement doubled", mapped[2].doubled eq 4);
 assertTrue("block-body arrow multi-statement label", mapped[3].label eq "n=3");
 
+// Issue #185: arrow functions with default parameter values.
+withDefaults = (a = 1, b = 2) => { return a + b; };
+assertTrue("arrow defaults - all omitted", withDefaults() eq 3);
+assertTrue("arrow defaults - first supplied", withDefaults(10) eq 12);
+assertTrue("arrow defaults - both supplied", withDefaults(10, 20) eq 30);
+
+singleDefault = (a = 5) => { return a; };
+assertTrue("arrow single default omitted", singleDefault() eq 5);
+assertTrue("arrow single default supplied", singleDefault(9) eq 9);
+
+// Expression-bodied arrow with a default.
+exprDefault = (a = 7) => a * 2;
+assertTrue("arrow expr-body default", exprDefault() eq 14);
+
+// Default referencing an earlier param + a non-default trailing param.
+mixedDefault = (a, b = 3) => { return a * b; };
+assertTrue("arrow mixed default", mixedDefault(4) eq 12);
+
 suiteEnd();
 </cfscript>

@@ -379,6 +379,21 @@ impl Parser {
             return self.parse_lock(stmt_loc);
         }
 
+        // cfscript-statement `loop` form (the script equivalent of <cfloop> with
+        // attributes): `loop query=q { … }`, `loop list="a,b" item="x" { … }`,
+        // `loop array=[…] item="x" { … }`, `loop from=1 to=3 index="i" { … }`,
+        // `loop times=3 { … }`, `loop condition="…" { … }`, `loop collection=…`.
+        // Only fires when `loop` leads either a `{` body (infinite loop) or an
+        // `attr=` pair, so `loop = 5;` (assignment) and `loop(…)` (call) are
+        // untouched. (Issue #183 — blocks Preside SqlSchemaSynchronizer.)
+        if matches!(self.peek(0), Token::Identifier(ref s) if s.eq_ignore_ascii_case("loop"))
+            && (matches!(self.peek(1), Token::LBrace)
+                || (self.is_identifier_like_at(1) && matches!(self.peek(2), Token::Equal)))
+        {
+            self.advance(); // consume `loop`
+            return self.parse_script_loop(stmt_loc);
+        }
+
         if self.match_token(&Token::Include) {
             let path = self.parse_expression()?;
             self.match_token(&Token::Semicolon);
@@ -1687,6 +1702,317 @@ impl Parser {
             value,
             location: loc,
         })
+    }
+
+    /// Parse the cfscript-statement `loop` form (`loop`-keyword already
+    /// consumed). Collects the `attr=value` pairs, parses the `{ … }` body, and
+    /// lowers to the equivalent `for`/`for-in`/`while` AST — mirroring the
+    /// `<cfloop>` tag preprocessor in tag_parser.rs. (Issue #183.)
+    fn parse_script_loop(&mut self, loc: SourceLocation) -> Result<CfmlNode, ParseError> {
+        // Collect attributes until the body block (or a stray `;`).
+        let mut attrs: Vec<(String, Expression)> = Vec::new();
+        while !self.check(&Token::LBrace) && !self.check(&Token::Semicolon) && !self.is_at_end() {
+            if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                let key = self.extract_identifier()?;
+                self.advance(); // consume =
+                let value = self.parse_expression()?;
+                attrs.push((key.to_lowercase(), value));
+            } else {
+                break;
+            }
+        }
+
+        let body = self.parse_block()?;
+
+        // --- attribute helpers ----------------------------------------------
+        let get = |name: &str| -> Option<Expression> {
+            attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+        };
+        // `index`/`item`/`key` name a variable; the value is a string literal
+        // (`index="i"`) or a bare identifier (`index=i`). Extract the name.
+        let var_name = |e: &Expression| -> Option<String> {
+            match e {
+                Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => {
+                    Some(s.clone())
+                }
+                Expression::Identifier(id) => Some(id.name.clone()),
+                _ => None,
+            }
+        };
+
+        // --- expression constructors ----------------------------------------
+        let ident = |name: &str| Expression::Identifier(Identifier { name: name.to_string(), location: loc });
+        let int = |n: i64| Expression::Literal(Literal { value: LiteralValue::Int(n), location: loc });
+        let bin = |l: Expression, op: BinaryOpType, r: Expression| {
+            Expression::BinaryOp(Box::new(BinaryOp {
+                left: Box::new(l),
+                operator: op,
+                right: Box::new(r),
+                location: loc,
+            }))
+        };
+        let call = |name: &str, args: Vec<Expression>| {
+            Expression::FunctionCall(Box::new(FunctionCall {
+                name: Box::new(Expression::Identifier(Identifier { name: name.to_string(), location: loc })),
+                arguments: args,
+                location: loc,
+            }))
+        };
+        // `name = value;` as an assignment statement.
+        let assign = |name: String, value: Expression| {
+            Statement::Assignment(Assignment {
+                target: AssignTarget::Variable(name),
+                value,
+                operator: AssignOp::Equal,
+                location: loc,
+            })
+        };
+        // Unique temp suffix for synthesized loop variables.
+        let uniq = self.current;
+
+        let from = get("from");
+        let to = get("to");
+        let index = get("index");
+        let item = get("item");
+
+        // 1) Index loop: from / to / index (+ optional step).
+        if let (Some(from), Some(to), Some(index)) = (from.clone(), to.clone(), index.clone()) {
+            let idx = var_name(&index).unwrap_or_else(|| "i".to_string());
+            let step = get("step").unwrap_or_else(|| int(1));
+            // Direction chosen from the sign of step (Lucee): when step < 0 the
+            // terminating test flips to `idx >= to`.
+            let cond = Expression::Ternary(Box::new(Ternary {
+                condition: Box::new(bin(step.clone(), BinaryOpType::Less, int(0))),
+                then_expr: Box::new(bin(ident(&idx), BinaryOpType::GreaterEqual, to.clone())),
+                else_expr: Box::new(bin(ident(&idx), BinaryOpType::LessEqual, to.clone())),
+                location: loc,
+            }));
+            let init = Statement::Var(Var { name: idx.clone(), value: Some(from), location: loc });
+            let increment = bin(ident(&idx), BinaryOpType::Add, step);
+            return Ok(CfmlNode::Statement(Statement::For(For {
+                init: Some(Box::new(init)),
+                condition: Some(cond),
+                increment: Some(Box::new(bin(ident(&idx), BinaryOpType::Assign, increment))),
+                body,
+                location: loc,
+            })));
+        }
+
+        // 2) times=N — repeat the body N times.
+        if let Some(times) = get("times") {
+            let counter = format!("__cfloop_times_{}", uniq);
+            let init = Statement::Var(Var { name: counter.clone(), value: Some(int(1)), location: loc });
+            let cond = bin(ident(&counter), BinaryOpType::LessEqual, times);
+            let increment = bin(ident(&counter), BinaryOpType::Assign, bin(ident(&counter), BinaryOpType::Add, int(1)));
+            return Ok(CfmlNode::Statement(Statement::For(For {
+                init: Some(Box::new(init)),
+                condition: Some(cond),
+                increment: Some(Box::new(increment)),
+                body,
+                location: loc,
+            })));
+        }
+
+        // 3) condition="…" — while loop. The condition attribute is an
+        //    *expression written as a string* (`condition="n LT 3"`), so its
+        //    contents must be reparsed as code rather than used as a literal
+        //    string value (which would be permanently truthy → infinite loop).
+        if let Some(cond) = get("condition") {
+            let condition = match &cond {
+                Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => {
+                    Self::reparse_expr_string(s).unwrap_or(cond)
+                }
+                _ => cond,
+            };
+            return Ok(CfmlNode::Statement(Statement::While(While {
+                condition,
+                body,
+                location: loc,
+            })));
+        }
+
+        // 4) array=… — iterate elements (with optional 1-based index).
+        if let Some(array) = get("array") {
+            // item + index: bind item=element, index=1-based position.
+            if let (Some(item), Some(index)) = (item.clone(), index.clone()) {
+                let item_n = var_name(&item).unwrap_or_else(|| "item".to_string());
+                let idx_n = var_name(&index).unwrap_or_else(|| "index".to_string());
+                let arr_tmp = format!("__cfloop_array_{}", uniq);
+                let mut for_body = vec![assign(item_n, Expression::ArrayAccess(Box::new(ArrayAccess {
+                    array: Box::new(ident(&arr_tmp)),
+                    index: Box::new(ident(&idx_n)),
+                    location: loc,
+                })))];
+                for_body.extend(body);
+                let init = Statement::Var(Var { name: idx_n.clone(), value: Some(int(1)), location: loc });
+                let cond = bin(ident(&idx_n), BinaryOpType::LessEqual, call("arrayLen", vec![ident(&arr_tmp)]));
+                let increment = bin(ident(&idx_n), BinaryOpType::Assign, bin(ident(&idx_n), BinaryOpType::Add, int(1)));
+                // Hoist the array into a temp so it is evaluated once.
+                return Ok(self.wrap_with_preamble(
+                    vec![assign(arr_tmp.clone(), array)],
+                    Statement::For(For {
+                        init: Some(Box::new(init)),
+                        condition: Some(cond),
+                        increment: Some(Box::new(increment)),
+                        body: for_body,
+                        location: loc,
+                    }),
+                    loc,
+                ));
+            }
+            // item (or index) alone names the element binding.
+            if let Some(binding) = item.clone().or(index.clone()) {
+                let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
+                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    variable: name,
+                    iterable: array,
+                    body,
+                    location: loc,
+                })));
+            }
+        }
+
+        // 5) list="a,b,c" item|index="x" (+ optional delimiters).
+        if let Some(list) = get("list") {
+            if let Some(binding) = index.clone().or(item.clone()) {
+                let name = var_name(&binding).unwrap_or_else(|| "item".to_string());
+                let delims = get("delimiters").unwrap_or_else(|| {
+                    Expression::Literal(Literal { value: LiteralValue::String(",".to_string()), location: loc })
+                });
+                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    variable: name,
+                    iterable: call("listToArray", vec![list, delims]),
+                    body,
+                    location: loc,
+                })));
+            }
+        }
+
+        // 6) collection=… (struct iteration). item names the value; key/index
+        //    names the key.
+        if let Some(collection) = get("collection") {
+            let item_n = item.as_ref().and_then(|e| var_name(e)).unwrap_or_else(|| "item".to_string());
+            let key = get("key").or(index.clone());
+            if let Some(key) = key {
+                let key_n = var_name(&key).unwrap_or_else(|| "key".to_string());
+                let coll_tmp = format!("__cfloop_coll_{}", uniq);
+                let mut for_body = vec![assign(item_n, Expression::ArrayAccess(Box::new(ArrayAccess {
+                    array: Box::new(ident(&coll_tmp)),
+                    index: Box::new(ident(&key_n)),
+                    location: loc,
+                })))];
+                for_body.extend(body);
+                return Ok(self.wrap_with_preamble(
+                    vec![assign(coll_tmp.clone(), collection.clone())],
+                    Statement::ForIn(ForIn {
+                        variable: key_n,
+                        iterable: call("structKeyArray", vec![ident(&coll_tmp)]),
+                        body: for_body,
+                        location: loc,
+                    }),
+                    loc,
+                ));
+            }
+            return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                variable: item_n,
+                iterable: collection,
+                body,
+                location: loc,
+            })));
+        }
+
+        // 7) query=q (+ optional index|item). Without a binding, reassign the
+        //    query variable to the current row each iteration so `q.col` works.
+        if let Some(query) = get("query") {
+            if let Some(binding) = index.clone().or(item.clone()) {
+                let name = var_name(&binding).unwrap_or_else(|| "row".to_string());
+                return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                    variable: name,
+                    iterable: query,
+                    body,
+                    location: loc,
+                })));
+            }
+            let row_tmp = format!("__cfloop_qrow_{}", uniq);
+            let mut for_body = Vec::new();
+            // `q = __qrow;` only when the query is a plain variable (an lvalue).
+            if let Expression::Identifier(id) = &query {
+                for_body.push(assign(id.name.clone(), ident(&row_tmp)));
+            }
+            for_body.extend(body);
+            return Ok(CfmlNode::Statement(Statement::ForIn(ForIn {
+                variable: row_tmp,
+                iterable: query,
+                body: for_body,
+                location: loc,
+            })));
+        }
+
+        // 8) No recognised attributes — infinite loop.
+        Ok(CfmlNode::Statement(Statement::While(While {
+            condition: Expression::Literal(Literal { value: LiteralValue::Bool(true), location: loc }),
+            body,
+            location: loc,
+        })))
+    }
+
+    /// Reparse a string's contents as a standalone expression (used for the
+    /// `loop condition="…"` attribute, whose value is CFML code written as a
+    /// string). Returns None if the string isn't a valid expression.
+    fn reparse_expr_string(src: &str) -> Option<Expression> {
+        let mut sub = Parser::new(src.to_string());
+        sub.parse_expression().ok()
+    }
+
+    /// Emit a synthesized loop that needs preamble statements (e.g. hoisting an
+    /// iterable into a temp) by wrapping the preamble + loop in a zero-iteration
+    /// scaffold. We have no `Block` statement node, so the preamble is run once
+    /// via a `for(init; once; ){ … }`-free construct: prepend the preamble to a
+    /// single-iteration wrapper. Simpler: use a `for` with the preamble folded
+    /// into a leading `if(true){}` is not available either — instead we return
+    /// the loop wrapped so the preamble executes first.
+    fn wrap_with_preamble(
+        &self,
+        preamble: Vec<Statement>,
+        loop_stmt: Statement,
+        loc: SourceLocation,
+    ) -> CfmlNode {
+        // Run the preamble once, then the loop, by nesting both inside a
+        // single-pass `for` whose body is [preamble…, loop]. A one-shot
+        // `for(var __once=0; __once<1; __once=__once+1)` executes its body
+        // exactly once and introduces no observable variable beyond the temp.
+        let once = format!("__cfloop_once_{}", self.current);
+        let mut body = preamble;
+        body.push(loop_stmt);
+        let init = Statement::Var(Var {
+            name: once.clone(),
+            value: Some(Expression::Literal(Literal { value: LiteralValue::Int(0), location: loc })),
+            location: loc,
+        });
+        let cond = Expression::BinaryOp(Box::new(BinaryOp {
+            left: Box::new(Expression::Identifier(Identifier { name: once.clone(), location: loc })),
+            operator: BinaryOpType::Less,
+            right: Box::new(Expression::Literal(Literal { value: LiteralValue::Int(1), location: loc })),
+            location: loc,
+        }));
+        let inc = Expression::BinaryOp(Box::new(BinaryOp {
+            left: Box::new(Expression::Identifier(Identifier { name: once.clone(), location: loc })),
+            operator: BinaryOpType::Assign,
+            right: Box::new(Expression::BinaryOp(Box::new(BinaryOp {
+                left: Box::new(Expression::Identifier(Identifier { name: once.clone(), location: loc })),
+                operator: BinaryOpType::Add,
+                right: Box::new(Expression::Literal(Literal { value: LiteralValue::Int(1), location: loc })),
+                location: loc,
+            }))),
+            location: loc,
+        }));
+        CfmlNode::Statement(Statement::For(For {
+            init: Some(Box::new(init)),
+            condition: Some(cond),
+            increment: Some(Box::new(inc)),
+            body,
+            location: loc,
+        }))
     }
 
     fn parse_while(&mut self) -> Result<While, ParseError> {
@@ -5093,59 +5419,40 @@ impl Parser {
                 // We need to peek ahead to see if this is an arrow function
                 // Note: parse_primary() already advanced past the LParen, so self.current points to the next token
 
-                // Look ahead to find ) and check if => follows
+                // Look ahead to find the matching `)` and check if `=>` follows.
+                // Track bracket depth so default-value expressions
+                // (`(a = 1, b = [2]) => ...`) and nested calls don't confuse the
+                // scan — we want the close paren that balances the one already
+                // consumed, then peek for the fat arrow.
                 let mut is_arrow = false;
                 {
                     let mut offset = 0;
-                    // Skip past identifiers and commas
-                    loop {
-                        if offset < self.tokens.len() - self.current {
-                            match &self.tokens[self.current + offset].token {
-                                Token::Identifier(_) | Token::Comma => {
-                                    offset += 1;
-                                    continue;
-                                }
-                                Token::RParen => {
-                                    // Check for => after )
-                                    if offset + 1 < self.tokens.len() - self.current {
-                                        if matches!(&self.tokens[self.current + offset + 1].token, Token::FatArrow) {
-                                            is_arrow = true;
-                                        }
-                                    }
+                    let mut depth: i32 = 1; // the opening `(` is already consumed
+                    while self.current + offset < self.tokens.len() {
+                        match &self.tokens[self.current + offset].token {
+                            Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
+                            Token::RParen | Token::RBracket | Token::RBrace => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    is_arrow = self.current + offset + 1 < self.tokens.len()
+                                        && matches!(
+                                            &self.tokens[self.current + offset + 1].token,
+                                            Token::FatArrow
+                                        );
                                     break;
                                 }
-                                _ => break,
                             }
+                            _ => {}
                         }
-                        break;
+                        offset += 1;
                     }
                 }
 
                 if is_arrow {
-                    // Parse as arrow function
-                    let mut params = Vec::new();
-
-                    if !self.check(&Token::RParen) {
-                        loop {
-                            let param_name = match self.peek(0).clone() {
-                                Token::Identifier(id) => {
-                                    let name = id.clone();
-                                    self.advance();
-                                    name
-                                }
-                                _ => "arg".to_string(),
-                            };
-                            params.push(Param {
-                                name: param_name,
-                                param_type: None,
-                                default: None,
-                                required: false,
-                            });
-                            if !self.match_token(&Token::Comma) {
-                                break;
-                            }
-                        }
-                    }
+                    // Parse as arrow function. Reuse the full parameter parser so
+                    // default values, type annotations and `required` are honoured
+                    // exactly like `function(...)` declarations.
+                    let params = self.parse_param_list()?;
                     self.consume(&Token::RParen)?;
                     self.match_token(&Token::FatArrow); // consume =>
 

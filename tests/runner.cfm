@@ -657,6 +657,7 @@ include "harness.cfm";
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">
 <cf_runtest file="tags/test_cfloop_list_literal.cfm">
+<cf_runtest file="tags/test_script_loop.cfm">
 <cf_runtest file="tags/test_tag_attribute_escaped_hash.cfm">
 
 <!--- --- Query of Queries --- --->
