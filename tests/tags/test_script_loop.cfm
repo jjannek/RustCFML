@@ -61,9 +61,12 @@ out = "";
 loop query=q { out &= q.a & q.b & " "; }
 assertTrue("loop query bare", trim(out) eq "x1 y2");
 
-// query with an explicit index variable
+// query with an explicit index variable (fresh query — the bare query loop
+// above reassigns `q` to the current row each iteration, as the <cfloop query>
+// tag form does, so use a separate variable here).
+q2 = queryNew("a,b", "varchar,varchar", [["x","1"],["y","2"]]);
 out = "";
-loop query=q index="row" { out &= row.a; }
+loop query=q2 index="row" { out &= row.a; }
 assertTrue("loop query index", out eq "xy");
 
 // break / continue bind to the synthesized loop

@@ -6,6 +6,12 @@ assert("server.coldfusion.productname", server.coldfusion.productname, "RustCFML
 assertTrue("server.coldfusion.productversion is non-empty", len(server.coldfusion.productversion) GT 0);
 assertTrue("server.coldfusion.productlevel exists", structKeyExists(server.coldfusion, "productlevel"));
 
+// --- server.lucee (engine-detection shim: frameworks like Wheels/ColdBox/
+// Preside sniff server.lucee.version to identify a Lucee-dialect engine) ---
+assertTrue("server.lucee exists", structKeyExists(server, "lucee"));
+assertTrue("server.lucee.version is non-empty", len(server.lucee.version) GT 0);
+assertTrue("server.lucee.version major >= 5", listFirst(server.lucee.version, ".") GTE 5);
+
 // --- server.os ---
 assertTrue("server.os.name is non-empty", len(server.os.name) GT 0);
 assertTrue("server.os.arch is non-empty", len(server.os.arch) GT 0);

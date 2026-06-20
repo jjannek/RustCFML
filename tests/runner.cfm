@@ -198,6 +198,7 @@ include "harness.cfm";
 <!--- SerializeJSON emits methods as null keys. Breaks Wheels model --->
 <!--- properties() (for-in over `this`) and renderWith(data=modelObject) — a --->
 <!--- single-record JSON response comes back as ~379 internal keys. Runtime-safe. --->
+<cf_runtest file="oop/test_overflow_arg_no_leak.cfm">
 <cf_runtest file="oop/test_component_internals_serialize_leak.cfm">
 <cf_runtest file="oop/test_component_method_builtin_name.cfm">
 <cf_runtest file="oop/test_component_return_type.cfm">

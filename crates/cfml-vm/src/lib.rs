@@ -367,6 +367,27 @@ fn build_server_scope() -> ValueMap {
     );
     info.insert("coldfusion".to_string(), CfmlValue::strukt(cf));
 
+    // Advertise Lucee compatibility. RustCFML targets the Lucee dialect, and
+    // frameworks (Wheels, ColdBox, Preside, …) sniff the engine via
+    // `StructKeyExists(server, "lucee")` and branch on `server.lucee.version`.
+    // Without this they fall through to the Adobe ColdFusion branch and reject
+    // RustCFML on the version gate. We still self-identify as "RustCFML" through
+    // `server.coldfusion.productname` (which `isRustCFML()` keys on), so engine
+    // detection in our own test suite is unaffected. The reported version
+    // mirrors our cross-engine reference build (Lucee 7).
+    let lucee_version = "7.0.0.243".to_string();
+    let mut lucee = ValueMap::default();
+    lucee.insert("version".to_string(), CfmlValue::string(lucee_version.clone()));
+    lucee.insert(
+        "versionName".to_string(),
+        CfmlValue::string("RustCFML".to_string()),
+    );
+    lucee.insert(
+        "versionLevel".to_string(),
+        CfmlValue::string("Stable".to_string()),
+    );
+    info.insert("lucee".to_string(), CfmlValue::strukt(lucee));
+
     let mut os = ValueMap::default();
     os.insert(
         "name".to_string(),
@@ -3488,6 +3509,7 @@ impl CfmlVirtualMachine {
                             | "cfinvoke"
                             | "cfhtmlhead"
                             | "cfhtmlbody"
+                            | "cfcache"
                     ) {
                         // Script-style tag calls: `cfcontent(reset=true)` routes to `__cfcontent`.
                         // `location(...)` is the documented script alias for `cflocation(...)`
@@ -4722,13 +4744,19 @@ impl CfmlVirtualMachine {
                     // locals — poisoning later bare-name calls.
                     if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
                         if !effective_local_mode_modern {
+                            let arg_scope_keys = Self::argument_scope_key_set(&locals);
                             let mut writeback = ValueMap::default();
                             for (k, v) in &locals {
+                                // See the matching note on the normal-exit epilogue
+                                // below: arguments-scope keys (incl. overflow named
+                                // args) must never leak into the caller's locals.
+                                // (GitHub #187.)
                                 if k == "arguments"
                                     || k == "this"
                                     || k.starts_with("__")
                                     || func.params.contains(k)
                                     || declared_locals.contains(k.as_str())
+                                    || arg_scope_keys.contains(&k.to_lowercase())
                                 {
                                     continue;
                                 }
@@ -6817,15 +6845,24 @@ impl CfmlVirtualMachine {
         // caller locals with the new component's methods).
         if let Some(parent) = parent_scope.filter(|_| !is_template_frame) {
             if !effective_local_mode_modern {
+                let arg_scope_keys = Self::argument_scope_key_set(&locals);
                 let mut writeback = ValueMap::default();
                 for (k, v) in &locals {
                     // Skip function params, arguments scope, 'this', var-declared
-                    // locals, and __variables (handled by method_variables_writeback)
+                    // locals, and __variables (handled by method_variables_writeback).
+                    // Also skip every key that lives in this frame's `arguments`
+                    // scope — overflow named args (a named arg with no matching
+                    // declared param, e.g. Wheels calling `validatesLengthOf(
+                    // property="password")` whose param is `properties`) land in
+                    // `arguments` and would otherwise be misread as a fresh local
+                    // write and leaked into the CALLER's locals, shadowing a
+                    // same-named function on a later bare call. (GitHub #187.)
                     if k == "arguments"
                         || k == "this"
                         || k.starts_with("__")
                         || func.params.contains(k)
                         || declared_locals.contains(k.as_str())
+                        || arg_scope_keys.contains(&k.to_lowercase())
                     {
                         continue;
                     }
@@ -12232,6 +12269,20 @@ impl CfmlVirtualMachine {
     /// Builtins whose script-form invocation takes a single struct of attrs
     /// (matching the corresponding cf<tag>): `cfdirectory(action="list", ...)`
     /// is shorthand for the tag and is bundled into one struct argument.
+    /// The lowercased key names present in a frame's `arguments` scope, used to
+    /// keep argument values (declared params AND overflow named args) from
+    /// leaking out as legacy-localmode parent-scope writebacks. Engine-internal
+    /// sentinels (`__arguments_scope`/`__arguments_params`) and numeric
+    /// positional keys are irrelevant here and harmlessly included.
+    fn argument_scope_key_set(locals: &ValueMap) -> std::collections::HashSet<String> {
+        match locals.get(ARGUMENTS_SCOPE_KEY) {
+            Some(CfmlValue::Struct(args)) => {
+                args.iter().map(|(k, _)| k.to_lowercase()).collect()
+            }
+            _ => std::collections::HashSet::new(),
+        }
+    }
+
     fn is_tag_call_builtin(name: &str) -> bool {
         matches!(
             name.to_lowercase().as_str(),
@@ -12262,6 +12313,11 @@ impl CfmlVirtualMachine {
                 // single options struct that the intercept unwraps. (PR #161.)
                 | "__cfhtmlhead"
                 | "__cfhtmlbody"
+                // cfcache exists as a tag (→ __cfcache no-op intercept); the
+                // script call form `cfcache(action=…, key=…)` — used by Wheels'
+                // `$cache()` — bundles its named args into one options struct so
+                // the intercept consumes them cleanly instead of 500-ing.
+                | "__cfcache"
         )
     }
 
@@ -12280,7 +12336,7 @@ impl CfmlVirtualMachine {
             // `name` attribute is a real option (header/cookie name), not a
             // caller-scope target.
             "cfheader" | "cfcontent" | "cflocation" | "cfcookie" | "cflog"
-            | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" => &[],
+            | "cfsetting" | "cfhtmlhead" | "cfhtmlbody" | "cfcache" => &[],
             _ => &["name", "variable"],
         }
     }
