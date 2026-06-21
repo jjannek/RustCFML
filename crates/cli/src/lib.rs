@@ -117,6 +117,12 @@ struct Args {
     #[arg(long, default_value = "8500")]
     port: u16,
 
+    /// Bind the web server to a Unix domain socket instead of a TCP port.
+    /// With no value, defaults to /run/rustcfml.sock. When set, --port is
+    /// ignored (the socket wins). Unix-only.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/run/rustcfml.sock")]
+    socket: Option<String>,
+
     /// Explicit path to the server-baseline `.cfconfig.json`. When set, it is
     /// loaded instead of searching webroot/cwd/exe-dir. Also honored via the
     /// `CFCONFIG` env var (Lucee/CommandBox parity). Per-application
@@ -380,6 +386,9 @@ fn real_main() {
         // setting (cfconfig is application-level). It comes solely from `--port`
         // (clap default 8500).
         let port = args.port;
+        // --socket overrides --port (the socket wins). A bare `--socket` with no
+        // path falls back to the clap default /run/rustcfml.sock.
+        let socket = args.socket.as_ref().map(PathBuf::from);
         // server.webroot from config only applies when --serve had no path.
         if doc_root == PathBuf::from(".") && !cfconfig.server.webroot.is_empty() {
             doc_root = PathBuf::from(&cfconfig.server.webroot);
@@ -392,6 +401,7 @@ fn real_main() {
         run_server(
             &doc_root,
             port,
+            socket,
             args.debug,
             args.single_threaded,
             vfs::real_fs(),
@@ -417,7 +427,7 @@ fn real_main() {
         println!("Usage: rustcfml <file.cfm|.cfc>");
         println!("       rustcfml -c \"<code>\"");
         println!("       rustcfml -r (REPL mode)");
-        println!("       rustcfml --serve [path] [--port 8500]");
+        println!("       rustcfml --serve [path] [--port 8500 | --socket [PATH]]");
         println!("       rustcfml --build <app-dir> [-o output]");
         println!("       rustcfml --help");
         exit(0);
@@ -863,6 +873,7 @@ struct AppState {
 fn run_server(
     doc_root: &Path,
     port: u16,
+    socket: Option<PathBuf>,
     debug: bool,
     single_threaded: bool,
     vfs: Arc<dyn Vfs>,
@@ -882,7 +893,7 @@ fn run_server(
             .build()
             .unwrap()
     };
-    rt.block_on(async_run_server(doc_root, port, debug, single_threaded, vfs, sandbox, production, cfconfig));
+    rt.block_on(async_run_server(doc_root, port, socket, debug, single_threaded, vfs, sandbox, production, cfconfig));
 }
 
 /// Known Lucee Memcached extension Java class names (both the old and new bundle).
@@ -1286,6 +1297,7 @@ fn now_unix_secs() -> u64 {
 async fn async_run_server(
     doc_root: &Path,
     port: u16,
+    socket: Option<PathBuf>,
     debug: bool,
     single_threaded: bool,
     vfs: Arc<dyn Vfs>,
@@ -1350,7 +1362,10 @@ async fn async_run_server(
     };
 
     let mode = if single_threaded { "single-threaded" } else { "multi-threaded" };
-    println!("RustCFML server running on http://127.0.0.1:{} ({})", port, mode);
+    match &socket {
+        Some(path) => println!("RustCFML server listening on Unix socket: {} ({})", path.display(), mode),
+        None => println!("RustCFML server running on http://0.0.0.0:{} ({})", port, mode),
+    }
     println!("Document root: {}", fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()).display());
     println!("Press Ctrl+C to stop\n");
 
@@ -1376,19 +1391,71 @@ async fn async_run_server(
         .fallback(handle_request)
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap_or_else(|e| {
-        eprintln!("Failed to start server on 0.0.0.0:{}: {}", port, e);
-        exit(1);
-    });
-    // Disable Nagle's algorithm on accepted connections. For a request/response
-    // HTTP server, Nagle adds latency by holding small writes, and can stall on
-    // the classic Nagle + delayed-ACK interaction. axum::serve does not set this
-    // by default, so opt in via tap_io. (Go net/http, nginx, Node all default on.)
-    use axum::serve::ListenerExt;
-    let listener = listener.tap_io(|tcp_stream| {
-        let _ = tcp_stream.set_nodelay(true);
-    });
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    match socket {
+        // --socket: bind a Unix domain socket instead of a TCP port.
+        Some(sock_path) => {
+            #[cfg(unix)]
+            {
+                // Remove any stale socket file left over from a previous run;
+                // bind(2) fails with EADDRINUSE if the path already exists.
+                if sock_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&sock_path) {
+                        eprintln!("Failed to remove stale socket {}: {}", sock_path.display(), e);
+                        exit(1);
+                    }
+                }
+                let listener = tokio::net::UnixListener::bind(&sock_path).unwrap_or_else(|e| {
+                    eprintln!("Failed to bind Unix socket {}: {}", sock_path.display(), e);
+                    exit(1);
+                });
+                // Unix-socket peers have no IP address, so the
+                // ConnectInfo<SocketAddr> extractor in `handle_request` would
+                // fail at runtime under `into_make_service()`. Inject a synthetic
+                // loopback ConnectInfo extension on every request so the shared
+                // handler works unchanged.
+                let app = app.layer(axum::middleware::map_request(
+                    |mut req: axum::extract::Request| async move {
+                        req.extensions_mut().insert(axum::extract::ConnectInfo(
+                            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                        ));
+                        req
+                    },
+                ));
+                // Graceful shutdown: on Ctrl+C, stop accepting and then remove the
+                // socket file so the next start binds cleanly.
+                let cleanup_path = sock_path.clone();
+                axum::serve(listener, app.into_make_service())
+                    .with_graceful_shutdown(async move {
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .await
+                    .unwrap();
+                let _ = std::fs::remove_file(&cleanup_path);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &sock_path;
+                eprintln!("Unix domain sockets are not supported on this platform");
+                exit(1);
+            }
+        }
+        // Default: TCP listener on the configured port.
+        None => {
+            let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap_or_else(|e| {
+                eprintln!("Failed to start server on 0.0.0.0:{}: {}", port, e);
+                exit(1);
+            });
+            // Disable Nagle's algorithm on accepted connections. For a request/response
+            // HTTP server, Nagle adds latency by holding small writes, and can stall on
+            // the classic Nagle + delayed-ACK interaction. axum::serve does not set this
+            // by default, so opt in via tap_io. (Go net/http, nginx, Node all default on.)
+            use axum::serve::ListenerExt;
+            let listener = listener.tap_io(|tcp_stream| {
+                let _ = tcp_stream.set_nodelay(true);
+            });
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        }
+    }
 }
 
 async fn handle_request(
@@ -2886,6 +2953,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
 
     // Parse args
     let mut port: u16 = 8500;
+    let mut socket: Option<PathBuf> = None;
     let mut single_threaded = false;
     let mut sandbox = false;
     let mut command = ""; // "", "start", "stop", "status"
@@ -2895,6 +2963,16 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
             "--port" if i + 1 < cli_args.len() => {
                 port = cli_args[i + 1].parse().unwrap_or(8500);
                 i += 2;
+            }
+            // --socket [PATH]: bind a Unix socket; bare flag uses the default path.
+            "--socket" => {
+                if i + 1 < cli_args.len() && !cli_args[i + 1].starts_with('-') {
+                    socket = Some(PathBuf::from(&cli_args[i + 1]));
+                    i += 2;
+                } else {
+                    socket = Some(PathBuf::from("/run/rustcfml.sock"));
+                    i += 1;
+                }
             }
             "--single-threaded" => {
                 single_threaded = true;
@@ -2958,7 +3036,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production, cfconfig);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig);
         }
         _ => {
             // Foreground mode (default: just run)
@@ -2983,7 +3061,7 @@ fn run_embedded_serve(vfs: Arc<dyn Vfs>, base_dir: &str, file_count: usize) {
                 secure_json: cfconfig.security.secure_json,
                 secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
             });
-            run_server(&doc_root, port, false, single_threaded, vfs, sandbox, production, cfconfig);
+            run_server(&doc_root, port, socket, false, single_threaded, vfs, sandbox, production, cfconfig);
         }
     }
 }

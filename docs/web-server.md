@@ -7,17 +7,44 @@ Serve `.cfm` files over HTTP with full CFML web scopes (CGI, URL, Form, Cookie, 
 ```bash
 rustcfml --serve                           # Current dir on port 8500
 rustcfml --serve ./mywebroot --port 3000   # Custom root and port
+rustcfml --serve ./mywebroot --socket      # Bind a Unix socket (default /run/rustcfml.sock)
 ```
 
 The server is built on [Axum](https://github.com/tokio-rs/axum) with concurrent request handling. It serves `.cfm` files and static assets from the document root. Directory requests serve `index.cfm` if present. Path-info routing is supported (`/index.cfm/users/123` resolves to `index.cfm` with path info `/users/123`). Bytecode caching skips recompilation for unchanged files across requests.
 
 For deploying the server (production caching, Docker, standalone binaries), see **[Deployment](deployment.md)**.
 
+## Listening: TCP port or Unix socket
+
+By default the server listens on a TCP port (`--port`, default `8500`, bound to `0.0.0.0`). For production deployments behind a reverse proxy on the same host, it can instead listen on a **Unix domain socket** — this avoids the loopback TCP stack entirely (no ephemeral-port churn, no `TIME_WAIT` pressure) and is measurably faster under load.
+
+```bash
+rustcfml --serve ./mywebroot --socket                    # default path: /run/rustcfml.sock
+rustcfml --serve ./mywebroot --socket /var/run/app.sock  # explicit path
+```
+
+Behaviour:
+
+- **`--socket` overrides `--port`.** If both are given, the socket wins and the port is ignored.
+- A bare `--socket` (no path) uses `/run/rustcfml.sock`.
+- On startup, any **stale socket file** at the path is removed before binding, so a crashed previous run won't block a restart.
+- On a clean shutdown (Ctrl+C / `SIGINT`), the socket file is **removed**.
+- Unix sockets are a Unix-only feature (Linux/macOS). On other platforms `--socket` exits with an error — use `--port`.
+- `cgi.remote_addr` is reported as `127.0.0.1` for socket connections (peers over a Unix socket have no IP); set `X-Forwarded-For` in your proxy and read it if you need the real client address.
+
+Quick local check:
+
+```bash
+curl --unix-socket /run/rustcfml.sock http://localhost/index.cfm
+```
+
+See **[Deployment → Behind a reverse proxy (nginx + Unix socket)](deployment.md#behind-a-reverse-proxy-nginx--unix-socket)** for a complete nginx configuration and a load comparison.
+
 ## Configuration (`.cfconfig.json`)
 
 Drop a `.cfconfig.json` at the webroot to configure datasources, mappings, mail, security policies, error handling, and more. The format follows the Ortus CFConfig filename convention with a BoxLang-style flat schema, so the same file works across CommandBox/Lucee, BoxLang, and RustCFML — engine-specific keys are silently ignored. Secrets can use environment-variable substitution.
 
-cfconfig is **application-level**: the webroot file is the server *baseline* (or set one explicitly with `--cfconfig <path>` / the `CFCONFIG` env var), and any `.cfconfig.json` sitting beside an `Application.cfc` is overlaid on top of it per request — so each application under the server can tune its own runtime, datasources, and security. The listening **port is not a cfconfig setting** — it is set with `--port` (pages read `cgi.server_port`).
+cfconfig is **application-level**: the webroot file is the server *baseline* (or set one explicitly with `--cfconfig <path>` / the `CFCONFIG` env var), and any `.cfconfig.json` sitting beside an `Application.cfc` is overlaid on top of it per request — so each application under the server can tune its own runtime, datasources, and security. The listening **port is not a cfconfig setting** — it is set with `--port` (pages read `cgi.server_port`), or replaced entirely by `--socket` to listen on a Unix domain socket (see [below](#listening-tcp-port-or-unix-socket)).
 
 See **[Configuration](configuration.md)** for the full reference.
 

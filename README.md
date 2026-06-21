@@ -118,6 +118,8 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
   rustcfml --serve ./mywebroot --production
   ```
 
+  On the same host as the proxy, bind a **Unix domain socket** with `--socket` instead of a TCP port — it skips loopback TCP and sustains ~40% more throughput than TCP loopback at high concurrency. See **[Deployment → Behind a reverse proxy (nginx + Unix socket)](docs/deployment.md#behind-a-reverse-proxy-nginx--unix-socket)**.
+
 - **Optimised Docker container** — *coming soon*: a minimal image for containerised deployment.
 
 - **CLI tool** — compile a CFML app into a standalone command-line binary. See **[Deployment → CLI tools](docs/deployment.md#cli-tools)**.

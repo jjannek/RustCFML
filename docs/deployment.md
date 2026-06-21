@@ -14,6 +14,75 @@ rustcfml --serve ./mywebroot --production
 
 See **[Web Server](web-server.md)** for serve-mode details, `Application.cfc` lifecycle, sessions, and URL rewriting.
 
+## Behind a reverse proxy (nginx + Unix socket)
+
+In production you typically run RustCFML behind a reverse proxy (nginx, Caddy, HAProxy) that terminates TLS, serves static assets, and load-balances. When the proxy and RustCFML run on the **same host** — the common single-box and containerised setup — **a Unix domain socket is the recommended way to connect them**, in preference to a loopback TCP port.
+
+**Why a socket rather than `127.0.0.1:8500`?** When nginx proxies to RustCFML, every upstream request that isn't served from a warm keep-alive connection opens a fresh transport connection. Over loopback TCP that means the full TCP path — three-way handshake, an ephemeral source port allocated per connection, and a `TIME_WAIT` entry left behind on close. Under sustained load those add up: ephemeral ports are a finite range that can exhaust, and `TIME_WAIT` build-up adds latency and can stall new connections. A Unix domain socket sidesteps all of it — it's kernel-local IPC with no handshake, no port allocation, and no `TIME_WAIT`, so it stays flat as concurrency rises where the loopback-TCP path degrades. It also can't be reached from off-box, so the app server isn't accidentally exposed, and access is governed by ordinary filesystem permissions on the socket file. In our testing the socket path consistently matched direct-serve throughput while loopback TCP trailed it under load (see the comparison below).
+
+Reach for loopback TCP instead only when the proxy and RustCFML are on **different hosts** (where a socket isn't an option), or when a tool in front genuinely can't address a Unix socket.
+
+Start RustCFML on a socket:
+
+```bash
+rustcfml --serve /srv/mywebroot --production --socket /run/rustcfml.sock
+```
+
+(`--socket` overrides `--port`; a bare `--socket` defaults to `/run/rustcfml.sock`. Stale socket files are cleared on start and removed on clean shutdown — see **[Web Server → Listening](web-server.md#listening-tcp-port-or-unix-socket)**.)
+
+Point nginx at the socket. The `keepalive` pool and `proxy_http_version 1.1` keep upstream connections warm, which matters for throughput:
+
+```nginx
+upstream rustcfml {
+    server unix:/run/rustcfml.sock;
+    keepalive 128;
+}
+
+server {
+    listen 80;
+    server_name example.com;
+
+    # Serve static assets directly from nginx; proxy everything else.
+    root /srv/mywebroot;
+
+    location / {
+        try_files $uri @cfml;
+    }
+
+    location @cfml {
+        proxy_pass http://rustcfml;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";              # reuse upstream keep-alive connections
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Because Unix-socket peers have no IP, RustCFML reports `cgi.remote_addr` as `127.0.0.1`; read `X-Forwarded-For` (set above) if your application needs the real client address.
+
+**Permissions:** the socket inherits the user/umask of the RustCFML process. nginx must be able to read/write it — run both as the same user, or `chmod`/`chown` the socket (e.g. group-accessible) so the nginx worker can connect.
+
+### Reverse-proxy throughput
+
+A reverse proxy costs a little raw throughput (RustCFML can serve faster when hit directly), but the proxy↔app **transport** matters: a Unix socket consistently beats TCP loopback, and the gap widens as concurrency climbs.
+
+"Hello World" `.cfm` page, `--production` mode, Apple M-series, ApacheBench with keep-alive (`-k`), 8s runs, requests/sec — higher is better:
+
+| Concurrency | Direct TCP (no proxy) | nginx → Unix socket | nginx → TCP loopback |
+|---|---|---|---|
+| `-c 1`   | 2,673 | 2,504 | 2,272 |
+| `-c 10`  | 16,900 | 14,700 | 13,500 |
+| `-c 50`  | 19,000 | 16,300 | 14,700 |
+| `-c 100` | 19,100 | 16,600 | 11,800 |
+| `-c 200` | 17,000 | 16,600 | 10,850 |
+
+As concurrency climbs, the **Unix-socket path tracks direct-serve almost exactly while TCP loopback falls away**: at `-c 100` nginx→socket sustains ~16,600 req/s vs ~11,800 over TCP loopback (~40% more), and at `-c 200` the gap widens to ~16,600 vs ~10,850 (~53% more) — the socket path costs almost nothing over hitting RustCFML directly (~16,600 vs ~17,000), whereas TCP loopback saturates flat at ~10,850 under ephemeral-port/`TIME_WAIT` pressure. Without client keep-alive the same ordering holds (nginx→socket ~5,500 vs nginx→TCP ~4,100 at `-c 50`). Numbers are from a single dev machine and are illustrative — measure on your own hardware — but the ranking is consistent across runs.
+
+See **[Performance](performance.md)** for the direct-serve methodology these build on.
+
 ## Docker
 
 *Coming soon* — an optimised, minimal container image for running RustCFML web applications. Until then, a standalone web-application binary (below) copied into a `scratch`/`distroless` base works well, since RustCFML has no runtime dependencies.
