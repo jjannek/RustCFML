@@ -328,6 +328,7 @@ include "harness.cfm";
 <cf_runtest file="tags/test_cfdirectory_mapping_path.cfm">
 <cf_runtest file="tags/test_cfdirectory_function_form.cfm">
 <cf_runtest file="tags/test_cfdirectory_recurse_symlink.cfm">
+<cf_runtest file="tags/test_cfdirectory_listinfo_name_relative.cfm">
 <cf_runtest file="tags/test_cfdirectory_attrcoll_name.cfm">
 <cf_runtest file="tags/test_cffile_script_form.cfm">
 <cf_runtest file="tags/test_cfhttpparam_runtime_body.cfm">

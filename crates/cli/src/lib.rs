@@ -878,7 +878,7 @@ fn run_server(
     } else {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .thread_stack_size(8 * 1024 * 1024) // 8MB stack like main thread
+            .thread_stack_size(64 * 1024 * 1024) // 64MB — parity with the CLI main thread for deep ColdBox/WireBox autowiring
             .build()
             .unwrap()
     };

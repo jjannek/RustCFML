@@ -335,6 +335,15 @@ pub enum BytecodeOp {
     TryEnd,
     Throw,
     Rethrow,            // Re-throw current exception
+    // Save/restore the engine's "last exception" register onto an internal
+    // stack. A `finally` body emitted inline before a `rethrow`/`return` may
+    // itself contain a `try {} catch {}` that throws-and-swallows — which would
+    // clobber `last_exception` and make the following `rethrow` re-raise the
+    // WRONG (inner, already-handled) exception. Wrapping the inline finally in
+    // SaveException/RestoreException preserves the exception the enclosing catch
+    // actually caught.
+    SaveException,
+    RestoreException,
     // Peek the exception value on top of the stack (does NOT consume it) and
     // push a boolean: does its `type` match this catch clause's declared type?
     // "any"/empty matches everything; otherwise case-insensitive exact match or
@@ -1243,13 +1252,20 @@ impl CfmlCompiler {
                 // `__`-prefix keeps the temp out of the variables-scope writeback.
                 if !self.finally_stack.is_empty() {
                     instructions.push(BytecodeOp::StoreLocal("__cf_finally_retval".to_string()));
-                    let finallys: Vec<Vec<Statement>> =
-                        self.finally_stack.iter().rev().cloned().collect();
-                    for fb in &finallys {
+                    // Take the whole stack while emitting the finallys inline, so a
+                    // `return`/`rethrow` that appears INSIDE a finally body does not
+                    // re-emit the very finallys being emitted (which contain it) —
+                    // that self-reference recurses until the native stack overflows
+                    // at compile time. The finallys currently unwinding are no longer
+                    // "enclosing" for statements within them. Restored afterwards so
+                    // sibling statements still see the correct enclosing finallys.
+                    let saved = std::mem::take(&mut self.finally_stack);
+                    for fb in saved.iter().rev() {
                         for s in fb {
                             self.compile_statement(s, instructions);
                         }
                     }
+                    self.finally_stack = saved;
                     instructions.push(BytecodeOp::LoadLocal("__cf_finally_retval".to_string()));
                 }
                 instructions.push(BytecodeOp::Return);
@@ -1304,8 +1320,24 @@ impl CfmlCompiler {
                 // propagates; outer finallys run when the exception reaches their
                 // runtime handlers).
                 if let Some(finally_body) = self.finally_stack.last().cloned() {
+                    // Pop the finally being emitted inline so a `rethrow` (or
+                    // `return`) INSIDE this finally body does not re-emit the same
+                    // finally that contains it. A `try {} catch { rethrow }` nested
+                    // in a finally block (Preside TaskManagerService) would otherwise
+                    // recurse here until the native stack overflows at compile time:
+                    // the inner try pushes no finally of its own, so the inner
+                    // rethrow re-reads THIS finally off the stack and re-emits it.
+                    let popped = self.finally_stack.pop();
+                    // Preserve the caught exception across the finally body: a
+                    // try/catch inside it that throws-and-swallows must not change
+                    // which exception the following Rethrow re-raises.
+                    instructions.push(BytecodeOp::SaveException);
                     for s in &finally_body {
                         self.compile_statement(s, instructions);
+                    }
+                    instructions.push(BytecodeOp::RestoreException);
+                    if let Some(p) = popped {
+                        self.finally_stack.push(p);
                     }
                 }
                 instructions.push(BytecodeOp::Rethrow);
@@ -2270,9 +2302,11 @@ impl CfmlCompiler {
                 // (pushed by Throw/Rethrow). Run the finally, then re-raise.
                 let handler_start = instructions.len();
                 instructions[try_start_idx] = BytecodeOp::TryStart(handler_start);
+                instructions.push(BytecodeOp::SaveException);
                 for s in finally_body {
                     self.compile_statement(s, instructions);
                 }
+                instructions.push(BytecodeOp::RestoreException);
                 instructions.push(BytecodeOp::Rethrow);
 
                 let end_pos = instructions.len();
@@ -2346,9 +2380,11 @@ impl CfmlCompiler {
         // outer try sees it.
         instructions.push(BytecodeOp::Pop);
         if let Some(finally_body) = &try_stmt.finally_body {
+            instructions.push(BytecodeOp::SaveException);
             for s in finally_body {
                 self.compile_statement(s, instructions);
             }
+            instructions.push(BytecodeOp::RestoreException);
         }
         instructions.push(BytecodeOp::Rethrow);
 

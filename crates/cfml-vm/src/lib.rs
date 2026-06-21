@@ -779,6 +779,11 @@ pub struct CfmlVirtualMachine {
     current_exception: Option<CfmlValue>,
     /// Last thrown exception (for rethrow support)
     last_exception: Option<CfmlValue>,
+    /// Save-stack for `last_exception`, used to protect the caught exception
+    /// across a `finally` body emitted inline before a `rethrow`/re-raise (the
+    /// finally may itself throw-and-catch, clobbering `last_exception`).
+    /// SaveException pushes, RestoreException pops.
+    exception_save_stack: Vec<Option<CfmlValue>>,
     /// Current source line being executed (updated by LineInfo op)
     current_line: usize,
     /// Current source column
@@ -1288,6 +1293,7 @@ impl CfmlVirtualMachine {
             try_stack: Vec::new(),
             current_exception: None,
             last_exception: None,
+            exception_save_stack: Vec::new(),
             current_line: 0,
             current_column: 0,
             method_this_writeback: None,
@@ -5944,6 +5950,15 @@ impl CfmlVirtualMachine {
                         });
                         err.stack_trace = self.build_stack_trace();
                         return Err(err);
+                    }
+                }
+
+                BytecodeOp::SaveException => {
+                    self.exception_save_stack.push(self.last_exception.clone());
+                }
+                BytecodeOp::RestoreException => {
+                    if let Some(saved) = self.exception_save_stack.pop() {
+                        self.last_exception = saved;
                     }
                 }
 
@@ -16295,8 +16310,12 @@ impl CfmlVirtualMachine {
             .get_ci("recurse")
             .map(|v| v.is_true())
             .unwrap_or(false);
+        let list_info = opts
+            .get_ci("listinfo")
+            .map(|v| v.as_string().to_lowercase())
+            .unwrap_or_else(|| "all".to_string());
         match self.resolve_directory_path_with_mappings(&dir) {
-            Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter),
+            Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter, &list_info),
             None => Err(CfmlError::runtime(format!(
                 "cfdirectory: directory not found: {}",
                 dir
@@ -16304,7 +16323,13 @@ impl CfmlVirtualMachine {
         }
     }
 
-    fn sandbox_cfdirectory_list(&self, path: &str, recurse: bool, filter: &str) -> CfmlResult {
+    fn sandbox_cfdirectory_list(
+        &self,
+        path: &str,
+        recurse: bool,
+        filter: &str,
+        list_info: &str,
+    ) -> CfmlResult {
         let mut entries = Vec::new();
         let mut visited = std::collections::HashSet::new();
         if let Ok(canon) = self.vfs.canonicalize(path) {
@@ -16312,7 +16337,38 @@ impl CfmlVirtualMachine {
         }
         self.sandbox_collect_entries(path, recurse, &mut entries, &mut visited)?;
         entries.retain(|(name, _, _)| Self::matches_directory_filter(name, filter));
+        // Lucee/ACF: `cfdirectory action="list" listinfo="name"` returns a
+        // single-column (`name`) query whose `name` is the path RELATIVE to the
+        // listed directory (subdirectories included, `/`-separated) when
+        // recursing — NOT the bare filename. ColdBox's WireBox `mapDirectory`
+        // relies on this to build each component's instantiation path; without
+        // the subdir the path collapses (e.g. `preside.system.services.features.
+        // FeatureService` → `preside.system.services.FeatureService`). The
+        // default `listinfo="all"` query keeps `name` = basename + a `directory`
+        // column. (The `directoryList()` BIF returns basenames for both, which
+        // already matches Lucee — that path is unchanged.)
+        if list_info == "name" {
+            return Ok(Self::build_directory_name_query(&entries, path));
+        }
         Ok(Self::build_directory_query(&entries, path))
+    }
+
+    /// Build the single-column `name` query for `cfdirectory listinfo="name"`,
+    /// where each `name` is the entry's path relative to the listed directory.
+    fn build_directory_name_query(entries: &[(String, String, bool)], listed_dir: &str) -> CfmlValue {
+        let query = cfml_common::dynamic::CfmlQuery::new(vec!["name".to_string()]);
+        let base = listed_dir.trim_end_matches('/');
+        for (name, full_path, _) in entries {
+            let rel = full_path
+                .strip_prefix(base)
+                .map(|s| s.trim_start_matches('/'))
+                .filter(|s| !s.is_empty())
+                .unwrap_or(name);
+            let mut row = ValueMap::default();
+            row.insert("name".to_string(), CfmlValue::string(rel.to_string()));
+            query.add_row(row);
+        }
+        CfmlValue::Query(query)
     }
 
     /// Build a real `Query` value from collected directory entries
@@ -18424,6 +18480,8 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::AddLocalConst(_, _) | BytecodeOp::MulLocalConst(_, _) => (0, 0), // pure local mutation, no stack traffic
         // Exception handling
         BytecodeOp::TryStart(_) | BytecodeOp::TryEnd => (0, 0),
+        // Operate only on the internal exception save-stack, not the operand stack.
+        BytecodeOp::SaveException | BytecodeOp::RestoreException => (0, 0),
         BytecodeOp::Throw | BytecodeOp::Rethrow => (0, 1),
         BytecodeOp::CatchMatch(_) => (1, 0), // peeks exception, pushes match bool
         // Method call: pops obj + args, pushes 1

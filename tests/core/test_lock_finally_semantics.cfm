@@ -68,5 +68,36 @@ rv = returnWithFinally( ran );
 assert("finally runs on return (value)", rv, "early");
 assertTrue("finally body executed on return", ran.finally);
 
+// --- 5. try/catch nested INSIDE a finally, with a rethrow in the outer catch ---
+// Regression (Preside TaskManagerService.runTask): a `rethrow` (or `return`)
+// emits its enclosing finally inline at compile time. When that finally body
+// itself contains a `try {} catch {}` (whose own catch has no finally), the
+// inner construct read the SAME finally off the compiler's finally_stack and
+// re-emitted it — recursing until the native stack overflowed AT COMPILE TIME
+// (a hard process abort while loading the .cfc). Fixed by popping the finally
+// being emitted inline. AND: the inner try's throw-and-swallow must not change
+// which exception the outer `rethrow` re-raises (it clobbered last_exception);
+// fixed with SaveException/RestoreException around the inline finally.
+function rethrowWithTryInFinally(){
+	try {
+		throw( type = "Outer", message = "boom" );
+	} catch ( any e ) {
+		rethrow;
+	} finally {
+		try {
+			throw( type = "Inner", message = "inner" );
+		} catch ( any e2 ) {
+			// swallowed — must NOT become the propagated exception
+		}
+	}
+}
+reThrew = "";
+try {
+	rethrowWithTryInFinally();
+} catch ( any e ) {
+	reThrew = e.message;
+}
+assert("rethrow re-raises the OUTER exception, not the finally's swallowed inner", reThrew, "boom");
+
 suiteEnd();
 </cfscript>
