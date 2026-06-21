@@ -371,6 +371,19 @@ pub enum BytecodeOp {
     // does not grow BytecodeOp past its size ceiling (it is the rare path).
     CallMethodNamed(String, Box<Vec<String>>, usize, Option<Vec<String>>),
 
+    // Computed-name method call: `obj[ nameExpr ]( args )`. Stack layout (bottom
+    // to top): object, method-name value, then `arg_count` positional args. The
+    // VM stringifies the method name at runtime and dispatches via the same
+    // member-call path as CallMethod, so the receiver's component scope
+    // (`this`/`__variables`/`super`) is bound correctly. Without this, the
+    // dynamic call collapsed to indexing out a bare Function and invoking it
+    // with the *caller's* scope (Preside DelayedInjector.onMissingMethod ->
+    // `instance[ missingMethodName ]( argumentCollection=... )` ran the target's
+    // method against the proxy's variables).
+    CallComputedMethod(usize),
+    // Named-argument variant of CallComputedMethod. Names box matches CallNamed.
+    CallComputedMethodNamed(Box<Vec<String>>, usize),
+
     // For-in support
     GetKeys,  // Pop value: if struct, push array of keys; if array, leave as-is
 
@@ -3448,6 +3461,41 @@ impl CfmlCompiler {
 
                 let has_spread = call.arguments.iter().any(|a| matches!(a, Expression::Spread(_)));
                 let has_named = call.arguments.iter().any(|a| matches!(a, Expression::NamedArgument(_)));
+                // Computed-name method call: `obj[ nameExpr ]( args )`. Dispatch
+                // as a method on `obj` (binds the receiver's component scope)
+                // rather than indexing out a bare Function and calling it with the
+                // caller's scope. Spread args keep the legacy path (rare; the
+                // dynamic-receiver + spread combination isn't exercised).
+                if !has_spread {
+                    if let Expression::ArrayAccess(aa) = &*call.name {
+                        // object
+                        self.compile_expression(&aa.array, instructions);
+                        // method name
+                        self.compile_expression(&aa.index, instructions);
+                        if has_named {
+                            let mut names = Vec::new();
+                            for arg in &call.arguments {
+                                if let Expression::NamedArgument(named) = arg {
+                                    names.push(named.name.clone());
+                                    self.compile_expression(&named.value, instructions);
+                                } else {
+                                    names.push(String::new());
+                                    self.compile_expression(arg, instructions);
+                                }
+                            }
+                            instructions.push(BytecodeOp::CallComputedMethodNamed(
+                                Box::new(names),
+                                call.arguments.len(),
+                            ));
+                        } else {
+                            for arg in &call.arguments {
+                                self.compile_expression(arg, instructions);
+                            }
+                            instructions.push(BytecodeOp::CallComputedMethod(call.arguments.len()));
+                        }
+                        return;
+                    }
+                }
                 if has_spread {
                     // Push function reference first
                     if let Expression::Identifier(ident) = &*call.name {

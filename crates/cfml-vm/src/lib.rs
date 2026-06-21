@@ -5821,17 +5821,31 @@ impl CfmlVirtualMachine {
                     // whose name matches a builtin (object dispatch wins over
                     // the BIF for `obj.method()`); the guard would otherwise
                     // poison the whole component (PR #79).
-                    if !func_name.starts_with("__")
-                        && !bc_func_arc.is_component_method
-                        && self.builtins.contains_key(func_name.as_str())
-                    {
+                    let shadows_builtin = !func_name.starts_with("__")
+                        && self.builtins.contains_key(func_name.as_str());
+                    if shadows_builtin && !bc_func_arc.is_component_method {
                         return Err(self.wrap_error(CfmlError::runtime(format!(
                             "The name [{}] is already used by a built in Function",
                             func_name
                         ))));
                     }
-                    self.user_functions
-                        .insert(func_name.clone(), Arc::clone(&bc_func_arc));
+                    // A component method whose name collides with a BIF is allowed
+                    // (object dispatch via call_member_function wins for
+                    // `obj.method()`), but it must NOT enter the global
+                    // `user_functions` table: that table is what a BARE call
+                    // resolves against, and a method there shadows the BIF for the
+                    // whole program. Preside hits this — its cfflow CFCs declare
+                    // `boolean function evaluate( wfInstance, required args )`,
+                    // which otherwise stole every bare `Evaluate( expr )` (e.g.
+                    // FeatureService) and failed with "parameter [args] is
+                    // required". Member dispatch resolves by global_id through
+                    // `fn_registry` (registered at program load), so skipping this
+                    // insert leaves `obj.evaluate()` working while bare
+                    // `Evaluate()` correctly falls through to the BIF.
+                    if !(shadows_builtin && bc_func_arc.is_component_method) {
+                        self.user_functions
+                            .insert(func_name.clone(), Arc::clone(&bc_func_arc));
+                    }
                     // Create or reuse a shared closure environment so all closures
                     // defined in this function invocation share the same mutable state.
                     // On first definition, seed directly from locals; on subsequent
@@ -6529,6 +6543,117 @@ impl CfmlVirtualMachine {
                         }
                     }
 
+                    stack.push(result);
+                }
+
+                BytecodeOp::CallComputedMethod(arg_count)
+                | BytecodeOp::CallComputedMethodNamed(_, arg_count) => {
+                    // `obj[ nameExpr ]( args )`. Recover the named-arg sources for
+                    // the named variant (ip already advanced past the op).
+                    let computed_arg_names: Option<&[String]> =
+                        match &func.instructions[ip - 1] {
+                            BytecodeOp::CallComputedMethodNamed(names, _) => {
+                                Some(names.as_slice())
+                            }
+                            _ => None,
+                        };
+                    let mut extra_args: Vec<CfmlValue> =
+                        (0..*arg_count).filter_map(|_| stack.pop()).collect();
+                    extra_args.reverse();
+                    let method_name_val = stack.pop().unwrap_or(CfmlValue::Null);
+                    let method_name = method_name_val.as_string();
+                    let object = stack.pop().unwrap_or(CfmlValue::Null);
+
+                    // Dispatch through the same member-call path as `obj.method()`,
+                    // so the receiver's component scope is bound. Isolate the
+                    // try-stack so a throw inside the callee can't consume the
+                    // caller's handlers (mirrors the CallMethod arm).
+                    self.method_this_writeback = None;
+                    self.method_variables_writeback = None;
+                    let saved_try_stack_method = std::mem::take(&mut self.try_stack);
+                    let named_args_check =
+                        computed_arg_names.map_or(Ok(()), Self::validate_named_args);
+                    // Only struct/component/native receivers carry methods. For a
+                    // plain collection (`arrayOfFns[ i ]()`, a query column, etc.)
+                    // there is no method table — index out the stored Function and
+                    // call it as a free function, preserving the legacy behaviour.
+                    let use_member_dispatch = matches!(
+                        &object,
+                        CfmlValue::Struct(_)
+                            | CfmlValue::Component(_)
+                            | CfmlValue::NativeObject(_)
+                    );
+                    let method_result = if let Err(e) = named_args_check {
+                        Err(e)
+                    } else if use_member_dispatch {
+                        self.call_member_function(
+                            &object,
+                            &method_name,
+                            &mut extra_args,
+                            computed_arg_names,
+                        )
+                    } else {
+                        // Legacy index-then-call fallback for non-method receivers.
+                        let callee = match &object {
+                            CfmlValue::Array(arr) => {
+                                let i = method_name.parse::<usize>().unwrap_or(0);
+                                if i > 0 {
+                                    arr.get(i - 1).unwrap_or(CfmlValue::Null)
+                                } else {
+                                    CfmlValue::Null
+                                }
+                            }
+                            CfmlValue::QueryColumn(arr) => {
+                                let i = method_name.parse::<usize>().unwrap_or(0);
+                                if i > 0 {
+                                    arr.get(i - 1).cloned().unwrap_or(CfmlValue::Null)
+                                } else {
+                                    CfmlValue::Null
+                                }
+                            }
+                            _ => CfmlValue::Null,
+                        };
+                        let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
+                        let (args, extras) = Self::reorder_named_args_with_extras(
+                            &callee,
+                            computed_arg_names,
+                            raw_args,
+                        );
+                        self.pending_extra_named_args =
+                            if extras.is_empty() { None } else { Some(extras) };
+                        self.call_function(&callee, args, &locals)
+                    };
+                    self.try_stack = saved_try_stack_method;
+                    // A dynamic receiver has no static variable path, so there is
+                    // no pass-by-ref write-back target (unlike CallMethod). The
+                    // common use — DelayedInjector forwarding — returns a value.
+                    self.method_this_writeback = None;
+                    self.method_variables_writeback = None;
+                    let result = match method_result {
+                        Ok(val) => val,
+                        Err(e) => {
+                            if Self::is_control_flow_error(&e) {
+                                return Err(e);
+                            }
+                            if let Some(handler) = self.try_stack.pop() {
+                                while stack.len() > handler.stack_depth {
+                                    stack.pop();
+                                }
+                                self.restore_capture_state(&handler);
+                                let error_val = self.resolve_catch_error_val(&e);
+                                stack.push(error_val);
+                                ip = handler.catch_ip;
+                                continue;
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    };
+                    if let Some(wb) = self.closure_parent_writeback.take() {
+                        for (k, v) in wb {
+                            self.scope_aware_store(&k, v, &mut locals);
+                        }
+                    }
                     stack.push(result);
                 }
 
@@ -18605,6 +18730,10 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::CatchMatch(_) => (1, 0), // peeks exception, pushes match bool
         // Method call: pops obj + args, pushes 1
         BytecodeOp::CallMethod(_, n, _) | BytecodeOp::CallMethodNamed(_, _, n, _) => (1, n + 1),
+        // Computed-name method call: pops obj + method-name + args, pushes 1.
+        BytecodeOp::CallComputedMethod(n) | BytecodeOp::CallComputedMethodNamed(_, n) => {
+            (1, n + 2)
+        }
         BytecodeOp::CallRustSuperCtor(n) => (1, *n),
         // Include
         BytecodeOp::Include(_) => (0, 0),

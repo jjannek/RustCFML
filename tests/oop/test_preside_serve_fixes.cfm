@@ -63,5 +63,20 @@ assert("bound method via arguments keeps definer scope", b.run(), "svc=bound-svc
 mt = new PresideFixMixTarget();
 assert("mixin invoked via host uses host scope", mt.run(), "TARGET-CACHEBOX");
 
+// 8) A component method whose name collides with a BIF (Preside cfflow's
+//    `evaluate( wfInstance, args )`) must NOT shadow the BIF for bare calls.
+evalShadow = new PresideFixEvalShadow();
+assert("component method named evaluate dispatches via object", evalShadow.evaluate(wfInstance="x", args={}), true);
+assert("bare Evaluate() still hits the BIF after a shadowing method loads", Evaluate("6 * 7"), 42);
+assert("bare Evaluate() inside the shadowing component hits the BIF", evalShadow.callBif("3 + 4"), 7);
+
+// 9) Computed-name method call `obj[ name ]( args )` must dispatch against the
+//    receiver's component scope (Preside DelayedInjector.onMissingMethod
+//    forwards `instance[ missingMethodName ]( argumentCollection=... )`).
+dynTarget = new PresideFixDynTarget();
+assert("direct method reads component state", dynTarget.readState(), "DYN-STATE");
+dynProxy = new PresideFixDynProxy( dynTarget );
+assert("computed-name forward keeps target scope", dynProxy.readState(), "DYN-STATE");
+
 suiteEnd();
 </cfscript>
