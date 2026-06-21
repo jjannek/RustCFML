@@ -1327,7 +1327,17 @@ async fn async_run_server(
         };
         let rewrite_xml_str = rewrite_xml.to_string_lossy().to_string();
         if vfs.is_file(&rewrite_xml_str) {
-            let rules = rewrite::parse_urlrewrite_xml(&rewrite_xml);
+            // Read through the VFS so embedded urlrewrite.xml in a
+            // self-contained binary is honoured; reading the real filesystem
+            // here would look for an absolute path that does not exist on the
+            // deployment machine.
+            let rules = match vfs.read_to_string(&rewrite_xml_str) {
+                Ok(content) => rewrite::parse_urlrewrite_xml_content(&content),
+                Err(e) => {
+                    eprintln!("Warning: Could not read urlrewrite.xml: {}", e);
+                    Vec::new()
+                }
+            };
             println!(
                 "Loaded {} URL rewrite rule(s) from {}",
                 rules.len(),

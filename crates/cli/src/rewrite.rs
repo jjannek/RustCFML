@@ -6,8 +6,6 @@
 
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -84,16 +82,13 @@ pub struct RewriteResult {
 // XML parser
 // ---------------------------------------------------------------------------
 
-/// Parse a urlrewrite.xml file into a list of rewrite rules.
-pub fn parse_urlrewrite_xml(path: &Path) -> Vec<RewriteRule> {
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Warning: Could not read urlrewrite.xml: {}", e);
-            return Vec::new();
-        }
-    };
-
+/// Parse the contents of a urlrewrite.xml document into a list of rewrite rules.
+///
+/// Callers should supply content read through the VFS so an embedded
+/// `urlrewrite.xml` in a self-contained binary is honoured — reading the real
+/// filesystem would look for an absolute path that does not exist on the
+/// deployment machine.
+pub fn parse_urlrewrite_xml_content(content: &str) -> Vec<RewriteRule> {
     let mut rules = Vec::new();
     let mut pos = 0;
     let bytes = content.as_bytes();
@@ -510,4 +505,30 @@ pub fn apply_rewrite_rules(
     }
 
     last_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_rules_from_content() {
+        // Content is parsed straight from a string (as a VFS read would
+        // supply), not the real filesystem.
+        let xml = r#"<?xml version="1.0"?>
+            <urlrewrite>
+                <rule>
+                    <from>^/foo/(.*)$</from>
+                    <to>/index.cfm/$1</to>
+                </rule>
+            </urlrewrite>"#;
+        let rules = parse_urlrewrite_xml_content(xml);
+        assert_eq!(rules.len(), 1);
+
+        let headers = HashMap::new();
+        let result =
+            apply_rewrite_rules(&rules, "/foo/bar", "GET", 8500, &headers, "", "127.0.0.1");
+        let result = result.expect("rule should match");
+        assert_eq!(result.new_path, "/index.cfm/bar");
+    }
 }
