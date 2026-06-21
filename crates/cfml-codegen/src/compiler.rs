@@ -681,6 +681,37 @@ impl CfmlCompiler {
         None
     }
 
+    /// Like [`scope_rooted_nested_path`] but rooted at *any* plain identifier,
+    /// not just an auto-viv scope name — e.g. `copies.request.cgi`, where
+    /// `copies` is an undeclared bare variable. Returns the dotted path only
+    /// when the target is ≥2 levels below a plain-`Identifier` root and every
+    /// level is a plain (non null-safe) member access (no array index, call,
+    /// or dynamic member). Used as a fallback after `scope_rooted_nested_path`
+    /// so an unscoped, undeclared nested container auto-vivifies through
+    /// `store_runtime_path` instead of throwing "Variable 'X' is undefined"
+    /// when the generic store path reads the missing base. Lucee silently
+    /// creates the intermediate structs (verified vs Lucee 7).
+    fn bare_rooted_nested_path(obj: &Expression, member: &str) -> Option<String> {
+        fn flatten_any(expr: &Expression) -> Option<String> {
+            match expr {
+                Expression::Identifier(id) => Some(id.name.clone()),
+                Expression::MemberAccess(access) if !access.null_safe => {
+                    let base = flatten_any(&access.object)?;
+                    Some(format!("{}.{}", base, access.member))
+                }
+                _ => None,
+            }
+        }
+        // Only ≥2-level chains (obj itself is a member access). A single-level
+        // `x.y = v` keeps its StoreLocalProperty fast path (which already
+        // auto-vivifies the bare local as a struct).
+        if matches!(obj, Expression::MemberAccess(_)) {
+            let base = flatten_any(obj)?;
+            return Some(format!("{}.{}", base, member));
+        }
+        None
+    }
+
     /// For a plain `=` assignment, return the dotted path string that names the
     /// target, so a Null RHS can DELETE it (CFML null-assignment semantics —
     /// `x = voidFn()` must leave the name undefined, not materialize a null key).
@@ -1151,6 +1182,16 @@ impl CfmlCompiler {
                             instructions.push(BytecodeOp::SetDynamicVar);
                             // SetDynamicVar pushes the value back; this is a
                             // statement, so discard it.
+                            instructions.push(BytecodeOp::Pop);
+                        } else if let Some(path) = Self::bare_rooted_nested_path(obj, member) {
+                            // Undeclared bare root ≥2 levels deep
+                            // (`copies.request.cgi = v`): same auto-vivifying
+                            // runtime store as the scope-rooted case, so the
+                            // missing `copies` container is created instead of
+                            // throwing "Variable 'copies' is undefined".
+                            instructions.push(BytecodeOp::String(path));
+                            instructions.push(BytecodeOp::Swap);
+                            instructions.push(BytecodeOp::SetDynamicVar);
                             instructions.push(BytecodeOp::Pop);
                         } else if let Expression::Identifier(ref ident) = **obj {
                             if !is_reserved_scope_name(&ident.name) {
@@ -2921,6 +2962,16 @@ impl CfmlCompiler {
                             if let Some(path) =
                                 Self::scope_rooted_nested_path(&access.object, &access.member)
                             {
+                                instructions.push(BytecodeOp::String(path));
+                                instructions.push(BytecodeOp::Swap);
+                                instructions.push(BytecodeOp::SetDynamicVar);
+                            } else if let Some(path) =
+                                Self::bare_rooted_nested_path(&access.object, &access.member)
+                            {
+                                // Undeclared bare root ≥2 levels deep in value
+                                // position (`x = (copies.request.cgi = v)`):
+                                // auto-vivify through the runtime store, which
+                                // pushes the value back for the outer store.
                                 instructions.push(BytecodeOp::String(path));
                                 instructions.push(BytecodeOp::Swap);
                                 instructions.push(BytecodeOp::SetDynamicVar);

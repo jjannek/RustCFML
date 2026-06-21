@@ -90,6 +90,7 @@ include "harness.cfm";
 <!--- but conflating the local and arguments views of a single frame. --->
 <!--- Runtime-level (wrong values, no parse error), so registration is safe. --->
 <cf_runtest file="core/test_local_shadows_arguments.cfm">
+<cf_runtest file="core/test_unscoped_nested_autoviv.cfm">
 <cf_runtest file="core/test_argument_reference_nested.cfm">
 <cf_runtest file="core/test_language_features.cfm">
 <cf_runtest file="core/test_scopes.cfm">

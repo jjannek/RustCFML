@@ -3253,7 +3253,7 @@ impl CfmlVirtualMachine {
                         .pop()
                         .map(|v| v.as_string())
                         .unwrap_or_default();
-                    self.store_runtime_path(&path, value.clone(), &mut locals);
+                    self.store_runtime_path(&path, value.clone(), &mut locals, effective_local_mode_modern);
                     stack.push(value);
                 }
                 BytecodeOp::UnsetPath(path) => {
@@ -4208,7 +4208,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -4381,6 +4381,7 @@ impl CfmlVirtualMachine {
                                             self.apply_pending_result_writeback(
                                                 &mut locals,
                                                 &mut inherited_or_param_keys,
+                                                effective_local_mode_modern,
                                             );
                                         }
                                     }
@@ -4558,12 +4559,12 @@ impl CfmlVirtualMachine {
                                         // through the scope-aware store, not a
                                         // literal dotted key in `locals`.
                                         if var.contains('.') {
-                                            self.store_runtime_path(&var, result.clone(), &mut locals);
+                                            self.store_runtime_path(&var, result.clone(), &mut locals, effective_local_mode_modern);
                                         } else {
                                             locals.insert(var, result.clone());
                                         }
                                     }
-                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys);
+                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
                                     stack.push(result);
                                 }
                                 Err(e) => {
@@ -4727,7 +4728,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -12127,6 +12128,7 @@ impl CfmlVirtualMachine {
         path: &str,
         value: CfmlValue,
         locals: &mut ValueMap,
+        local_mode_modern: bool,
     ) {
         // CFML null-assignment: storing Null through a scope path (a dynamic
         // `"variables.x" = voidFn()` LHS, or a null result-writeback delivery)
@@ -12160,7 +12162,33 @@ impl CfmlVirtualMachine {
             // reference-typed scopes (a CFC's __variables) the leaf is
             // already mutated in place; for page scope this commits the
             // new key into locals.
-            self.scope_aware_store(scope, root, locals);
+            //
+            // A brand-new BARE (non-reserved) root inside a CFC method under
+            // classic localmode belongs to the component (variables) scope, so
+            // sibling methods/closures see it — exactly like StoreLocal's
+            // unscoped-write rule. Otherwise (reserved scope, already-present
+            // root, or modern localmode) defer to scope_aware_store.
+            let scope_lc = scope.to_lowercase();
+            let is_reserved_store_scope = matches!(
+                scope_lc.as_str(),
+                "local" | "variables" | "application" | "request"
+                    | "thread" | "session" | "static" | "arguments"
+            );
+            if !is_reserved_store_scope
+                && !local_mode_modern
+                && !locals.contains_key(scope)
+                && !self.globals.contains_key(scope)
+            {
+                if let Some(vars) =
+                    locals.get_mut("__variables").and_then(|v| v.as_cfml_struct())
+                {
+                    vars.insert(scope.to_string(), root);
+                } else {
+                    self.scope_aware_store(scope, root, locals);
+                }
+            } else {
+                self.scope_aware_store(scope, root, locals);
+            }
         } else {
             // Bare name (no scope prefix) — single-variable store.
             self.scope_aware_store(path, value, locals);
@@ -12275,10 +12303,11 @@ impl CfmlVirtualMachine {
         &mut self,
         locals: &mut ValueMap,
         inherited_or_param_keys: &mut std::collections::HashSet<String>,
+        local_mode_modern: bool,
     ) {
         if let Some(sets) = self.pending_result_writeback.take() {
             for (path, value) in sets {
-                self.store_runtime_path(&path, value, locals);
+                self.store_runtime_path(&path, value, locals, local_mode_modern);
                 let parts: Vec<&str> = path.split('.').collect();
                 if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("local") {
                     inherited_or_param_keys.remove(parts[1]);
