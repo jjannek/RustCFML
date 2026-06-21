@@ -22,3 +22,13 @@ js-sys = "0.3"
 version = "0.3"
 features = ["console"]
 
+# wasm-pack runs Binaryen's `wasm-opt -O` as a post-build step. The bundled
+# wasm-opt SIGSEGVs (signal 11) on this module in CI — it can't handle the wasm
+# features the current Rust toolchain emits as the module grows, which broke the
+# "Deploy Interactive Demo" workflow from v0.240.0 onward. Disable the
+# optimization pass: the demo .wasm is a bit larger but functionally identical,
+# and the deploy is deterministic. (Our gate's wasm check is `cargo build
+# --target wasm32-...`, which doesn't run wasm-opt, so only the deploy hit this.)
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
