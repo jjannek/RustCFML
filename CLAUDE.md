@@ -19,14 +19,23 @@ cargo test --workspace               # ALL Rust tests — incl. the JIT integrat
 
 # Wasm-target members — NOT built by the commands above (see warning below):
 cargo build -p cfml-worker -p rustcfml-wasm --target wasm32-unknown-unknown
+
+# Interactive-demo build — exercises the wasm-pack + wasm-bindgen path that the
+# "Deploy Interactive Demo" GitHub Action uses (the plain cargo build above does
+# NOT). Run before pushing to main. (`cargo install wasm-pack` if missing.)
+wasm-pack build crates/wasm --target web
 ```
 
 > 🚨 **Verification gate — a red OR skipped test in ANY suite is a release
 > blocker, never a shrug.** A green `cargo build` + `tests/runner.cfm` is NOT
 > sufficient. Before tagging you MUST have all of these green: `cargo test
 > --workspace` (Rust + JIT integration tests), `cargo run -- tests/runner.cfm`
-> (CFML, CLI **and** serve-mode cold+warm — see "Validate in serve mode"), and the
-> wasm build above. If a test fails or is `#[ignore]`d, do NOT dismiss it as
+> (CFML, CLI **and** serve-mode cold+warm — see "Validate in serve mode"), the
+> wasm build above, AND — when pushing to `main` — `wasm-pack build crates/wasm
+> --target web` (the demo-deploy path; a plain `cargo build --target
+> wasm32-unknown-unknown` does NOT run wasm-pack/wasm-bindgen, so it cannot catch
+> a broken demo deploy — this is exactly how the v0.240.0 wasm-opt SIGSEGV slipped
+> through to the "Deploy Interactive Demo" Action). If a test fails or is `#[ignore]`d, do NOT dismiss it as
 > "flaky" or "unrelated" — `git bisect` to the commit that broke it and fix the
 > root cause (or open a tracked issue). **This bit us hard:** a v0.137.0 codegen
 > change (the PR #112 null-delete guard) silently disqualified every hot
