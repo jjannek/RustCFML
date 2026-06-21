@@ -332,10 +332,29 @@ impl Vfs for FallbackFs {
     }
     fn read_dir(&self, path: &str) -> io::Result<Vec<VfsDirEntry>> {
         if self.sandbox { return self.embedded.read_dir(path); }
-        // Prefer real FS for directories (modules live on disk),
-        // fall back to embedded
-        self.real.read_dir(path)
-            .or_else(|_| self.embedded.read_dir(path))
+        // Merge real FS and embedded FS listings so embedded files (e.g.
+        // Application.cfc) remain visible even when the real directory also
+        // exists (e.g. the compiled binary's own CWD contains real files
+        // alongside the embedded app). Real-FS entries take precedence over
+        // embedded ones on a case-insensitive name collision, preserving the
+        // intended behaviour of letting on-disk modules override embedded ones.
+        let real = self.real.read_dir(path);
+        let embedded = self.embedded.read_dir(path);
+        match (real, embedded) {
+            (Ok(mut real_entries), Ok(embedded_entries)) => {
+                let real_names: std::collections::HashSet<String> =
+                    real_entries.iter().map(|e| e.name.to_lowercase()).collect();
+                for entry in embedded_entries {
+                    if !real_names.contains(&entry.name.to_lowercase()) {
+                        real_entries.push(entry);
+                    }
+                }
+                Ok(real_entries)
+            }
+            (Ok(real_entries), Err(_)) => Ok(real_entries),
+            (Err(_), Ok(embedded_entries)) => Ok(embedded_entries),
+            (Err(e), Err(_)) => Err(e),
+        }
     }
     fn modified(&self, path: &str) -> io::Result<SystemTime> {
         let result = self.embedded.modified(path);
@@ -481,4 +500,143 @@ pub fn create_self_contained_binary(
 /// Default VFS instance (real filesystem).
 pub fn real_fs() -> Arc<dyn Vfs> {
     Arc::new(RealFs)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch directory on the real filesystem, removed on drop. Each call
+    /// gets a unique path (pid + monotonic counter) so tests don't collide.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("rustcfml-vfs-test-{}-{}-{}", tag, std::process::id(), n));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            TempDir(dir)
+        }
+        fn str(&self) -> &str { self.0.to_str().unwrap() }
+        fn write(&self, name: &str, contents: &str) {
+            std::fs::write(self.0.join(name), contents).expect("write temp file");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn entry_names_lower(entries: &[VfsDirEntry]) -> Vec<String> {
+        let mut v: Vec<String> = entries.iter().map(|e| e.name.to_lowercase()).collect();
+        v.sort();
+        v
+    }
+
+    fn fallback_for(real_dir: &str, embedded_files: &[(&str, &str)]) -> FallbackFs {
+        let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+        for (path, body) in embedded_files {
+            files.insert(path.to_string(), body.as_bytes().to_vec());
+        }
+        FallbackFs {
+            embedded: EmbeddedFs::new(files, real_dir.to_string()),
+            real: RealFs,
+            sandbox: false,
+        }
+    }
+
+    /// The compiled-binary regression: the real CWD exists and holds unrelated
+    /// files, while the app (incl. Application.cfc) lives only in the embedded
+    /// VFS under that same base dir. `read_dir` MUST surface the embedded files
+    /// or `find_application_cfc`'s tree-walk never finds Application.cfc and the
+    /// binary 500s on every request. (Was broken from v0.6.2 through v0.243.0.)
+    #[test]
+    fn read_dir_merges_embedded_app_into_real_cwd() {
+        let dir = TempDir::new("merge");
+        // Real filesystem holds the binary + sundry files, but NO Application.cfc.
+        dir.write("myapp", "binary bytes");
+        dir.write("notes.txt", "todo");
+
+        let fs = fallback_for(
+            dir.str(),
+            &[
+                ("Application.cfc", "component {}"),
+                ("index.cfm", "hi"),
+                ("modules/home/handler.cfc", "component {}"),
+            ],
+        );
+
+        let entries = fs.read_dir(dir.str()).expect("read_dir should succeed");
+        let names = entry_names_lower(&entries);
+
+        // Real-FS entries are still present.
+        assert!(names.contains(&"myapp".to_string()), "real files preserved: {names:?}");
+        assert!(names.contains(&"notes.txt".to_string()), "real files preserved: {names:?}");
+        // The embedded-only app files are now visible — this is the fix.
+        assert!(names.contains(&"application.cfc".to_string()), "Application.cfc must be visible: {names:?}");
+        assert!(names.contains(&"index.cfm".to_string()), "index.cfm must be visible: {names:?}");
+        assert!(names.contains(&"modules".to_string()), "embedded subdir must be visible: {names:?}");
+
+        // And the embedded subdirectory listing works too (modules.home resolution).
+        let modules = fs.read_dir(&format!("{}/modules", dir.str())).expect("read modules");
+        assert!(entry_names_lower(&modules).contains(&"home".to_string()));
+    }
+
+    /// On a case-insensitive name collision, the real-FS entry wins (so on-disk
+    /// modules can override embedded ones) and the name is NOT duplicated.
+    #[test]
+    fn read_dir_real_wins_on_collision() {
+        let dir = TempDir::new("collision");
+        dir.write("shared.cfc", "real version");
+
+        let fs = fallback_for(dir.str(), &[("shared.cfc", "embedded version"), ("only_embedded.cfm", "x")]);
+
+        let entries = fs.read_dir(dir.str()).expect("read_dir");
+        let shared: Vec<&VfsDirEntry> = entries
+            .iter()
+            .filter(|e| e.name.eq_ignore_ascii_case("shared.cfc"))
+            .collect();
+        assert_eq!(shared.len(), 1, "collision must not duplicate the entry: {entries:?}");
+        // Real FS preserves original casing ("shared.cfc"); the embedded copy is
+        // lowercased, so the surviving entry being exactly "shared.cfc" proves
+        // the real entry won.
+        assert_eq!(shared[0].name, "shared.cfc", "real-FS entry must win the collision");
+        // Embedded-only entry still comes through.
+        assert!(entry_names_lower(&entries).contains(&"only_embedded.cfm".to_string()));
+    }
+
+    /// Sandbox mode never touches the real filesystem, even when it exists.
+    #[test]
+    fn read_dir_sandbox_is_embedded_only() {
+        let dir = TempDir::new("sandbox");
+        dir.write("myapp", "binary");
+        dir.write("notes.txt", "todo");
+
+        let mut fs = fallback_for(dir.str(), &[("index.cfm", "hi")]);
+        fs.sandbox = true;
+
+        let names = entry_names_lower(&fs.read_dir(dir.str()).expect("read_dir"));
+        assert_eq!(names, vec!["index.cfm".to_string()], "sandbox must hide real FS: {names:?}");
+    }
+
+    /// When the real directory doesn't exist at all (read fails), the embedded
+    /// listing still comes through — the original `or_else` fallback case.
+    #[test]
+    fn read_dir_embedded_only_when_real_missing() {
+        let base = format!("{}/does-not-exist-{}", std::env::temp_dir().display(), std::process::id());
+        let fs = fallback_for(&base, &[("Application.cfc", "component {}"), ("index.cfm", "hi")]);
+
+        let names = entry_names_lower(&fs.read_dir(&base).expect("embedded read_dir"));
+        assert!(names.contains(&"application.cfc".to_string()), "{names:?}");
+        assert!(names.contains(&"index.cfm".to_string()), "{names:?}");
+    }
 }

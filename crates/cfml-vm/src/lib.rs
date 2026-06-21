@@ -2292,6 +2292,42 @@ impl CfmlVirtualMachine {
         self.program = restored;
     }
 
+    /// Evaluate one REPL line against this *persistent* VM.
+    ///
+    /// Swaps `program` in as the active program (registering its functions into
+    /// the process-stable `fn_registry` by global_id, so they remain resolvable
+    /// on later lines) and runs its `__main__`. Crucially, state carries across
+    /// calls so `x = 5` on one line is visible to `writeOutput(x)` on the next —
+    /// unlike a fresh-VM-per-line REPL:
+    ///
+    /// - Function declarations persist in `user_functions` + `fn_registry`.
+    /// - The page (`variables`) scope is `__main__`'s frame locals, which the VM
+    ///   stashes into `captured_locals` on exit. We feed the previous line's
+    ///   scope back in as `parent_scope` (whose non-Function entries `__main__`
+    ///   copies into its locals), so top-level variables survive too. The
+    ///   internal arguments marker is stripped so it can't leak into the new
+    ///   frame's `arguments` scope.
+    ///
+    /// On error, `captured_locals` is left as it was (the failing line never
+    /// reaches the exit-capture), so a typo at the prompt doesn't wipe prior
+    /// state. `output_buffer` is cleared first so the caller reads only this
+    /// line's output.
+    pub fn repl_eval(&mut self, program: BytecodeProgram) -> CfmlResult {
+        let _displaced = self.push_program_swap(program);
+        self.output_buffer.clear();
+        let mut carried = self.captured_locals.clone().unwrap_or_default();
+        carried.shift_remove(ARGUMENTS_SCOPE_KEY);
+        let main_idx = self
+            .program
+            .functions
+            .iter()
+            .position(|f| f.name == "__main__")
+            .ok_or_else(|| CfmlError::runtime("No main function found".to_string()))?;
+        let func = self.program.functions[main_idx].clone();
+        self.execute_function_with_args(&func, Vec::new(), Some(&carried))
+            .map_err(|e| self.wrap_error(e))
+    }
+
     /// Restore output-capture state when an exception is caught by `handler`.
     /// A cfsavecontent / cfsilent / custom-tag body that throws before its
     /// matching end op leaves `saved_output_buffers` (and `custom_tag_stack`)

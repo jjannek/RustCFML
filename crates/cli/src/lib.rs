@@ -2134,9 +2134,49 @@ mod cfconfig_block_tests {
 // REPL
 // ---------------------------------------------------------------------------
 
+/// Compile a single REPL line through the full pipeline (tag preprocess → lex →
+/// parse → bytecode), returning a runnable program or a human-readable error.
+fn compile_repl_line(source: &str, debug: bool) -> Result<cfml_codegen::BytecodeProgram, String> {
+    let source = if tag_parser::has_cfml_tags(source) {
+        tag_parser::tags_to_script_checked(source)?
+    } else {
+        source.to_string()
+    };
+    let tokens = lexer::tokenize(source.clone());
+    if debug {
+        eprintln!("=== TOKENS ===");
+        for (i, tok) in tokens.iter().enumerate() {
+            eprintln!("{:3}: {:?}", i, tok.token);
+        }
+    }
+    let ast = CfmlParser::new(source)
+        .parse()
+        .map_err(|e| format!("Parse Error [line {}, col {}]: {}", e.line, e.column, e.message))?;
+    Ok(CfmlCompiler::new().compile(ast))
+}
+
 fn run_repl(debug: bool) {
     println!("RustCFML REPL v{}", env!("CARGO_PKG_VERSION"));
     println!("Type 'exit' or 'quit' to exit\n");
+
+    // A single, persistent VM lives for the whole session so that variables and
+    // function declarations carry across lines (the page/`variables` scope is
+    // `vm.globals`, which `repl_eval` preserves). Start from an empty program
+    // and swap each line's compiled `__main__` in via `repl_eval`.
+    let empty = match compile_repl_line("", false) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("REPL init failed: {}", e);
+            return;
+        }
+    };
+    let mut vm = CfmlVirtualMachine::new(empty);
+    vm.vfs = vfs::real_fs();
+    register_vm_runtime(&mut vm);
+    // CFML guarantees url/cgi/form always exist.
+    vm.globals.entry("url".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+    vm.globals.entry("cgi".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+    vm.globals.entry("form".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     loop {
         print!("cfml> ");
@@ -2144,6 +2184,7 @@ fn run_repl(debug: bool) {
 
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).unwrap() == 0 {
+            println!();
             break;
         }
 
@@ -2156,7 +2197,28 @@ fn run_repl(debug: bool) {
             continue;
         }
 
-        execute_code(line, debug);
+        let program = match compile_repl_line(line, debug) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", e);
+                continue;
+            }
+        };
+
+        let result = vm.repl_eval(program);
+        vm.finalize_html_injections();
+        if !vm.output_buffer.is_empty() {
+            print!("{}", vm.output_buffer);
+            // Ensure the next prompt starts on its own line.
+            if !vm.output_buffer.ends_with('\n') {
+                println!();
+            }
+        }
+        // An error prints but never terminates the session — a typo at the
+        // prompt must not kill the REPL (it used to `exit(1)`).
+        if let Err(e) = result {
+            eprintln!("{}", e);
+        }
     }
 }
 
