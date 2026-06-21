@@ -2334,6 +2334,54 @@ impl CfmlVirtualMachine {
             .map_err(|e| self.wrap_error(e))
     }
 
+    /// Evaluate a CFML expression given as a string against the caller's scope,
+    /// returning its value. Backs the `evaluate()` BIF. The expression is wrapped
+    /// as `return (<expr>);`, compiled through the normal lexer/parser/codegen
+    /// pipeline, and run as a synthetic `__main__` seeded with `parent_locals`
+    /// (a copy of the caller's locals), so bare variable references resolve the
+    /// same way they would inline. The `return` op hands the expression value
+    /// straight back, so no scope read-back is needed.
+    ///
+    /// Each distinct expression mints fresh process-stable `global_id`s, so a
+    /// hot evaluate() loop slowly grows `fn_registry`; acceptable for the
+    /// boot-time / config-time expressions this targets.
+    fn eval_expression_string(
+        &mut self,
+        expr: &str,
+        parent_locals: &ValueMap,
+    ) -> CfmlResult {
+        let source = format!("return ({});\n", expr);
+        let ast = cfml_compiler::parser::Parser::new(source)
+            .parse()
+            .map_err(|e| {
+                CfmlError::runtime(format!(
+                    "evaluate(): parse error in expression \"{}\" [line {}, col {}]: {}",
+                    expr, e.line, e.column, e.message
+                ))
+            })?;
+        let program = cfml_codegen::compiler::CfmlCompiler::new()
+            .with_source_file(self.source_file.clone())
+            .compile(ast);
+        let old_program = self.push_program_swap(program);
+        let main_idx = self
+            .program
+            .functions
+            .iter()
+            .position(|f| f.name == "__main__")
+            .unwrap_or(0);
+        let func = self.program.functions[main_idx].clone();
+        // The synthetic __main__ captures its locals into `captured_locals` on
+        // exit (the __main__ epilogue); save/restore so it can't clobber the
+        // surrounding template/REPL capture. execute_function_with_args already
+        // truncates the call/try stacks back to entry depth, so a `return` from
+        // inside the synthetic frame leaks neither.
+        let saved_captured = self.captured_locals.take();
+        let result = self.execute_function_with_args(&func, Vec::new(), Some(parent_locals));
+        self.captured_locals = saved_captured;
+        self.pop_program_swap(old_program);
+        result
+    }
+
     /// Restore output-capture state when an exception is caught by `handler`.
     /// A cfsavecontent / cfsilent / custom-tag body that throws before its
     /// matching end op leaves `saved_output_buffers` (and `custom_tag_stack`)
@@ -7415,6 +7463,7 @@ impl CfmlVirtualMachine {
                 | "callstackget"
                 | "callstackdump"
                 | "getpagecontext"
+                | "evaluate"
                 | "precisionevaluate" => {
                     // Will be handled at the end of this function (needs VM access)
                 }
@@ -11560,6 +11609,25 @@ impl CfmlVirtualMachine {
                     let expr = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     let result = precision_evaluate_expr(&expr)?;
                     return Ok(CfmlValue::string(result));
+                }
+
+                "evaluate" => {
+                    // evaluate(expr1 [, expr2 ...]): compile + run each string as a
+                    // CFML expression against the caller's scope, returning the value
+                    // of the last. Each expression sees the caller's local/variables
+                    // values (read), but writes inside an evaluated expression are not
+                    // propagated back to the caller's frame — assignment side effects
+                    // (`evaluate("x=5")`) are NOT supported, which is the rare case;
+                    // read-only expression evaluation is the documented common use.
+                    if args.is_empty() {
+                        return Ok(CfmlValue::Null);
+                    }
+                    let mut result = CfmlValue::Null;
+                    for arg in &args {
+                        let expr = arg.as_string();
+                        result = self.eval_expression_string(&expr, parent_locals)?;
+                    }
+                    return Ok(result);
                 }
 
                 "getpagecontext" => {

@@ -179,6 +179,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_valuelist_functions.cfm">
 <cf_runtest file="stdlib/test_callstack.cfm">
 <cf_runtest file="stdlib/test_precisionevaluate.cfm">
+<cf_runtest file="stdlib/test_evaluate.cfm">
 <cf_runtest file="stdlib/test_htmlparse.cfm">
 <cf_runtest file="stdlib/test_gettagdata.cfm">
 <cf_runtest file="stdlib/test_ini_functions.cfm">
