@@ -52,5 +52,21 @@ assert("cache: NoCase vs sensitive distinct", reReplaceNoCase("AbC", "b", "X"), 
 assert("cache: sensitive same pattern matches lower", reReplace("AbC", "b", "X"), "AXC");
 assert("cache: sensitive pattern no match on upper", reReplace("ABC", "b", "X"), "ABC");
 
+// --- reReplace replacement-string backslash semantics (Lucee 7 parity) ---
+// Only \0-\9 (backreferences) and \u \l \U \L \E (case modifiers) are special
+// in a replacement string. Every OTHER escape keeps its backslash VERBATIM —
+// \n \t \r stay literal two-char sequences, and \\, \d, \/ etc. are not
+// interpreted. (Previously RustCFML expanded \n/\t/\r and dropped the backslash
+// on unknown escapes, breaking Wheels routing/validation replacements.)
+assert("reReplace backref kept", reReplace("abc", "(b)", "[\1]"), "a[b]c");
+assert("reReplace \d keeps backslash", reReplace("abc", "b", "X\dY"), "aX\dYc");
+assert("reReplace \\ keeps both", reReplace("abc", "b", "X\\Y"), "aX\\Yc");
+assert("reReplace \/ keeps backslash", reReplace("a-b", "-", "\/"), "a\/b");
+assert("reReplace \n stays literal", reReplace("ab", "b", "[\n]"), "a[\n]");
+assert("reReplace \t stays literal", reReplace("ab", "b", "[\t]"), "a[\t]");
+assert("reReplace \w keeps backslash", reReplace("abc", "b", "\w"), "a\wc");
+assert("reReplace \U..\E uppercases backref", reReplace("a-hello-z", "(hello)", "\U\1\E"), "a-HELLO-z");
+assert("reReplace \l lowercases next", reReplace("aBc", "(B)", "\l\1"), "abc");
+
 suiteEnd();
 </cfscript>

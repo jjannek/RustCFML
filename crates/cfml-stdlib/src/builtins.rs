@@ -1284,7 +1284,6 @@ fn expand_cfml_replacement(template: &str, caps: &regex::Captures) -> String {
         if c == '\\' && i + 1 < n {
             let next = chars[i + 1];
             i += 2;
-            let mut buf = [0u8; 4];
             match next {
                 '0'..='9' => {
                     let g = next as usize - '0' as usize;
@@ -1296,11 +1295,16 @@ fn expand_cfml_replacement(template: &str, caps: &regex::Captures) -> String {
                 'U' => ranged_upper = Some(true),
                 'L' => ranged_upper = Some(false),
                 'E' => ranged_upper = None,
-                'n' => emit(&mut out, "\n", ranged_upper, &mut oneshot_upper),
-                't' => emit(&mut out, "\t", ranged_upper, &mut oneshot_upper),
-                'r' => emit(&mut out, "\r", ranged_upper, &mut oneshot_upper),
-                // Unknown escape (incl. "\\"): emit the escaped char literally.
-                other => emit(&mut out, other.encode_utf8(&mut buf), ranged_upper, &mut oneshot_upper),
+                // Any OTHER escape is NOT interpreted in a CFML reReplace
+                // replacement string — the backslash is kept verbatim (Lucee 7
+                // parity, verified): `\n`/`\t`/`\r` stay literal `\n`/`\t`/`\r`,
+                // `\\`→`\\`, `\d`→`\d`, `\/`→`\/`. Only `\0`-`\9` (backreferences)
+                // and `\u`/`\l`/`\U`/`\L`/`\E` (case modifiers) are special.
+                other => {
+                    let mut s = String::from('\\');
+                    s.push(other);
+                    emit(&mut out, &s, ranged_upper, &mut oneshot_upper);
+                }
             }
         } else {
             let mut buf = [0u8; 4];
