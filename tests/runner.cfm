@@ -662,6 +662,11 @@ include "harness.cfm";
 <!--- are captured, and component-level annotations surface top-level in --->
 <!--- getComponentMetadata (Lucee parity) — the surface WireBox delegation reads. --->
 <cf_runtest file="oop/test_delegate_annotation_metadata.cfm">
+<!--- - javadoc & inline parameter annotations: `@arg.inject ...` javadoc and --->
+<!--- inline `arg inject="..."` attributes surface on the parameter struct in --->
+<!--- getMetadata()/getComponentMetadata() — the surface WireBox DI reads for --->
+<!--- constructor-argument injection (Preside FeatureService boot). --->
+<cf_runtest file="oop/test_javadoc_param_annotations.cfm">
 
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">

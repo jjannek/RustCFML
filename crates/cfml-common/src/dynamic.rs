@@ -1075,6 +1075,11 @@ pub struct CfmlParam {
     pub param_type: Option<String>,
     pub default: Option<CfmlValue>,
     pub required: bool,
+    /// Javadoc-style annotations attached to this parameter, e.g.
+    /// `@configuredFeatures.inject coldbox:setting:features` → `("inject",
+    /// "coldbox:setting:features")`. Surfaced in getMetadata()/
+    /// getComponentMetadata() so WireBox-style DI can read `param.inject`.
+    pub annotations: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -4962,6 +4962,11 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                             if let Some(ref d) = p.default {
                                 pm.insert("default".to_string(), d.clone());
                             }
+                            // Javadoc/inline annotations (e.g. WireBox `inject`)
+                            // appear as top-level keys on the parameter struct.
+                            for (k, v) in &p.annotations {
+                                pm.insert(k.clone(), CfmlValue::string(v.clone()));
+                            }
                             CfmlValue::strukt(pm)
                         }).collect();
                         func_meta.insert("parameters".to_string(), CfmlValue::array(params));

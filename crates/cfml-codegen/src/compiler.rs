@@ -138,6 +138,13 @@ pub struct BytecodeFunction {
     /// application default (`this.localMode` in Application.cfc), falling
     /// back to classic if no app default is set.
     pub declared_local_mode: Option<bool>,
+    /// Declared parameter types (parallel to `params`; `None` when untyped).
+    /// Surfaced in getMetadata()/getComponentMetadata().
+    pub param_types: Vec<Option<String>>,
+    /// Javadoc/inline annotations per parameter (parallel to `params`), e.g.
+    /// WireBox `@arg.inject coldbox:setting:features`. Surfaced as `param.inject`
+    /// etc. in getMetadata()/getComponentMetadata() for DI frameworks.
+    pub param_annotations: Vec<Vec<(String, String)>>,
     /// True when this function is a component method (declared inside a CFC
     /// body). Lucee/ACF allow component methods to shadow built-in function
     /// names — `obj.canonicalize()` dispatches to the method, not the BIF —
@@ -420,6 +427,8 @@ impl CfmlCompiler {
                     source_file: None,
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
+                    param_types: Vec::new(),
+                    param_annotations: Vec::new(),
                     is_component_method: false,
                 })],
             },
@@ -2475,6 +2484,8 @@ impl CfmlCompiler {
             source_file: self.source_file.clone(),
             global_id: next_global_fn_id(),
             declared_local_mode: declared_mode,
+            param_types: func.params.iter().map(|p| p.param_type.clone()).collect(),
+            param_annotations: func.params.iter().map(|p| p.annotations.clone()).collect(),
             is_component_method: self.in_component_method,
         };
 
@@ -2678,6 +2689,8 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
+                    param_types: Vec::new(),
+                    param_annotations: Vec::new(),
                     is_component_method: true,
                 };
                 self.program.functions.push(Arc::new(getter_func));
@@ -2723,6 +2736,8 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
+                    param_types: vec![None],
+                    param_annotations: vec![Vec::new()],
                     is_component_method: true,
                 };
                 self.program.functions.push(Arc::new(setter_func));
@@ -2862,6 +2877,8 @@ impl CfmlCompiler {
                 source_file: self.source_file.clone(),
                 global_id: next_global_fn_id(),
                 declared_local_mode: None,
+                param_types: Vec::new(),
+                param_annotations: Vec::new(),
                 is_component_method: true,
             };
             self.program.functions.push(Arc::new(static_func));
@@ -3725,6 +3742,8 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: effective_declared,
+                    param_types: closure.params.iter().map(|p| p.param_type.clone()).collect(),
+                    param_annotations: closure.params.iter().map(|p| p.annotations.clone()).collect(),
                     is_component_method: false,
                 };
 
@@ -3775,6 +3794,8 @@ impl CfmlCompiler {
                     source_file: self.source_file.clone(),
                     global_id: next_global_fn_id(),
                     declared_local_mode: arrow_effective,
+                    param_types: arrow.params.iter().map(|p| p.param_type.clone()).collect(),
+                    param_annotations: arrow.params.iter().map(|p| p.annotations.clone()).collect(),
                     is_component_method: false,
                 };
 

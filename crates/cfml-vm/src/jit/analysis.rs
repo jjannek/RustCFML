@@ -1240,6 +1240,8 @@ mod tests {
             source_file: None,
             global_id: 1,
             declared_local_mode: None,
+            param_types: params.iter().map(|_| None).collect(),
+            param_annotations: params.iter().map(|_| Vec::new()).collect(),
             is_component_method: false,
         }
     }

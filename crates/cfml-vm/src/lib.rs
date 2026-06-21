@@ -3006,13 +3006,18 @@ impl CfmlVirtualMachine {
                                 .enumerate()
                                 .map(|(i, pname)| cfml_common::dynamic::CfmlParam {
                                     name: pname.clone(),
-                                    param_type: None,
+                                    param_type: bc_func.param_types.get(i).cloned().flatten(),
                                     default: None,
                                     required: bc_func
                                         .required_params
                                         .get(i)
                                         .copied()
                                         .unwrap_or(false),
+                                    annotations: bc_func
+                                        .param_annotations
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or_default(),
                                 })
                                 .collect(),
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -3491,13 +3496,18 @@ impl CfmlVirtualMachine {
                                     .enumerate()
                                     .map(|(i, p)| cfml_common::dynamic::CfmlParam {
                                         name: p.clone(),
-                                        param_type: None,
+                                        param_type: uf.param_types.get(i).cloned().flatten(),
                                         default: None,
                                         required: uf
                                             .required_params
                                             .get(i)
                                             .copied()
                                             .unwrap_or(false),
+                                        annotations: uf
+                                            .param_annotations
+                                            .get(i)
+                                            .cloned()
+                                            .unwrap_or_default(),
                                     })
                                     .collect()
                             })
@@ -3550,13 +3560,18 @@ impl CfmlVirtualMachine {
                                     .enumerate()
                                     .map(|(i, p)| cfml_common::dynamic::CfmlParam {
                                         name: p.clone(),
-                                        param_type: None,
+                                        param_type: uf.param_types.get(i).cloned().flatten(),
                                         default: None,
                                         required: uf
                                             .required_params
                                             .get(i)
                                             .copied()
                                             .unwrap_or(false),
+                                        annotations: uf
+                                            .param_annotations
+                                            .get(i)
+                                            .cloned()
+                                            .unwrap_or_default(),
                                     })
                                     .collect()
                             })
@@ -5811,13 +5826,18 @@ impl CfmlVirtualMachine {
                             .enumerate()
                             .map(|(i, name)| cfml_common::dynamic::CfmlParam {
                                 name: name.clone(),
-                                param_type: None,
+                                param_type: bc_func_ref.param_types.get(i).cloned().flatten(),
                                 default: None,
                                 required: bc_func_ref
                                     .required_params
                                     .get(i)
                                     .copied()
                                     .unwrap_or(false),
+                                annotations: bc_func_ref
+                                    .param_annotations
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or_default(),
                             })
                             .collect(),
                         body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
@@ -9129,10 +9149,36 @@ impl CfmlVirtualMachine {
                                             CfmlValue::string(rt.clone()),
                                         );
                                     }
+                                    // Full parameter structs (name/type/required +
+                                    // any javadoc/inline annotations such as WireBox
+                                    // `inject`), matching getMetadata() and Lucee/ACF.
                                     let params: Vec<CfmlValue> = f
                                         .params
                                         .iter()
-                                        .map(|p| CfmlValue::string(p.name.clone()))
+                                        .map(|p| {
+                                            let mut pm = ValueMap::default();
+                                            pm.insert(
+                                                "name".to_string(),
+                                                CfmlValue::string(p.name.clone()),
+                                            );
+                                            if let Some(ref t) = p.param_type {
+                                                pm.insert(
+                                                    "type".to_string(),
+                                                    CfmlValue::string(t.clone()),
+                                                );
+                                            }
+                                            pm.insert(
+                                                "required".to_string(),
+                                                CfmlValue::Bool(p.required),
+                                            );
+                                            for (k, v) in &p.annotations {
+                                                pm.insert(
+                                                    k.clone(),
+                                                    CfmlValue::string(v.clone()),
+                                                );
+                                            }
+                                            CfmlValue::strukt(pm)
+                                        })
                                         .collect();
                                     func_meta
                                         .insert("parameters".to_string(), CfmlValue::array(params));
@@ -15384,13 +15430,18 @@ impl CfmlVirtualMachine {
                                     .enumerate()
                                     .map(|(i, name)| cfml_common::dynamic::CfmlParam {
                                         name: name.clone(),
-                                        param_type: None,
+                                        param_type: func_def.param_types.get(i).cloned().flatten(),
                                         default: None,
                                         required: func_def
                                             .required_params
                                             .get(i)
                                             .copied()
                                             .unwrap_or(false),
+                                        annotations: func_def
+                                            .param_annotations
+                                            .get(i)
+                                            .cloned()
+                                            .unwrap_or_default(),
                                     })
                                     .collect(),
                                 body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(

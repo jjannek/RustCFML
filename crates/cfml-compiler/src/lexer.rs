@@ -12,6 +12,11 @@ pub struct Lexer {
     /// Start position of the current token being scanned
     token_start_line: usize,
     token_start_column: usize,
+    /// Javadoc (`/** ... */`) comments captured during scanning, each paired
+    /// with the index of the token it immediately precedes (`tokens.len()` at
+    /// capture time). The parser consults this to attach `@annotations` to the
+    /// following component / function / property declaration.
+    doc_comments: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +35,14 @@ impl Lexer {
             tokens: Vec::new(),
             token_start_line: 1,
             token_start_column: 1,
+            doc_comments: Vec::new(),
         }
+    }
+
+    /// Javadoc comments captured during the most recent `tokenize()`, paired
+    /// with the index of the token each precedes.
+    pub fn doc_comments(&self) -> &[(usize, String)] {
+        &self.doc_comments
     }
 
     pub fn tokenize(&mut self) -> Vec<TokenWithLoc> {
@@ -584,13 +596,27 @@ impl Lexer {
     }
 
     fn multi_line_comment(&mut self) {
+        // A `/**` (but not the empty `/**/`) opens a javadoc comment whose
+        // `@key value` annotations are attached to the following declaration.
+        let is_doc = self.current() == '*' && self.peek(1) != '/';
+        let mut content = String::new();
+        if is_doc {
+            self.advance(); // consume the leading '*' of '/**'
+        }
         while !self.is_at_end() {
             if self.current() == '*' && self.peek(1) == '/' {
                 self.advance();
                 self.advance();
                 break;
             }
+            if is_doc {
+                content.push(self.current());
+            }
             self.advance();
+        }
+        if is_doc {
+            // Anchor to the index the next emitted token will occupy.
+            self.doc_comments.push((self.tokens.len(), content));
         }
     }
 }

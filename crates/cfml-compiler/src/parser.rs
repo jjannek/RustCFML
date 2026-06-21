@@ -9,6 +9,8 @@ use std::convert::TryFrom;
 pub struct Parser {
     tokens: Vec<TokenWithLoc>,
     current: usize,
+    /// Map from token index → javadoc comment text immediately preceding it.
+    doc_comments: std::collections::HashMap<usize, String>,
 }
 
 #[derive(Debug)]
@@ -20,8 +22,14 @@ pub struct ParseError {
 
 impl Parser {
     pub fn new(source: String) -> Self {
-        let tokens = Lexer::new(source).tokenize();
-        Self { tokens, current: 0 }
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let doc_comments = lexer.doc_comments().iter().cloned().collect();
+        Self {
+            tokens,
+            current: 0,
+            doc_comments,
+        }
     }
 
     pub fn parse(&mut self) -> Result<Program, ParseError> {
@@ -331,11 +339,12 @@ impl Parser {
         // ordinary identifier and must fall through to expression parsing. This
         // matches Lucee/ACF/BoxLang, which all treat `component` as soft.
         if self.check(&Token::Component) && self.is_component_declaration() {
+            let comp_doc_idx = self.current;
             self.advance(); // consume `component`
+            let mut component = self.parse_component()?;
+            self.apply_doc_to_metadata(comp_doc_idx, &mut component.metadata);
             return Ok(CfmlNode::Statement(Statement::ComponentDecl(
-                ComponentDecl {
-                    component: self.parse_component()?,
-                },
+                ComponentDecl { component },
             )));
         }
 
@@ -3527,6 +3536,101 @@ impl Parser {
         })
     }
 
+    /// Parse a javadoc comment body into `(declaration-level annotations,
+    /// per-parameter annotations keyed by lowercased param name)`.
+    /// `@key value` → declaration annotation; `@name.sub value` → the parameter
+    /// named `name` gets annotation `sub`. A bare `@key` (no value) yields
+    /// `"true"` (Lucee parity). Leading non-`@` text becomes the `hint`
+    /// annotation unless an explicit `@hint` is present.
+    fn parse_doc_comment(
+        text: &str,
+    ) -> (
+        Vec<(String, String)>,
+        std::collections::HashMap<String, Vec<(String, String)>>,
+    ) {
+        let mut decl: Vec<(String, String)> = Vec::new();
+        let mut params: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        let mut hint_lines: Vec<String> = Vec::new();
+        let mut seen_at = false;
+        for raw in text.lines() {
+            let mut line = raw.trim();
+            // Strip the leading '*' (and following space) of javadoc continuation lines.
+            if let Some(rest) = line.strip_prefix('*') {
+                line = rest.trim_start();
+            }
+            if let Some(rest) = line.strip_prefix('@') {
+                seen_at = true;
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    continue;
+                }
+                let (key, val) = match rest.find(char::is_whitespace) {
+                    Some(i) => (rest[..i].to_string(), rest[i..].trim().to_string()),
+                    None => (rest.to_string(), String::new()),
+                };
+                let value = if val.is_empty() {
+                    "true".to_string()
+                } else {
+                    val
+                };
+                if let Some(dot) = key.find('.') {
+                    let pname = key[..dot].to_lowercase();
+                    let anno = key[dot + 1..].to_string();
+                    params.entry(pname).or_default().push((anno, value));
+                } else {
+                    decl.push((key, value));
+                }
+            } else if !seen_at && !line.is_empty() {
+                hint_lines.push(line.to_string());
+            }
+        }
+        if !hint_lines.is_empty()
+            && !decl.iter().any(|(k, _)| k.eq_ignore_ascii_case("hint"))
+        {
+            decl.push(("hint".to_string(), hint_lines.join(" ")));
+        }
+        (decl, params)
+    }
+
+    /// If a javadoc comment precedes the declaration starting at token `idx`,
+    /// fold its annotations into the function metadata and parameter annotations.
+    /// Explicit inline attributes already present win over javadoc.
+    fn apply_doc_to_function(&self, idx: usize, func: &mut Function) {
+        let Some(text) = self.doc_comments.get(&idx) else {
+            return;
+        };
+        let (decl, params) = Self::parse_doc_comment(text);
+        for (k, v) in decl {
+            if !func.metadata.iter().any(|(ek, _)| ek.eq_ignore_ascii_case(&k)) {
+                func.metadata.push((k, v));
+            }
+        }
+        for p in func.params.iter_mut() {
+            if let Some(annos) = params.get(&p.name.to_lowercase()) {
+                for (k, v) in annos {
+                    if !p.annotations.iter().any(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+                        p.annotations.push((k.clone(), v.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fold a preceding javadoc comment's declaration-level annotations into a
+    /// component/interface metadata list.
+    fn apply_doc_to_metadata(&self, idx: usize, metadata: &mut Vec<(String, String)>) {
+        let Some(text) = self.doc_comments.get(&idx) else {
+            return;
+        };
+        let (decl, _params) = Self::parse_doc_comment(text);
+        for (k, v) in decl {
+            if !metadata.iter().any(|(ek, _)| ek.eq_ignore_ascii_case(&k)) {
+                metadata.push((k, v));
+            }
+        }
+    }
+
     fn parse_component(&mut self) -> Result<Component, ParseError> {
         let loc = self.current_location();
         // Parse component name: can be `component Name extends=...` (rare,
@@ -3745,6 +3849,9 @@ impl Parser {
         let mut static_body = Vec::new();
 
         while !self.check(&Token::RBrace) && !self.is_at_end() {
+            // Index of the first token of this member — a preceding javadoc
+            // comment is anchored here.
+            let member_start = self.current;
             // Check for access modifiers — only consume if followed by function/property/static
             let access = if matches!(
                 self.peek(0),
@@ -3784,6 +3891,7 @@ impl Parser {
                 let mut func = self.parse_function()?;
                 func.access = access;
                 func.is_static = is_static;
+                self.apply_doc_to_function(member_start, &mut func);
                 functions.push(func);
             } else if self.match_token(&Token::Var) {
                 body.push(Statement::Var(self.parse_var()?));
@@ -4107,8 +4215,11 @@ impl Parser {
                 None
             };
 
-            // Consume and discard optional per-parameter attributes (e.g. `hint="..."`).
-            // These are accepted for source compatibility but not stored on Param.
+            // Capture optional per-parameter attributes (e.g. `inject="..."`,
+            // `hint="..."`). These mirror the javadoc `@param.key value` form and
+            // are surfaced as parameter annotations in getMetadata() (WireBox DI
+            // reads `param.inject`).
+            let mut annotations: Vec<(String, String)> = Vec::new();
             loop {
                 let is_attr_key = matches!(self.peek(1), Token::Equal)
                     && (matches!(self.peek(0), Token::Identifier(_))
@@ -4116,10 +4227,21 @@ impl Parser {
                 if !is_attr_key {
                     break;
                 }
-                self.advance(); // key
-                self.consume(&Token::Equal)?;
-                if matches!(self.peek(0), Token::String(_)) {
+                let key = if let Token::Identifier(ref s) = self.peek(0) {
+                    let s = s.clone();
                     self.advance();
+                    s
+                } else if let Some(s) = self.token_as_string(&self.peek(0).clone()) {
+                    self.advance();
+                    s
+                } else {
+                    break;
+                };
+                self.consume(&Token::Equal)?;
+                if let Token::String(ref v) = self.peek(0) {
+                    let v = v.clone();
+                    self.advance();
+                    annotations.push((key, v));
                 } else {
                     // Tolerate bare identifier / number / etc. as attribute value
                     let _ = self.parse_expression();
@@ -4131,6 +4253,7 @@ impl Parser {
                 param_type,
                 default,
                 required,
+                annotations,
             });
 
             if !self.match_token(&Token::Comma) {

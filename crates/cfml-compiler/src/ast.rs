@@ -79,6 +79,9 @@ pub struct Param {
     pub param_type: Option<String>,
     pub default: Option<Expression>,
     pub required: bool,
+    /// Javadoc-style `@paramname.key value` annotations attached to this
+    /// parameter (e.g. WireBox `@configuredFeatures.inject coldbox:setting:features`).
+    pub annotations: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
