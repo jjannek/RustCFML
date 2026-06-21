@@ -5786,14 +5786,20 @@ fn fn_charset_encode(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_encode_for_html_attribute(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
     let mut result = String::new();
-    // OWASP/ESAPI semantics (matches Lucee/Adobe): in HTML-attribute context every
-    // non-alphanumeric char below U+0100 is encoded — including space (&#x20;) and = (&#x3d;) —
-    // because an UNQUOTED attribute value can be broken out of with a raw space + =. Use a named
-    // entity where one exists, otherwise a hex numeric entity. Codepoints >= U+0100 are passed
-    // through (immune), mirroring ESAPI's default.
+    // OWASP/ESAPI HTMLEntityCodec semantics for an attribute context: every
+    // non-alphanumeric char below U+0100 is encoded — including space (&#x20;)
+    // and = (&#x3d;), because an UNQUOTED attribute value can be broken out of
+    // with a raw space + = — EXCEPT the ESAPI immune set `, . - _`, which are
+    // inert in any attribute context and pass through. (Adobe CF and BoxLang
+    // match this; Lucee 7's encodeForHTMLAttribute is the outlier — it encodes
+    // almost nothing. Keeping the immune set OWASP-exact is what Wheels' asset/
+    // form helpers expect, e.g. `href="/a/b.css"` → `&#x2f;a&#x2f;b.css` with the
+    // dots untouched.) Named entity where one exists, else a hex numeric entity.
+    // Codepoints >= U+0100 pass through (immune), mirroring ESAPI's default.
     for c in s.chars() {
         match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' => result.push(c),
+            ',' | '.' | '-' | '_' => result.push(c),
             '&' => result.push_str("&amp;"),
             '<' => result.push_str("&lt;"),
             '>' => result.push_str("&gt;"),

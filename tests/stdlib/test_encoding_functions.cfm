@@ -51,6 +51,13 @@ assert("charsetEncode iso round-trip", csStrIso, "test");
 // ========================================
 htmlAttr = encodeForHTMLAttribute('<div class="test">');
 assertTrue("encodeForHTMLAttribute encodes lt", find("&lt;", htmlAttr) > 0);
+// OWASP ESAPI immune set for an HTML-attribute context is `, . - _` — those
+// inert chars pass through unencoded. (Engine-agnostic: Adobe/BoxLang/RustCFML
+// follow OWASP and leave them alone; Lucee 7 encodes almost nothing, so it also
+// leaves them alone — the assert holds on both. We deliberately do NOT assert
+// that `/` IS encoded here, since that genuinely diverges between engines.)
+immune = encodeForHTMLAttribute("a.b,c-d_e");
+assert("encodeForHTMLAttribute leaves immune set , . - _ untouched", immune, "a.b,c-d_e");
 
 // ========================================
 // encodeForXML
