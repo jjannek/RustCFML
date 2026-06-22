@@ -252,6 +252,16 @@ assert("positional argumentCollection binds required named param", _argCollProxy
 _argNamedOverflow( foo = "x" );
 assert("no named-extra leak into next positional call", _argPositionalKeys("v"), "1");
 
+// E) Unscoped compound auto-viv inside a classic-localmode CFC method must
+//    land in the shared component (variables) scope — so a super.method()
+//    dispatched sibling can read it. (ColdBox cbi18n: parent `init` seeds
+//    `instance.aLocale = createObject(...)`, then a child-overridden
+//    `buildLocale` reaches back via `super` and must find it — it was being
+//    forked into a phantom frame-local invisible to the super-dispatched frame,
+//    so `instance.aLocale.getDefault()` threw a null-method error at boot.)
+superScope = new PresideFixSuperScopeChild();
+assert("super-dispatched sibling sees parent-init's auto-vivd instance", superScope.getSeed(), "SEEDED");
+
 suiteEnd();
 
 // Paramless proxy forwarding a positional arg via argumentCollection to a

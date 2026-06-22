@@ -5452,11 +5452,37 @@ impl CfmlVirtualMachine {
                             } else {
                                 // Auto-vivification: assigning to a member path of a
                                 // variable that does not yet exist creates that variable
-                                // as a struct, matching Lucee/ACF/BoxLang. e.g.
-                                // `initArgs.path = "x"` where initArgs was never declared.
+                                // as a struct, matching Lucee/ACF/BoxLang.
                                 let mut s = ValueMap::default();
                                 s.insert(prop_name.clone(), value);
-                                locals.insert(local_name.clone(), CfmlValue::strukt(s));
+                                // Inside a CFC method under classic localmode, an
+                                // unscoped write belongs to the component (variables)
+                                // scope — so sibling methods AND super/override
+                                // dispatch (which each get their own frame `locals`
+                                // but share the Arc-backed `__variables`) see it.
+                                // Vivifying into frame `locals` instead forks a
+                                // phantom local that a `super.x()`-dispatched sibling
+                                // can't read (ColdBox cbi18n: parent `init` seeds
+                                // `instance.aLocale`, then a child-overridden
+                                // `buildLocale` reaches back via `super` and finds it
+                                // null). Matches StoreLocal's unscoped rule + the
+                                // store_runtime_path nested-path branch. (e.g. a true
+                                // page-local temp `initArgs.path = "x"` has no
+                                // `__variables` and still lands in locals.)
+                                let vivd_into_variables = !effective_local_mode_modern
+                                    && locals
+                                        .get_mut("__variables")
+                                        .and_then(|v| v.as_cfml_struct())
+                                        .map(|vars| {
+                                            vars.insert(
+                                                local_name.clone(),
+                                                CfmlValue::strukt(s.clone()),
+                                            );
+                                        })
+                                        .is_some();
+                                if !vivd_into_variables {
+                                    locals.insert(local_name.clone(), CfmlValue::strukt(s));
+                                }
                             }
                         }
                     }
@@ -9671,6 +9697,24 @@ impl CfmlVirtualMachine {
                                 "java.util.regex.pattern" => {
                                     handle_java_pattern("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.util.locale" => {
+                                    java_shims::handle_java_locale("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.util.timezone" => {
+                                    java_shims::handle_java_timezone("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.util.gregoriancalendar" | "java.util.calendar" => {
+                                    java_shims::handle_java_gregoriancalendar("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.text.dateformatsymbols" => {
+                                    java_shims::handle_java_dateformatsymbols("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.text.decimalformatsymbols" => {
+                                    java_shims::handle_java_decimalformatsymbols("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.text.dateformat" | "java.text.simpledateformat" => {
+                                    java_shims::handle_java_dateformat("init", empty_args, &CfmlValue::Null)
+                                }
                                 _ => Ok(CfmlValue::Null),
                             };
                         }
@@ -13502,6 +13546,20 @@ impl CfmlVirtualMachine {
                     }
                     "java.lang.class" => handle_java_class(&m, all_args, object),
                     "java.util.map.entry" => handle_java_map_entry(&m, all_args, object),
+                    "java.util.locale" => java_shims::handle_java_locale(&m, all_args, object),
+                    "java.util.timezone" => java_shims::handle_java_timezone(&m, all_args, object),
+                    "java.util.gregoriancalendar" | "java.util.calendar" => {
+                        java_shims::handle_java_gregoriancalendar(&m, all_args, object)
+                    }
+                    "java.text.dateformatsymbols" => {
+                        java_shims::handle_java_dateformatsymbols(&m, all_args, object)
+                    }
+                    "java.text.decimalformatsymbols" => {
+                        java_shims::handle_java_decimalformatsymbols(&m, all_args, object)
+                    }
+                    "java.text.dateformat" | "java.text.simpledateformat" => {
+                        java_shims::handle_java_dateformat(&m, all_args, object)
+                    }
                     _ => Ok(CfmlValue::Null),
                 };
                 match result {

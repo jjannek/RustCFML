@@ -2,6 +2,7 @@
 
 use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
+use chrono::{Datelike, NaiveDateTime, Timelike};
 
 pub fn handle_java_messagedigest(
     method: &str,
@@ -1472,4 +1473,865 @@ pub fn handle_servlet_request(method: &str, args: Vec<CfmlValue>, object: &CfmlV
         // with no value).
         _ => CfmlValue::Null,
     })
+}
+
+// ============================================================================
+// java.util.Locale / java.util.TimeZone / java.util.GregorianCalendar and the
+// java.text.* date/number-formatting classes. ColdBox's cbi18n module
+// (`models/i18n.cfc`) is a thin wrapper over these JVM classes; on a real JVM
+// Lucee/ACF hand back the genuine objects, but RustCFML has no JVM, so we shim
+// them. These are sufficient to construct + configure cbi18n at boot
+// (`buildLocale()` calls Locale.getDefault()/init()/getAvailableLocales(), and
+// the GregorianCalendar/DateFormatSymbols `.init(buildLocale())` chains must
+// return a non-null receiver). Request-time date/number formatting is
+// best-effort.
+// ============================================================================
+
+/// Build a base java-shim ValueMap flagged with the given (already-lowercase)
+/// class name.
+fn jshim(class: &str) -> ValueMap {
+    let mut shim = ValueMap::default();
+    shim.insert(
+        "__java_class".to_string(),
+        CfmlValue::string(class.to_string()),
+    );
+    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    shim
+}
+
+/// A reasonable subset of the locale ids the JVM ships from
+/// `Locale.getAvailableLocales()`. cbi18n's `isValidLocale()` does
+/// `listFind( arrayToList( getAvailableLocales() ), "<id>" )`, so the list must
+/// contain the exact Java-style ids (e.g. `en_US`) it validates.
+const AVAILABLE_LOCALES: &[&str] = &[
+    "ar", "ar_AE", "ar_EG", "ar_SA", "bg", "bg_BG", "ca", "ca_ES", "cs", "cs_CZ", "da", "da_DK",
+    "de", "de_AT", "de_CH", "de_DE", "el", "el_GR", "en", "en_AU", "en_CA", "en_GB", "en_IE",
+    "en_IN", "en_NZ", "en_US", "en_ZA", "es", "es_AR", "es_ES", "es_MX", "et", "et_EE", "fi",
+    "fi_FI", "fr", "fr_BE", "fr_CA", "fr_CH", "fr_FR", "he", "he_IL", "hi", "hi_IN", "hr", "hr_HR",
+    "hu", "hu_HU", "id", "id_ID", "is", "is_IS", "it", "it_CH", "it_IT", "iw", "iw_IL", "ja",
+    "ja_JP", "ko", "ko_KR", "lt", "lt_LT", "lv", "lv_LV", "nl", "nl_BE", "nl_NL", "no", "no_NO",
+    "pl", "pl_PL", "pt", "pt_BR", "pt_PT", "ro", "ro_RO", "ru", "ru_RU", "sk", "sk_SK", "sl",
+    "sl_SI", "sr", "sr_RS", "sv", "sv_SE", "th", "th_TH", "tr", "tr_TR", "uk", "uk_UA", "vi",
+    "vi_VN", "zh", "zh_CN", "zh_HK", "zh_SG", "zh_TW",
+];
+
+fn locale_language_name(code: &str) -> &'static str {
+    match code {
+        "ar" => "Arabic",
+        "bg" => "Bulgarian",
+        "ca" => "Catalan",
+        "cs" => "Czech",
+        "da" => "Danish",
+        "de" => "German",
+        "el" => "Greek",
+        "en" => "English",
+        "es" => "Spanish",
+        "et" => "Estonian",
+        "fi" => "Finnish",
+        "fr" => "French",
+        "he" | "iw" => "Hebrew",
+        "hi" => "Hindi",
+        "hr" => "Croatian",
+        "hu" => "Hungarian",
+        "id" => "Indonesian",
+        "is" => "Icelandic",
+        "it" => "Italian",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "lt" => "Lithuanian",
+        "lv" => "Latvian",
+        "nl" => "Dutch",
+        "no" => "Norwegian",
+        "pl" => "Polish",
+        "pt" => "Portuguese",
+        "ro" => "Romanian",
+        "ru" => "Russian",
+        "sk" => "Slovak",
+        "sl" => "Slovenian",
+        "sr" => "Serbian",
+        "sv" => "Swedish",
+        "th" => "Thai",
+        "tr" => "Turkish",
+        "uk" => "Ukrainian",
+        "vi" => "Vietnamese",
+        "zh" => "Chinese",
+        _ => "",
+    }
+}
+
+/// ISO 639-2/T 3-letter language codes for the languages we tabulate (matching
+/// `Locale.getISO3Language()`). Empty string => not tabulated.
+fn locale_iso3_language(code: &str) -> &'static str {
+    match code {
+        "ar" => "ara",
+        "bg" => "bul",
+        "ca" => "cat",
+        "cs" => "ces",
+        "da" => "dan",
+        "de" => "deu",
+        "el" => "ell",
+        "en" => "eng",
+        "es" => "spa",
+        "et" => "est",
+        "fi" => "fin",
+        "fr" => "fra",
+        "he" => "heb",
+        "iw" => "heb",
+        "hi" => "hin",
+        "hr" => "hrv",
+        "hu" => "hun",
+        "id" => "ind",
+        "is" => "isl",
+        "it" => "ita",
+        "ja" => "jpn",
+        "ko" => "kor",
+        "lt" => "lit",
+        "lv" => "lav",
+        "nl" => "nld",
+        "no" => "nor",
+        "pl" => "pol",
+        "pt" => "por",
+        "ro" => "ron",
+        "ru" => "rus",
+        "sk" => "slk",
+        "sl" => "slv",
+        "sr" => "srp",
+        "sv" => "swe",
+        "th" => "tha",
+        "tr" => "tur",
+        "uk" => "ukr",
+        "vi" => "vie",
+        "zh" => "zho",
+        _ => "",
+    }
+}
+
+/// ISO 3166-1 alpha-3 country codes for the countries we tabulate (matching
+/// `Locale.getISO3Country()`). Empty string => not tabulated.
+fn locale_iso3_country(code: &str) -> &'static str {
+    match code {
+        "AU" => "AUS",
+        "BR" => "BRA",
+        "CA" => "CAN",
+        "CH" => "CHE",
+        "CN" => "CHN",
+        "DE" => "DEU",
+        "ES" => "ESP",
+        "FR" => "FRA",
+        "GB" => "GBR",
+        "IE" => "IRL",
+        "IN" => "IND",
+        "IT" => "ITA",
+        "JP" => "JPN",
+        "KR" => "KOR",
+        "MX" => "MEX",
+        "NL" => "NLD",
+        "NZ" => "NZL",
+        "PT" => "PRT",
+        "RU" => "RUS",
+        "TW" => "TWN",
+        "US" => "USA",
+        "ZA" => "ZAF",
+        _ => "",
+    }
+}
+
+/// The server/JVM default locale. Java reads the `user.language`/`user.country`
+/// system properties, which the JVM derives from the OS locale; we read the
+/// POSIX `LC_ALL`/`LANG` environment the same way (e.g. `en_GB.UTF-8` → en/GB).
+/// Falls back to `en`/`US` if unset.
+fn default_locale_parts() -> (String, String) {
+    let raw = std::env::var("LC_ALL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("LANG").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    // Strip the `.charset`/`@modifier` suffix: `en_GB.UTF-8` → `en_GB`.
+    let base = raw.split(['.', '@']).next().unwrap_or("").trim();
+    if base.is_empty() || base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
+        return ("en".to_string(), "US".to_string());
+    }
+    let mut parts = base.split(['_', '-']);
+    let lang = parts.next().unwrap_or("en").to_lowercase();
+    let country = parts.next().unwrap_or("").to_uppercase();
+    (lang, country)
+}
+
+fn locale_country_name(code: &str) -> &'static str {
+    match code {
+        "AU" => "Australia",
+        "BR" => "Brazil",
+        "CA" => "Canada",
+        "CH" => "Switzerland",
+        "CN" => "China",
+        "DE" => "Germany",
+        "ES" => "Spain",
+        "FR" => "France",
+        "GB" => "United Kingdom",
+        "IE" => "Ireland",
+        "IN" => "India",
+        "IT" => "Italy",
+        "JP" => "Japan",
+        "KR" => "South Korea",
+        "MX" => "Mexico",
+        "NL" => "Netherlands",
+        "NZ" => "New Zealand",
+        "PT" => "Portugal",
+        "RU" => "Russia",
+        "TW" => "Taiwan",
+        "US" => "United States",
+        "ZA" => "South Africa",
+        _ => "",
+    }
+}
+
+/// Build a Locale instance shim carrying its language/country/variant and the
+/// Java-style id (`en`, `en_US`, `en_US_POSIX`).
+fn make_locale(lang: &str, country: &str, variant: &str) -> CfmlValue {
+    let mut id = lang.to_string();
+    if !country.is_empty() {
+        id.push('_');
+        id.push_str(country);
+    }
+    if !variant.is_empty() {
+        // Java emits language_COUNTRY_VARIANT; if country is empty it uses a
+        // double underscore, but cbi18n only feeds us 1-3 well-formed parts.
+        id.push('_');
+        id.push_str(variant);
+    }
+    let mut shim = jshim("java.util.locale");
+    shim.insert("__locale_lang".to_string(), CfmlValue::string(lang.to_string()));
+    shim.insert(
+        "__locale_country".to_string(),
+        CfmlValue::string(country.to_string()),
+    );
+    shim.insert(
+        "__locale_variant".to_string(),
+        CfmlValue::string(variant.to_string()),
+    );
+    shim.insert("__locale_id".to_string(), CfmlValue::string(id));
+    CfmlValue::strukt(shim)
+}
+
+pub fn handle_java_locale(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    // Static factory methods first (callable on the class-ref shim).
+    match method {
+        "init" => {
+            // createObject(...) → 0 args → class-ref shim.
+            // new Locale(lang[,country[,variant]]) → instance.
+            if args.is_empty() {
+                return Ok(CfmlValue::strukt(jshim("java.util.locale")));
+            }
+            let lang = args.first().map(|v| v.as_string()).unwrap_or_default();
+            let country = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+            let variant = args.get(2).map(|v| v.as_string()).unwrap_or_default();
+            return Ok(make_locale(&lang, &country, &variant));
+        }
+        "getdefault" => {
+            let (lang, country) = default_locale_parts();
+            return Ok(make_locale(&lang, &country, ""));
+        }
+        "getavailablelocales" => {
+            // Return real Locale shim objects (not strings): cbi18n's
+            // isValidLocale() does arrayToList(...) for a listFind — and a
+            // Locale shim stringifies to its id (see as_string) — while
+            // getLocaleNames() calls `.getDisplayName()` on each element, so
+            // they must be Locale objects, matching the JVM's Locale[].
+            let arr: Vec<CfmlValue> = AVAILABLE_LOCALES
+                .iter()
+                .map(|id| {
+                    let mut it = id.split('_');
+                    let lang = it.next().unwrap_or("");
+                    let country = it.next().unwrap_or("");
+                    let variant = it.next().unwrap_or("");
+                    make_locale(lang, country, variant)
+                })
+                .collect();
+            return Ok(CfmlValue::array(arr));
+        }
+        "getisolanguages" => {
+            let langs = [
+                "ar", "bg", "ca", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "he", "hi",
+                "hr", "hu", "id", "is", "it", "ja", "ko", "lt", "lv", "nl", "no", "pl", "pt", "ro",
+                "ru", "sk", "sl", "sr", "sv", "th", "tr", "uk", "vi", "zh",
+            ];
+            return Ok(CfmlValue::array(
+                langs.iter().map(|s| CfmlValue::string(s.to_string())).collect(),
+            ));
+        }
+        "getisocountries" => {
+            let countries = [
+                "AU", "BR", "CA", "CH", "CN", "DE", "ES", "FR", "GB", "IE", "IN", "IT", "JP", "KR",
+                "MX", "NL", "NZ", "PT", "RU", "TW", "US", "ZA",
+            ];
+            return Ok(CfmlValue::array(
+                countries.iter().map(|s| CfmlValue::string(s.to_string())).collect(),
+            ));
+        }
+        _ => {}
+    }
+    // Instance getters.
+    let s = match object {
+        CfmlValue::Struct(s) => s,
+        _ => return Ok(CfmlValue::Null),
+    };
+    let lang = s.get("__locale_lang").map(|v| v.as_string()).unwrap_or_default();
+    let country = s.get("__locale_country").map(|v| v.as_string()).unwrap_or_default();
+    let variant = s.get("__locale_variant").map(|v| v.as_string()).unwrap_or_default();
+    let id = s.get("__locale_id").map(|v| v.as_string()).unwrap_or_default();
+    Ok(match method {
+        "getlanguage" => CfmlValue::string(lang),
+        "getcountry" => CfmlValue::string(country),
+        "getvariant" => CfmlValue::string(variant),
+        "tostring" => CfmlValue::string(id),
+        "getdisplaylanguage" => {
+            let n = locale_language_name(&lang);
+            CfmlValue::string(if n.is_empty() { lang } else { n.to_string() })
+        }
+        "getdisplaycountry" => {
+            let n = locale_country_name(&country);
+            CfmlValue::string(if n.is_empty() { country } else { n.to_string() })
+        }
+        "getdisplayname" => {
+            let l = locale_language_name(&lang);
+            let lname = if l.is_empty() { lang.clone() } else { l.to_string() };
+            let c = locale_country_name(&country);
+            if country.is_empty() || c.is_empty() {
+                CfmlValue::string(lname)
+            } else {
+                CfmlValue::string(format!("{} ({})", lname, c))
+            }
+        }
+        "getiso3language" => {
+            let i = locale_iso3_language(&lang);
+            CfmlValue::string(if i.is_empty() { lang } else { i.to_string() })
+        }
+        "getiso3country" => {
+            let i = locale_iso3_country(&country);
+            CfmlValue::string(if i.is_empty() { country } else { i.to_string() })
+        }
+        _ => CfmlValue::Null,
+    })
+}
+
+pub fn handle_java_timezone(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    let make_tz = |id: &str| -> CfmlValue {
+        let mut shim = jshim("java.util.timezone");
+        shim.insert("__tz_id".to_string(), CfmlValue::string(id.to_string()));
+        CfmlValue::strukt(shim)
+    };
+    match method {
+        "init" => {
+            // createObject → class-ref shim. Carry the LONG/SHORT static int
+            // constants (TimeZone.LONG=1, TimeZone.SHORT=0) as fields so
+            // `tz.LONG` property access resolves.
+            let mut shim = jshim("java.util.timezone");
+            shim.insert("long".to_string(), CfmlValue::Int(1));
+            shim.insert("short".to_string(), CfmlValue::Int(0));
+            return Ok(CfmlValue::strukt(shim));
+        }
+        "getdefault" => {
+            let id = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
+            return Ok(make_tz(&id));
+        }
+        "gettimezone" => {
+            let id = args.first().map(|v| v.as_string()).unwrap_or_else(|| "UTC".to_string());
+            return Ok(make_tz(&id));
+        }
+        "getavailableids" => {
+            let ids = [
+                "UTC", "GMT", "Europe/London", "Europe/Paris", "Europe/Berlin", "America/New_York",
+                "America/Chicago", "America/Denver", "America/Los_Angeles", "Asia/Tokyo",
+                "Asia/Shanghai", "Asia/Kolkata", "Australia/Sydney",
+            ];
+            return Ok(CfmlValue::array(
+                ids.iter().map(|s| CfmlValue::string(s.to_string())).collect(),
+            ));
+        }
+        _ => {}
+    }
+    let s = match object {
+        CfmlValue::Struct(s) => s,
+        _ => return Ok(CfmlValue::Null),
+    };
+    let id = s.get("__tz_id").map(|v| v.as_string()).unwrap_or_else(|| "UTC".to_string());
+    Ok(match method {
+        "getid" => CfmlValue::string(id),
+        "getdisplayname" => CfmlValue::string(id),
+        "getrawoffset" | "getdstsavings" | "getoffset" => CfmlValue::Int(0),
+        "usedaylighttime" | "indaylighttime" => CfmlValue::Bool(false),
+        _ => CfmlValue::Null,
+    })
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub fn handle_java_gregoriancalendar(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = jshim("java.util.gregoriancalendar");
+            shim.insert("__millis".to_string(), CfmlValue::Int(now_millis()));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "gettime" => {
+            // Returns a java.util.Date. Reuse the Date shim shape (`__millis`).
+            let millis = match object {
+                CfmlValue::Struct(s) => {
+                    s.get("__millis").map(|v| v.as_string().parse::<i64>().unwrap_or(0)).unwrap_or(0)
+                }
+                _ => now_millis(),
+            };
+            let mut shim = jshim("java.util.date");
+            shim.insert("__millis".to_string(), CfmlValue::Int(millis));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "gettimeinmillis" => match object {
+            CfmlValue::Struct(s) => Ok(s.get("__millis").unwrap_or(CfmlValue::Int(now_millis()))),
+            _ => Ok(CfmlValue::Int(now_millis())),
+        },
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+pub fn handle_java_dateformatsymbols(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    let arr = |items: &[&str]| {
+        CfmlValue::array(items.iter().map(|s| CfmlValue::string(s.to_string())).collect())
+    };
+    match method {
+        "init" => Ok(CfmlValue::strukt(jshim("java.text.dateformatsymbols"))),
+        "getmonths" => Ok(arr(&[
+            "January", "February", "March", "April", "May", "June", "July", "August", "September",
+            "October", "November", "December", "",
+        ])),
+        "getshortmonths" => Ok(arr(&[
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "",
+        ])),
+        "getweekdays" => Ok(arr(&[
+            "", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+        ])),
+        "getshortweekdays" => {
+            Ok(arr(&["", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]))
+        }
+        "getampmstrings" => Ok(arr(&["AM", "PM"])),
+        "geteras" => Ok(arr(&["BC", "AD"])),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+pub fn handle_java_decimalformatsymbols(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    // cbi18n calls `.toString()` on each returned symbol; we return Strings, and
+    // String.toString() is the identity, so the chain works.
+    let s = |t: &str| Ok(CfmlValue::string(t.to_string()));
+    match method {
+        "init" => Ok(CfmlValue::strukt(jshim("java.text.decimalformatsymbols"))),
+        "getpercent" => s("%"),
+        "getminussign" => s("-"),
+        "getcurrencysymbol" => s("$"),
+        "getinternationalcurrencysymbol" => s("USD"),
+        "getmonetarydecimalseparator" | "getdecimalseparator" => s("."),
+        "getgroupingseparator" => s(","),
+        "getexponentseparator" => s("E"),
+        "getpermill" => s("\u{2030}"),
+        "getplussign" => s("+"),
+        "getzerodigit" => s("0"),
+        "getinfinity" => s("\u{221e}"),
+        "getnan" => s("NaN"),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// Locale-aware date/time pattern for `(kind, dateStyle, timeStyle)`, matching
+/// what the JVM's `DateFormat.getXInstance(style, locale).toPattern()` returns
+/// (verified against Lucee 7.0.4 / OpenJDK 21). Only locales we have explicitly
+/// ground-truthed are tabulated; an unverified locale returns Err so we never
+/// emit a guessed pattern. Style ints: FULL=0, LONG=1, MEDIUM=2, SHORT=3.
+fn java_date_time_pattern(
+    locale_id: &str,
+    kind: &str,
+    date_style: i64,
+    time_style: i64,
+) -> Result<String, CfmlError> {
+    let lc = locale_id.to_lowercase();
+    // en, en_US, en_CA, … default to the US CLDR forms; en_GB (and en_IE/en_AU
+    // which share the day-first/24h forms) use the GB forms. We only claim the
+    // ones verified below.
+    let date_pat = |style: i64| -> Option<&'static str> {
+        match lc.as_str() {
+            "en" | "en_us" => Some(match style {
+                0 => "EEEE, MMMM d, y",
+                1 => "MMMM d, y",
+                2 => "MMM d, y",
+                3 => "M/d/yy",
+                _ => return None,
+            }),
+            "en_gb" => Some(match style {
+                0 => "EEEE, d MMMM y",
+                1 => "d MMMM y",
+                2 => "d MMM y",
+                3 => "dd/MM/y",
+                _ => return None,
+            }),
+            _ => None,
+        }
+    };
+    let time_pat = |style: i64| -> Option<&'static str> {
+        match lc.as_str() {
+            // NB: the separator before the AM/PM marker is U+202F (narrow
+            // no-break space), matching the JDK 21 / CLDR pattern — NOT an ASCII
+            // space. The JVM emits e.g. "2:05\u{202f}PM"; a plain space would
+            // diverge byte-for-byte from Lucee.
+            "en" | "en_us" => Some(match style {
+                0 => "h:mm:ss\u{202f}a zzzz",
+                1 => "h:mm:ss\u{202f}a z",
+                2 => "h:mm:ss\u{202f}a",
+                3 => "h:mm\u{202f}a",
+                _ => return None,
+            }),
+            "en_gb" => Some(match style {
+                0 => "HH:mm:ss zzzz",
+                1 => "HH:mm:ss z",
+                2 => "HH:mm:ss",
+                3 => "HH:mm",
+                _ => return None,
+            }),
+            _ => None,
+        }
+    };
+    let unsupported = || {
+        CfmlError::runtime(format!(
+            "java.text.DateFormat: locale [{}] is not supported by RustCFML's \
+             Java shim (only en/en_US/en_GB are CLDR-verified). Add it after \
+             ground-truthing its patterns against the JVM, or use CFML's \
+             lsDateFormat()/lsDateTimeFormat() which are locale-aware.",
+            locale_id
+        ))
+    };
+    match kind {
+        "date" => date_pat(date_style).map(|s| s.to_string()).ok_or_else(unsupported),
+        "time" => time_pat(time_style).map(|s| s.to_string()).ok_or_else(unsupported),
+        // DateFormat.getDateTimeInstance joins the two with ", " (verified:
+        // "M/d/yy, h:mm a").
+        _ => {
+            let d = date_pat(date_style).ok_or_else(unsupported)?;
+            let t = time_pat(time_style).ok_or_else(unsupported)?;
+            Ok(format!("{}, {}", d, t))
+        }
+    }
+}
+
+/// Render a `NaiveDateTime` per a Java `SimpleDateFormat` pattern, using English
+/// month/weekday names (we only support en* locales). A timezone field
+/// (`z`/`Z`/`X`/`v`/`O`) returns Err: producing a zone abbreviation/offset needs
+/// a timezone database (chrono-tz, absent here), so rather than guess we fail.
+fn format_java_pattern(dt: &NaiveDateTime, pattern: &str) -> Result<String, CfmlError> {
+    const MONTHS_FULL: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    const MONTHS_SHORT: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // chrono Weekday::num_days_from_sunday(): Sun=0 .. Sat=6.
+    const WEEKDAYS_FULL: [&str; 7] = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    const WEEKDAYS_SHORT: [&str; 7] =
+        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let month0 = (dt.month() as usize).saturating_sub(1).min(11);
+    let wd = dt.weekday().num_days_from_sunday() as usize;
+    let hour24 = dt.hour();
+    let hour12 = match hour24 % 12 {
+        0 => 12,
+        h => h,
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // Java quotes literal text in single quotes; '' is a literal quote.
+            i += 1;
+            if i < chars.len() && chars[i] == '\'' {
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            while i < chars.len() && chars[i] != '\'' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            i += 1; // skip closing quote
+            continue;
+        }
+        if !c.is_ascii_alphabetic() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Count the run of the same pattern letter.
+        let mut n = 0;
+        while i < chars.len() && chars[i] == c {
+            n += 1;
+            i += 1;
+        }
+        match c {
+            'y' | 'Y' => {
+                if n == 2 {
+                    out.push_str(&format!("{:02}", (dt.year() % 100).abs()));
+                } else {
+                    out.push_str(&dt.year().to_string());
+                }
+            }
+            'M' | 'L' => match n {
+                1 => out.push_str(&dt.month().to_string()),
+                2 => out.push_str(&format!("{:02}", dt.month())),
+                3 => out.push_str(MONTHS_SHORT[month0]),
+                _ => out.push_str(MONTHS_FULL[month0]),
+            },
+            'd' => {
+                if n >= 2 {
+                    out.push_str(&format!("{:02}", dt.day()));
+                } else {
+                    out.push_str(&dt.day().to_string());
+                }
+            }
+            'E' | 'e' | 'c' => {
+                if n >= 4 {
+                    out.push_str(WEEKDAYS_FULL[wd]);
+                } else {
+                    out.push_str(WEEKDAYS_SHORT[wd]);
+                }
+            }
+            'h' => {
+                if n >= 2 {
+                    out.push_str(&format!("{:02}", hour12));
+                } else {
+                    out.push_str(&hour12.to_string());
+                }
+            }
+            'H' => {
+                if n >= 2 {
+                    out.push_str(&format!("{:02}", hour24));
+                } else {
+                    out.push_str(&hour24.to_string());
+                }
+            }
+            'm' => {
+                if n >= 2 {
+                    out.push_str(&format!("{:02}", dt.minute()));
+                } else {
+                    out.push_str(&dt.minute().to_string());
+                }
+            }
+            's' => {
+                if n >= 2 {
+                    out.push_str(&format!("{:02}", dt.second()));
+                } else {
+                    out.push_str(&dt.second().to_string());
+                }
+            }
+            'a' => out.push_str(if hour24 < 12 { "AM" } else { "PM" }),
+            'z' | 'Z' | 'X' | 'v' | 'O' => {
+                return Err(CfmlError::runtime(format!(
+                    "java.text.DateFormat: pattern timezone field '{}' is not \
+                     supported (no timezone database). This affects LONG/FULL \
+                     time styles; use SHORT/MEDIUM, or CFML's lsTimeFormat().",
+                    c
+                )));
+            }
+            _ => {
+                // Unhandled pattern letter — fail rather than drop or guess.
+                return Err(CfmlError::runtime(format!(
+                    "java.text.DateFormat: unsupported pattern field '{}'",
+                    c
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parse the argument handed to `DateFormat.format(...)` into a wall-clock
+/// `NaiveDateTime`. cbi18n passes either a numeric Java epoch-millis offset
+/// (the `i18n*Format` methods) or a CFML date value/string (the
+/// `*LocaleFormat` methods). A numeric epoch is an absolute instant, so it only
+/// has a well-defined wall clock once a timezone is known: we support UTC/GMT
+/// (and the unset case, treated as UTC) and otherwise return None so the caller
+/// fails loudly rather than guessing an offset (chrono-tz is absent).
+fn parse_dateformat_arg(arg: &CfmlValue, tz_id: Option<&str>) -> Option<NaiveDateTime> {
+    let from_epoch_millis = |ms: i64| -> Option<NaiveDateTime> {
+        let tz = tz_id.unwrap_or("UTC").to_uppercase();
+        if tz == "UTC" || tz == "GMT" || tz.is_empty() {
+            chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.naive_utc())
+        } else {
+            // Named/offset zone: we can't resolve it without a tz database.
+            None
+        }
+    };
+    match arg {
+        CfmlValue::Int(n) => from_epoch_millis(*n),
+        CfmlValue::Double(d) => from_epoch_millis(*d as i64),
+        CfmlValue::Struct(s) if s.contains_key("__millis") => {
+            let ms = s.get("__millis").map(|v| match v {
+                CfmlValue::Int(n) => n,
+                other => other.as_string().trim().parse::<i64>().unwrap_or(0),
+            })?;
+            from_epoch_millis(ms)
+        }
+        other => {
+            // A CFML date value — a wall-clock string; parse directly (no tz
+            // shift: the *LocaleFormat methods set no timezone, so the JVM
+            // formats the date's own components).
+            let s = other.as_string();
+            let s = s.trim();
+            for fmt in [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y",
+            ] {
+                if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+                    return Some(dt);
+                }
+            }
+            // Date-only forms → midnight.
+            for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"] {
+                if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) {
+                    return d.and_hms_opt(0, 0, 0);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Shared implementation for java.text.DateFormat and java.text.SimpleDateFormat.
+///
+/// The factory methods (`getDateInstance`/`getTimeInstance`/`getDateTimeInstance`)
+/// return a formatter shim carrying its kind, style(s), locale id and (optional)
+/// timezone; `format()` renders a date faithfully per the locale's CLDR pattern
+/// (verified against the JVM via Lucee). Unsupported locales and timezone-name
+/// pattern fields raise a clear error rather than emitting a guessed string.
+pub fn handle_java_dateformat(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    // Read the locale id from a Locale shim arg (its as_string is its id).
+    let locale_of = |v: Option<&CfmlValue>| -> String {
+        v.map(|x| x.as_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "en".to_string())
+    };
+    let as_int = |v: Option<&CfmlValue>, default: i64| -> i64 {
+        v.map(|x| match x {
+            CfmlValue::Int(n) => *n,
+            CfmlValue::Double(d) => *d as i64,
+            other => other.as_string().trim().parse::<i64>().unwrap_or(default),
+        })
+        .unwrap_or(default)
+    };
+    let mut make_formatter = |kind: &str, ds: i64, ts: i64, loc: String| {
+        let mut shim = jshim("java.text.dateformat");
+        shim.insert("__df_kind".to_string(), CfmlValue::string(kind.to_string()));
+        shim.insert("__df_date_style".to_string(), CfmlValue::Int(ds));
+        shim.insert("__df_time_style".to_string(), CfmlValue::Int(ts));
+        shim.insert("__df_locale".to_string(), CfmlValue::string(loc));
+        CfmlValue::strukt(shim)
+    };
+    match method {
+        "init" => {
+            // createObject → class-ref shim carrying DateFormat's style int
+            // constants (FULL=0, LONG=1, MEDIUM=2, SHORT=3) for `df[style]` /
+            // `df.SHORT` access.
+            let mut shim = jshim("java.text.dateformat");
+            shim.insert("full".to_string(), CfmlValue::Int(0));
+            shim.insert("long".to_string(), CfmlValue::Int(1));
+            shim.insert("medium".to_string(), CfmlValue::Int(2));
+            shim.insert("short".to_string(), CfmlValue::Int(3));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "getdateinstance" => {
+            let style = as_int(args.first(), 2); // DateFormat.DEFAULT == MEDIUM
+            Ok(make_formatter("date", style, 2, locale_of(args.get(1))))
+        }
+        "gettimeinstance" => {
+            let style = as_int(args.first(), 2);
+            Ok(make_formatter("time", 2, style, locale_of(args.get(1))))
+        }
+        "getdatetimeinstance" => {
+            let ds = as_int(args.first(), 2);
+            let ts = as_int(args.get(1), 2);
+            Ok(make_formatter("datetime", ds, ts, locale_of(args.get(2))))
+        }
+        "getinstance" => Ok(make_formatter("datetime", 3, 3, "en".to_string())),
+        "settimezone" => {
+            // Store the bound zone id; return the (updated) receiver so the
+            // chained `.format()` sees it.
+            if let CfmlValue::Struct(ref s) = object {
+                let mut ns = s.snapshot();
+                let tz = args
+                    .first()
+                    .map(|v| match v {
+                        CfmlValue::Struct(ts) => {
+                            ts.get("__tz_id").map(|t| t.as_string()).unwrap_or_else(|| v.as_string())
+                        }
+                        other => other.as_string(),
+                    })
+                    .unwrap_or_default();
+                ns.insert("__df_tz".to_string(), CfmlValue::string(tz));
+                return Ok(CfmlValue::strukt(ns));
+            }
+            Ok(object.clone())
+        }
+        "setlenient" | "setcalendar" | "applypattern" => Ok(object.clone()),
+        "format" => {
+            let s = match object {
+                CfmlValue::Struct(s) => s,
+                _ => return Ok(CfmlValue::Null),
+            };
+            let kind = s.get("__df_kind").map(|v| v.as_string()).unwrap_or_else(|| "date".to_string());
+            let ds = s.get("__df_date_style").map(|v| v.as_string().parse().unwrap_or(2)).unwrap_or(2);
+            let ts = s.get("__df_time_style").map(|v| v.as_string().parse().unwrap_or(2)).unwrap_or(2);
+            let locale = s.get("__df_locale").map(|v| v.as_string()).unwrap_or_else(|| "en".to_string());
+            let tz = s.get("__df_tz").map(|v| v.as_string());
+            let pattern = java_date_time_pattern(&locale, &kind, ds, ts)?;
+            let dt = parse_dateformat_arg(args.first().unwrap_or(&CfmlValue::Null), tz.as_deref())
+                .ok_or_else(|| {
+                    CfmlError::runtime(format!(
+                        "java.text.DateFormat.format(): could not interpret the date \
+                         argument{}.",
+                        tz.as_deref()
+                            .filter(|t| !t.eq_ignore_ascii_case("UTC") && !t.eq_ignore_ascii_case("GMT"))
+                            .map(|t| format!(
+                                " for timezone [{}] (named zones need a tz database; \
+                                 only UTC/GMT are supported)",
+                                t
+                            ))
+                            .unwrap_or_default()
+                    ))
+                })?;
+            Ok(CfmlValue::string(format_java_pattern(&dt, &pattern)?))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
 }

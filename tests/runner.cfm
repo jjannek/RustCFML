@@ -168,6 +168,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_query_mutations.cfm">
 <cf_runtest file="stdlib/test_date_functions_extra.cfm">
 <cf_runtest file="stdlib/test_locale_functions.cfm">
+<cf_runtest file="stdlib/test_java_i18n_shims.cfm">
 <cf_runtest file="stdlib/test_cache_functions.cfm">
 <cf_runtest file="stdlib/test_higher_order_functions.cfm">
 <cf_runtest file="stdlib/test_bitmask_functions.cfm">

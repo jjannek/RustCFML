@@ -738,6 +738,15 @@ impl CfmlValue {
             // proxy behavior so `q.col & "x"` concatenates the first row.
             CfmlValue::QueryColumn(a) => a.first().map(|v| v.as_string()).unwrap_or_default(),
             CfmlValue::Struct(s) => {
+                // A java.util.Locale shim stringifies to its Java-style id
+                // (`en`, `en_US`) — matching Locale.toString() — so cbi18n's
+                // `arrayToList( Locale.getAvailableLocales() )` yields the ids
+                // it validates against (rather than a struct dump).
+                if let Some(id) = s.get("__locale_id") {
+                    if s.get("__java_shim").map(|v| v.is_true()).unwrap_or(false) {
+                        return id.as_string();
+                    }
+                }
                 let ptr = s.backing_ptr();
                 if visited.contains(&ptr) {
                     return "{...}".to_string();
