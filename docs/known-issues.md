@@ -101,14 +101,22 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 
 | Feature | Behaviour |
 |---|---|
-| `evaluate()` | Throws — not implemented (use bracket notation). |
-| `structSetMetadata()` | Throws — ordered/case-sensitive struct metadata not supported. |
+| `structSetMetadata()` | Throws — Adobe-CF-only function (ACF 2016.0.2+) for per-key JSON-serialization metadata; not present in Lucee, our compatibility target. |
 | `xmlTransform()` | Throws — no XSLT engine. |
 | `xmlValidate()` | Throws — no schema-validation engine. |
 | `<cfimport>` without `taglib` | Throws — Java/JSP class imports unsupported (custom-tag taglibs work). |
 | `<cffile action="...">` outside the supported actions | Throws "not implemented". |
 | `<cfthread action="...">` outside run/join/terminate | Throws "not supported". |
-| Nested `<cftransaction>` | Throws — nesting unsupported. |
+
+> **`evaluate()` is supported** (read-only). It compiles and runs each string
+> argument as a CFML expression against the caller's scope and returns the value
+> of the last one. The one caveat: assignment side effects do **not** propagate
+> back to the caller's frame — `evaluate("x = 5")` will not set `x`. Read-only
+> expression evaluation (the common use) works.
+
+> **Nested `<cftransaction>` is supported** via savepoints. An inner transaction
+> block opens a SAVEPOINT on the outer transaction; a nested commit releases it
+> and a nested rollback rolls back to it (Lucee/ACF/BoxLang semantics).
 
 ## 7. Partially-ignored parameters 🔇
 
