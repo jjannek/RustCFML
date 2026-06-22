@@ -3180,7 +3180,11 @@ fn scan_cfqueryparam_tags(sql_body: &str) -> (String, Vec<CfQueryParam>) {
 /// Converts #var# to string concatenation: `"..." & var & "..."`
 /// Returns a script expression that builds the final SQL string.
 fn process_sql_hashes(sql: &str) -> String {
-    let sql = sql.trim().replace('\n', " ").replace('\r', "");
+    // Preserve line breaks: SQL `--` comments are line-scoped, so flattening
+    // newlines to spaces would make the comment swallow the rest of the
+    // statement (e.g. `SELECT a\n-- note\nFROM t` -> `SELECT a -- note FROM t`).
+    // Normalize CRLF / bare CR to LF so the generated string keeps real breaks.
+    let sql = sql.trim().replace("\r\n", "\n").replace('\r', "\n");
 
     if !sql.contains('#') {
         // No hash expressions — simple string literal. CFML escapes an embedded
@@ -3556,6 +3560,22 @@ mod tests {
         let result = tags_to_script(input);
         assert!(result.contains(r#""tok-" & (mailVar)"#), "got: {result}");
         assert!(!result.contains("value: tok-mailVar"), "got: {result}");
+    }
+
+    #[test]
+    fn test_cfquery_preserves_sql_line_comment_newlines() {
+        // A `--` SQL comment is line-scoped; the lowered query string must keep
+        // the newline so the comment does not swallow the following clauses.
+        let input = "<cfquery name=\"q\" dbtype=\"query\">\nSELECT name\n-- comment\nFROM src\nWHERE id = #targetId#\n</cfquery>";
+        let result = tags_to_script(input);
+        assert!(
+            result.contains("SELECT name\n-- comment\nFROM src\nWHERE id = "),
+            "got: {result}"
+        );
+        assert!(
+            !result.contains("SELECT name -- comment FROM src"),
+            "got: {result}"
+        );
     }
 
     #[test]
