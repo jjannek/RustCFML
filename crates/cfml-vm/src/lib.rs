@@ -14781,7 +14781,17 @@ impl CfmlVirtualMachine {
         let root = parts[0].to_lowercase();
 
         // Try to resolve the root variable from scope chain
-        let root_val = if root == "local" || root == "variables" {
+        let root_val = if root == "variables" {
+            // Inside a component method the `variables` scope is the component
+            // scope stored under `__variables`, not the function-local frame.
+            // Without this, `isDefined("variables.x")` checks the wrong scope
+            // and wrongly returns false for a member set in the pseudo-ctor or
+            // an inherited method (e.g. Wheels' SQLite migrator sqlTypes map).
+            match locals.get("__variables") {
+                Some(vars) => Some(vars.clone()),
+                None => Some(CfmlValue::strukt(locals.clone())),
+            }
+        } else if root == "local" {
             Some(CfmlValue::strukt(locals.clone()))
         } else if root == "arguments" {
             // The arguments scope lives under the reserved ARGUMENTS_SCOPE_KEY,
