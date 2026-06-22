@@ -75,5 +75,33 @@ assert("for (this.wheels.folder in array): the Wheels Application.cfc shape",
 assert("`this`-scoped loop var holds the final element after the loop",
     probe.lastFolder(), "z");
 
+// ------------------------------------------------------------
+// (3) Member-path loop variable whose ROOT does not yet exist:
+//     `for (loc.route in coll)` where `loc` is undeclared. Lucee/ACF/
+//     BoxLang auto-vivify `loc` as a struct on the first iteration; the
+//     manual write-back chain used to load the root first and threw
+//     "Variable 'loc' is undefined". (Wheels mapperSpec wildcard tests
+//     iterate `for (loc.route in application.wheels.routes)`.)
+//
+//     Wrapped in a function so `loc` is a fresh undeclared local.
+function scanUndeclaredRoot() {
+    var total = 0;
+    for (loc.n in [1, 2, 3, 4]) {
+        total += loc.n;
+    }
+    return total;
+}
+assert("for (undeclaredRoot.member in array): auto-vivifies the root",
+    scanUndeclaredRoot(), 10);
+
+function lastUndeclaredRoot() {
+    for (loc.item in ["a", "b", "c"]) {
+        // loop body intentionally empty
+    }
+    return loc.item;
+}
+assert("undeclared-root loop var holds the final element after the loop",
+    lastUndeclaredRoot(), "c");
+
 suiteEnd();
 </cfscript>

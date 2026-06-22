@@ -2064,31 +2064,49 @@ impl CfmlCompiler {
             // struct back up to the root local.
             let segments: Vec<String> =
                 loop_var_name.split('.').map(|s| s.to_string()).collect();
-            let root = segments[0].clone();
-            let leaf = segments[segments.len() - 1].clone();
-            let intermediate = &segments[1..segments.len() - 1];
-            // Stack on entry: [element_value]
-            // Load deepest parent: root[.intermediate[0]...intermediate[n]]
-            instructions.push(BytecodeOp::LoadLocal(root.clone()));
-            for seg in intermediate {
-                instructions.push(BytecodeOp::GetProperty(seg.clone()));
-            }
-            // Stack: [element_value, deepest_parent]
-            instructions.push(BytecodeOp::Swap);
-            instructions.push(BytecodeOp::SetProperty(leaf));
-            // Stack: [modified_deepest_parent]
-            // Unwind: for each intermediate level (deepest -> shallowest),
-            // reload its parent and SetProperty back in.
-            for i in (0..intermediate.len()).rev() {
+            // Single-level member path rooted at a bare (non-reserved)
+            // identifier (`loc.route`): emit the auto-vivifying
+            // StoreLocalProperty, mirroring the assignment side
+            // (`loc.route = v`). The manual LoadLocal-based chain below loads
+            // the root first, which throws "Variable 'loc' is undefined" when
+            // the loop variable's root doesn't exist yet — but Lucee/ACF/
+            // BoxLang auto-create it. (Wheels mapperSpec
+            // `for (loc.route in application.wheels.routes)`.)
+            if segments.len() == 2 && !is_reserved_scope_name(&segments[0]) {
+                // Stack on entry: [element_value]. StoreLocalProperty pops the
+                // value, auto-vivifies the root local as a struct if absent,
+                // and sets the leaf.
+                instructions.push(BytecodeOp::StoreLocalProperty(
+                    segments[0].clone(),
+                    segments[1].clone(),
+                ));
+            } else {
+                let root = segments[0].clone();
+                let leaf = segments[segments.len() - 1].clone();
+                let intermediate = &segments[1..segments.len() - 1];
+                // Stack on entry: [element_value]
+                // Load deepest parent: root[.intermediate[0]...intermediate[n]]
                 instructions.push(BytecodeOp::LoadLocal(root.clone()));
-                for seg in &intermediate[..i] {
+                for seg in intermediate {
                     instructions.push(BytecodeOp::GetProperty(seg.clone()));
                 }
+                // Stack: [element_value, deepest_parent]
                 instructions.push(BytecodeOp::Swap);
-                instructions.push(BytecodeOp::SetProperty(intermediate[i].clone()));
+                instructions.push(BytecodeOp::SetProperty(leaf));
+                // Stack: [modified_deepest_parent]
+                // Unwind: for each intermediate level (deepest -> shallowest),
+                // reload its parent and SetProperty back in.
+                for i in (0..intermediate.len()).rev() {
+                    instructions.push(BytecodeOp::LoadLocal(root.clone()));
+                    for seg in &intermediate[..i] {
+                        instructions.push(BytecodeOp::GetProperty(seg.clone()));
+                    }
+                    instructions.push(BytecodeOp::Swap);
+                    instructions.push(BytecodeOp::SetProperty(intermediate[i].clone()));
+                }
+                // Stack: [modified_root]
+                instructions.push(BytecodeOp::StoreLocal(root));
             }
-            // Stack: [modified_root]
-            instructions.push(BytecodeOp::StoreLocal(root));
         } else {
             instructions.push(BytecodeOp::DeclareLocal(loop_var_name.clone()));
             instructions.push(BytecodeOp::StoreLocal(loop_var_name));
