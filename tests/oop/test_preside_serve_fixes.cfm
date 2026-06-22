@@ -214,7 +214,54 @@ assert("unquoted attr preserves uniqueindexes", uqProps.benefit.uniqueindexes ?:
 assert("unquoted numeric attr does not drop trailing feature (qty)", uqProps.qty.feature ?: "MISSING", "someFeature");
 assert("unquoted numeric attr value captured (maxlength)", uqProps.qty.maxlength ?: "MISSING", "100");
 
+// ---------------------------------------------------------------------------
+// Session 2026-06-22 boot fixes.
+
+// A) Chained assignment where the MIDDLE target is a bracket/array access
+//    (Preside SqlSchemaSynchronizer: `column = sql.columns[colName] = StructNew()`).
+//    The leftmost target was left undefined because the SetIndex path didn't
+//    leave the value for the outer store.
+chSql = { columns = {} };
+chCol = chSql.columns[ "foo" ] = StructNew();
+assert("chained bracket-middle assign — left target is the struct", isStruct(chCol), true);
+assert("chained bracket-middle assign — bracket target is the struct", isStruct(chSql.columns.foo), true);
+chCol.definitionSql = "ddl";
+assert("chained bracket-middle assign — left/bracket share reference", chSql.columns.foo.definitionSql ?: "MISSING", "ddl");
+
+// B) String member-method list functions (NoCase + mutators) were missing from
+//    the member dispatch map, so `list.listFindNoCase(x)` returned empty while
+//    `listFindNoCase(list, x)` worked. Preside VersioningService guards a
+//    dbFieldList append with `!objMeta.dbFieldList.listFindNoCase(field)`; the
+//    broken member form duplicated _version columns in CREATE TABLE.
+lst = "id,name,_version_is_draft,_version_has_drafts,datecreated";
+assert("member listFindNoCase finds present value", lst.listFindNoCase("_version_is_draft"), 3);
+assert("member listFindNoCase absent value is 0", lst.listFindNoCase("nope"), 0);
+assert("member listFind agrees", lst.listFind("name"), 2);
+assert("member listValueCountNoCase", lst.listValueCountNoCase("name"), 1);
+
+// C) Positional argumentCollection forward: a paramless proxy forwarding
+//    `argumentCollection=arguments` (arguments={1:val}) to a required named
+//    param. (Preside _getAdapter() -> getAdapter(argumentCollection=arguments).)
+assert("positional argumentCollection binds required named param", _argCollProxy("preside"), "got[preside]");
+
+// D) pending_extra_named_args must not leak into a following positional call.
+//    A named call to a paramless fn creates an overflow-named extra; the next
+//    paramless POSITIONAL call must still see its arg keyed "1", not the stale
+//    name. (Preside: runSql(dsn=…, sql=_getAdapter(dsn)…) renamed the inner
+//    positional arg to "sql".)
+_argNamedOverflow( foo = "x" );
+assert("no named-extra leak into next positional call", _argPositionalKeys("v"), "1");
+
 suiteEnd();
+
+// Paramless proxy forwarding a positional arg via argumentCollection to a
+// function declaring the param by name.
+private string function _argCollReal( required string dsn ) { return "got[" & dsn & "]"; }
+private string function _argCollProxy() { return _argCollReal( argumentCollection = arguments ); }
+// Paramless fn called with a NAMED arg (overflow → arguments scope keyed by name).
+private string function _argNamedOverflow() { return structKeyList( arguments ); }
+// Paramless fn called positionally — its arguments scope must be keyed "1".
+private string function _argPositionalKeys() { return structKeyList( arguments ); }
 
 private string function _bareIdentStatement() {
 	if ( true ) {j

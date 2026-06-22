@@ -4270,6 +4270,21 @@ impl CfmlVirtualMachine {
                         self.closure_parent_writeback = None;
                         self.arg_ref_writeback = None;
                         self.pending_result_writeback = None;
+                        // A purely positional call has no extra NAMED args. Clear
+                        // any stale `pending_extra_named_args` so it can't leak in:
+                        // a preceding NAMED call whose callee never reached
+                        // `execute_function_with_args` (a builtin/native/method
+                        // shim that doesn't `.take()` it at the consume site)
+                        // leaves it set, and this positional call's
+                        // `execute_function_with_args` would otherwise consume that
+                        // stale list — naming a positional arg after an unrelated
+                        // overflow arg. Preside hit this: `_getSqlRunner().runSql(
+                        // dsn=…, sql=_getAdapter(dsn).getAllTablesSql() )` left a
+                        // `[(0,"sql")]` extra that renamed the next paramless
+                        // `_getAdapter(dsn)` positional arg to "sql", so the
+                        // forwarded `argumentCollection=arguments` carried `{sql:…}`
+                        // and the required `dsn` arrived empty.
+                        self.pending_extra_named_args = None;
                         // For closures with captured scope, merge defining scope + caller locals.
                         // For CFC method calls (this in locals), caller locals take priority.
                         // For plain UDF calls, pass caller locals by reference (no clone).
@@ -4568,6 +4583,23 @@ impl CfmlVirtualMachine {
                             if name.eq_ignore_ascii_case("argumentcollection") {
                                 if let Some(CfmlValue::Struct(s)) = named_values.get(i) {
                                     for (k, v) in s.iter() {
+                                        // A positive-integer key is a POSITIONAL
+                                        // argument (Lucee/ACF/BoxLang). Emit it
+                                        // with an EMPTY name so the reorder below
+                                        // binds it to a param SLOT, not a named
+                                        // arg called "1". Forwarding
+                                        // `argumentCollection=arguments` from a
+                                        // paramless proxy (Preside's
+                                        // `_getAdapter()` -> `getAdapter(
+                                        // argumentCollection=arguments)` where
+                                        // arguments={1:dsn}) relies on this —
+                                        // otherwise the required `dsn` param was
+                                        // left undefined.
+                                        if k.parse::<usize>().map(|n| n >= 1).unwrap_or(false) {
+                                            expanded_names.push(String::new());
+                                            expanded_values.push(v.clone());
+                                            continue;
+                                        }
                                         if explicit_named.contains(&k.to_lowercase()) {
                                             continue; // explicit named arg wins
                                         }
@@ -13549,6 +13581,31 @@ impl CfmlVirtualMachine {
                 "listgetat" => Some("listGetAt"),
                 "gettoken" => Some("getToken"),
                 "listfind" => Some("listFind"),
+                // NoCase + mutator list member methods. These all have builtins
+                // but were absent from this map, so the member form
+                // (`list.listFindNoCase(x)`) fell through to "get property and
+                // call" and returned empty/Null while the function form
+                // (`listFindNoCase(list, x)`) worked. Preside's VersioningService
+                // guards a dbFieldList append with
+                // `!objMeta.dbFieldList.listFindNoCase(field)`; the broken member
+                // form made the guard always true, duplicating _version_is_draft/
+                // _version_has_drafts columns in the CREATE TABLE.
+                "listfindnocase" => Some("listFindNoCase"),
+                "listcontainsnocase" => Some("listContainsNoCase"),
+                "listdeleteat" => Some("listDeleteAt"),
+                "listsetat" => Some("listSetAt"),
+                "listinsertat" => Some("listInsertAt"),
+                "listprepend" => Some("listPrepend"),
+                "listsort" => Some("listSort"),
+                "listvaluecount" => Some("listValueCount"),
+                "listvaluecountnocase" => Some("listValueCountNoCase"),
+                "listchangedelims" => Some("listChangeDelims"),
+                "listqualify" => Some("listQualify"),
+                "listremoveduplicates" => Some("listRemoveDuplicates"),
+                "listcompact" => Some("listCompact"),
+                "listavg" => Some("listAvg"),
+                "listitemtrim" => Some("listItemTrim"),
+                "listindexexists" => Some("listIndexExists"),
                 "listcontains" => Some("listContains"),
                 "listappend" => Some("listAppend"),
                 "refind" => Some("reFind"),
@@ -15798,10 +15855,27 @@ impl CfmlVirtualMachine {
                     _ => true,
                 };
                 if needs_override {
-                    s.insert(
-                        "__name".to_string(),
-                        CfmlValue::string(class_name.to_string()),
-                    );
+                    // Normalize the caller-supplied path to the dotted component
+                    // name Lucee/ACF expose in metadata.name (e.g.
+                    // "/app/extensions/x/preside-objects/security_group" ->
+                    // "app.extensions.x.preside-objects.security_group"). Preside's
+                    // PresideObjectReader.getAutoPivotObjectDefinition derives a
+                    // related-object name via ListLast(meta.name, "."), so a
+                    // slash-path name yielded the whole path and broke m2m join
+                    // relationship validation. Already-dotted names are unchanged
+                    // (no slashes to replace). Verified vs Lucee 7.0.4.
+                    let dotted = {
+                        let mut n = class_name.to_string();
+                        if let Some(stripped) = n
+                            .strip_suffix(".cfc")
+                            .or_else(|| n.strip_suffix(".CFC"))
+                        {
+                            n = stripped.to_string();
+                        }
+                        let n = n.trim_start_matches(['/', '\\']);
+                        n.replace(['/', '\\'], ".")
+                    };
+                    s.insert("__name".to_string(), CfmlValue::string(dotted));
                 }
             }
             // Inject functions added by cfinclude inside the component body

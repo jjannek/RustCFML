@@ -3147,6 +3147,18 @@ impl CfmlCompiler {
                             }
                         }
                         Expression::ArrayAccess(access) => {
+                            // In VALUE position (`a = b[k] = v`), the inner
+                            // assignment must leave the assigned value for the
+                            // outer store. SetIndex consumes [value, collection,
+                            // index] and leaves only the modified collection (then
+                            // the writeback consumes that), so Dup the value first;
+                            // the spare copy sits at the bottom and is what remains
+                            // after the writeback. (Was: `column = sql.columns[k] =
+                            // StructNew()` left `column` undefined — Preside
+                            // SqlSchemaSynchronizer.)
+                            if want_value {
+                                instructions.push(BytecodeOp::Dup);
+                            }
                             self.compile_index_assign_base(&access.array, instructions);
                             self.compile_expression(&access.index, instructions);
                             instructions.push(BytecodeOp::SetIndex);

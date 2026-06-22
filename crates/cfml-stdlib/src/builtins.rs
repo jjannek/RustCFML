@@ -8251,6 +8251,12 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
             let vals: Vec<mysql::Value> = arr.iter().map(|v| cfml_to_mysql_value(&v)).collect();
             Params::Positional(vals)
         }
+        // An empty params struct means "no parameters" (Preside passes `{}`
+        // to placeholder-free SQL). The mysql crate rejects Params::Named for a
+        // query with no `:name` placeholders ("Can not pass named parameters to
+        // positional query"), so map empty -> Empty. Lucee treats empty params
+        // as no params.
+        CfmlValue::Struct(map) if map.is_empty() => Params::Empty,
         CfmlValue::Struct(map) => {
             let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
             for (k, v) in map.iter() {
@@ -9806,6 +9812,12 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
             let vals: Vec<mysql::Value> = arr.iter().map(|v| cfml_to_mysql_value(&v)).collect();
             Params::Positional(vals)
         }
+        // An empty params struct means "no parameters" (Preside passes `{}`
+        // to placeholder-free SQL). The mysql crate rejects Params::Named for a
+        // query with no `:name` placeholders ("Can not pass named parameters to
+        // positional query"), so map empty -> Empty. Lucee treats empty params
+        // as no params.
+        CfmlValue::Struct(map) if map.is_empty() => Params::Empty,
         CfmlValue::Struct(map) => {
             let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
             for (k, v) in map.iter() {
