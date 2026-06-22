@@ -2354,11 +2354,25 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
     if is_java_shim {
         return keys.into_iter().filter(|k| !k.starts_with("__")).collect();
     }
+    // The magic-scope marker (cgi) is engine-internal — never surface it.
+    let has_magic = keys
+        .iter()
+        .any(|k| k == cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER);
     if !keys.iter().any(|k| k == "__arguments_scope") {
+        if has_magic {
+            return keys
+                .into_iter()
+                .filter(|k| k != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER)
+                .collect();
+        }
         return keys;
     }
     keys.into_iter()
-        .filter(|k| k != "__arguments_scope" && k != "__arguments_params")
+        .filter(|k| {
+            k != "__arguments_scope"
+                && k != "__arguments_params"
+                && k != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER
+        })
         .collect()
 }
 
@@ -2382,6 +2396,12 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
                     && s.contains_key("__arguments_scope")
                     && (key == "__arguments_scope" || key == "__arguments_params")
                 {
+                    return Ok(CfmlValue::Bool(false));
+                }
+                // The magic-scope marker is never a user-visible key, and a
+                // magic scope (cgi) reports every UNSET key as absent (Lucee
+                // parity) even though reading it yields "".
+                if key == cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER {
                     return Ok(CfmlValue::Bool(false));
                 }
                 return Ok(CfmlValue::Bool(found));
@@ -4463,6 +4483,7 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
     let is_args = s.contains_key("__arguments_scope");
     let items: Vec<String> = s
         .iter()
+        .filter(|(k, _)| k.as_str() != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER)
         .filter(|(k, _)| {
             !is_args
                 || (k.as_str() != "__arguments_scope"

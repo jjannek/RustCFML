@@ -5243,6 +5243,13 @@ impl CfmlVirtualMachine {
                                 } else {
                                     CfmlValue::Null
                                 }
+                            } else if direct.is_none()
+                                && s.contains_key(
+                                    cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER,
+                                )
+                            {
+                                // Magic scope (cgi): unset key reads as "".
+                                CfmlValue::string(String::new())
                             } else {
                                 direct.unwrap_or(CfmlValue::Null)
                             };
@@ -5620,6 +5627,11 @@ impl CfmlVirtualMachine {
                                             } else {
                                                 CfmlValue::Null
                                             }
+                                        } else if s.contains_key(
+                                            cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER,
+                                        ) {
+                                            // Magic scope (cgi): unset key reads as "".
+                                            CfmlValue::string(String::new())
                                         } else {
                                             CfmlValue::Null
                                         }
@@ -6831,6 +6843,9 @@ impl CfmlVirtualMachine {
                                                 && k != "__arguments_params")
                                     })
                                     .filter(|k| !is_java_shim || !k.starts_with("__"))
+                                    .filter(|k| {
+                                        k != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER
+                                    })
                                     .filter(|k| {
                                         if !is_cfc {
                                             return true;

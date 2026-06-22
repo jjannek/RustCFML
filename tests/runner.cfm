@@ -96,6 +96,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_argument_reference_nested.cfm">
 <cf_runtest file="core/test_language_features.cfm">
 <cf_runtest file="core/test_scopes.cfm">
+<cf_runtest file="core/test_cgi_magic_scope.cfm">
 <!--- - this_dot_call_detaches_writes: inside a component method, a `this.`-DOT --->
 <!--- qualified method call (this.noop()) detaches the frame's `this` binding --->
 <!--- onto a data-complete SHALLOW COPY on RustCFML 0.108.0 -- every later --->

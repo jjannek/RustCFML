@@ -178,6 +178,15 @@ pub fn build_web_scopes(
     let request_url = format!("{}://{}{}", scheme, authority, script_name);
     cgi.insert("request_url".to_string(), CfmlValue::string(request_url));
 
+    // Tag cgi as a magic scope: reading an unset key returns "" (Lucee/ACF
+    // parity), not null. Wheels' $cgiScope copies optional keys like
+    // `http_x_requested_with` out of cgi unconditionally; without "" defaults
+    // the copy stored null, which the null-delete guard then dropped.
+    cgi.insert(
+        cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER.to_string(),
+        CfmlValue::Bool(true),
+    );
+
     globals.insert("cgi".to_string(), CfmlValue::strukt(cgi));
 
     let url_scope = parse_query_string(query_string);

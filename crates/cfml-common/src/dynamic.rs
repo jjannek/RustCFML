@@ -21,6 +21,13 @@ pub type ValueBuildHasher = std::hash::BuildHasherDefault<rustc_hash::FxHasher>;
 /// and pre-size with `ValueMap::with_capacity_and_hasher(n, Default::default())`.
 pub type ValueMap = IndexMap<String, CfmlValue, ValueBuildHasher>;
 
+/// Marker key that tags a struct as a Lucee-style "magic" scope (currently the
+/// `cgi` scope): reading ANY missing key returns an empty string `""` rather
+/// than throwing / yielding null, while `structKeyExists` still reports the
+/// unset key as absent. The marker is engine-internal and must never surface
+/// in struct introspection (`structKeyList`, `structCount`, for-in, JSON, …).
+pub const EMPTY_DEFAULT_SCOPE_MARKER: &str = "__cfml_empty_default_scope__";
+
 /// Shared, interior-mutable backing for a CFML array — the basis of Lucee-style
 /// **reference semantics**. Cloning a `CfmlArray` bumps the `Arc` (it does NOT
 /// copy the elements), so `b = a` makes `a` and `b` two handles onto the *same*

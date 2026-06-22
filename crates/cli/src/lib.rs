@@ -30,6 +30,18 @@ pub use cfml_qoq::function::QoQFnKind;
 // without declaring indexmap as a separate dep.
 pub use indexmap::IndexMap;
 
+/// An empty `cgi` scope tagged as a Lucee-style magic scope: reading any unset
+/// key yields `""` (not null), matching the serve-mode cgi. Used for the
+/// no-request CLI/`include` paths so cgi semantics are identical in both modes.
+fn empty_magic_cgi() -> CfmlValue {
+    let mut m = ValueMap::default();
+    m.insert(
+        cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER.to_string(),
+        CfmlValue::Bool(true),
+    );
+    CfmlValue::strukt(m)
+}
+
 // ---------------------------------------------------------------------------
 // Native-module registrar
 // ---------------------------------------------------------------------------
@@ -748,7 +760,7 @@ fn compile_and_run(
 
     // Ensure web scopes always exist (CFML guarantees url/cgi/form are always defined)
     vm.globals.entry("url".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
-    vm.globals.entry("cgi".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+    vm.globals.entry("cgi".to_string()).or_insert_with(empty_magic_cgi);
     vm.globals.entry("form".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     // Inject extra globals (web scopes, etc.) — overrides defaults above in serve mode
@@ -2257,7 +2269,7 @@ fn run_repl(debug: bool) {
     register_vm_runtime(&mut vm);
     // CFML guarantees url/cgi/form always exist.
     vm.globals.entry("url".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
-    vm.globals.entry("cgi".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+    vm.globals.entry("cgi".to_string()).or_insert_with(empty_magic_cgi);
     vm.globals.entry("form".to_string()).or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
 
     loop {
