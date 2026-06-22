@@ -3117,7 +3117,7 @@ impl CfmlVirtualMachine {
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
                                 CfmlValue::Int(bc_func.global_id as i64),
                             )),
-                            return_type: None,
+                            return_type: bc_func.return_type.clone(),
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: Some(scope),
                         }))
@@ -3609,13 +3609,13 @@ impl CfmlVirtualMachine {
                         // For user functions, find the bytecode index and capture the
                         // current scope so the function retains access to its defining
                         // scope's variables when stored in a struct and called later.
-                        let (body_val, scope) = if let Some(uf) =
+                        let (body_val, scope, ret_type) = if let Some(uf) =
                             self.user_functions.get(name.as_str())
                         {
                             // Reference the function by its stable global_id.
-                            (CfmlValue::Int(uf.global_id as i64), None)
+                            (CfmlValue::Int(uf.global_id as i64), None, uf.return_type.clone())
                         } else {
-                            (CfmlValue::Null, None)
+                            (CfmlValue::Null, None, None)
                         };
                         stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: name.clone(),
@@ -3623,7 +3623,7 @@ impl CfmlVirtualMachine {
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
                                 body_val,
                             )),
-                            return_type: None,
+                            return_type: ret_type,
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: scope,
                         })));
@@ -3671,7 +3671,7 @@ impl CfmlVirtualMachine {
                             })
                             .unwrap_or_default();
                         // For user functions (CI match), reference by stable global_id.
-                        let (body_val, scope, resolved_name) = if let Some((uf_name, uf)) = self
+                        let (body_val, scope, resolved_name, ret_type) = if let Some((uf_name, uf)) = self
                             .user_functions
                             .iter()
                             .find(|(k, _)| k.eq_ignore_ascii_case(&name_lower))
@@ -3680,9 +3680,10 @@ impl CfmlVirtualMachine {
                                 CfmlValue::Int(uf.global_id as i64),
                                 None,
                                 uf_name.clone(),
+                                uf.return_type.clone(),
                             )
                         } else {
-                            (CfmlValue::Null, None, canonical)
+                            (CfmlValue::Null, None, canonical, None)
                         };
                         stack.push(CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: resolved_name,
@@ -3690,7 +3691,7 @@ impl CfmlVirtualMachine {
                             body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
                                 body_val,
                             )),
-                            return_type: None,
+                            return_type: ret_type,
                             access: cfml_common::dynamic::CfmlAccess::Public,
                             captured_scope: scope,
                         })));
@@ -6038,7 +6039,7 @@ impl CfmlVirtualMachine {
                         body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
                             CfmlValue::Int(global_id),
                         )),
-                        return_type: None,
+                        return_type: bc_func_ref.return_type.clone(),
                         // Carry the declared modifier so for-in over a component
                         // instance can hide private/package methods (Lucee parity).
                         access: bc_func_ref.access.clone(),
@@ -16107,7 +16108,7 @@ impl CfmlVirtualMachine {
                         body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
                             CfmlValue::Int(bf.global_id as i64),
                         )),
-                        return_type: None,
+                        return_type: bf.return_type.clone(),
                         access: bf.access.clone(),
                         captured_scope: None,
                     }));
@@ -16289,7 +16290,7 @@ impl CfmlVirtualMachine {
                                 body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
                                     CfmlValue::Int(func_def.global_id as i64),
                                 )),
-                                return_type: None,
+                                return_type: func_def.return_type.clone(),
                                 access: cfml_common::dynamic::CfmlAccess::Public,
                                 captured_scope: None,
                             }));

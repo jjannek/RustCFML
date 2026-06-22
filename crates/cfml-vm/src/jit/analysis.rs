@@ -1241,6 +1241,7 @@ mod tests {
             global_id: 1,
             declared_local_mode: None,
             param_types: params.iter().map(|_| None).collect(),
+            return_type: None,
             param_annotations: params.iter().map(|_| Vec::new()).collect(),
             is_component_method: false,
             access: cfml_common::dynamic::CfmlAccess::Public,

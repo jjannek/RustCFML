@@ -144,6 +144,10 @@ pub struct BytecodeFunction {
     /// Declared parameter types (parallel to `params`; `None` when untyped).
     /// Surfaced in getMetadata()/getComponentMetadata().
     pub param_types: Vec<Option<String>>,
+    /// Declared return type (`function string foo()` → `Some("string")`,
+    /// `None` when undeclared/`any`). Surfaced as `returnType` in
+    /// getMetadata() on a function reference.
+    pub return_type: Option<String>,
     /// Javadoc/inline annotations per parameter (parallel to `params`), e.g.
     /// WireBox `@arg.inject coldbox:setting:features`. Surfaced as `param.inject`
     /// etc. in getMetadata()/getComponentMetadata() for DI frameworks.
@@ -449,6 +453,7 @@ impl CfmlCompiler {
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
                     param_types: Vec::new(),
+                    return_type: None,
                     param_annotations: Vec::new(),
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
@@ -2548,6 +2553,7 @@ impl CfmlCompiler {
             global_id: next_global_fn_id(),
             declared_local_mode: declared_mode,
             param_types: func.params.iter().map(|p| p.param_type.clone()).collect(),
+            return_type: func.return_type.clone(),
             param_annotations: func.params.iter().map(|p| p.annotations.clone()).collect(),
             is_component_method: self.in_component_method,
             access: match func.access {
@@ -2759,6 +2765,7 @@ impl CfmlCompiler {
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
                     param_types: Vec::new(),
+                    return_type: prop.prop_type.clone(),
                     param_annotations: Vec::new(),
                     is_component_method: true,
                     access: cfml_common::dynamic::CfmlAccess::Public,
@@ -2807,6 +2814,7 @@ impl CfmlCompiler {
                     global_id: next_global_fn_id(),
                     declared_local_mode: None,
                     param_types: vec![None],
+                    return_type: Some(component.name.clone()),
                     param_annotations: vec![Vec::new()],
                     is_component_method: true,
                     access: cfml_common::dynamic::CfmlAccess::Public,
@@ -2949,6 +2957,7 @@ impl CfmlCompiler {
                 global_id: next_global_fn_id(),
                 declared_local_mode: None,
                 param_types: Vec::new(),
+                return_type: None,
                 param_annotations: Vec::new(),
                 is_component_method: true,
                     access: cfml_common::dynamic::CfmlAccess::Public,
@@ -3862,6 +3871,7 @@ impl CfmlCompiler {
                     global_id: next_global_fn_id(),
                     declared_local_mode: effective_declared,
                     param_types: closure.params.iter().map(|p| p.param_type.clone()).collect(),
+                    return_type: None,
                     param_annotations: closure.params.iter().map(|p| p.annotations.clone()).collect(),
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,
@@ -3915,6 +3925,7 @@ impl CfmlCompiler {
                     global_id: next_global_fn_id(),
                     declared_local_mode: arrow_effective,
                     param_types: arrow.params.iter().map(|p| p.param_type.clone()).collect(),
+                    return_type: None,
                     param_annotations: arrow.params.iter().map(|p| p.annotations.clone()).collect(),
                     is_component_method: false,
                     access: cfml_common::dynamic::CfmlAccess::Public,

@@ -157,45 +157,31 @@ impl Parser {
         ) && self.is_access_modifier_for_function()
         {
             let access = self.parse_access_modifier();
-            // Skip optional return type annotation (e.g. "private array function ..."
+            // Capture optional return type annotation (e.g. "private array function ..."
             // or "public MachII.framework.AppManager function ..." or
-            // "public component function init()")
-            if self.is_return_type_token(0) {
-                // Look ahead past dotted name: Ident.Ident.Ident... then Function
-                let mut lookahead = 1;
-                while matches!(self.peek(lookahead), Token::Dot) && matches!(self.peek(lookahead + 1), Token::Identifier(_)) {
-                    lookahead += 2;
-                }
-                if matches!(self.peek(lookahead), Token::Function) {
-                    for _ in 0..lookahead {
-                        self.advance(); // skip return type tokens
-                    }
-                }
-            }
+            // "public component function init()") so it is not dropped — the
+            // declared return type must surface in getMetadata().
+            let captured_rt = self.capture_dotted_return_type_before_function();
             if self.match_token(&Token::Function) {
                 let mut func = self.parse_function()?;
                 func.access = access;
+                if func.return_type.is_none() {
+                    func.return_type = captured_rt;
+                }
                 return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
                     func,
                 })));
             }
             if self.match_token(&Token::Static) {
-                // Skip optional return type after static (including dotted names)
-                if self.is_return_type_token(0) {
-                    let mut lookahead = 1;
-                    while matches!(self.peek(lookahead), Token::Dot) && matches!(self.peek(lookahead + 1), Token::Identifier(_)) {
-                        lookahead += 2;
-                    }
-                    if matches!(self.peek(lookahead), Token::Function) {
-                        for _ in 0..lookahead {
-                            self.advance();
-                        }
-                    }
-                }
+                // Capture optional return type after static (including dotted names)
+                let captured_rt = self.capture_dotted_return_type_before_function();
                 if self.match_token(&Token::Function) {
                     let mut func = self.parse_function()?;
                     func.access = access;
                     func.is_static = true;
+                    if func.return_type.is_none() {
+                        func.return_type = captured_rt;
+                    }
                     return Ok(CfmlNode::Statement(Statement::FunctionDecl(FunctionDecl {
                         func,
                     })));
@@ -3910,9 +3896,10 @@ impl Parser {
                 continue;
             }
 
-            // Skip optional return type annotation (e.g. "array function ...",
-            // "component function init()", or a dotted component-path type).
-            self.skip_dotted_return_type_before_function();
+            // Capture optional return type annotation (e.g. "array function ...",
+            // "component function init()", or a dotted component-path type) so it
+            // surfaces as meta.returnType.
+            let captured_rt = self.capture_dotted_return_type_before_function();
 
             if self.match_token(&Token::Property) {
                 properties.push(self.parse_property()?);
@@ -3920,6 +3907,9 @@ impl Parser {
                 let mut func = self.parse_function()?;
                 func.access = access;
                 func.is_static = is_static;
+                if func.return_type.is_none() {
+                    func.return_type = captured_rt;
+                }
                 self.apply_doc_to_function(member_start, &mut func);
                 functions.push(func);
             } else if self.match_token(&Token::Var) {
@@ -4056,12 +4046,15 @@ impl Parser {
                 AccessModifier::Public
             };
 
-            // Skip optional return type annotation (incl. dotted component-path)
-            self.skip_dotted_return_type_before_function();
+            // Capture optional return type annotation (incl. dotted component-path)
+            let captured_rt = self.capture_dotted_return_type_before_function();
 
             if self.match_token(&Token::Function) {
                 let mut func = self.parse_function()?;
                 func.access = access;
+                if func.return_type.is_none() {
+                    func.return_type = captured_rt;
+                }
                 functions.push(func);
             } else {
                 // Skip unexpected tokens
@@ -4381,8 +4374,17 @@ impl Parser {
     /// (MockBox / any CFC returning a typed object) — silently dropping the
     /// whole method declaration. (GitHub #177)
     fn skip_dotted_return_type_before_function(&mut self) -> bool {
+        self.capture_dotted_return_type_before_function().is_some()
+    }
+
+    /// Like [`skip_dotted_return_type_before_function`], but returns the captured
+    /// (possibly dotted) return-type string when one precedes `function`, so the
+    /// declared return type in `access returnType function name(...)` is not
+    /// dropped (it must surface as `meta.returnType` in getMetadata()). Returns
+    /// `None` (consuming nothing) when no return type precedes `function`.
+    fn capture_dotted_return_type_before_function(&mut self) -> Option<String> {
         if !self.is_return_type_token(0) {
-            return false;
+            return None;
         }
         let mut lookahead = 1;
         while matches!(self.peek(lookahead), Token::Dot)
@@ -4391,12 +4393,21 @@ impl Parser {
             lookahead += 2;
         }
         if matches!(self.peek(lookahead), Token::Function) {
-            for _ in 0..lookahead {
+            let mut parts = String::new();
+            for i in 0..lookahead {
+                let tok = self.peek(i).clone();
                 self.advance();
+                match tok {
+                    Token::Dot => parts.push('.'),
+                    Token::Identifier(s) => parts.push_str(&s),
+                    Token::Component => parts.push_str("component"),
+                    Token::Interface => parts.push_str("interface"),
+                    _ => {}
+                }
             }
-            return true;
+            return Some(parts);
         }
-        false
+        None
     }
 
     fn is_access_modifier_for_function(&self) -> bool {
