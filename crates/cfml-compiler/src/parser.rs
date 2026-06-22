@@ -5196,6 +5196,13 @@ impl Parser {
             })));
         }
 
+        // Unary plus (`+1`, `+x`, `3 + +1`) is a numeric-identity prefix in CFML —
+        // parse and return the operand unchanged. Lucee/ACF accept it; we previously
+        // only handled unary `-`, so a leading `+` failed with "Expected RParen".
+        if self.match_token(&Token::Plus) {
+            return self.parse_unary();
+        }
+
         // Prefix ++ / --
         if self.match_token(&Token::PlusPlus) {
             let operand = Box::new(self.parse_call()?);

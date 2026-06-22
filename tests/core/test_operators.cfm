@@ -59,6 +59,13 @@ assert("ternary false branch", (x > 20) ? "big" : "small", "small");
 pos = 5;
 assert("unary negation", -pos, -5);
 
+// --- Unary: plus (numeric identity) — issue #192 ---
+assert("unary plus literal", +1, 1);
+assert("unary plus var", +pos, 5);
+assert("binary then unary plus", 3 + +1, 4);
+assert("unary plus coerces string", +"7" + 1, 8);
+assert("unary plus as fn arg", DateAdd("d", +1, createDate(2020,1,1)), createDate(2020,1,2));
+
 // --- Unary: ++ and -- ---
 inc = 10;
 inc++;
