@@ -37,6 +37,23 @@ These are *not* bugs; they are guarded only so the shared suite stays green.
   — RustCFML adds a `"counter"` form returning an incrementing per-instance
   integer. Standard CF / Lucee ignore the argument.
 
+### B1. Timezone display names — verified table, not full CLDR
+RustCFML backs `getTimeZoneInfo()`, `setTimeZone()`/`getTimeZone()`,
+`dateConvert()` and the `java.text.DateFormat` shim's `z`/`zzzz` fields with the
+IANA database (`chrono-tz`). Offsets, DST transitions and instant↔wall-clock
+conversion are faithful for **every** IANA zone. The four *display-name* fields
+(`shortName`/`shortNameDST`/`name`/`nameDST`, and the `z`/`zzzz` pattern fields)
+are CLDR data `chrono-tz` does not carry — Java even synthesises a *theoretical*
+DST name for zones that never observe DST (e.g. `JDT` / "Japan Daylight Time").
+RustCFML therefore serves these from a table captured **byte-for-byte from Lucee
+7.0.4 / OpenJDK 21** (`crates/cfml-vm/src/tz.rs` `display_names`), covering the
+common world zones. A valid zone that is **not** tabulated has full numeric
+facts but no verified names, so name-bearing calls **fail loudly** (consistent
+with the "Lucee-verified or fail loud" rule) rather than guess. Adding a zone is
+a one-line table entry, ground-truthed against Lucee; the eventual full-coverage
+path is `icu4x` (CLDR) behind an optional feature. `Z`/`X`/`O` numeric-offset
+pattern fields are computed directly and need no table.
+
 ### C. Ordered-struct semantics (by design — `IndexMap` everywhere)
 - **Auto-vivified struct key order** (`tests/core/test_subscript_autovivify.cfm`)
   and **struct-literal key order with a member-inc value**

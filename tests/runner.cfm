@@ -148,6 +148,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_struct_higher_order.cfm">
 <cf_runtest file="stdlib/test_math_functions.cfm">
 <cf_runtest file="stdlib/test_date_functions.cfm">
+<cf_runtest file="stdlib/test_timezone.cfm">
 <cf_runtest file="stdlib/test_list_functions.cfm">
 <cf_runtest file="stdlib/test_list_rest_literal_remainder.cfm">
 <cf_runtest file="stdlib/test_list_higher_order.cfm">

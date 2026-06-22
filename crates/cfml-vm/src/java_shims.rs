@@ -2037,11 +2037,87 @@ fn java_date_time_pattern(
     }
 }
 
+enum OffsetStyle {
+    /// RFC822: `+0000`, `-0400` (Java `Z`).
+    Rfc822,
+    /// ISO8601: `Z`, `-04`, `+0530` (Java `X`/`XX`).
+    Iso8601,
+    /// ISO8601 with colon: `Z`, `-04:00` (Java `XXX`).
+    Iso8601Colon,
+    /// Localized GMT short: `GMT`, `GMT-4`, `GMT+5:30` (Java `O`).
+    GmtShort,
+    /// Localized GMT long: `GMT`, `GMT-04:00` (Java `OOOO`).
+    GmtColon,
+}
+
+/// Format a signed (east-positive) UTC offset in seconds per a Java zone style.
+fn format_offset(offset_secs: i64, style: OffsetStyle) -> String {
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.abs();
+    let h = abs / 3600;
+    let m = (abs % 3600) / 60;
+    match style {
+        OffsetStyle::Rfc822 => format!("{}{:02}{:02}", sign, h, m),
+        OffsetStyle::Iso8601 => {
+            if offset_secs == 0 {
+                "Z".to_string()
+            } else if m == 0 {
+                format!("{}{:02}", sign, h)
+            } else {
+                format!("{}{:02}{:02}", sign, h, m)
+            }
+        }
+        OffsetStyle::Iso8601Colon => {
+            if offset_secs == 0 {
+                "Z".to_string()
+            } else {
+                format!("{}{:02}:{:02}", sign, h, m)
+            }
+        }
+        OffsetStyle::GmtShort => {
+            if offset_secs == 0 {
+                "GMT".to_string()
+            } else if m == 0 {
+                format!("GMT{}{}", sign, h)
+            } else {
+                format!("GMT{}{}:{:02}", sign, h, m)
+            }
+        }
+        OffsetStyle::GmtColon => {
+            if offset_secs == 0 {
+                "GMT".to_string()
+            } else {
+                format!("GMT{}{:02}:{:02}", sign, h, m)
+            }
+        }
+    }
+}
+
+/// The timezone facts a formatter needs to render zone pattern fields, resolved
+/// for the specific instant being formatted (so DST is already decided).
+struct ZoneCtx {
+    /// Abbreviation for this instant (e.g. "EDT" / "EST"), from the verified
+    /// table. `None` when the zone is valid but not tabulated — a `z`/`zzzz`
+    /// field then fails loudly rather than guessing.
+    short: Option<String>,
+    /// Long display name for this instant (e.g. "Eastern Daylight Time").
+    long: Option<String>,
+    /// Canonical zone id, for the error message when names are missing.
+    id: String,
+    /// Signed UTC offset in seconds, east positive (EDT = -14400).
+    offset_secs: i64,
+}
+
 /// Render a `NaiveDateTime` per a Java `SimpleDateFormat` pattern, using English
-/// month/weekday names (we only support en* locales). A timezone field
-/// (`z`/`Z`/`X`/`v`/`O`) returns Err: producing a zone abbreviation/offset needs
-/// a timezone database (chrono-tz, absent here), so rather than guess we fail.
-fn format_java_pattern(dt: &NaiveDateTime, pattern: &str) -> Result<String, CfmlError> {
+/// month/weekday names (we only support en* locales). Timezone fields
+/// (`z`/`Z`/`X`/`O`) are rendered from `zone`; if `zone` is `None` (no resolvable
+/// zone) or the field is unsupported (`v` generic), it returns Err rather than
+/// guess.
+fn format_java_pattern(
+    dt: &NaiveDateTime,
+    pattern: &str,
+    zone: Option<&ZoneCtx>,
+) -> Result<String, CfmlError> {
     const MONTHS_FULL: [&str; 12] = [
         "January", "February", "March", "April", "May", "June", "July", "August", "September",
         "October", "November", "December",
@@ -2151,13 +2227,50 @@ fn format_java_pattern(dt: &NaiveDateTime, pattern: &str) -> Result<String, Cfml
                 }
             }
             'a' => out.push_str(if hour24 < 12 { "AM" } else { "PM" }),
-            'z' | 'Z' | 'X' | 'v' | 'O' => {
-                return Err(CfmlError::runtime(format!(
-                    "java.text.DateFormat: pattern timezone field '{}' is not \
-                     supported (no timezone database). This affects LONG/FULL \
-                     time styles; use SHORT/MEDIUM, or CFML's lsTimeFormat().",
-                    c
-                )));
+            'z' | 'Z' | 'X' | 'O' => {
+                let z = zone.ok_or_else(|| {
+                    CfmlError::runtime(format!(
+                        "java.text.DateFormat: pattern timezone field '{}' needs a \
+                         resolvable timezone but none is available.",
+                        c
+                    ))
+                })?;
+                let need_name = |name: &Option<String>| -> Result<String, CfmlError> {
+                    name.clone().ok_or_else(|| {
+                        CfmlError::runtime(format!(
+                            "java.text.DateFormat: timezone [{}] is valid but its display \
+                             name is not in the verified table (only common zones are \
+                             tabulated). See docs/lucee-differences.md.",
+                            z.id
+                        ))
+                    })
+                };
+                match c {
+                    // z/zz/zzz → short abbreviation; zzzz → long display name.
+                    'z' if n >= 4 => out.push_str(&need_name(&z.long)?),
+                    'z' => out.push_str(&need_name(&z.short)?),
+                    // Z → RFC822 numeric offset, e.g. "-0400".
+                    'Z' => out.push_str(&format_offset(z.offset_secs, OffsetStyle::Rfc822)),
+                    // X/XX/XXX → ISO8601 ("Z" for UTC); XXX uses a colon.
+                    'X' => out.push_str(&format_offset(
+                        z.offset_secs,
+                        if n >= 3 { OffsetStyle::Iso8601Colon } else { OffsetStyle::Iso8601 },
+                    )),
+                    // O/OOOO → localized GMT offset, e.g. "GMT-4" / "GMT-04:00".
+                    'O' => out.push_str(&format_offset(
+                        z.offset_secs,
+                        if n >= 4 { OffsetStyle::GmtColon } else { OffsetStyle::GmtShort },
+                    )),
+                    _ => unreachable!(),
+                }
+            }
+            'v' => {
+                // Generic non-location zone name ("ET") — needs CLDR generic
+                // data we don't carry. Fail loudly rather than guess.
+                return Err(CfmlError::runtime(
+                    "java.text.DateFormat: generic timezone field 'v' is not supported."
+                        .to_string(),
+                ));
             }
             _ => {
                 // Unhandled pattern letter — fail rather than drop or guess.
@@ -2172,21 +2285,19 @@ fn format_java_pattern(dt: &NaiveDateTime, pattern: &str) -> Result<String, Cfml
 }
 
 /// Parse the argument handed to `DateFormat.format(...)` into a wall-clock
-/// `NaiveDateTime`. cbi18n passes either a numeric Java epoch-millis offset
-/// (the `i18n*Format` methods) or a CFML date value/string (the
-/// `*LocaleFormat` methods). A numeric epoch is an absolute instant, so it only
-/// has a well-defined wall clock once a timezone is known: we support UTC/GMT
-/// (and the unset case, treated as UTC) and otherwise return None so the caller
-/// fails loudly rather than guessing an offset (chrono-tz is absent).
-fn parse_dateformat_arg(arg: &CfmlValue, tz_id: Option<&str>) -> Option<NaiveDateTime> {
-    let from_epoch_millis = |ms: i64| -> Option<NaiveDateTime> {
-        let tz = tz_id.unwrap_or("UTC").to_uppercase();
-        if tz == "UTC" || tz == "GMT" || tz.is_empty() {
-            chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.naive_utc())
-        } else {
-            // Named/offset zone: we can't resolve it without a tz database.
-            None
-        }
+/// `NaiveDateTime` *in `tz`* plus the zone's offset facts at that instant.
+/// cbi18n passes either a numeric Java epoch-millis instant (the `i18n*Format`
+/// methods) or a CFML date value/string (the `*LocaleFormat` methods):
+///   - epoch millis is an absolute instant → shifted into `tz`'s wall clock,
+///     with the offset/DST taken at that instant.
+///   - a CFML date string is already a wall clock → used verbatim, with the
+///     offset/DST computed by interpreting it as local time in `tz`.
+/// Returns `(wall_clock, offset_secs, is_dst)`.
+fn parse_dateformat_arg(arg: &CfmlValue, tz: &chrono_tz::Tz) -> Option<(NaiveDateTime, i64, bool)> {
+    let from_epoch_millis = |ms: i64| -> Option<(NaiveDateTime, i64, bool)> {
+        let utc = chrono::DateTime::from_timestamp_millis(ms)?.naive_utc();
+        let info = crate::tz::offset_info_at(tz, utc);
+        Some((crate::tz::utc_to_local(tz, utc), info.total_secs, info.is_dst()))
     };
     match arg {
         CfmlValue::Int(n) => from_epoch_millis(*n),
@@ -2199,29 +2310,35 @@ fn parse_dateformat_arg(arg: &CfmlValue, tz_id: Option<&str>) -> Option<NaiveDat
             from_epoch_millis(ms)
         }
         other => {
-            // A CFML date value — a wall-clock string; parse directly (no tz
-            // shift: the *LocaleFormat methods set no timezone, so the JVM
-            // formats the date's own components).
+            // A CFML date value — a wall-clock string; parse directly. The zone
+            // offset/DST is decided by interpreting it as local time in `tz`.
             let s = other.as_string();
             let s = s.trim();
-            for fmt in [
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M",
-                "%m/%d/%Y %H:%M:%S",
-                "%m/%d/%Y",
-            ] {
-                if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-                    return Some(dt);
+            let wall = {
+                let mut found = None;
+                for fmt in [
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M",
+                    "%m/%d/%Y %H:%M:%S",
+                    "%m/%d/%Y",
+                ] {
+                    if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
+                        found = Some(dt);
+                        break;
+                    }
                 }
-            }
-            // Date-only forms → midnight.
-            for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"] {
-                if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) {
-                    return d.and_hms_opt(0, 0, 0);
-                }
-            }
-            None
+                found.or_else(|| {
+                    for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"] {
+                        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) {
+                            return d.and_hms_opt(0, 0, 0);
+                        }
+                    }
+                    None
+                })?
+            };
+            let info = crate::tz::offset_info_for_local(tz, wall);
+            Some((wall, info.total_secs, info.is_dst()))
         }
     }
 }
@@ -2313,24 +2430,42 @@ pub fn handle_java_dateformat(
             let ds = s.get("__df_date_style").map(|v| v.as_string().parse().unwrap_or(2)).unwrap_or(2);
             let ts = s.get("__df_time_style").map(|v| v.as_string().parse().unwrap_or(2)).unwrap_or(2);
             let locale = s.get("__df_locale").map(|v| v.as_string()).unwrap_or_else(|| "en".to_string());
-            let tz = s.get("__df_tz").map(|v| v.as_string());
+            // The formatter's bound zone (setTimeZone) or, when unset, the JVM
+            // default — i.e. the host system zone (TimeZone.getDefault()).
+            let tz_id = s
+                .get("__df_tz")
+                .map(|v| v.as_string())
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(crate::tz::system_tz_id);
+            let zone = crate::tz::resolve_tz(&tz_id).ok_or_else(|| {
+                CfmlError::runtime(format!(
+                    "java.text.DateFormat.format(): unknown timezone id [{}].",
+                    tz_id
+                ))
+            })?;
             let pattern = java_date_time_pattern(&locale, &kind, ds, ts)?;
-            let dt = parse_dateformat_arg(args.first().unwrap_or(&CfmlValue::Null), tz.as_deref())
-                .ok_or_else(|| {
-                    CfmlError::runtime(format!(
-                        "java.text.DateFormat.format(): could not interpret the date \
-                         argument{}.",
-                        tz.as_deref()
-                            .filter(|t| !t.eq_ignore_ascii_case("UTC") && !t.eq_ignore_ascii_case("GMT"))
-                            .map(|t| format!(
-                                " for timezone [{}] (named zones need a tz database; \
-                                 only UTC/GMT are supported)",
-                                t
-                            ))
-                            .unwrap_or_default()
-                    ))
-                })?;
-            Ok(CfmlValue::string(format_java_pattern(&dt, &pattern)?))
+            let (dt, offset_secs, is_dst) =
+                parse_dateformat_arg(args.first().unwrap_or(&CfmlValue::Null), &zone).ok_or_else(
+                    || {
+                        CfmlError::runtime(
+                            "java.text.DateFormat.format(): could not interpret the date \
+                             argument."
+                                .to_string(),
+                        )
+                    },
+                )?;
+            let names = crate::tz::names_for(&zone);
+            let zone_ctx = ZoneCtx {
+                short: names.map(|(std, dst, _, _)| {
+                    if is_dst { dst.to_string() } else { std.to_string() }
+                }),
+                long: names.map(|(_, _, std, dst)| {
+                    if is_dst { dst.to_string() } else { std.to_string() }
+                }),
+                id: crate::tz::canonical_name(&zone),
+                offset_secs,
+            };
+            Ok(CfmlValue::string(format_java_pattern(&dt, &pattern, Some(&zone_ctx))?))
         }
         _ => Ok(CfmlValue::Null),
     }

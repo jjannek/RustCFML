@@ -1271,7 +1271,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cfml-codegen"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-common"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "indexmap",
  "js-sys",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-compiler"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "cfml-common",
  "log",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-config"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "indexmap",
  "log",
@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-qoq"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "cfml-common",
  "indexmap",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-stdlib"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "aes",
  "argon2",
@@ -1339,6 +1339,7 @@ dependencies = [
  "cbc",
  "cfml-common",
  "chrono",
+ "chrono-tz",
  "des",
  "ego-tree",
  "hmac 0.12.1",
@@ -1377,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-vm"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "anyhow",
  "cfml-codegen",
@@ -1387,6 +1388,7 @@ dependencies = [
  "cfml-qoq",
  "cfml-stdlib",
  "chrono",
+ "chrono-tz",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",
@@ -1406,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-worker"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "cfml-codegen",
  "cfml-common",
@@ -1460,6 +1462,30 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "chrono-tz-build",
+ "phf 0.12.1",
+ "uncased",
+]
+
+[[package]]
+name = "chrono-tz-build"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7d8d1efd5109b9c1cd3b7966bd071cdfb53bb6eb0b22a473a68c2f70a11a1eb"
+dependencies = [
+ "parse-zoneinfo",
+ "phf_codegen 0.12.1",
+ "phf_shared 0.12.1",
+ "uncased",
 ]
 
 [[package]]
@@ -3673,7 +3699,7 @@ checksum = "c7a7213d12e1864c0f002f52c2923d4556935a43dec5e71355c2760e0f6e7a18"
 dependencies = [
  "log",
  "phf 0.11.3",
- "phf_codegen",
+ "phf_codegen 0.11.3",
  "string_cache",
  "string_cache_codegen",
  "tendril",
@@ -4303,6 +4329,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "parse-zoneinfo"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3c406c9e2aa74554e662d2c2ee11cd3e73756988800be7e6f5eddb16fed4699"
+
+[[package]]
 name = "password-hash"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4364,8 +4396,18 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
 dependencies = [
- "phf_macros",
+ "phf_macros 0.11.3",
  "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_macros 0.12.1",
+ "phf_shared 0.12.1",
 ]
 
 [[package]]
@@ -4384,8 +4426,18 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.11.3",
  "phf_shared 0.11.3",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efbdcb6f01d193b17f0b9c3360fa7e0e620991b193ff08702f78b3ce365d7e61"
+dependencies = [
+ "phf_generator 0.12.1",
+ "phf_shared 0.12.1",
 ]
 
 [[package]]
@@ -4399,16 +4451,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf_generator"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cbb1126afed61dd6368748dae63b1ee7dc480191c6262a3b4ff1e29d86a6c5b"
+dependencies = [
+ "fastrand",
+ "phf_shared 0.12.1",
+]
+
+[[package]]
 name = "phf_macros"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.11.3",
  "phf_shared 0.11.3",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d713258393a82f091ead52047ca779d37e5766226d009de21696c4e667044368"
+dependencies = [
+ "phf_generator 0.12.1",
+ "phf_shared 0.12.1",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "uncased",
 ]
 
 [[package]]
@@ -4418,6 +4494,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
 dependencies = [
  "siphasher",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+ "uncased",
 ]
 
 [[package]]
@@ -5128,7 +5214,7 @@ dependencies = [
 
 [[package]]
 name = "rustcfml-cli"
-version = "0.262.0"
+version = "0.263.0"
 dependencies = [
  "anyhow",
  "automerge",
@@ -5420,7 +5506,7 @@ dependencies = [
  "log",
  "new_debug_unreachable",
  "phf 0.11.3",
- "phf_codegen",
+ "phf_codegen 0.11.3",
  "precomputed-hash",
  "servo_arc",
  "smallvec",
@@ -5758,7 +5844,7 @@ version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c711928715f1fe0fe509c53b43e993a9a557babc2d0a3567d0a3006f1ac931a0"
 dependencies = [
- "phf_generator",
+ "phf_generator 0.11.3",
  "phf_shared 0.11.3",
  "proc-macro2",
  "quote",
@@ -6292,6 +6378,15 @@ name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+
+[[package]]
+name = "uncased"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1b88fcfe09e89d3866a5c11019378088af2d24c3fbd4f0543f96b479ec90697"
+dependencies = [
+ "version_check",
+]
 
 [[package]]
 name = "unicode-bidi"

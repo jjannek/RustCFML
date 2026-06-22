@@ -480,6 +480,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getCurrentTemplatePath".into(), fn_get_current_template_path);
     f.insert("getBaseTemplatePath".into(), fn_get_base_template_path);
     f.insert("getTimeZone".into(), fn_get_time_zone);
+    f.insert("getTimeZoneInfo".into(), fn_get_time_zone_info);
     f.insert("getContextRoot".into(), fn_get_context_root);
     f.insert("GetContextRoot".into(), fn_get_context_root);
     f.insert("getPageContext".into(), fn_get_page_context);
@@ -12141,9 +12142,15 @@ fn fn_get_locale(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(locale_code_to_friendly("en_US")))
 }
 
-fn fn_set_time_zone(args: Vec<CfmlValue>) -> CfmlResult {
-    let _tz = get_str(&args, 0);
-    Ok(CfmlValue::Null)
+fn fn_set_time_zone(_args: Vec<CfmlValue>) -> CfmlResult {
+    // VM-intercepted (needs VM state to set the request timezone). This stub is
+    // only reached if the intercept is bypassed.
+    Err(CfmlError::runtime("setTimeZone() requires VM context".to_string()))
+}
+
+fn fn_get_time_zone_info(_args: Vec<CfmlValue>) -> CfmlResult {
+    // VM-intercepted (resolves the current request timezone via chrono-tz).
+    Err(CfmlError::runtime("getTimeZoneInfo() requires VM context".to_string()))
 }
 
 fn fn_application_stop(_args: Vec<CfmlValue>) -> CfmlResult {

@@ -81,14 +81,19 @@ assert( "time en_GB MEDIUM", df.getTimeInstance( df.MEDIUM, enGB ).format( d ), 
 assert( "datetime en SHORT/SHORT", df.getDateTimeInstance( df.SHORT, df.SHORT, en ).format( d ), "6/10/24, 2:05" & nnbsp & "PM" );
 assert( "style by-name lookup df['SHORT']", df[ "SHORT" ], 3 );
 
-// RustCFML-specific: rather than emit a guessed string, the shim throws for
-// what it can't reproduce faithfully — a timezone-name pattern field (LONG/FULL
-// time styles need a tz database) and an unverified locale. (On Lucee these
-// return real JVM output, so the assertions are RustCFML-only.)
+// Time styles WITH a timezone field (LONG=z short abbrev, FULL=zzzz long name),
+// now backed by the IANA tz database (chrono-tz) + a Lucee-verified name table.
+// June 10 is summer in New York -> EDT. Byte-identical to the JVM/Lucee.
+nyTZ = timeZone.getTimeZone( "America/New_York" );
+fLong = df.getTimeInstance( df.LONG, enus ); fLong.setTimeZone( nyTZ );
+fFull = df.getTimeInstance( df.FULL, enus ); fFull.setTimeZone( nyTZ );
+assert( "time en_US LONG (z abbrev)", fLong.format( d ), "2:05:09" & nnbsp & "PM EDT" );
+assert( "time en_US FULL (zzzz long name)", fFull.format( d ), "2:05:09" & nnbsp & "PM Eastern Daylight Time" );
+
+// RustCFML-specific: rather than emit a guessed string, the shim still throws
+// for what it can't reproduce faithfully — an unverified locale (CLDR pattern
+// data we only tabulate for en*). On Lucee this returns real JVM output.
 if ( isRustCFML() ) {
-	assertThrows( "time LONG (tz field) throws, not guessed", function(){
-		df.getTimeInstance( df.LONG, enus ).format( d );
-	} );
 	assertThrows( "unverified locale throws, not guessed", function(){
 		df.getDateInstance( df.SHORT, aLocale.init( "fr", "FR" ) ).format( d );
 	} );

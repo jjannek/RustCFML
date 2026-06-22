@@ -14,6 +14,7 @@ pub mod application_store;
 pub mod async_kernel;
 pub mod dump;
 mod java_shims;
+pub mod tz;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
 /// remains the default and fallback; see `jit/mod.rs` and `JIT_DESIGN.md`.
 #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
@@ -7674,6 +7675,9 @@ impl CfmlVirtualMachine {
                 | "getbasetemplatepath"
                 | "getfunctioncalledname"
                 | "gettimezone"
+                | "settimezone"
+                | "gettimezoneinfo"
+                | "dateconvert"
                 | "expandpath"
                 | "isdefined"
                 | "__cfparam"
@@ -9364,6 +9368,11 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Null);
                 }
                 "gettimezone" => {
+                    // A timezone set via setTimeZone() (or cfconfig
+                    // runtime.timezone) wins over the system zone.
+                    if !self.timezone.is_empty() {
+                        return Ok(CfmlValue::string(self.timezone.clone()));
+                    }
                     // Return the system timezone name
                     // Try to get IANA timezone from environment variable first
                     if let Ok(tz) = std::env::var("TZ") {
@@ -9385,6 +9394,90 @@ impl CfmlVirtualMachine {
                     }
                     // Fallback: return UTC
                     return Ok(CfmlValue::string("UTC".to_string()));
+                }
+                "settimezone" => {
+                    // Set the request/application timezone honored by
+                    // getTimeZone(), getTimeZoneInfo() and dateConvert().
+                    let id = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    match tz::resolve_tz(&id) {
+                        Some(t) => {
+                            self.timezone = tz::canonical_name(&t);
+                            return Ok(CfmlValue::Null);
+                        }
+                        None => {
+                            return Err(CfmlError::runtime(format!(
+                                "setTimeZone(): unknown timezone id [{}].",
+                                id
+                            )));
+                        }
+                    }
+                }
+                "gettimezoneinfo" => {
+                    // getTimeZoneInfo([timezone]) — info for the given zone, or
+                    // the current request zone when omitted.
+                    let id = match args.first() {
+                        Some(v) if !v.as_string().trim().is_empty() => v.as_string(),
+                        _ => self.current_timezone_id(),
+                    };
+                    let zone = tz::resolve_tz(&id).ok_or_else(|| {
+                        CfmlError::runtime(format!(
+                            "getTimeZoneInfo(): unknown timezone id [{}].",
+                            id
+                        ))
+                    })?;
+                    let canonical = tz::canonical_name(&zone);
+                    let names = tz::names_for(&zone).ok_or_else(|| {
+                        CfmlError::runtime(format!(
+                            "getTimeZoneInfo(): timezone [{}] is valid but its display \
+                             names are not in the verified table (only common zones are \
+                             tabulated). See docs/lucee-differences.md.",
+                            canonical
+                        ))
+                    })?;
+                    let (short_std, short_dst, long_std, long_dst) = names;
+                    let info = tz::offset_info_now(&zone);
+                    let total = info.total_secs; // signed, east-positive
+                    let utc_total = -total; // seconds to add to local to reach UTC
+                    let utc_hour = utc_total / 3600;
+                    let utc_min = (utc_total % 3600) / 60;
+                    let mut m = ValueMap::default();
+                    m.insert("id".to_string(), CfmlValue::string(canonical.clone()));
+                    m.insert("timezone".to_string(), CfmlValue::string(canonical));
+                    m.insert("shortName".to_string(), CfmlValue::string(short_std.to_string()));
+                    m.insert("shortNameDST".to_string(), CfmlValue::string(short_dst.to_string()));
+                    m.insert("name".to_string(), CfmlValue::string(long_std.to_string()));
+                    m.insert("nameDST".to_string(), CfmlValue::string(long_dst.to_string()));
+                    m.insert("offset".to_string(), CfmlValue::Int(total));
+                    m.insert("utcTotalOffset".to_string(), CfmlValue::Int(utc_total));
+                    m.insert("utcHourOffset".to_string(), CfmlValue::Int(utc_hour));
+                    m.insert("utcMinuteOffset".to_string(), CfmlValue::Int(utc_min));
+                    m.insert("DSTOffset".to_string(), CfmlValue::Int(info.dst_secs));
+                    m.insert("isDSTon".to_string(), CfmlValue::Bool(info.is_dst()));
+                    return Ok(CfmlValue::strukt(m));
+                }
+                "dateconvert" => {
+                    // dateConvert(type, date) — local<->utc using the current
+                    // request timezone (falls back to the system zone).
+                    let conv = args.first().map(|v| v.as_string().to_lowercase()).unwrap_or_default();
+                    let date_str = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+                    let dt = parse_cookie_expiry_date(&date_str).ok_or_else(|| {
+                        CfmlError::runtime(format!("dateConvert(): invalid date [{}]", date_str))
+                    })?;
+                    let zone = tz::resolve_tz(&self.current_timezone_id()).unwrap_or(chrono_tz::Tz::UTC);
+                    let out = match conv.as_str() {
+                        "local2utc" => tz::local_to_utc(&zone, dt).ok_or_else(|| {
+                            CfmlError::runtime("dateConvert(): ambiguous local time".to_string())
+                        })?,
+                        "utc2local" => tz::utc_to_local(&zone, dt),
+                        other => {
+                            return Err(CfmlError::runtime(format!(
+                                "dateConvert(): invalid conversion type [{}]. Use \
+                                 'local2utc' or 'utc2local'.",
+                                other
+                            )))
+                        }
+                    };
+                    return Ok(CfmlValue::string(out.format("%Y-%m-%d %H:%M:%S").to_string()));
                 }
                 "getapplicationmetadata" => {
                     // Build application metadata from the loaded Application.cfc
@@ -16602,6 +16695,16 @@ impl CfmlVirtualMachine {
     /// paths, Windows drive paths (`C:\`), and VFS schemes (`s3://`, …) are
     /// left untouched — the VFS/builtin resolves those exactly as before, so
     /// only a genuinely relative argument is rebased.
+    /// The effective timezone id for tz-aware BIFs: the request/application
+    /// zone set via setTimeZone() / cfconfig, else the host system zone, else
+    /// UTC. Mirrors the resolution `getTimeZone()` exposes.
+    fn current_timezone_id(&self) -> String {
+        if !self.timezone.is_empty() {
+            return self.timezone.clone();
+        }
+        tz::system_tz_id()
+    }
+
     fn resolve_template_relative(&self, raw: &str) -> String {
         if raw.is_empty() {
             return raw.to_string();
