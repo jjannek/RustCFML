@@ -215,6 +215,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_overflow_arg_no_leak.cfm">
 <cf_runtest file="oop/test_component_internals_serialize_leak.cfm">
 <cf_runtest file="oop/test_component_method_builtin_name.cfm">
+<cf_runtest file="oop/test_component_name_builtin_collision.cfm">
 <cf_runtest file="oop/test_component_return_type.cfm">
 <cf_runtest file="oop/test_inheritance.cfm">
 <cf_runtest file="oop/test_super_case_insensitive_this.cfm">

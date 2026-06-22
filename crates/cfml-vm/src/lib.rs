@@ -16184,16 +16184,30 @@ impl CfmlVirtualMachine {
             // are reference-typed, so a plain handle clone would alias mutable
             // state across instances; the deep copy restores the per-instance
             // independence the old value-type copy-on-write gave implicitly.
+            // Only accept Struct globals as the resolved component. A component is
+            // always a Struct; a same-named builtin/UDF Function (e.g. a component
+            // literally named `Mid`/`Left`/`Len`, colliding with the BIFs `mid`/
+            // `left`/`len`) must NOT shadow it. The case-insensitive scan in
+            // particular would otherwise return the builtin Function — registered
+            // earlier in `globals` than the just-built component — and short-circuit
+            // the `Anonymous` fallback that holds anonymous `component {}` instances.
+            let is_struct = |v: &CfmlValue| matches!(v, CfmlValue::Struct(_));
             let mut result = self
                 .globals
                 .get(class_name)
+                .filter(|v| is_struct(v))
                 .cloned()
-                .or_else(|| self.globals.get(short_name).cloned())
+                .or_else(|| {
+                    self.globals
+                        .get(short_name)
+                        .filter(|v| is_struct(v))
+                        .cloned()
+                })
                 .or_else(|| {
                     let lower = class_name.to_lowercase();
                     self.globals
                         .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
+                        .find(|(k, v)| k.eq_ignore_ascii_case(&lower) && is_struct(v))
                         .map(|(_, v)| v.clone())
                 })
                 .or_else(|| self.globals.get("Anonymous").cloned())
