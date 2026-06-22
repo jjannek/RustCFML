@@ -4718,6 +4718,38 @@ impl CfmlVirtualMachine {
                         // callee's `arguments` scope keeps their names.
                         let mut extras: Vec<(usize, String)> = Vec::new();
                         let args = if let CfmlValue::Function(ref f) = func_ref {
+                            let f_name_lc = f.name.to_lowercase();
+                            // Intercepted BIF with a known signature, called with
+                            // named args (zero-param stub → generic reorder can't
+                            // place them): map each name to its positional slot.
+                            if f.params.is_empty()
+                                && Self::builtin_has_named_sig(&f_name_lc)
+                                && expanded_names.iter().any(|n| !n.is_empty())
+                            {
+                                let mut positional: Vec<CfmlValue> = Vec::new();
+                                for (i, name) in expanded_names.iter().enumerate() {
+                                    let value = if i < expanded_values.len() {
+                                        std::mem::replace(&mut expanded_values[i], CfmlValue::Null)
+                                    } else {
+                                        CfmlValue::Null
+                                    };
+                                    let slot = if name.is_empty() {
+                                        Some(i)
+                                    } else {
+                                        Self::builtin_named_arg_index(&f_name_lc, &name.to_lowercase())
+                                    };
+                                    match slot {
+                                        Some(s) => {
+                                            if positional.len() <= s {
+                                                positional.resize(s + 1, CfmlValue::Null);
+                                            }
+                                            positional[s] = value;
+                                        }
+                                        None => positional.push(value),
+                                    }
+                                }
+                                positional
+                            } else {
                             // Size to the declared params only; positional overflow
                             // and unmatched named args are appended below. Padding to
                             // expanded_names.len() created spurious empty slots that
@@ -4755,6 +4787,7 @@ impl CfmlVirtualMachine {
                                 }
                             }
                             positional
+                            }
                         } else {
                             named_values
                         };
@@ -9353,6 +9386,14 @@ impl CfmlVirtualMachine {
                         meta.insert("name".to_string(), name_val.clone());
                         // fullname mirrors getMetadata(): the dotted component path.
                         meta.insert("fullname".to_string(), name_val);
+                        // `path` = the absolute filesystem path to the .cfc, which
+                        // Lucee/ACF include in component metadata. Preside's
+                        // PresideObjectReader reads `meta.path` to locate the source
+                        // file (re-parsing it for declared-property order); without
+                        // it the value was null and `.reReplace()` threw.
+                        if let Some(CfmlValue::String(src)) = s.get("__source_file") {
+                            meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
+                        }
                         if let Some(chain) = s.get("__extends_chain") {
                             if let CfmlValue::Array(arr) = chain {
                                 if let Some(first) = arr.first() {
@@ -12818,6 +12859,34 @@ impl CfmlVirtualMachine {
     /// args that overflow past those params. The VM stashes the extras in
     /// `pending_extra_named_args` so the callee's `arguments` scope keeps
     /// their original names — matching Lucee/ACF/BoxLang.
+    /// Positional slot for a NAMED argument to a VM-intercepted BIF. Intercepted
+    /// builtins are registered as zero-param `Function` stubs, so the generic
+    /// name→param reorder can't place named args — without this they land in
+    /// call-site order and the positional intercept misreads them. Preside/
+    /// ColdBox call `directoryList( path=, recurse=, filter= )`; that put
+    /// `filter` in the `listInfo` slot and left the real filter empty, so
+    /// subdirectories leaked into the result (the empty preside-object filename
+    /// boot error). Lucee accepts `path` as an alias for the `directory` param.
+    fn builtin_named_arg_index(builtin_lc: &str, arg_lc: &str) -> Option<usize> {
+        match builtin_lc {
+            "directorylist" => Some(match arg_lc {
+                "directory" | "path" => 0,
+                "recurse" => 1,
+                "listinfo" => 2,
+                "filter" => 3,
+                "sort" => 4,
+                "type" => 5,
+                _ => return None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `builtin_named_arg_index` knows a signature for this BIF.
+    fn builtin_has_named_sig(builtin_lc: &str) -> bool {
+        matches!(builtin_lc, "directorylist")
+    }
+
     fn reorder_named_args_with_extras(
         func_ref: &CfmlValue,
         arg_names: Option<&[String]>,
@@ -13497,6 +13566,15 @@ impl CfmlVirtualMachine {
                 "append" | "push" => Some("arrayAppend"),
                 "prepend" => Some("arrayPrepend"),
                 "deleteat" => Some("arrayDeleteAt"),
+                // `arr.delete(value)` deletes the element equal to `value`
+                // (Lucee member function). Missing here, it fell through to
+                // "get property and call" → returned Null; since `delete` is a
+                // mutating method, the member-call write-back then stored that
+                // Null back into the variable, nulling the array (Preside
+                // PresideObjectReader._deletePropertiesMarkedForDeletion does
+                // `meta.propertyNames.delete( name )` in a loop — the 2nd
+                // iteration then hit a null receiver).
+                "delete" => Some("arrayDelete"),
                 "insertat" => Some("arrayInsertAt"),
                 "contains" => Some("arrayContains"),
                 "containsnocase" => Some("arrayContainsNoCase"),

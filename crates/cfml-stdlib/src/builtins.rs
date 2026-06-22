@@ -4924,6 +4924,14 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                 // Type
                 meta.insert("type".to_string(), CfmlValue::string("component".to_string()));
 
+                // `path` = the absolute filesystem path to the .cfc. Lucee/ACF
+                // include it in component metadata; Preside's PresideObjectReader
+                // reads `meta.path` to re-parse the source for declared-property
+                // order (calling `.reReplace()` on it), so a missing key NPE'd.
+                if let Some(CfmlValue::String(src)) = s.get("__source_file") {
+                    meta.insert("path".to_string(), CfmlValue::string(src.to_string()));
+                }
+
                 // Extract __extends info
                 if let Some(CfmlValue::Array(chain)) = s.get("__extends_chain") {
                     if let Some(first) = chain.first() {

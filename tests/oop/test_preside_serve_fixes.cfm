@@ -151,7 +151,60 @@ assert("case-fork: lowercase-written subkey landed in same struct", forkS.assetM
 assert("case-fork: second lowercase branch landed too", forkS.assetManager.derivativeLimits.maxHeight, 99);
 assert("case-fork: queue.concurrency still reachable", forkS.assetManager.queue.concurrency, 1);
 
+// 17) getMetadata()/getComponentMetadata() expose `path` = the absolute .cfc
+//     file path (Lucee/ACF parity). Preside's PresideObjectReader reads
+//     `meta.path` to re-parse a CFC's source (calling `.reReplace()` on it);
+//     a missing key NPE'd ("cannot call method [reReplace] on a null value").
+pathMeta = getMetadata( new PresideFixChainService() );
+assert("getMetadata exposes path key", structKeyExists( pathMeta, "path" ), true);
+assert("getMetadata path ends with the .cfc filename", listLast( replace( pathMeta.path, "\", "/", "all" ), "/" ), "PresideFixChainService.cfc");
+
+// 18) directoryList( path=, recurse=, filter= ) — NAMED-argument form. Intercepted
+//     BIFs are zero-param stubs, so named args fell through in call-site order and
+//     `filter` landed in the `listInfo` slot → no filtering + subdirectories leaked
+//     (Preside _getAllObjectPaths built an empty object filename from a leaked dir).
+dlRoot = getTempDirectory() & "/rcfml_dl_" & createUUID();
+directoryCreate( dlRoot & "/sub", true );
+fileWrite( dlRoot & "/a.cfc", "" );
+fileWrite( dlRoot & "/b.txt", "" );
+fileWrite( dlRoot & "/sub/c.cfc", "" );
+dlNamed = directoryList( path=dlRoot, recurse=true, filter="*.cfc" );
+assert("directoryList named-arg filter+recurse returns only matching files", arrayLen( dlNamed ), 2);
+dlHasDir = false;
+for ( dlEntry in dlNamed ) { if ( !findNoCase( ".cfc", dlEntry ) ) { dlHasDir = true; } }
+assert("directoryList named-arg excludes subdirectories", dlHasDir, false);
+directoryDelete( dlRoot, true );
+
+// 19) A bare identifier used as a statement (`j;`) is dead code: Lucee/ACF do NOT
+//     throw even when the variable is undefined (Preside PresideObjectReader
+//     ._setUseDrafts ships a stray `{j` typo that boots fine on Lucee).
+bareIdentResult = _bareIdentStatement();
+assert("bare undefined-identifier statement is a no-op (no throw)", bareIdentResult, "reached");
+
+// 20) `array.delete( value )` member function deletes the element equal to `value`
+//     and returns the modified array (Lucee parity). It was unmapped → returned
+//     Null, and because `delete` is a mutating method the member-call write-back
+//     stored that Null back into the variable, nulling the array — so a delete
+//     loop (Preside _deletePropertiesMarkedForDeletion) hit a null receiver on
+//     its 2nd iteration.
+delArr = [ "x", "y", "z" ];
+delArr.delete( "y" );
+assert("array.delete(value) removes the element", arrayToList( delArr ), "x,z");
+assert("array.delete(value) leaves the array non-null/usable", isArray( delArr ), true);
+// Delete-in-loop must not null the array after the first removal.
+loopArr = [ "a", "b", "c", "d" ];
+toRemove = [ "b", "d" ];
+for ( rm in toRemove ) { loopArr.delete( rm ); }
+assert("array.delete in a loop survives (no null receiver)", arrayToList( loopArr ), "a,c");
+
 suiteEnd();
+
+private string function _bareIdentStatement() {
+	if ( true ) {j
+		return "reached";
+	}
+	return "no";
+}
 
 private string function _testIncludeAttrForm() {
 	var dir = "subinc";

@@ -1029,10 +1029,21 @@ impl CfmlCompiler {
 
         match stmt {
             Statement::Expression(expr_stmt) => {
+                // A bare identifier used as a statement (`j;`) is dead code:
+                // reading a variable has no side effects and the result is
+                // discarded, so emit nothing. Lucee/ACF evaluate such a
+                // statement leniently — notably they do NOT throw when the
+                // variable is undefined (Preside's PresideObjectReader
+                // ._setUseDrafts ships a stray `{j` typo that boots fine on
+                // Lucee). A bare word is never an implicit call in CFML — that
+                // needs `()` — so this can't drop a side-effecting call.
+                if matches!(&expr_stmt.expr, Expression::Identifier(_)) {
+                    // no-op
+                }
                 // Peephole: `i++;` / `i--;` / `++i;` / `--i;` as a bare statement.
                 // The normal 5-op expand (Load/Dup/Int1/Add/Store) plus a trailing
                 // Pop collapses to a single Increment/Decrement.
-                if self.try_emit_inc_dec_statement(&expr_stmt.expr, instructions) {
+                else if self.try_emit_inc_dec_statement(&expr_stmt.expr, instructions) {
                     // emitted; no Pop needed — the op has no stack effect
                 }
                 // Check for mutating function calls: structAppend(a, b), structInsert(a, k, v), etc.
