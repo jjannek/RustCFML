@@ -83,7 +83,11 @@ impl Lexer {
     fn advance(&mut self) -> char {
         let c = self.current();
         self.pos += 1;
-        if c == '\n' {
+        // Count a new line on LF, and on a *bare* CR (classic-Mac endings).
+        // In CRLF the CR is skipped here and the following LF does the count,
+        // so the pair increments the line exactly once and pos is never
+        // double-advanced.
+        if c == '\n' || (c == '\r' && self.current() != '\n') {
             self.line += 1;
             self.column = 1;
         } else {
@@ -590,7 +594,12 @@ impl Lexer {
     }
 
     fn single_line_comment(&mut self) {
-        while !self.is_at_end() && self.current() != '\n' {
+        // Stop at either LF or a bare CR. Classic-Mac (CR-only) line endings
+        // have no '\n', so a '\n'-only terminator would let a `// ...` comment
+        // run to EOF and swallow the rest of the file — including closing
+        // braces ("Expected RBrace, found Eof"). ColdBox EventHandler.cfc ships
+        // with CR-only endings and 18 line comments.
+        while !self.is_at_end() && self.current() != '\n' && self.current() != '\r' {
             self.advance();
         }
     }

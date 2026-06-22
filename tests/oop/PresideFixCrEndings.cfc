@@ -1,0 +1,1 @@
+﻿<cfscript>component {    // a leading line comment that would eat to EOF on CR-only files    public string function greet() {        // another comment        return "cr-ok"; // trailing comment    }}</cfscript>

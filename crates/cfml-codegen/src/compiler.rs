@@ -527,6 +527,16 @@ impl CfmlCompiler {
                         | "toarray" | "tojson" | "serializejson" | "merge"
                         | "splice" | "indexexists" | "keyarray" | "keylist"
                         | "valuearray" | "copy"
+                        // Element/key lookups return a looked-up value (struct
+                        // entry, array index), NOT the receiver — so the outer
+                        // call in `states.find( k ).process()` operates on that
+                        // element and must NOT inherit the receiver's write-back
+                        // path. Without this break, a chained non-mutating method
+                        // (e.g. `.process()`) propagates its `this` snapshot back
+                        // onto `states.find`'s receiver, clobbering it (ColdBox
+                        // InterceptorService.processState: `interceptionStates`
+                        // got replaced by an InterceptorState on the 2nd call).
+                        | "find" | "findnocase"
                     );
                     if is_transformative {
                         return false;

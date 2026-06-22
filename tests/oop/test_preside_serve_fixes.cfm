@@ -108,6 +108,28 @@ lhmForIn = [];
 for ( mk in lhm ) { arrayAppend( lhmForIn, mk ); }
 assert("java map for-in hides __ markers", arrayToList( lhmForIn.sort( "textnocase" ) ), "alpha,beta");
 
+// 13) Chained member call on a `variables.X` struct receiver, where the inner
+//     method looks up an element (`.find( key )`) and the outer method runs on
+//     that element. The outer (non-mutating) call must NOT write its `this`
+//     snapshot back onto the inner receiver's path — doing so replaced
+//     `variables.interceptionStates` with the looked-up InterceptorState on the
+//     2nd call (ColdBox InterceptorService.processState: state has no `find`).
+chainSvc = new PresideFixChainService();
+assert("chained .find().process() — 1st call", chainSvc.processState( "s1" ), "processed:EVT");
+assert("chained .find().process() — 2nd call (receiver not clobbered)", chainSvc.processState( "s2" ), "processed:EVT");
+assert("chained .find().process() — receiver still a struct", chainSvc.statesIsStruct(), true);
+
+// 14) A component source file with classic-Mac (CR-only) line endings parses:
+//     `//` line comments must terminate at a bare CR, not run to EOF and
+//     swallow the closing braces (ColdBox EventHandler.cfc ships CR-only).
+crComp = new PresideFixCrEndings();
+assert("CR-only line endings parse + // comments terminate at CR", crComp.greet(), "cr-ok");
+
+// 15) A leading UTF-8 BOM is stripped, not emitted as literal page output
+//     (Preside/ColdBox files ship with a BOM).
+savecontent variable="bomOut" { include "preside_fix_bom_include.cfm"; }
+assert("leading UTF-8 BOM is stripped from page output", bomOut, "BODY");
+
 suiteEnd();
 
 private string function _testIncludeAttrForm() {

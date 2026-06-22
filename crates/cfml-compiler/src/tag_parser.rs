@@ -188,6 +188,11 @@ fn record_preprocess_error(msg: impl Into<String>) {
 /// than fail. Prefer [`tags_to_script_checked`] on compile paths so those
 /// errors surface the way Lucee/ACF report them.
 pub fn tags_to_script(source: &str) -> String {
+    // Strip a leading UTF-8 BOM. Without this it is treated as literal text
+    // before the first tag and emitted into page output (Lucee/ACF strip it).
+    // Preside/ColdBox .cfc files ship with a BOM, so the marker would otherwise
+    // surface in every rendered response.
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut imports = std::collections::HashMap::<String, String>::new();
     PREPROCESS_ERROR.with(|e| *e.borrow_mut() = None);
     tags_to_script_impl(source, &mut imports)
