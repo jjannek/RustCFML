@@ -69,8 +69,11 @@ fn capitalize_first(s: &str) -> String {
 
 pub struct CfmlCompiler {
     pub program: BytecodeProgram,
-    /// Stack of (break_placeholder_indices, continue_placeholder_indices) for loops
-    loop_stack: Vec<(Vec<usize>, Vec<usize>)>,
+    /// Stack of (break_placeholder_indices, continue_placeholder_indices, is_loop)
+    /// for loops and `switch` blocks. `is_loop` is true for real loops and false
+    /// for `switch`: `break` targets the nearest frame (loop OR switch, C-style),
+    /// but `continue` must skip `switch` frames and target the enclosing loop.
+    loop_stack: Vec<(Vec<usize>, Vec<usize>, bool)>,
     /// Stack of enclosing `finally` bodies (one entry per enclosing
     /// try-with-finally / `lock {}`, innermost last). A `return` must run ALL of
     /// them (innermost first) before the Return op exits the function, since the
@@ -1348,7 +1351,9 @@ impl CfmlCompiler {
             Statement::Continue(_) => {
                 let idx = instructions.len();
                 instructions.push(BytecodeOp::Jump(0)); // placeholder
-                if let Some(loop_ctx) = self.loop_stack.last_mut() {
+                // `continue` targets the enclosing LOOP, not a `switch` it sits
+                // inside (a switch has no loop semantics). Skip switch frames.
+                if let Some(loop_ctx) = self.loop_stack.iter_mut().rev().find(|c| c.2) {
                     loop_ctx.1.push(idx); // continue indices
                 }
             }
@@ -1919,7 +1924,7 @@ impl CfmlCompiler {
                 idx
             };
 
-            self.loop_stack.push((Vec::new(), Vec::new()));
+            self.loop_stack.push((Vec::new(), Vec::new(), true));
 
             for s in &for_stmt.body {
                 self.compile_statement(s, instructions);
@@ -1943,7 +1948,7 @@ impl CfmlCompiler {
                 _ => unreachable!("compile_for exit jump slot has unexpected op"),
             }
 
-            let (break_indices, continue_indices) = self.loop_stack.pop().unwrap();
+            let (break_indices, continue_indices, _) = self.loop_stack.pop().unwrap();
             for idx in break_indices {
                 instructions[idx] = BytecodeOp::Jump(loop_end);
             }
@@ -1973,7 +1978,7 @@ impl CfmlCompiler {
 
         let body_start = instructions.len();
 
-        self.loop_stack.push((Vec::new(), Vec::new()));
+        self.loop_stack.push((Vec::new(), Vec::new(), true));
 
         for s in body {
             self.compile_statement(s, instructions);
@@ -1994,7 +1999,7 @@ impl CfmlCompiler {
             *off = loop_end;
         }
 
-        let (break_indices, continue_indices) = self.loop_stack.pop().unwrap();
+        let (break_indices, continue_indices, _) = self.loop_stack.pop().unwrap();
         for idx in break_indices {
             instructions[idx] = BytecodeOp::Jump(loop_end);
         }
@@ -2112,7 +2117,7 @@ impl CfmlCompiler {
             instructions.push(BytecodeOp::StoreLocal(loop_var_name));
         }
 
-        self.loop_stack.push((Vec::new(), Vec::new()));
+        self.loop_stack.push((Vec::new(), Vec::new(), true));
 
         for s in &for_in.body {
             self.compile_statement(s, instructions);
@@ -2128,7 +2133,7 @@ impl CfmlCompiler {
         let loop_end = instructions.len();
         instructions[jump_false_idx] = BytecodeOp::JumpIfFalse(loop_end);
 
-        let (break_indices, continue_indices) = self.loop_stack.pop().unwrap();
+        let (break_indices, continue_indices, _) = self.loop_stack.pop().unwrap();
         for idx in break_indices {
             instructions[idx] = BytecodeOp::Jump(loop_end);
         }
@@ -2165,7 +2170,7 @@ impl CfmlCompiler {
 
         let jump_false_idx = self.emit_cond_jump_false(&while_stmt.condition, instructions);
 
-        self.loop_stack.push((Vec::new(), Vec::new()));
+        self.loop_stack.push((Vec::new(), Vec::new(), true));
 
         for s in &while_stmt.body {
             self.compile_statement(s, instructions);
@@ -2176,7 +2181,7 @@ impl CfmlCompiler {
         let loop_end = instructions.len();
         Self::patch_cond_jump_target(instructions, jump_false_idx, loop_end);
 
-        let (break_indices, continue_indices) = self.loop_stack.pop().unwrap();
+        let (break_indices, continue_indices, _) = self.loop_stack.pop().unwrap();
         for idx in break_indices {
             instructions[idx] = BytecodeOp::Jump(loop_end);
         }
@@ -2206,7 +2211,7 @@ impl CfmlCompiler {
 
         let loop_start = instructions.len();
 
-        self.loop_stack.push((Vec::new(), Vec::new()));
+        self.loop_stack.push((Vec::new(), Vec::new(), true));
 
         for s in &do_stmt.body {
             self.compile_statement(s, instructions);
@@ -2219,7 +2224,7 @@ impl CfmlCompiler {
 
         let loop_end = instructions.len();
 
-        let (break_indices, continue_indices) = self.loop_stack.pop().unwrap();
+        let (break_indices, continue_indices, _) = self.loop_stack.pop().unwrap();
         for idx in break_indices {
             instructions[idx] = BytecodeOp::Jump(loop_end);
         }
@@ -2241,7 +2246,7 @@ impl CfmlCompiler {
     ) {
         let body_start = instructions.len();
 
-        self.loop_stack.push((Vec::new(), Vec::new()));
+        self.loop_stack.push((Vec::new(), Vec::new(), true));
 
         for s in body {
             self.compile_statement(s, instructions);
@@ -2254,7 +2259,7 @@ impl CfmlCompiler {
 
         let loop_end = instructions.len();
 
-        let (break_indices, continue_indices) = self.loop_stack.pop().unwrap();
+        let (break_indices, continue_indices, _) = self.loop_stack.pop().unwrap();
         for idx in break_indices {
             instructions[idx] = BytecodeOp::Jump(loop_end);
         }
@@ -2269,7 +2274,7 @@ impl CfmlCompiler {
         let switch_var = format!("__switch_{}", instructions.len());
         instructions.push(BytecodeOp::StoreLocal(switch_var.clone()));
 
-        self.loop_stack.push((Vec::new(), Vec::new())); // break support
+        self.loop_stack.push((Vec::new(), Vec::new(), false)); // break support (not a loop)
 
         // CFML/Lucee `switch` is C-style: matching a case transfers control to
         // its body, and execution then FALLS THROUGH into subsequent case bodies
@@ -2329,7 +2334,7 @@ impl CfmlCompiler {
         let end_pos = instructions.len();
 
         // Patch break statements
-        let (break_indices, _) = self.loop_stack.pop().unwrap();
+        let (break_indices, _, _) = self.loop_stack.pop().unwrap();
         for idx in break_indices {
             instructions[idx] = BytecodeOp::Jump(end_pos);
         }
