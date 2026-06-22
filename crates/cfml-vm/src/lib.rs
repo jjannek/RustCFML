@@ -14497,6 +14497,21 @@ impl CfmlVirtualMachine {
                     .and_then(|vars| vars.get_ci(method))
                     .filter(|v| matches!(v, CfmlValue::Function(_)))
                     .unwrap_or(prop),
+                // A function injected into the component's PRIVATE `variables`
+                // scope (`__variables`) — not the public scope — is still
+                // callable as a method. Wheels' plugin loader mixes plugin
+                // methods in via `StructAppend(variables, mixins, true)`
+                // (Plugins.cfc $initializeMixins), which lands them in
+                // __variables; the public scope never gets them (Lucee exposes
+                // the live `variables.this` alias, which RustCFML doesn't), so
+                // `controller.$helper01()` would otherwise miss. RustCFML does
+                // not enforce method access control (private methods are
+                // externally callable too), so this introduces no new exposure.
+                CfmlValue::Struct(ref s) => s
+                    .get("__variables")
+                    .and_then(|v| v.as_cfml_struct().and_then(|vars| vars.get_ci(method)))
+                    .filter(|v| matches!(v, CfmlValue::Function(_)))
+                    .unwrap_or(prop),
                 _ => prop,
             },
         };
