@@ -3610,7 +3610,10 @@ fn fn_create_date(args: Vec<CfmlValue>) -> CfmlResult {
     let year = short_year(get_int(&args, 0));
     let month = get_int(&args, 1);
     let day = get_int(&args, 2);
-    Ok(CfmlValue::string(format!("{:04}-{:02}-{:02}", year, month, day)))
+    // Lucee/ACF treat createDate() as a midnight timestamp, not a date-only
+    // value, so it compares equal to createDateTime(y,m,d,0,0,0) and to
+    // DateAdd("d",1,...). Emit the full datetime representation to match.
+    Ok(CfmlValue::string(format!("{:04}-{:02}-{:02} 00:00:00", year, month, day)))
 }
 
 fn fn_create_date_time(args: Vec<CfmlValue>) -> CfmlResult {
