@@ -197,6 +197,23 @@ toRemove = [ "b", "d" ];
 for ( rm in toRemove ) { loopArr.delete( rm ); }
 assert("array.delete in a loop survives (no null receiver)", arrayToList( loopArr ), "a,c");
 
+// 21) UNQUOTED property attribute values (`required=false`, `ondelete=cascade`,
+//     `maxlength=100`) must not terminate attribute parsing — every later
+//     attribute (esp. a trailing `feature="…"`) must survive. This was the
+//     Preside serve-mode boot blocker: `website_applied_permission.benefit`
+//     declares `… required=false … feature="websiteBenefits"`, the unquoted
+//     `required=false` dropped the trailing `feature`, so the feature-disabled
+//     relationship was never removed → RelationshipGuidance threw "Object,
+//     [website_benefit], could not be found" (Lucee reads `feature` and boots).
+uqMeta = getComponentMetadata("oop.PresideFixUnquotedAttrs");
+uqProps = {};
+for ( p in uqMeta.properties ) { uqProps[ p.name ] = p; }
+assert("unquoted attr does not drop trailing feature (benefit)", uqProps.benefit.feature ?: "MISSING", "websiteBenefits");
+assert("unquoted attr preserves ondelete after required=false", uqProps.benefit.ondelete ?: "MISSING", "cascade");
+assert("unquoted attr preserves uniqueindexes", uqProps.benefit.uniqueindexes ?: "MISSING", "context_permission|4");
+assert("unquoted numeric attr does not drop trailing feature (qty)", uqProps.qty.feature ?: "MISSING", "someFeature");
+assert("unquoted numeric attr value captured (maxlength)", uqProps.qty.maxlength ?: "MISSING", "100");
+
 suiteEnd();
 
 private string function _bareIdentStatement() {

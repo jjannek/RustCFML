@@ -4167,12 +4167,37 @@ impl Parser {
                     let expr = self.parse_expression()?;
                     default = Some(expr);
                 } else {
-                    // name, type, inject="X", delegateSuffix="disk", … — string value
-                    let val = if let Token::String(v) = self.peek(0).clone() {
-                        self.advance();
-                        v
-                    } else {
-                        break;
+                    // name, type, inject="X", delegateSuffix="disk", … — string value.
+                    // Lucee also accepts UNQUOTED scalar values on property attributes
+                    // (e.g. `required=false`, `maxlength=100`, `ondelete=cascade`); these
+                    // must NOT terminate the attribute list, or every later attribute
+                    // (e.g. a trailing `feature="…"`) is silently dropped.
+                    let val = match self.peek(0).clone() {
+                        Token::String(v) => {
+                            self.advance();
+                            v
+                        }
+                        Token::Integer(i) => {
+                            self.advance();
+                            i.to_string()
+                        }
+                        Token::Double(d) => {
+                            self.advance();
+                            d.to_string()
+                        }
+                        Token::True => {
+                            self.advance();
+                            "true".to_string()
+                        }
+                        Token::False => {
+                            self.advance();
+                            "false".to_string()
+                        }
+                        Token::Identifier(s) => {
+                            self.advance();
+                            s
+                        }
+                        _ => break,
                     };
 
                     match key.to_lowercase().as_str() {
