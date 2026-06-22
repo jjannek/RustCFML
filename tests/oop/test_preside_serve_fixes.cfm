@@ -130,6 +130,27 @@ assert("CR-only line endings parse + // comments terminate at CR", crComp.greet(
 savecontent variable="bomOut" { include "preside_fix_bom_include.cfm"; }
 assert("leading UTF-8 BOM is stripped from page output", bomOut, "BODY");
 
+// 16) A nested dotted assignment must navigate an existing intermediate key
+//     case-INSENSITIVELY, not fork a second physical key under a different
+//     casing. Preside's system Config built `settings.assetManager = {…}`
+//     (capital M, many keys); the site Config then wrote
+//     `settings.assetmanager.storage.x = v` (lowercase). RustCFML forked a
+//     separate `assetmanager` key holding only the lowercase-written subkeys,
+//     and ColdBox's `structAppend(configStruct, settings, true)` later merged
+//     both — last-writer (the 3-key fork) won, dropping `queue` etc. so
+//     `getSetting("assetManager.queue.concurrency")` threw "does not exist".
+forkS = {};
+forkS.assetManager = { maxFileSize = "5", queue = { concurrency = 1 } };
+forkS.assetmanager.storage.public = "/x";          // lowercase, 3-level deep write
+forkS.assetmanager.derivativeLimits.maxHeight = 99; // lowercase, another branch
+forkKeys = "";
+for ( fk in forkS ) { forkKeys &= "[" & fk & "]"; }
+assert("nested dotted write navigates case-insensitively — no key fork", forkKeys, "[assetManager]");
+assert("case-fork: original keys preserved", structKeyExists( forkS.assetManager, "queue" ), true);
+assert("case-fork: lowercase-written subkey landed in same struct", forkS.assetManager.storage.public, "/x");
+assert("case-fork: second lowercase branch landed too", forkS.assetManager.derivativeLimits.maxHeight, 99);
+assert("case-fork: queue.concurrency still reachable", forkS.assetManager.queue.concurrency, 1);
+
 suiteEnd();
 
 private string function _testIncludeAttrForm() {

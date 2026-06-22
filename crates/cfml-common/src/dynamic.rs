@@ -467,25 +467,35 @@ impl CfmlStruct {
     /// (in either case the entry is overwritten / created).
     pub fn get_or_insert_struct(&self, key: &str) -> CfmlStruct {
         let mut g = self.0.write();
-        let pre_existing = g.map.get(key).map(|v| matches!(v, CfmlValue::Struct(_)));
-        let entry = g
-            .map
-            .entry(key.to_string())
-            .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
-        let result = if let CfmlValue::Struct(s) = entry {
-            s.clone()
+        // Case-insensitive locate, matching `insert`'s write semantics: an
+        // existing key under a different casing (`assetManager` vs
+        // `assetmanager`) must be navigated into, NOT forked into a second
+        // physical entry. Forking here was the root of the Preside boot bug —
+        // a nested dotted assignment `settings.assetmanager.x = v` created a
+        // parallel lowercase key, and a later `structAppend` then merged both
+        // (the partial fork last-writer-wins), dropping most keys.
+        let existing_idx = if g.map.contains_key(key) {
+            g.map.get_index_of(key)
         } else {
+            g.map.iter().position(|(k, _)| k.eq_ignore_ascii_case(key))
+        };
+        if let Some(idx) = existing_idx {
+            let (_, entry) = g.map.get_index_mut(idx).expect("existing_idx in range");
+            if let CfmlValue::Struct(s) = entry {
+                return s.clone();
+            }
+            // Present but not a struct — overwrite in place (preserves the
+            // original key casing/order), bumping the shape.
             let s = CfmlStruct::empty();
             *entry = CfmlValue::Struct(s.clone());
-            s
-        };
-        // pre_existing = Some(true) means key was already a struct → no
-        // structural change; Some(false) = overwrote non-struct; None =
-        // brand-new key. Both of the latter mutate the shape.
-        if pre_existing != Some(true) {
             g.shape_id = next_shape_id();
+            return s;
         }
-        result
+        // Brand-new key.
+        let s = CfmlStruct::empty();
+        g.map.insert(key.to_string(), CfmlValue::Struct(s.clone()));
+        g.shape_id = next_shape_id();
+        s
     }
 }
 
