@@ -675,6 +675,7 @@ include "harness.cfm";
 <!--- getMetadata()/getComponentMetadata() — the surface WireBox DI reads for --->
 <!--- constructor-argument injection (Preside FeatureService boot). --->
 <cf_runtest file="oop/test_javadoc_param_annotations.cfm">
+<cf_runtest file="oop/test_cfinvoke_sibling_scope.cfm">
 
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
 <cf_runtest file="comments/test_cfset_expression_comments.cfm">

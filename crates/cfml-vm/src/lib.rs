@@ -4502,27 +4502,23 @@ impl CfmlVirtualMachine {
                             // Resolve the component. No component (or an empty one)
                             // inside a CFC method means a SIBLING call — dispatch
                             // the method on the current component (this + its
-                            // private functions), NOT as a component path.
+                            // private functions), NOT as a component path. Pass an
+                            // empty component through so the positional __cfinvoke
+                            // intercept takes its in-scope branch, which runs the
+                            // method against the LIVE `this`/`__variables` of this
+                            // frame (Arc-backed, shared) — so a callback's
+                            // `this.X = v` / `variables.X = v` mutation propagates
+                            // back to the caller's object. Snapshotting `this` here
+                            // instead would silently discard those writes (Wheels
+                            // model callbacks set `this.setByCallback` etc. via
+                            // `$invoke(method=...)` with no component).
                             let have_component = matches!(&comp_val, Some(v)
                                 if !matches!(v, CfmlValue::Null)
                                     && !matches!(v, CfmlValue::String(s) if s.is_empty()));
                             let component = if have_component {
                                 comp_val.unwrap()
-                            } else if let Some(CfmlValue::Struct(this_s)) = locals.get("this") {
-                                let mut merged = this_s.snapshot();
-                                if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
-                                    for (k, v) in vars.snapshot() {
-                                        if matches!(v, CfmlValue::Function(_))
-                                            && !merged.keys()
-                                                .any(|mk| mk.eq_ignore_ascii_case(&k))
-                                        {
-                                            merged.insert(k, v);
-                                        }
-                                    }
-                                }
-                                CfmlValue::strukt(merged)
                             } else {
-                                comp_val.unwrap_or(CfmlValue::Null)
+                                CfmlValue::Null
                             };
 
                             let saved_try_stack = if self.try_stack.is_empty() {
@@ -10042,11 +10038,22 @@ impl CfmlVirtualMachine {
                         _ => false,
                     };
                     if comp_is_empty && !method_name.is_empty() {
+                        // Look up the sibling method in the component (private)
+                        // scope first; fall back to the public `this` scope for a
+                        // method declared `access="public"` only (it may not be
+                        // mirrored into `__variables`).
                         let in_scope = parent_locals
                             .get("__variables")
                             .and_then(|v| v.as_cfml_struct())
                             .and_then(|vars| vars.get_ci(&method_name))
-                            .filter(|v| matches!(v, CfmlValue::Function(_)));
+                            .filter(|v| matches!(v, CfmlValue::Function(_)))
+                            .or_else(|| {
+                                parent_locals
+                                    .get("this")
+                                    .and_then(|v| v.as_cfml_struct())
+                                    .and_then(|t| t.get_ci(&method_name))
+                                    .filter(|v| matches!(v, CfmlValue::Function(_)))
+                            });
                         if let Some(func) = in_scope {
                             let call_args = self.build_invoke_call_args(&func, invoke_args);
                             let mut method_locals = ValueMap::default();
@@ -10058,6 +10065,41 @@ impl CfmlVirtualMachine {
                                     .insert("__variables".to_string(), vars.clone());
                             }
                             return self.call_function(&func, call_args, &method_locals);
+                        }
+                        // No such sibling method: route to the component's
+                        // onMissingMethod against the LIVE `this`/`__variables`,
+                        // mirroring the struct-component branch below. Wheels
+                        // dispatches dynamic association methods this way.
+                        let omm = parent_locals
+                            .get("__variables")
+                            .and_then(|v| v.as_cfml_struct())
+                            .and_then(|vars| vars.get_ci("onmissingmethod"))
+                            .filter(|v| matches!(v, CfmlValue::Function(_)))
+                            .or_else(|| {
+                                parent_locals
+                                    .get("this")
+                                    .and_then(|v| v.as_cfml_struct())
+                                    .and_then(|t| t.get_ci("onmissingmethod"))
+                                    .filter(|v| matches!(v, CfmlValue::Function(_)))
+                            });
+                        if let Some(handler) = omm {
+                            let missing_args = match invoke_args {
+                                s @ CfmlValue::Struct(_) => s,
+                                _ => CfmlValue::strukt(ValueMap::default()),
+                            };
+                            let mut method_locals = ValueMap::default();
+                            if let Some(this_v) = parent_locals.get("this") {
+                                method_locals.insert("this".to_string(), this_v.clone());
+                            }
+                            if let Some(vars) = parent_locals.get("__variables") {
+                                method_locals
+                                    .insert("__variables".to_string(), vars.clone());
+                            }
+                            return self.call_function(
+                                &handler,
+                                vec![CfmlValue::string(method_name.clone()), missing_args],
+                                &method_locals,
+                            );
                         }
                     }
 
