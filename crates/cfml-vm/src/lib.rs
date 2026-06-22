@@ -896,6 +896,16 @@ pub struct CfmlVirtualMachine {
     /// Captured locals from most recent execute_function_with_args call
     /// Used to capture component body variables (variables scope) after component loading
     captured_locals: Option<ValueMap>,
+    /// The calling frame's `__variables` scope, captured at each `CallMethod`
+    /// dispatch. Used as a FALLBACK when a `this.method()` receiver carries no
+    /// `__variables` of its own — which happens while a component is still
+    /// being constructed: the in-construction `this` has its methods as members
+    /// but not yet a `__variables` scope, so a method dispatched on it during
+    /// the pseudo-constructor would otherwise run against an empty scope and
+    /// fail to see sibling methods (the "X is not an object" construction-order
+    /// bug). Composes through nested calls because each frame inherits the
+    /// caller's `__variables` (the hoisted method table).
+    dispatch_caller_variables: Option<CfmlValue>,
     /// Active transaction connection (held during cftransaction block, type-erased)
     pub transaction_conn: Option<Box<dyn std::any::Any>>,
     /// Datasource URL of the active transaction
@@ -1343,6 +1353,7 @@ impl CfmlVirtualMachine {
             base_template_path: None,
             mappings: Vec::new(),
             captured_locals: None,
+            dispatch_caller_variables: None,
             transaction_conn: None,
             transaction_datasource: None,
             transaction_pending: false,
@@ -6204,6 +6215,11 @@ impl CfmlVirtualMachine {
                     // Pop the object (receiver)
                     let object = stack.pop().unwrap_or(CfmlValue::Null);
 
+                    // Record this frame's `__variables` so a method dispatched on
+                    // a still-being-constructed receiver (no `__variables` of its
+                    // own yet) can fall back to the caller's hoisted method table.
+                    self.dispatch_caller_variables = locals.get("__variables").cloned();
+
                     // Does this receiver have `this`/variables write-back semantics?
                     // Only CFCs (carry __variables/__name) and Java shims (e.g.
                     // Queue.poll / Map.remove mutate-in-place) do. A plain struct or
@@ -10007,6 +10023,44 @@ impl CfmlVirtualMachine {
                     let method_name = args.get(1).map(|v| v.as_string()).unwrap_or_default();
                     let invoke_args = args.get(2).cloned().unwrap_or(CfmlValue::Null);
 
+                    // A `cfinvoke` with NO `component` (Lucee: `cfinvoke
+                    // method="x"`) invokes the method in the CURRENT component
+                    // scope. This commonly arrives via `cfinvoke
+                    // attributeCollection="#args#"` whose struct carries no
+                    // `component` key — e.g. Wheels' `$invoke()`, which omits
+                    // `component` precisely WHEN the method exists in
+                    // `variables`. Resolve the method from the caller's
+                    // component scope (`__variables`, which during a
+                    // pseudo-constructor holds the hoisted method table) and run
+                    // it with the caller's `this`/`variables`. Without this the
+                    // empty name fell through to resolve_component_template("")
+                    // and threw "Component '' not found" — breaking `model()`
+                    // called from a controller's pseudo-constructor.
+                    let comp_is_empty = match &comp_val {
+                        CfmlValue::Null => true,
+                        CfmlValue::String(s) => s.trim().is_empty(),
+                        _ => false,
+                    };
+                    if comp_is_empty && !method_name.is_empty() {
+                        let in_scope = parent_locals
+                            .get("__variables")
+                            .and_then(|v| v.as_cfml_struct())
+                            .and_then(|vars| vars.get_ci(&method_name))
+                            .filter(|v| matches!(v, CfmlValue::Function(_)));
+                        if let Some(func) = in_scope {
+                            let call_args = self.build_invoke_call_args(&func, invoke_args);
+                            let mut method_locals = ValueMap::default();
+                            if let Some(this_v) = parent_locals.get("this") {
+                                method_locals.insert("this".to_string(), this_v.clone());
+                            }
+                            if let Some(vars) = parent_locals.get("__variables") {
+                                method_locals
+                                    .insert("__variables".to_string(), vars.clone());
+                            }
+                            return self.call_function(&func, call_args, &method_locals);
+                        }
+                    }
+
                     let component = match &comp_val {
                         CfmlValue::Struct(_) => comp_val.clone(),
                         CfmlValue::String(name) => {
@@ -13486,6 +13540,11 @@ impl CfmlVirtualMachine {
         arg_names: Option<&[String]>,
     ) -> CfmlResult {
         let method_lower = method.to_lowercase();
+        // Caller's `__variables` (set by the CallMethod op). Used as a fallback
+        // for a receiver that has no `__variables` of its own yet — the
+        // in-construction `this` during a pseudo-constructor. Taken up-front so
+        // nested dispatches inside this call can't clobber it.
+        let caller_variables = self.dispatch_caller_variables.take();
 
         // A method call on a null receiver is an error in CFML (Lucee throws);
         // silently returning Null lets `<null>.save(...)` no-op and report fake
@@ -14365,6 +14424,24 @@ impl CfmlVirtualMachine {
         } else {
             object.get(method).unwrap_or(CfmlValue::Null)
         };
+        // In-construction `this` (a CFC with no `__variables` scope assembled
+        // yet) does not carry INHERITED methods as members — inheritance is
+        // merged after the pseudo-constructor. So `this.inheritedMethod()`
+        // mid-construction misses here. Resolve it from the caller's hoisted
+        // method table (which already holds inherited methods) so the call
+        // dispatches instead of falling through to onMissingMethod/null.
+        let prop = match prop {
+            CfmlValue::Function(_) => prop,
+            _ => match object {
+                CfmlValue::Struct(ref s) if !s.contains_key("__variables") => caller_variables
+                    .as_ref()
+                    .and_then(|v| v.as_cfml_struct())
+                    .and_then(|vars| vars.get_ci(method))
+                    .filter(|v| matches!(v, CfmlValue::Function(_)))
+                    .unwrap_or(prop),
+                _ => prop,
+            },
+        };
         if let CfmlValue::Function(ref _fdata) = &prop {
             let mut func_ref = prop.clone();
             let raw_args: Vec<CfmlValue> = extra_args.drain(..).collect();
@@ -14471,6 +14548,11 @@ impl CfmlVirtualMachine {
                 if let CfmlValue::Struct(ref s) = object {
                     if let Some(vars) = s.get("__variables") {
                         method_locals.insert("__variables".to_string(), vars.clone());
+                    } else if let Some(ref cv) = caller_variables {
+                        // In-construction `this`: no own `__variables` yet — use
+                        // the caller's hoisted method table so this method sees
+                        // its siblings (construction-order fix).
+                        method_locals.insert("__variables".to_string(), cv.clone());
                     }
                 }
                 method_locals.insert("this".to_string(), object.clone());
@@ -14604,6 +14686,8 @@ impl CfmlVirtualMachine {
                 if let CfmlValue::Struct(ref s2) = object {
                     if let Some(vars) = s2.get("__variables") {
                         method_locals.insert("__variables".to_string(), vars.clone());
+                    } else if let Some(ref cv) = caller_variables {
+                        method_locals.insert("__variables".to_string(), cv.clone());
                     }
                 }
                 method_locals.insert("this".to_string(), object.clone());
@@ -15915,6 +15999,87 @@ impl CfmlVirtualMachine {
                 injected_scope.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
             }
 
+            // Construction-ordering fix: hoist the full method table into a
+            // SHARED `__variables` handle BEFORE running the pseudo-constructor.
+            //
+            // CFML (Lucee/ACF/BoxLang) assembles a component's `variables` scope
+            // — all own + inherited methods — FIRST, then runs the body. So a
+            // method called DURING construction (e.g. Wheels `model("user")`
+            // dispatching through inherited helpers, or any body statement
+            // calling a sibling) sees a fully-populated `variables`. Previously
+            // we ran the body against a scope that lacked the method table, so a
+            // mid-construction `StructKeyExists(variables, "someMethod")` was
+            // false, inherited dispatch threw, the body error was swallowed, and
+            // the instance came back half-built ("X is not an object").
+            //
+            // The handle is `Arc`-shared, so the body's unscoped and
+            // `variables.x` writes accumulate INTO it in place (classic
+            // localmode routes them there — see StoreLocal), and bare sub-calls
+            // inherit it via parent-scope propagation (Function values are
+            // stripped on inherit, so the method table can ONLY reach sub-calls
+            // through this struct). It becomes the instance's `variables` scope.
+            let body_vars = {
+                // Seed with the parent's resolved variables (inherited methods +
+                // inherited property defaults) — `injected_scope` currently holds
+                // exactly that snapshot — minus per-instance/internal keys.
+                let mut method_table: ValueMap = injected_scope.clone();
+                method_table.shift_remove("this");
+                method_table.shift_remove("super");
+                method_table.shift_remove(ARGUMENTS_SCOPE_KEY);
+                // Own methods from the swapped-in CFC sub-program. Full hoist: a
+                // method defined anywhere in the body is visible from the first
+                // statement (Lucee parity). Built with no captured_scope — CFC
+                // methods resolve via __variables injected at call time.
+                for bf in self.program.functions.iter() {
+                    if !bf.is_component_method || bf.name.starts_with("__") {
+                        continue;
+                    }
+                    let cf = CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
+                        name: bf.name.clone(),
+                        params: bf
+                            .params
+                            .iter()
+                            .enumerate()
+                            .map(|(i, name)| cfml_common::dynamic::CfmlParam {
+                                name: name.clone(),
+                                param_type: bf.param_types.get(i).cloned().flatten(),
+                                default: None,
+                                required: bf.required_params.get(i).copied().unwrap_or(false),
+                                annotations: bf
+                                    .param_annotations
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            })
+                            .collect(),
+                        body: cfml_common::dynamic::CfmlClosureBody::Expression(Box::new(
+                            CfmlValue::Int(bf.global_id as i64),
+                        )),
+                        return_type: None,
+                        access: bf.access.clone(),
+                        captured_scope: None,
+                    }));
+                    method_table.insert(bf.name.clone(), cf);
+                }
+                CfmlStruct::new(method_table)
+            };
+            // Reachable via __variables (LoadLocal / lookup_name_in_scopes fall
+            // through to it) and via the dedicated `static` handle. Inherited
+            // vars are NOT kept as flat locals too — that would split writes
+            // (an inherited-name write lands in flat locals, not the handle, and
+            // would be lost from the captured component scope).
+            let injected_scope = {
+                let mut s = ValueMap::default();
+                s.insert(
+                    "__variables".to_string(),
+                    CfmlValue::Struct(body_vars.clone()),
+                );
+                if let Some(ref h) = static_handle {
+                    s.insert("__static".to_string(), CfmlValue::Struct(h.clone()));
+                }
+                s
+            };
+
             // Snapshot user_functions AFTER parent resolution (parent body may have
             // registered helper functions which should not be flagged as
             // "added by cfinclude" inside this child body).
@@ -16086,17 +16251,30 @@ impl CfmlVirtualMachine {
             // unqualified calls inside methods resolve via the normal scope chain.
             if let Some(s) = result.as_mut().and_then(|v| v.as_cfml_struct()) {
                 let mut vars_scope: ValueMap = ValueMap::default();
-                // Add component body variables (non-function values from the
-                // pseudo-constructor). Function values carry stable global_ids
-                // (no index fixup needed); strip their captured_scope because CFC
-                // methods resolve via __variables, not closures.
-                for (k, v) in &component_variables {
+                // Add component body variables. With the shared `__variables`
+                // handle injected before the body (the construction-ordering
+                // fix), the body's unscoped and `variables.x` writes — plus the
+                // pre-seeded method table — accumulated INTO `body_vars`, so it
+                // is the authoritative source for the component scope. Fall back
+                // to the flat captured locals for anything that stayed
+                // top-level (e.g. modern-localmode bare assignments).
+                // Function values carry stable global_ids (no index fixup
+                // needed); strip their captured_scope because CFC methods
+                // resolve via __variables, not closures.
+                let body_scope = body_vars.snapshot();
+                for (k, v) in body_scope.iter().chain(component_variables.iter()) {
                     let k_lower = k.to_lowercase();
                     if k_lower == "this"
                         || k_lower == "arguments"
                         || k_lower == "super"
                         || k.starts_with("__")
                     {
+                        continue;
+                    }
+                    // body_vars wins over the flat locals (it captured the real
+                    // component-scope writes); don't let a stale flat value
+                    // overwrite it.
+                    if vars_scope.contains_key(k) {
                         continue;
                     }
                     if let CfmlValue::Function(ref f) = v {
@@ -16124,9 +16302,17 @@ impl CfmlVirtualMachine {
                         continue;
                     }
                     if let CfmlValue::Function(ref f) = v {
-                        let shadowed_by_ctor = component_variables.iter().any(|(ck, cv)| {
-                            ck.eq_ignore_ascii_case(&k) && !matches!(cv, CfmlValue::Function(_))
-                        });
+                        // A `variables.foo = value` write in the body now lands
+                        // in body_scope (the injected handle); a `var foo = value`
+                        // local stays in component_variables. Either non-function
+                        // shadow must beat the same-named method.
+                        let shadowed_by_ctor = body_scope
+                            .iter()
+                            .chain(component_variables.iter())
+                            .any(|(ck, cv)| {
+                                ck.eq_ignore_ascii_case(&k)
+                                    && !matches!(cv, CfmlValue::Function(_))
+                            });
                         if shadowed_by_ctor {
                             continue;
                         }
