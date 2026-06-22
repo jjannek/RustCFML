@@ -253,6 +253,22 @@ fn format_cookie_expires(raw: &str) -> String {
     dt.format(FMT).to_string()
 }
 
+/// Normalize a `<cfcookie samesite>` value to its canonical `SameSite` token.
+/// Known policies are case-corrected (Lax/Strict/None); any other non-empty
+/// value is passed through verbatim. Empty/whitespace yields no attribute.
+fn format_cookie_samesite(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match trimmed.to_ascii_lowercase().as_str() {
+        "lax" => "Lax".to_string(),
+        "strict" => "Strict".to_string(),
+        "none" => "None".to_string(),
+        _ => trimmed.to_string(),
+    })
+}
+
 /// A cached compiled bytecode program with its source file modification time.
 pub struct CachedProgram {
     pub program: BytecodeProgram,
@@ -10698,10 +10714,20 @@ impl CfmlVirtualMachine {
                         {
                             cookie.push_str(&format!("; Domain={}", domain.as_string()));
                         }
-                        if let Some((_, path)) =
-                            opts.iter().find(|(k, _)| k.to_lowercase() == "path")
+                        // Lucee defaults an omitted path to "/" so the cookie is
+                        // site-wide rather than scoped to the request directory.
+                        let path = opts
+                            .iter()
+                            .find(|(k, _)| k.to_lowercase() == "path")
+                            .map(|(_, v)| v.as_string())
+                            .unwrap_or_else(|| "/".to_string());
+                        cookie.push_str(&format!("; Path={}", path));
+                        if let Some((_, samesite)) =
+                            opts.iter().find(|(k, _)| k.to_lowercase() == "samesite")
                         {
-                            cookie.push_str(&format!("; Path={}", path.as_string()));
+                            if let Some(value) = format_cookie_samesite(&samesite.as_string()) {
+                                cookie.push_str(&format!("; SameSite={}", value));
+                            }
                         }
                         if let Some((_, secure)) =
                             opts.iter().find(|(k, _)| k.to_lowercase() == "secure")
