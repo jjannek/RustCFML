@@ -6095,6 +6095,39 @@ fn merge_cfhttp_attribute_collection(arg: CfmlValue) -> CfmlValue {
     CfmlValue::Struct(CfmlStruct::new(merged))
 }
 
+/// Whether a `getAsBinary` attribute value requests a binary response body.
+/// Lucee treats "yes"/"true"/"1"/"binary"/"always" (and truthy numbers/bools)
+/// as enabling binary decoding; everything else stays text.
+#[cfg(feature = "http")]
+fn cfhttp_get_as_binary_enabled(value: &CfmlValue) -> bool {
+    match value {
+        CfmlValue::Bool(b) => *b,
+        CfmlValue::Int(i) => *i != 0,
+        CfmlValue::Double(d) => *d != 0.0,
+        CfmlValue::String(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "binary" | "always"
+        ),
+        _ => false,
+    }
+}
+
+/// Read a response body either as decoded text or as raw bytes. Decoding bytes
+/// through `into_string()` would corrupt non-UTF-8 payloads (images, etc.).
+#[cfg(feature = "http")]
+fn cfhttp_file_content(resp: ureq::Response, get_as_binary: bool) -> CfmlValue {
+    if !get_as_binary {
+        return CfmlValue::string(resp.into_string().unwrap_or_default());
+    }
+
+    let mut reader = resp.into_reader();
+    let mut body = Vec::new();
+    if std::io::Read::read_to_end(&mut reader, &mut body).is_err() {
+        body.clear();
+    }
+    CfmlValue::Binary(body)
+}
+
 #[cfg(feature = "http")]
 fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
     use std::collections::HashMap;
@@ -6102,8 +6135,8 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
     let arg = merge_cfhttp_attribute_collection(args.into_iter().next().unwrap_or(CfmlValue::Null));
 
     // Parse arguments: either a URL string or an options struct
-    let (mut url, method, headers, body, timeout_secs, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port) = match &arg {
-        CfmlValue::String(url) => ((**url).clone(), "GET".to_string(), HashMap::<String, String>::new(), None::<Vec<u8>>, 30u64, false, true, true, None::<u16>, None::<String>, None::<u16>),
+    let (mut url, method, headers, body, timeout_secs, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port, get_as_binary) = match &arg {
+        CfmlValue::String(url) => ((**url).clone(), "GET".to_string(), HashMap::<String, String>::new(), None::<Vec<u8>>, 30u64, false, true, true, None::<u16>, None::<String>, None::<u16>, false),
         CfmlValue::Struct(opts) => {
             let mut url = opts.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("url"))
@@ -6355,7 +6388,12 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                     _ => None,
                 });
 
-            (url, method, hdrs, body, timeout, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port)
+            let get_as_binary = opts.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("getasbinary"))
+                .map(|(_, v)| cfhttp_get_as_binary_enabled(&v))
+                .unwrap_or(false);
+
+            (url, method, hdrs, body, timeout, throw_on_error, follow_redirects, encode_url, port, proxy_server, proxy_port, get_as_binary)
         }
         _ => return Err(CfmlError::runtime("cfhttp requires a URL string or options struct".to_string())),
     };
@@ -6461,7 +6499,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
 
-            let body_text = resp.into_string().unwrap_or_default();
+            let file_content = cfhttp_file_content(resp, get_as_binary);
 
             let (mime, charset) = parse_content_type(&content_type);
 
@@ -6473,7 +6511,7 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
             result_struct.insert("status_code".to_string(), CfmlValue::Int(status as i64));
             result_struct.insert("statusText".to_string(), CfmlValue::string(status_text.clone()));
             result_struct.insert("status_text".to_string(), CfmlValue::string(status_text));
-            result_struct.insert("fileContent".to_string(), CfmlValue::string(body_text));
+            result_struct.insert("fileContent".to_string(), file_content);
             result_struct.insert("mimeType".to_string(), CfmlValue::string(mime));
             result_struct.insert("charset".to_string(), CfmlValue::string(charset));
             result_struct.insert("responseHeader".to_string(), CfmlValue::strukt(resp_headers));
@@ -6497,14 +6535,14 @@ fn fn_cfhttp(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
 
-            let body_text = resp.into_string().unwrap_or_default();
+            let file_content = cfhttp_file_content(resp, get_as_binary);
             let (mime, charset) = parse_content_type(&content_type);
 
             result_struct.insert("statusCode".to_string(), CfmlValue::string(format!("{} {}", code, status_text)));
             result_struct.insert("status_code".to_string(), CfmlValue::Int(code as i64));
             result_struct.insert("statusText".to_string(), CfmlValue::string(status_text.clone()));
             result_struct.insert("status_text".to_string(), CfmlValue::string(status_text));
-            result_struct.insert("fileContent".to_string(), CfmlValue::string(body_text));
+            result_struct.insert("fileContent".to_string(), file_content);
             result_struct.insert("mimeType".to_string(), CfmlValue::string(mime));
             result_struct.insert("charset".to_string(), CfmlValue::string(charset));
             result_struct.insert("responseHeader".to_string(), CfmlValue::strukt(resp_headers));

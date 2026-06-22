@@ -1839,11 +1839,16 @@ fn build_success_response(
         &response.response_headers,
     );
 
-    // Determine body
+    // Determine body. A binary cfcontent payload (CfmlValue::Binary) must be
+    // emitted as raw bytes; routing it through as_string() would substitute the
+    // diagnostic placeholder text and corrupt the response.
     let body = if let Some(ref body_override) = response.response_body {
-        body_override.as_string()
+        match body_override {
+            CfmlValue::Binary(bytes) => axum::body::Body::from(bytes.clone()),
+            other => axum::body::Body::from(other.as_string()),
+        }
     } else {
-        response.output
+        axum::body::Body::from(response.output)
     };
 
     // Determine status code
@@ -1872,7 +1877,7 @@ fn build_success_response(
         }
     }
 
-    builder.body(axum::body::Body::from(body)).unwrap()
+    builder.body(body).unwrap()
 }
 
 use cfml_vm::web::{ResolvedFile, resolve_file};
