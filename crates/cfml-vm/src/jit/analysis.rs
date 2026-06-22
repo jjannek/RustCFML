@@ -1243,6 +1243,7 @@ mod tests {
             param_types: params.iter().map(|_| None).collect(),
             param_annotations: params.iter().map(|_| Vec::new()).collect(),
             is_component_method: false,
+            access: cfml_common::dynamic::CfmlAccess::Public,
         }
     }
 

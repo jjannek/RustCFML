@@ -594,6 +594,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("__cflog".into(), fn_cflog_stub);
     f.insert("__cfparam".into(), fn_cfparam_stub);
     f.insert("__cfsetting".into(), fn_cfsetting_stub);
+    f.insert("__cfapplication".into(), fn_cfapplication_stub);
     f.insert("__cflock_start".into(), fn_cflock_start_stub);
     f.insert("__cflock_end".into(), fn_cflock_end_stub);
     f.insert("__cfcookie".into(), fn_cfcookie_stub);
@@ -2343,6 +2344,15 @@ fn fn_get_tag_data(args: Vec<CfmlValue>) -> CfmlResult {
 /// how Lucee surfaces them.
 fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
     let keys: Vec<String> = s.keys();
+    // A Java-collection shim (e.g. createObject("java","java.util.LinkedHashMap"))
+    // is a transparent map facade — its `__java_class`/`__java_shim` markers are
+    // engine-internal and must never surface as struct keys (ColdBox's
+    // ModuleService iterates `structKeyArray( moduleRegistry )` over exactly such
+    // a LinkedHashMap, and a leaked `__java_class` was being treated as a module).
+    let is_java_shim = keys.iter().any(|k| k == "__java_shim");
+    if is_java_shim {
+        return keys.into_iter().filter(|k| !k.starts_with("__")).collect();
+    }
     if !keys.iter().any(|k| k == "__arguments_scope") {
         return keys;
     }
@@ -9883,6 +9893,12 @@ fn fn_cfdbinfo_stub(_args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_cfheader_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Err(CfmlError::runtime("__cfheader requires VM intercept".into()))
+}
+
+fn fn_cfapplication_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime(
+        "__cfapplication requires VM intercept".into(),
+    ))
 }
 
 fn fn_cfcontent_stub(_args: Vec<CfmlValue>) -> CfmlResult {

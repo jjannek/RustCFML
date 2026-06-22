@@ -78,5 +78,42 @@ assert("direct method reads component state", dynTarget.readState(), "DYN-STATE"
 dynProxy = new PresideFixDynProxy( dynTarget );
 assert("computed-name forward keeps target scope", dynProxy.readState(), "DYN-STATE");
 
+// 10) for-in over a component yields PUBLIC data + PUBLIC methods, never
+//     private methods or engine internals (Lucee `this`-scope iteration —
+//     WireBox virtual inheritance copies a base class's public methods this
+//     way in `toVirtualInheritance`).
+forinState = new PresideFixForInState();
+forinKeys = [];
+for ( k in forinState ) { arrayAppend( forinKeys, k ); }
+forinKeys.sort( "textnocase" );
+assert("for-in over CFC yields public data + public methods", arrayToList( forinKeys ), "configure,dataKey,greet");
+assert("for-in over CFC hides private methods", arrayFindNoCase( forinKeys, "secret" ), 0);
+assert("for-in over CFC hides engine internals", arrayFindNoCase( forinKeys, "__variables" ), 0);
+
+// 11) Script `include template=<expr>` attribute form evaluates the whole
+//     expression (Preside Router.cfc: `include template=ext.dir & "/x.cfm"`).
+//     Without the fix `template=expr` parses as a variable assignment and the
+//     include path comes out empty.
+assert("include template=expr attribute form resolves the path", _testIncludeAttrForm(), "INC-OK");
+
+// 12) A java.util.LinkedHashMap shim is a transparent map — its `__java_*`
+//     markers never surface in struct key enumeration (ColdBox ModuleService
+//     iterates `structKeyArray( moduleRegistry )` over exactly such a map).
+lhm = createObject( "java", "java.util.LinkedHashMap" ).init();
+lhm[ "alpha" ] = { x = 1 };
+lhm[ "beta" ]  = { x = 2 };
+assert("java map structKeyArray hides __ markers", arrayToList( structKeyArray( lhm ).sort( "textnocase" ) ), "alpha,beta");
+assert("java map structCount excludes __ markers", structCount( lhm ), 2);
+lhmForIn = [];
+for ( mk in lhm ) { arrayAppend( lhmForIn, mk ); }
+assert("java map for-in hides __ markers", arrayToList( lhmForIn.sort( "textnocase" ) ), "alpha,beta");
+
 suiteEnd();
+
+private string function _testIncludeAttrForm() {
+	var dir = "subinc";
+	request._incProbe = "EMPTY";
+	include template=dir & "/included.cfm";
+	return request._incProbe;
+}
 </cfscript>

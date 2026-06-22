@@ -168,6 +168,15 @@ pub struct RuntimeCfg {
     pub whitespace_compression_enabled: bool,
     #[serde(rename = "trustedCache")]
     pub trusted_cache: bool,
+    /// When true, `server.coldfusion.productname` reports `"Lucee"` instead of
+    /// `"RustCFML"`. RustCFML targets the Lucee dialect and already advertises
+    /// `server.lucee`, but some frameworks (e.g. ColdBox's mapping-helper
+    /// selection) branch specifically on `productname` and only take their
+    /// Lucee code path when it equals "Lucee". Opt in per-app when a framework
+    /// needs that. `server.lucee.versionName` stays `"RustCFML"` regardless, so
+    /// engine self-identification is unaffected.
+    #[serde(rename = "reportAsLucee")]
+    pub report_as_lucee: bool,
     /// `"days,hours,minutes,seconds"`.
     #[serde(rename = "applicationTimeout")]
     pub application_timeout: String,
@@ -186,6 +195,7 @@ impl Default for RuntimeCfg {
             timezone: String::new(),
             whitespace_compression_enabled: false,
             trusted_cache: false,
+            report_as_lucee: false,
             application_timeout: "1,0,0,0".into(),
             session_timeout: "0,0,30,0".into(),
             client_timeout: "7,0,0,0".into(),

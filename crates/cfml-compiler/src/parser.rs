@@ -404,7 +404,35 @@ impl Parser {
         }
 
         if self.match_token(&Token::Include) {
-            let path = self.parse_expression()?;
+            // Script include has two forms:
+            //   include "path";                          (bare expression)
+            //   include template="path" [attr=val ...];  (attribute form)
+            // The attribute form must NOT be parsed as a plain expression, or
+            // `template = <expr>` is read as an assignment to a variable named
+            // `template` whose value never reaches the include — yielding an
+            // empty path (Preside Router.cfc does `include template=ext.dir & "/x"`).
+            let path = if self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                let mut template_expr = None;
+                while self.is_identifier_like() && matches!(self.peek(1), Token::Equal) {
+                    let attr = self.extract_identifier()?.to_lowercase();
+                    self.advance(); // consume '='
+                    let val = self.parse_expression()?;
+                    if attr == "template" {
+                        template_expr = Some(val);
+                    }
+                    // Other attributes (e.g. runOnce) are accepted and ignored.
+                }
+                match template_expr {
+                    Some(p) => p,
+                    None => {
+                        return Err(self.parse_error(
+                            "cfinclude requires a 'template' attribute",
+                        ))
+                    }
+                }
+            } else {
+                self.parse_expression()?
+            };
             self.match_token(&Token::Semicolon);
             return Ok(CfmlNode::Statement(Statement::Include(Include {
                 path,
@@ -766,6 +794,7 @@ impl Parser {
                 let bare = lower.strip_prefix("cf").unwrap_or(lower.as_str());
                 match bare {
                     "content" => Some(TagStmt::StructArg("__cfcontent")),
+                    "application" => Some(TagStmt::StructArg("__cfapplication")),
                     "header" => Some(TagStmt::StructArg("__cfheader")),
                     "location" => Some(TagStmt::StructArg("__cflocation")),
                     "setting" => Some(TagStmt::StructArg("__cfsetting")),

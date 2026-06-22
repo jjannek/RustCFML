@@ -151,6 +151,11 @@ pub struct BytecodeFunction {
     /// so the VM's DefineFunction guard against builtin-name collisions must
     /// skip these. Top-level UDFs keep the guard.
     pub is_component_method: bool,
+    /// Declared access modifier (`public`/`private`/`package`/`remote`).
+    /// Surfaced so for-in over a component instance can yield only PUBLIC
+    /// methods (matching Lucee's `this`-scope iteration, which WireBox virtual
+    /// inheritance relies on). Defaults to `Public`.
+    pub access: cfml_common::dynamic::CfmlAccess,
 }
 
 /// Inspect a function/closure metadata attribute list for `localMode`.
@@ -443,6 +448,7 @@ impl CfmlCompiler {
                     param_types: Vec::new(),
                     param_annotations: Vec::new(),
                     is_component_method: false,
+                    access: cfml_common::dynamic::CfmlAccess::Public,
                 })],
             },
             loop_stack: Vec::new(),
@@ -2500,6 +2506,12 @@ impl CfmlCompiler {
             param_types: func.params.iter().map(|p| p.param_type.clone()).collect(),
             param_annotations: func.params.iter().map(|p| p.annotations.clone()).collect(),
             is_component_method: self.in_component_method,
+            access: match func.access {
+                AccessModifier::Private => cfml_common::dynamic::CfmlAccess::Private,
+                AccessModifier::Package => cfml_common::dynamic::CfmlAccess::Package,
+                AccessModifier::Remote => cfml_common::dynamic::CfmlAccess::Remote,
+                AccessModifier::Public => cfml_common::dynamic::CfmlAccess::Public,
+            },
         };
 
         let global_id = bc_func.global_id as usize;
@@ -2705,6 +2717,7 @@ impl CfmlCompiler {
                     param_types: Vec::new(),
                     param_annotations: Vec::new(),
                     is_component_method: true,
+                    access: cfml_common::dynamic::CfmlAccess::Public,
                 };
                 self.program.functions.push(Arc::new(getter_func));
                 let getter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -2752,6 +2765,7 @@ impl CfmlCompiler {
                     param_types: vec![None],
                     param_annotations: vec![Vec::new()],
                     is_component_method: true,
+                    access: cfml_common::dynamic::CfmlAccess::Public,
                 };
                 self.program.functions.push(Arc::new(setter_func));
                 let setter_gid = self.program.functions.last().unwrap().global_id as usize;
@@ -2893,6 +2907,7 @@ impl CfmlCompiler {
                 param_types: Vec::new(),
                 param_annotations: Vec::new(),
                 is_component_method: true,
+                    access: cfml_common::dynamic::CfmlAccess::Public,
             };
             self.program.functions.push(Arc::new(static_func));
         }
@@ -3793,6 +3808,7 @@ impl CfmlCompiler {
                     param_types: closure.params.iter().map(|p| p.param_type.clone()).collect(),
                     param_annotations: closure.params.iter().map(|p| p.annotations.clone()).collect(),
                     is_component_method: false,
+                    access: cfml_common::dynamic::CfmlAccess::Public,
                 };
 
                 let global_id = bc_func.global_id as usize;
@@ -3845,6 +3861,7 @@ impl CfmlCompiler {
                     param_types: arrow.params.iter().map(|p| p.param_type.clone()).collect(),
                     param_annotations: arrow.params.iter().map(|p| p.annotations.clone()).collect(),
                     is_component_method: false,
+                    access: cfml_common::dynamic::CfmlAccess::Public,
                 };
 
                 let global_id = bc_func.global_id as usize;

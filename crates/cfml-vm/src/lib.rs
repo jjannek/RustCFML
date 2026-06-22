@@ -350,13 +350,19 @@ fn json_value_to_cfml(value: serde_json::Value) -> CfmlValue {
     }
 }
 
-fn build_server_scope() -> ValueMap {
+fn build_server_scope(report_as_lucee: bool) -> ValueMap {
     let mut info = ValueMap::default();
 
     let mut cf = ValueMap::default();
+    // RustCFML self-identifies as "RustCFML" by default. The `reportAsLucee`
+    // cfconfig knob makes it report "Lucee" instead, for frameworks (e.g.
+    // ColdBox's mapping-helper selection) that branch specifically on
+    // `productname == "Lucee"`. `server.lucee.versionName` stays "RustCFML"
+    // either way, so `isRustCFML()`-style detection via that field is stable.
+    let product_name = if report_as_lucee { "Lucee" } else { "RustCFML" };
     cf.insert(
         "productname".to_string(),
-        CfmlValue::string("RustCFML".to_string()),
+        CfmlValue::string(product_name.to_string()),
     );
     cf.insert(
         "productversion".to_string(),
@@ -1602,6 +1608,18 @@ impl CfmlVirtualMachine {
     }
 
     /// Resolve a `global_id` to its `BytecodeFunction` via the dense registry.
+    /// Effective `reportAsLucee` cfconfig flag: the per-request application
+    /// overlay wins, else the server baseline, else false (default identity).
+    fn report_as_lucee(&self) -> bool {
+        if let Some(ref cfg) = self.app_cfconfig {
+            return cfg.runtime.report_as_lucee;
+        }
+        if let Some(ref ss) = self.server_state {
+            return ss.cfconfig.runtime.report_as_lucee;
+        }
+        false
+    }
+
     /// O(1), no hashing, independent of the active `self.program`.
     #[inline]
     fn resolve_fn(&self, global_id: i64) -> Option<Arc<BytecodeFunction>> {
@@ -2961,7 +2979,7 @@ impl CfmlVirtualMachine {
                             .cloned()
                             .unwrap_or(CfmlValue::strukt(ValueMap::default()))
                     } else if name_lower == "server" {
-                        let mut scope = build_server_scope();
+                        let mut scope = build_server_scope(self.report_as_lucee());
                         // Prefer the per-request application-level cfconfig overlay
                         // (a `.cfconfig.json` beside the Application.cfc) over the
                         // server baseline when present.
@@ -5906,7 +5924,9 @@ impl CfmlVirtualMachine {
                             CfmlValue::Int(global_id),
                         )),
                         return_type: None,
-                        access: cfml_common::dynamic::CfmlAccess::Public,
+                        // Carry the declared modifier so for-in over a component
+                        // instance can hide private/package methods (Lucee parity).
+                        access: bc_func_ref.access.clone(),
                         captured_scope: Some(Arc::clone(env)),
                     })));
                 }
@@ -6670,10 +6690,17 @@ impl CfmlVirtualMachine {
                                 // A struct carrying CFC instance markers is a
                                 // component instance (this engine materialises
                                 // CFCs as marker-bearing structs). Lucee/ACF
-                                // for-in over a component yields only its data
-                                // members — never engine-internal `__` keys, the
-                                // `this` scope itself, or methods (UDFs).
+                                // for-in over a component iterates its `this`
+                                // scope: public data members AND public methods
+                                // (UDFs) — never engine-internal `__` keys, the
+                                // `this` scope itself, or PRIVATE/PACKAGE methods.
+                                // (WireBox virtual inheritance relies on the
+                                // public-method enumeration to mix in a base
+                                // class's methods — `toVirtualInheritance`.)
                                 let is_cfc = is_component_struct(&s);
+                                // A Java-collection shim (LinkedHashMap etc.) is a
+                                // transparent map — hide its `__java_*` markers.
+                                let is_java_shim = s.contains_key("__java_shim");
                                 let keys: Vec<CfmlValue> = s
                                     .keys()
                                     .into_iter()
@@ -6682,6 +6709,7 @@ impl CfmlVirtualMachine {
                                             || (k != "__arguments_scope"
                                                 && k != "__arguments_params")
                                     })
+                                    .filter(|k| !is_java_shim || !k.starts_with("__"))
                                     .filter(|k| {
                                         if !is_cfc {
                                             return true;
@@ -6689,11 +6717,19 @@ impl CfmlVirtualMachine {
                                         if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
                                             return false;
                                         }
-                                        !matches!(
-                                            s.get(k),
-                                            Some(CfmlValue::Function(_))
-                                                | Some(CfmlValue::Closure(_))
-                                        )
+                                        // Methods: keep only public/remote ones.
+                                        // A named UDF carries its access modifier;
+                                        // private/package methods stay hidden.
+                                        match s.get(k) {
+                                            Some(CfmlValue::Function(f)) => matches!(
+                                                f.access,
+                                                cfml_common::dynamic::CfmlAccess::Public
+                                                    | cfml_common::dynamic::CfmlAccess::Remote
+                                            ),
+                                            // Closures (e.g. `this.x = () => {}`)
+                                            // are public data assignments.
+                                            _ => true,
+                                        }
                                     })
                                     .map(CfmlValue::string)
                                     .collect();
@@ -7516,6 +7552,7 @@ impl CfmlVirtualMachine {
                 | "getcomponentstaticscope"
                 | "getapplicationmetadata"
                 | "__cfheader"
+                | "__cfapplication"
                 | "__cfcontent"
                 | "__cflocation"
                 | "__cfabort"
@@ -9263,6 +9300,23 @@ impl CfmlVirtualMachine {
                         let nm = self.current_application_name.clone().unwrap_or_default();
                         meta.insert("name".to_string(), CfmlValue::string(nm));
                     }
+                    // Reflect the *effective* runtime mappings (cfconfig + this.mappings
+                    // + any registered via `application action="update"`), not just the
+                    // Application.cfc literal `this.mappings`. ColdBox's
+                    // CFMappingHelper/LuceeMappingHelper read this to append new module
+                    // cfmappings, so it must mirror the live mapping table.
+                    let mut map_struct = ValueMap::default();
+                    for mp in &self.mappings {
+                        // Present names without the normalized trailing slash (Lucee
+                        // surfaces "/HTMLHelper", not "/HTMLHelper/"); keep "/" as-is.
+                        let key = if mp.name == "/" {
+                            "/".to_string()
+                        } else {
+                            mp.name.trim_end_matches('/').to_string()
+                        };
+                        map_struct.insert(key, CfmlValue::string(mp.path.clone()));
+                    }
+                    meta.insert("mappings".to_string(), CfmlValue::strukt(map_struct));
                     return Ok(CfmlValue::strukt(meta));
                 }
                 "getcomponentstaticscope" => {
@@ -10372,6 +10426,49 @@ impl CfmlVirtualMachine {
                             .map(|(_, v)| v.as_string())
                             .unwrap_or_else(|| "application".to_string());
                         eprintln!("[CFLOG {}:{}] {}", file, log_type, text);
+                    }
+                    return Ok(CfmlValue::Null);
+                }
+                "__cfapplication" => {
+                    // `application action="update" mappings={...}` — runtime CF
+                    // mapping registration. ColdBox's LuceeMappingHelper.addMapping
+                    // registers a module's cfmapping (e.g. "/HTMLHelper") through
+                    // exactly this path, so a subsequent expandPath("/HTMLHelper/
+                    // models") (Binder.mapDirectory) resolves to the module dir.
+                    // Other cfapplication attributes (name/sessionmanagement/...)
+                    // are established at application start and ignored here.
+                    if let Some(CfmlValue::Struct(opts)) = args.get(0) {
+                        let mapping_struct = opts
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("mappings"))
+                            .and_then(|(_, v)| match v {
+                                CfmlValue::Struct(m) => Some(m.snapshot()),
+                                _ => None,
+                            });
+                        if let Some(m) = mapping_struct {
+                            for (raw_name, v) in m.iter() {
+                                let mut name = raw_name.clone();
+                                if !name.starts_with('/') {
+                                    name = format!("/{}", name);
+                                }
+                                if !name.ends_with('/') {
+                                    name = format!("{}/", name);
+                                }
+                                let path = v.as_string();
+                                if let Some(slot) = self
+                                    .mappings
+                                    .iter_mut()
+                                    .find(|mp| mp.name.eq_ignore_ascii_case(&name))
+                                {
+                                    slot.path = path;
+                                } else {
+                                    self.mappings.push(CfmlMapping { name, path });
+                                }
+                            }
+                            // Keep longest-prefix-first so the most specific
+                            // mapping wins during resolution.
+                            self.mappings.sort_by(|a, b| b.name.len().cmp(&a.name.len()));
+                        }
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -12978,6 +13075,12 @@ impl CfmlVirtualMachine {
             _ => return Ok(CfmlValue::Null),
         };
         match method_lower {
+            // Lucee engine-internal plumbing. `getPageContext().getCFMLFactory()
+            // .resetPageContext()` (Preside Bootstrap, Lucee-only branch) — we
+            // expose the page context itself as the "factory" so the chained
+            // resetPageContext() lands back here as a harmless no-op.
+            "getcfmlfactory" => Ok(object.clone()),
+            "resetpagecontext" | "releasepagecontext" => Ok(CfmlValue::Null),
             "getrequest" | "gethttpservletrequest" => {
                 Ok(pc.get("__pc_request").unwrap_or(CfmlValue::Null))
             }
@@ -14310,7 +14413,7 @@ impl CfmlVirtualMachine {
                 .cloned()
                 .or(Some(CfmlValue::strukt(ValueMap::default())))
         } else if root == "server" {
-            Some(CfmlValue::strukt(build_server_scope()))
+            Some(CfmlValue::strukt(build_server_scope(self.report_as_lucee())))
         } else {
             // Check locals (exact then CI)
             locals
@@ -16268,6 +16371,18 @@ impl CfmlVirtualMachine {
             return raw.to_string();
         }
         let bytes = raw.as_bytes();
+        // A leading-slash path may be a `this.mappings` virtual path (e.g.
+        // "/app/config/Config.cfc", "/preside/..."). ExpandPath resolves these
+        // via the application mappings; file BIFs must agree, otherwise
+        // FileExists("/app/...") is false even though ExpandPath("/app/...")
+        // points at a real file (Preside's `_discoverConfigPath` relies on this).
+        // Only rewrite when a mapping prefix genuinely matches — non-mapped
+        // web-root paths (e.g. "/css/x.css") fall through unchanged as before.
+        if (raw.starts_with('/') || raw.starts_with('\\')) && !raw.contains("://") {
+            if let Some(mapped) = self.resolve_leading_slash_mapping(raw) {
+                return mapped;
+            }
+        }
         let is_absolute = raw.starts_with('/')
             || raw.starts_with('\\')
             || raw.contains("://")
@@ -16284,6 +16399,42 @@ impl CfmlVirtualMachine {
             Some(dir) => dir.join(raw).to_string_lossy().into_owned(),
             None => raw.to_string(),
         }
+    }
+
+    /// If a leading-slash virtual path matches an application mapping
+    /// (`this.mappings`), return its physical filesystem path. Mirrors the
+    /// mapping-resolution branch of `expandPath` so file BIFs and `ExpandPath`
+    /// agree on mapped paths. Returns `None` when no mapping prefix matches
+    /// (caller keeps the path as a plain web-root/absolute path).
+    fn resolve_leading_slash_mapping(&self, raw: &str) -> Option<String> {
+        if self.mappings.is_empty() {
+            return None;
+        }
+        // Collapse a leading run of slashes to a single '/' before matching,
+        // matching expandPath's "//x" == "/x" behaviour.
+        let trimmed = raw.trim_start_matches(['/', '\\']);
+        let rel = format!("/{}", trimmed);
+        let rel_lower = rel.to_lowercase();
+        for mapping in &self.mappings {
+            let prefix = mapping.name.trim_end_matches(['/', '\\']);
+            if prefix.is_empty() {
+                continue;
+            }
+            let prefix_lower = prefix.to_lowercase();
+            // Match the prefix only on a path-segment boundary, so "/app"
+            // matches "/app/x" but not "/application/x".
+            let after = match rel_lower.strip_prefix(&prefix_lower) {
+                Some(a) => a,
+                None => continue,
+            };
+            if !after.is_empty() && !after.starts_with(['/', '\\']) {
+                continue;
+            }
+            let remainder = rel[prefix.len()..].trim_start_matches(['/', '\\']);
+            let candidate = std::path::PathBuf::from(&mapping.path).join(remainder);
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+        None
     }
 
     /// Rebase the path argument(s) of a file/directory BIF against the current

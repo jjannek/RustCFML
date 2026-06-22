@@ -136,6 +136,7 @@ overlay. There is intentionally **no `port` key**: the listening port is set wit
 | `timezone` | string | `""` | IANA tz name. Empty = system |
 | `whitespaceCompressionEnabled` | bool | `false` | Global `cfsetting enableCFOutputOnly=true` |
 | `trustedCache` | bool | `false` | Skip recompile when template mtime unchanged |
+| `reportAsLucee` | bool | `false` | Report `server.coldfusion.productname` as `"Lucee"` instead of `"RustCFML"`. RustCFML targets the Lucee dialect and always advertises `server.lucee`, but some frameworks (e.g. ColdBox's mapping-helper selection) branch specifically on `productname == "Lucee"`. `server.lucee.versionName` stays `"RustCFML"` regardless |
 | `applicationTimeout` | `"d,h,m,s"` | `"1,0,0,0"` | Application scope timeout |
 | `sessionTimeout` | `"d,h,m,s"` | `"0,0,30,0"` | Session scope timeout |
 | `clientTimeout` | `"d,h,m,s"` | `"7,0,0,0"` | Client scope timeout |
