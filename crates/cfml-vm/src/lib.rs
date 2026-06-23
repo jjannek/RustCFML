@@ -2687,7 +2687,23 @@ impl CfmlVirtualMachine {
             std::collections::HashSet::new();
         if let Some(parent) = parent_scope {
             for (k, v) in parent {
-                if !matches!(v, CfmlValue::Function(_)) {
+                // Function values are normally skipped here: a named function /
+                // sibling closure is already reachable via user_functions or the
+                // captured-scope merge, and cloning its (large) captured scope on
+                // every call is pure waste. The ONE exception is a var-scoped
+                // function EXPRESSION captured into a closure's env by
+                // closure_env_capture_value — those carry `captured_scope: None`
+                // (stripped to break the Arc cycle) and live under their VARIABLE
+                // name, so they are NOT in user_functions; they must be carried
+                // into this frame's locals or a nested closure can't resolve the
+                // helper by bare name (PR #198). Named functions and real
+                // closures keep `captured_scope: Some(env)`, so this copies only
+                // the stripped helpers — no waste and no cycle reintroduced.
+                let carry = match v {
+                    CfmlValue::Function(f) => f.captured_scope.is_none(),
+                    _ => true,
+                };
+                if carry {
                     locals.insert(k.clone(), v.clone());
                     inherited_or_param_keys.insert(k.clone());
                 }
@@ -6061,27 +6077,23 @@ impl CfmlVirtualMachine {
                         Some(ref env) => {
                             let mut m = env.write().unwrap();
                             for (k, v) in &locals {
-                                // Do NOT store Function values in the shared closure
-                                // env: each closure's captured_scope is an Arc clone
-                                // of this env, so an env-resident Function creates a
-                                // self-referential Arc cycle (env -> Function ->
-                                // captured_scope -> env) that leaks the whole env on
-                                // frame exit. Sibling closures resolve each other via
-                                // user_functions / by-name fast paths, and call sites
-                                // overlay caller-local Functions, so omitting them
-                                // here is observationally transparent.
-                                if !matches!(v, CfmlValue::Function(_)) {
-                                    m.insert(k.clone(), v.clone());
+                                if let Some(cv) =
+                                    Self::closure_env_capture_value(k, v, &declared_locals)
+                                {
+                                    m.insert(k.clone(), cv);
                                 }
                             }
                             env
                         }
                         None => {
-                            let seed: ValueMap = locals
-                                .iter()
-                                .filter(|(_, v)| !matches!(v, CfmlValue::Function(_)))
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
+                            let mut seed = ValueMap::default();
+                            for (k, v) in locals.iter() {
+                                if let Some(cv) =
+                                    Self::closure_env_capture_value(k, v, &declared_locals)
+                                {
+                                    seed.insert(k.clone(), cv);
+                                }
+                            }
                             closure_env.insert(Arc::new(RwLock::new(seed)))
                         }
                     };
@@ -15214,6 +15226,47 @@ impl CfmlVirtualMachine {
         } else {
             Some(writeback)
         };
+    }
+
+    /// Decide what (if anything) to store in a closure's shared env for a given
+    /// enclosing-frame local, when seeding/syncing the env at `DefineFunction`.
+    ///
+    /// Non-Function values are captured verbatim (closures see enclosing data).
+    /// A Function value is captured ONLY when it was declared with `var` — a
+    /// var-scoped function EXPRESSION like `var fn = function(){…}` — so that a
+    /// nested closure can resolve it by bare name (PR #198: Wheels/TestBox
+    /// define a helper at the top of `run()` and call it from inside
+    /// `it()`/`describe()` closures). Crucially it is captured with
+    /// `captured_scope` STRIPPED: an env-resident Function whose captured_scope
+    /// is an Arc clone of this same env forms a self-referential cycle (env ->
+    /// Function -> captured_scope -> env) that leaks the env on frame exit (the
+    /// reason Functions were historically excluded wholesale). Stripping the
+    /// scope breaks the cycle; the helper still resolves its enclosing values
+    /// because the calling closure passes its own effective scope (which carries
+    /// the same env data) as the parent. Anonymous / non-`var` sibling closures
+    /// stay out of the env (resolved via user_functions / call-site overlay),
+    /// preserving prior behaviour and the leak guard.
+    fn closure_env_capture_value(
+        name: &str,
+        value: &CfmlValue,
+        declared_locals: &std::collections::HashSet<String>,
+    ) -> Option<CfmlValue> {
+        match value {
+            CfmlValue::Function(f) => {
+                let is_var_scoped = declared_locals.contains(name)
+                    || declared_locals.contains(&name.to_lowercase());
+                if !is_var_scoped {
+                    return None;
+                }
+                if f.captured_scope.is_none() {
+                    return Some(value.clone());
+                }
+                let mut nf = (**f).clone();
+                nf.captured_scope = None;
+                Some(CfmlValue::Function(Arc::new(nf)))
+            }
+            _ => Some(value.clone()),
+        }
     }
 
     /// Write back mutations into a closure's shared Arc<RwLock> environment.
