@@ -13872,7 +13872,54 @@ impl CfmlVirtualMachine {
                 "comparenocase" => Some("compareNoCase"),
                 "asc" => Some("asc"),
                 "chr" => Some("chr"),
-                "split" => Some("listToArray"),
+                "split" => {
+                    // CFML string member `.split(regex [, limit])` follows
+                    // Java's `String.split` (regex delimiter), NOT CFML
+                    // `listToArray` (character-set delimiter). Aliasing it to
+                    // listToArray was wrong: `"LEFT OUTER JOIN x ON y".split("ON")`
+                    // split on the chars {O,N} (yielding "UTER J") instead of the
+                    // literal substring "ON" — this corrupted Wheels' updateAll
+                    // include→EXISTS join-condition extraction
+                    // (model/sql.cfc `JOIN.Split("ON")[2]`), producing invalid
+                    // SQL that threw and leaked Wheels' transaction marker.
+                    let src = object.as_string();
+                    let pattern = extra_args.first().map(|v| v.as_string()).unwrap_or_default();
+                    // Java split limit semantics: 0/absent => trailing empty
+                    // strings are removed; >0 => at most `limit` parts (trailing
+                    // empties kept); <0 => unlimited, trailing empties kept.
+                    let limit: i64 = extra_args
+                        .get(1)
+                        .and_then(|v| v.as_string().trim().parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let parts: Vec<String> = match regex::Regex::new(&pattern) {
+                        Ok(re) => {
+                            let mut v: Vec<String> = if limit > 0 {
+                                re.splitn(&src, limit as usize).map(|s| s.to_string()).collect()
+                            } else {
+                                re.split(&src).map(|s| s.to_string()).collect()
+                            };
+                            if limit == 0 {
+                                while v.last().map(|s| s.is_empty()).unwrap_or(false) {
+                                    v.pop();
+                                }
+                            }
+                            v
+                        }
+                        // Invalid regex pattern: fall back to a literal-substring
+                        // split (pragmatic — Lucee would throw, but a literal
+                        // split is safer for existing callers).
+                        Err(_) => {
+                            if pattern.is_empty() {
+                                vec![src.clone()]
+                            } else {
+                                src.split(pattern.as_str()).map(|s| s.to_string()).collect()
+                            }
+                        }
+                    };
+                    return Ok(CfmlValue::array(
+                        parts.into_iter().map(CfmlValue::string).collect(),
+                    ));
+                }
                 "listtoarray" => Some("listToArray"),
                 "listlen" => Some("listLen"),
                 "listfirst" => Some("listFirst"),
