@@ -148,6 +148,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_string_split_member.cfm">
 <cf_runtest file="stdlib/test_regex_backspace_in_class.cfm">
 <cf_runtest file="stdlib/test_inetaddress_loopback.cfm">
+<cf_runtest file="stdlib/test_jwt.cfm">
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">
 <cf_runtest file="stdlib/test_encode_for_html_esapi.cfm">
 <cf_runtest file="stdlib/test_string_functions_encoding.cfm">

@@ -93,8 +93,15 @@ RustCFML supports those as a BoxLang-faithful superset — see `docs/known-issue
 ### Low Priority
 - (none currently)
 
+### Partial Support
+- JWT: `JwtSign` / `JwtVerify` / `JwtDecode` (Lucee crypto-extension names) for the
+  HMAC algorithms HS256 / HS384 / HS512. RSA (RS*/PS*) and ECDSA (ES*) — which need
+  asymmetric keys — are not yet implemented and fail with a clear error. The Adobe
+  `createSignedJWT` / `verifySignedJWT` / `createEncryptedJWT` / `verifyEncryptedJWT`
+  names are not provided.
+
 ### Explicitly Unsupported
-- Image functions (80+), Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway, JWT
+- Image functions (80+), Spreadsheet functions (40+), ORM (20+), SOAP/WSDL, Flash/Flex UI tags, Exchange, PDF, LDAP, Registry, .NET, Gateway
 - cfschedule, cfwddx
 
 ### Taffy Framework

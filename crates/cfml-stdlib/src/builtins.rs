@@ -737,6 +737,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
 
     // ---- Security functions ----
     f.insert("hmac".into(), fn_hmac);
+    // JWT (Lucee crypto-extension names) — HMAC algorithms (HS256/384/512).
+    f.insert("jwtSign".into(), fn_jwt_sign);
+    f.insert("jwtVerify".into(), fn_jwt_verify);
+    f.insert("jwtDecode".into(), fn_jwt_decode);
     #[cfg(feature = "security")]
     f.insert("generateSecretKey".into(), fn_generate_secret_key);
     f.insert("encrypt".into(), fn_encrypt);
@@ -10799,6 +10803,220 @@ fn fn_hmac(args: Vec<CfmlValue>) -> CfmlResult {
     };
 
     Ok(CfmlValue::string(hex_result))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JWT (JSON Web Token) — JwtSign / JwtVerify / JwtDecode (Lucee crypto-extension
+// names). HMAC algorithms only (HS256/HS384/HS512); RSA/ECDSA need asymmetric
+// keys and are rejected with a clear error. Tokens are standard RFC 7519 JWS.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Base64url-encode (RFC 4648 §5, no padding) — the JWT segment encoding.
+fn base64url_encode(data: &[u8]) -> String {
+    base64_encode_bytes(data)
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
+}
+
+/// Base64url-decode (tolerates missing padding).
+fn base64url_decode(s: &str) -> Vec<u8> {
+    let mut t = s.replace('-', "+").replace('_', "/");
+    while t.len() % 4 != 0 {
+        t.push('=');
+    }
+    base64_decode_bytes(&t)
+}
+
+/// Normalise a JWT `alg` to its canonical upper-case form.
+fn jwt_alg_canonical(a: &str) -> String {
+    a.trim().to_uppercase()
+}
+
+/// Coerce a numeric JWT claim (exp/nbf/iat) — may be Int, Double, or String.
+fn jwt_claim_seconds(v: &CfmlValue) -> Option<i64> {
+    match v {
+        CfmlValue::Int(i) => Some(*i),
+        CfmlValue::Double(d) => Some(*d as i64),
+        CfmlValue::String(s) => s.trim().parse::<f64>().ok().map(|f| f as i64),
+        _ => None,
+    }
+}
+
+/// HMAC-sign the JWT signing input, returning the raw signature bytes.
+fn jwt_hmac_sign(alg: &str, key: &str, msg: &str) -> Result<Vec<u8>, CfmlError> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Sha256, Sha384, Sha512};
+    let keyerr = |e: hmac::digest::InvalidLength| CfmlError::runtime(format!("JWT key error: {}", e));
+    Ok(match alg {
+        "HS256" => {
+            let mut m = Hmac::<Sha256>::new_from_slice(key.as_bytes()).map_err(keyerr)?;
+            m.update(msg.as_bytes());
+            m.finalize().into_bytes().to_vec()
+        }
+        "HS384" => {
+            let mut m = Hmac::<Sha384>::new_from_slice(key.as_bytes()).map_err(keyerr)?;
+            m.update(msg.as_bytes());
+            m.finalize().into_bytes().to_vec()
+        }
+        "HS512" => {
+            let mut m = Hmac::<Sha512>::new_from_slice(key.as_bytes()).map_err(keyerr)?;
+            m.update(msg.as_bytes());
+            m.finalize().into_bytes().to_vec()
+        }
+        _ => return Err(CfmlError::runtime(format!(
+            "JWT algorithm '{}' is not supported. RustCFML supports HS256/HS384/HS512; RSA (RS*/PS*) and ECDSA (ES*) require asymmetric keys not yet implemented.",
+            alg
+        ))),
+    })
+}
+
+/// Constant-time verify of an HMAC JWT signature.
+fn jwt_hmac_verify(alg: &str, key: &str, msg: &str, sig: &[u8]) -> Result<bool, CfmlError> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Sha256, Sha384, Sha512};
+    let keyerr = |e: hmac::digest::InvalidLength| CfmlError::runtime(format!("JWT key error: {}", e));
+    Ok(match alg {
+        "HS256" => {
+            let mut m = Hmac::<Sha256>::new_from_slice(key.as_bytes()).map_err(keyerr)?;
+            m.update(msg.as_bytes());
+            m.verify_slice(sig).is_ok()
+        }
+        "HS384" => {
+            let mut m = Hmac::<Sha384>::new_from_slice(key.as_bytes()).map_err(keyerr)?;
+            m.update(msg.as_bytes());
+            m.verify_slice(sig).is_ok()
+        }
+        "HS512" => {
+            let mut m = Hmac::<Sha512>::new_from_slice(key.as_bytes()).map_err(keyerr)?;
+            m.update(msg.as_bytes());
+            m.verify_slice(sig).is_ok()
+        }
+        _ => return Err(CfmlError::runtime(format!(
+            "JWT algorithm '{}' is not supported (HS256/HS384/HS512 only).",
+            alg
+        ))),
+    })
+}
+
+/// `JwtSign(payload, key [, algorithm="HS256" [, expiresIn]])` → signed JWT string.
+/// payload: a struct of claims (or a raw string). key: the HMAC secret. expiresIn:
+/// optional lifetime in seconds — when given, `iat` (now) and `exp` (now+expiresIn)
+/// are added to a struct payload if absent.
+fn fn_jwt_sign(args: Vec<CfmlValue>) -> CfmlResult {
+    let payload = args.first().cloned().unwrap_or(CfmlValue::Null);
+    let key = get_str(&args, 1);
+    let alg = {
+        let a = get_str(&args, 2);
+        if a.is_empty() { "HS256".to_string() } else { jwt_alg_canonical(&a) }
+    };
+    let expires_in: Option<i64> = args.get(3).and_then(jwt_claim_seconds);
+
+    let header_json = format!("{{\"alg\":\"{}\",\"typ\":\"JWT\"}}", alg);
+    let header_b64 = base64url_encode(header_json.as_bytes());
+
+    let payload_json = match &payload {
+        CfmlValue::Struct(s) => {
+            let mut map = s.snapshot();
+            if let Some(exp_secs) = expires_in {
+                let now = chrono::Utc::now().timestamp();
+                if !map.keys().any(|k| k.eq_ignore_ascii_case("iat")) {
+                    map.insert("iat".to_string(), CfmlValue::Int(now));
+                }
+                if !map.keys().any(|k| k.eq_ignore_ascii_case("exp")) {
+                    map.insert("exp".to_string(), CfmlValue::Int(now + exp_secs));
+                }
+            }
+            let mut visited = Vec::new();
+            serialize_value(&CfmlValue::strukt(map), &mut visited)
+        }
+        CfmlValue::String(s) => (**s).clone(),
+        CfmlValue::Null => "{}".to_string(),
+        other => {
+            let mut visited = Vec::new();
+            serialize_value(other, &mut visited)
+        }
+    };
+    let payload_b64 = base64url_encode(payload_json.as_bytes());
+
+    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let sig = jwt_hmac_sign(&alg, &key, &signing_input)?;
+    let sig_b64 = base64url_encode(&sig);
+    Ok(CfmlValue::string(format!("{}.{}", signing_input, sig_b64)))
+}
+
+/// `JwtVerify(token, key [, algorithm])` → the claims struct. Throws on a bad
+/// signature, an algorithm mismatch, or an expired / not-yet-valid token.
+fn fn_jwt_verify(args: Vec<CfmlValue>) -> CfmlResult {
+    let token = get_str(&args, 0);
+    let key = get_str(&args, 1);
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(CfmlError::runtime(
+            "JwtVerify: invalid JWT format (expected 3 dot-separated parts).".to_string(),
+        ));
+    }
+
+    // Read the alg from the header and (defensively) reject an algorithm-substitution
+    // attempt when the caller pinned an expected algorithm.
+    let header_json = String::from_utf8_lossy(&base64url_decode(parts[0])).to_string();
+    let header = fn_deserialize_json(vec![CfmlValue::string(header_json)])?;
+    let alg_in_token = match &header {
+        CfmlValue::Struct(h) => h
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("alg"))
+            .map(|(_, v)| v.as_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let expected = get_str(&args, 2);
+    if !expected.is_empty() && !jwt_alg_canonical(&expected).eq_ignore_ascii_case(&alg_in_token) {
+        return Err(CfmlError::runtime(format!(
+            "JwtVerify: token algorithm '{}' does not match expected '{}'.",
+            alg_in_token, expected
+        )));
+    }
+    let alg = jwt_alg_canonical(&alg_in_token);
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = base64url_decode(parts[2]);
+    if !jwt_hmac_verify(&alg, &key, &signing_input, &sig_bytes)? {
+        return Err(CfmlError::runtime(
+            "JwtVerify: signature verification failed.".to_string(),
+        ));
+    }
+
+    let payload_json = String::from_utf8_lossy(&base64url_decode(parts[1])).to_string();
+    let claims = fn_deserialize_json(vec![CfmlValue::string(payload_json)])?;
+    if let CfmlValue::Struct(c) = &claims {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(exp) = c.iter().find(|(k, _)| k.eq_ignore_ascii_case("exp")).and_then(|(_, v)| jwt_claim_seconds(&v)) {
+            if exp < now {
+                return Err(CfmlError::runtime("JwtVerify: token has expired.".to_string()));
+            }
+        }
+        if let Some(nbf) = c.iter().find(|(k, _)| k.eq_ignore_ascii_case("nbf")).and_then(|(_, v)| jwt_claim_seconds(&v)) {
+            if nbf > now {
+                return Err(CfmlError::runtime("JwtVerify: token is not yet valid (nbf).".to_string()));
+            }
+        }
+    }
+    Ok(claims)
+}
+
+/// `JwtDecode(token)` → the claims struct WITHOUT verifying the signature.
+/// For inspection only — never trust decoded claims without JwtVerify.
+fn fn_jwt_decode(args: Vec<CfmlValue>) -> CfmlResult {
+    let token = get_str(&args, 0);
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() < 2 {
+        return Err(CfmlError::runtime(
+            "JwtDecode: invalid JWT format (expected at least 2 dot-separated parts).".to_string(),
+        ));
+    }
+    let payload_json = String::from_utf8_lossy(&base64url_decode(parts[1])).to_string();
+    fn_deserialize_json(vec![CfmlValue::string(payload_json)])
 }
 
 #[cfg(feature = "security")]
