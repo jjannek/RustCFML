@@ -31,6 +31,7 @@ include "harness.cfm";
 <!--- from nested it()/describe() closures). --->
 <cf_runtest file="core/test_closure_captures_local_function.cfm">
 <cf_runtest file="core/test_struct_stored_closure_dotcall.cfm">
+<cf_runtest file="core/test_closure_unscoped_reset.cfm">
 <cf_runtest file="core/test_compound_assignment.cfm">
 <cf_runtest file="core/test_undeclared_named_args.cfm">
 <!--- - invoke_undeclared_keys: the argument struct of the positional BIF --->

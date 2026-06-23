@@ -3445,7 +3445,7 @@ impl CfmlVirtualMachine {
                     // CFML null-assignment: `x = voidFn()` (Null RHS) must DELETE
                     // the target rather than materialize a null-valued key. The
                     // value (Null) was already popped by the guard's `Pop`.
-                    self.delete_scope_path(path, &mut locals);
+                    self.delete_scope_path(path, &mut locals, effective_local_mode_modern);
                     // Drop any closure-env copy so sibling closures see the
                     // deletion too (mirrors StoreLocal's env sync).
                     if let Some(ref env) = closure_env {
@@ -6515,7 +6515,7 @@ impl CfmlVirtualMachine {
                                             && !cur.ptr_eq(res)
                                 );
                                 if !clobbers_foreign_cfc {
-                                    self.scope_aware_store(var_name, result.clone(), &mut locals);
+                                    self.scope_aware_store(var_name, result.clone(), &mut locals, effective_local_mode_modern);
                                 }
                             }
                         } else if path.len() >= 2 && Self::is_mutating_method(&method_name) {
@@ -6559,7 +6559,7 @@ impl CfmlVirtualMachine {
                                 }
                                 if !skip_for_identity {
                                     Self::deep_set(&mut root_obj, props, result.clone());
-                                    self.scope_aware_store(var_name, root_obj, &mut locals);
+                                    self.scope_aware_store(var_name, root_obj, &mut locals, effective_local_mode_modern);
                                 }
                             }
                         }
@@ -6647,7 +6647,7 @@ impl CfmlVirtualMachine {
                                 } else {
                                     modified_this
                                 };
-                                self.scope_aware_store(var_name, merged, &mut locals);
+                                self.scope_aware_store(var_name, merged, &mut locals, effective_local_mode_modern);
                                 }
                             } else {
                                 // Chained-CFC identity guard: for
@@ -6700,7 +6700,7 @@ impl CfmlVirtualMachine {
                                 {
                                     let props = &path[1..];
                                     Self::deep_set(&mut root_obj, props, modified_this);
-                                    self.scope_aware_store(var_name, root_obj, &mut locals);
+                                    self.scope_aware_store(var_name, root_obj, &mut locals, effective_local_mode_modern);
                                 }
                             }
                         }
@@ -6743,13 +6743,13 @@ impl CfmlVirtualMachine {
                                 }
                                 // Store back
                                 if load_path.len() == 1 {
-                                    self.scope_aware_store(var_name, comp_obj, &mut locals);
+                                    self.scope_aware_store(var_name, comp_obj, &mut locals, effective_local_mode_modern);
                                 } else {
                                     if let Some(mut root_obj) =
                                         self.scope_aware_load(var_name, &locals)
                                     {
                                         Self::deep_set(&mut root_obj, &load_path[1..], comp_obj);
-                                        self.scope_aware_store(var_name, root_obj, &mut locals);
+                                        self.scope_aware_store(var_name, root_obj, &mut locals, effective_local_mode_modern);
                                     }
                                 }
                             }
@@ -6765,7 +6765,7 @@ impl CfmlVirtualMachine {
                     // threading; the member-call path does not, so we merge here.
                     if let Some(wb) = self.closure_parent_writeback.take() {
                         for (k, v) in wb {
-                            self.scope_aware_store(&k, v, &mut locals);
+                            self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
                         }
                     }
 
@@ -6877,7 +6877,7 @@ impl CfmlVirtualMachine {
                     };
                     if let Some(wb) = self.closure_parent_writeback.take() {
                         for (k, v) in wb {
-                            self.scope_aware_store(&k, v, &mut locals);
+                            self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
                         }
                     }
                     stack.push(result);
@@ -12852,11 +12852,16 @@ impl CfmlVirtualMachine {
     }
 
     /// Store a variable by name, routing to the correct scope (locals, globals, application, request, local/variables).
+    ///
+    /// `modern` is the frame's effective Lucee localMode (`true` = a bare write
+    /// is a LOCAL-scope write). It governs only the brand-new bare-name case
+    /// below — see the `__variables` routing branch in the tail.
     fn scope_aware_store(
         &mut self,
         name: &str,
         val: CfmlValue,
         locals: &mut ValueMap,
+        modern: bool,
     ) {
         let name_lower = name.to_lowercase();
         if name_lower == "local" {
@@ -12949,6 +12954,40 @@ impl CfmlVirtualMachine {
             locals.insert(ARGUMENTS_SCOPE_KEY.to_string(), val);
         } else if locals.contains_key(name) {
             locals.insert(name.to_string(), val);
+        } else if !modern
+            && locals.contains_key("__variables")
+            && !matches!(name_lower.as_str(), "cfcatch" | "cookie" | "server" | "attributes")
+        {
+            // Classic-localmode CFC method frame: an unscoped bare name that is
+            // NOT a frame-local belongs to the component (`variables`) scope —
+            // exactly StoreLocal's unscoped-write rule (lib.rs StoreLocal
+            // `__variables` branch) and store_runtime_path's bare-root rule, and
+            // consistent with where a bare READ resolves it: lookup_name_in_scopes
+            // checks top-level locals, then __variables, BEFORE globals — so this
+            // sits before the globals arm below. Routing it here (rather than
+            // forking a top-level `locals`/`globals` key) keeps every write-back
+            // path — the method-receiver write-back after `obj.method()`, and the
+            // closure parent write-back — agreeing with the read side. Without it,
+            // a method call on an unscoped complex var inside a closure pinned a
+            // stale top-level shadow into the shared captured env, masking a
+            // sibling/`before`-closure reassignment that correctly lands in
+            // `__variables` (the TestBox beforeEach accumulation bug; cleared the
+            // Wheels AuthenticatorSpec + InjectorSpec failures).
+            //
+            // Excludes ONLY: the catch-block var (`cfcatch`), and the scope names
+            // whose bare READ has a dedicated LoadLocal arm that BYPASSES
+            // __variables (`cookie`→globals, `server`→synthetic build_server_scope,
+            // `attributes`→cfthread/globals) — for those the round-trip would break
+            // if the write went to __variables. The reserved scope names
+            // local/variables/request/application/session/thread/static/arguments
+            // are handled by earlier branches above and never reach here.
+            if let Some(vars) =
+                locals.get_mut("__variables").and_then(|v| v.as_cfml_struct())
+            {
+                vars.insert(name.to_string(), val);
+            } else {
+                locals.insert(name.to_string(), val);
+            }
         } else if self.globals.contains_key(name) {
             self.globals.insert(name.to_string(), val);
         } else {
@@ -12972,7 +13011,7 @@ impl CfmlVirtualMachine {
         // `"variables.x" = voidFn()` LHS, or a null result-writeback delivery)
         // DELETES the target rather than materializing a null-valued key.
         if matches!(value, CfmlValue::Null) {
-            self.delete_scope_path(path, locals);
+            self.delete_scope_path(path, locals, local_mode_modern);
             return;
         }
         let parts: Vec<&str> = path.split('.').collect();
@@ -13022,14 +13061,14 @@ impl CfmlVirtualMachine {
                 {
                     vars.insert(scope.to_string(), root);
                 } else {
-                    self.scope_aware_store(scope, root, locals);
+                    self.scope_aware_store(scope, root, locals, local_mode_modern);
                 }
             } else {
-                self.scope_aware_store(scope, root, locals);
+                self.scope_aware_store(scope, root, locals, local_mode_modern);
             }
         } else {
             // Bare name (no scope prefix) — single-variable store.
-            self.scope_aware_store(path, value, locals);
+            self.scope_aware_store(path, value, locals, local_mode_modern);
         }
     }
 
@@ -13038,7 +13077,13 @@ impl CfmlVirtualMachine {
     /// rather than materializing a null one). The bare-name case is handled
     /// inline in the `UnsetPath` opcode (it also clears globals + closure env);
     /// this covers `<scope>.leaf` and deeper `<scope>.a.b…leaf` paths.
-    fn delete_scope_path(&mut self, path: &str, locals: &mut ValueMap) {
+    fn delete_scope_path(&mut self, path: &str, locals: &mut ValueMap, modern: bool) {
+        // `modern` is the live frame's effective localMode (not the app default),
+        // threaded from the callers so the scope-container store-backs below
+        // commit a classic-localmode component var back to __variables rather
+        // than forking a top-level shadow. (effective = func.declared_local_mode
+        // .unwrap_or(app_local_mode_modern); the two diverge when a method
+        // declares localmode="classic" under an app default of modern.)
         let parts: Vec<&str> = path.split('.').collect();
         if parts.len() < 2 {
             imap_remove_ci(locals, path);
@@ -13096,7 +13141,7 @@ impl CfmlVirtualMachine {
                         if let Some(s) = obj.as_cfml_struct() {
                             s.remove_ci(leaf);
                         }
-                        self.scope_aware_store(scope, obj, locals);
+                        self.scope_aware_store(scope, obj, locals, modern);
                     }
                 }
             }
@@ -13125,7 +13170,7 @@ impl CfmlVirtualMachine {
             // `session` before it is attached, or a value-typed page scope.
             // Mirrors the set path in store_runtime_path; for already-reference-typed
             // scopes the leaf is removed in place and this re-commit is a no-op.
-            self.scope_aware_store(scope, root, locals);
+            self.scope_aware_store(scope, root, locals, modern);
         }
     }
 
