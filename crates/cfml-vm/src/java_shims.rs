@@ -234,6 +234,24 @@ pub fn handle_java_thread(method: &str, _args: Vec<CfmlValue>, object: &CfmlValu
     }
 }
 
+/// Java `InetAddress.isLoopbackAddress()` semantics: true for the entire IPv4
+/// 127.0.0.0/8 block and the IPv6 loopback `::1` (in any zero-padded / compressed
+/// form), plus the literal host "localhost". Rust's address parsers canonicalise
+/// "::1", "0:0:0:0:0:0:0:1" and "0000:…:0001" to the same value.
+fn is_loopback_addr(addr: &str) -> bool {
+    let a = addr.trim().to_lowercase();
+    if a == "localhost" {
+        return true;
+    }
+    if let Ok(v4) = a.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    if let Ok(v6) = a.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback();
+    }
+    false
+}
+
 pub fn handle_java_inetaddress(
     method: &str,
     args: Vec<CfmlValue>,
@@ -290,11 +308,30 @@ pub fn handle_java_inetaddress(
                 "__hostname".to_string(),
                 CfmlValue::string(hostname.clone()),
             );
+            // Resolve the address. We do no DNS, so: an IP literal is stored as-is
+            // (the input was already an address); "localhost" resolves to the IPv4
+            // loopback like real Java; any other hostname round-trips the name as a
+            // best effort. isLoopbackAddress()/getHostAddress() read this back.
+            let address = if hostname.eq_ignore_ascii_case("localhost") {
+                "127.0.0.1".to_string()
+            } else {
+                hostname
+            };
             shim.insert(
                 "__address".to_string(),
-                CfmlValue::string("127.0.0.1".to_string()),
+                CfmlValue::string(address),
             );
             Ok(CfmlValue::strukt(shim))
+        }
+        "isloopbackaddress" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                let addr = shim
+                    .get("__address")
+                    .map(|v| v.as_string())
+                    .unwrap_or_default();
+                return Ok(CfmlValue::Bool(is_loopback_addr(&addr)));
+            }
+            Ok(CfmlValue::Bool(false))
         }
         "gethostname" | "gethostaddress" | "getcanonicalhostname" | "tostring" => {
             if let CfmlValue::Struct(ref shim) = object {
