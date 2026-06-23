@@ -14,7 +14,7 @@
 //! - Query functions
 //! - System functions
 
-use cfml_common::dynamic::{CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
+use cfml_common::dynamic::{build_implements_meta, CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use std::collections::HashMap;
 use regex::Regex;
@@ -4965,6 +4965,15 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                         meta.insert("extends".to_string(), CfmlValue::strukt(extends_meta));
                     }
                     meta.insert("fullExtends".to_string(), CfmlValue::Array(chain.clone()));
+                }
+
+                // `implements`: a struct keyed by each implemented interface's
+                // declared FQN -> a minimal interface metadata stub. Lucee/ACF
+                // expose `implements` this way (keyed by interface name);
+                // frameworks (Wheels interface specs, WireBox) read the keys to
+                // detect a declared interface contract.
+                if let Some(imp) = build_implements_meta(&s.snapshot()) {
+                    meta.insert("implements".to_string(), imp);
                 }
 
                 // Extract __metadata (custom attributes)

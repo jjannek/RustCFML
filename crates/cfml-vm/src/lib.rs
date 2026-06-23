@@ -1,7 +1,9 @@
 //! CFML Virtual Machine - Bytecode execution engine
 
 use cfml_codegen::{BytecodeFunction, BytecodeOp, BytecodeProgram, CmpOp};
-use cfml_common::dynamic::{CfmlQuery, CfmlStruct, CfmlValue, ValueMap};
+use cfml_common::dynamic::{
+    build_implements_meta, interface_meta_stub, CfmlQuery, CfmlStruct, CfmlValue, ValueMap,
+};
 use cfml_common::vfs::{RealFs, Vfs};
 use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use cfml_qoq::function::{QoQFn, QoQFnKind, QoQFunctionRegistry};
@@ -9589,12 +9591,42 @@ impl CfmlVirtualMachine {
                         if let Some(CfmlValue::String(src)) = s.get("__source_file") {
                             meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
                         }
-                        if let Some(chain) = s.get("__extends_chain") {
+                        // `extends`: a component stores __extends as a single
+                        // parent name (a String, surfaced via __extends_chain
+                        // below); an INTERFACE stores __extends as an array of
+                        // parent interface names. Lucee/ACF expose interface
+                        // `extends` as a struct keyed by each parent interface's
+                        // FQN (interfaces are multi-parent), so build that form
+                        // for the array case and leave the component string path
+                        // untouched.
+                        if let Some(CfmlValue::Array(parents)) = s.get("__extends") {
+                            let mut ext = ValueMap::default();
+                            for p in parents.iter() {
+                                let fqn = p.as_string();
+                                if fqn.is_empty() {
+                                    continue;
+                                }
+                                ext.insert(fqn.clone(), interface_meta_stub(&fqn));
+                            }
+                            if !ext.is_empty() {
+                                meta.insert("extends".to_string(), CfmlValue::strukt(ext));
+                            }
+                        } else if let Some(chain) = s.get("__extends_chain") {
                             if let CfmlValue::Array(arr) = chain {
                                 if let Some(first) = arr.first() {
                                     meta.insert("extends".to_string(), first.clone());
                                 }
                             }
+                        }
+                        // `implements`: a struct keyed by each implemented
+                        // interface's declared FQN -> a minimal interface
+                        // metadata stub. Lucee/ACF expose `implements` this way
+                        // (keyed by interface name). Source the transitive chain
+                        // when available (so an interface's own `extends`
+                        // ancestors appear too), unioned with the directly
+                        // declared list.
+                        if let Some(imp) = build_implements_meta(s) {
+                            meta.insert("implements".to_string(), imp);
                         }
                         let mut functions = Vec::new();
                         for (k, v) in s {

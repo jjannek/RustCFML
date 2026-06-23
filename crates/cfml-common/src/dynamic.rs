@@ -21,6 +21,51 @@ pub type ValueBuildHasher = std::hash::BuildHasherDefault<rustc_hash::FxHasher>;
 /// and pre-size with `ValueMap::with_capacity_and_hasher(n, Default::default())`.
 pub type ValueMap = IndexMap<String, CfmlValue, ValueBuildHasher>;
 
+/// A minimal interface-metadata stub: `{ name, fullname, type:"interface" }`.
+/// Used as the value for each entry of the `implements` / interface-`extends`
+/// metadata structs. Lucee/ACF store the interface's full metadata here, but
+/// every consumer that matters (and the Wheels interface specs) only reads the
+/// key (the interface FQN) and `name`, so a stub is sufficient and avoids a
+/// recursive template resolve.
+pub fn interface_meta_stub(fqn: &str) -> CfmlValue {
+    let mut m = ValueMap::default();
+    m.insert("name".to_string(), CfmlValue::string(fqn.to_string()));
+    m.insert("fullname".to_string(), CfmlValue::string(fqn.to_string()));
+    m.insert("type".to_string(), CfmlValue::string("interface".to_string()));
+    CfmlValue::strukt(m)
+}
+
+/// Build the `implements` metadata struct for a component: a struct keyed by
+/// each implemented interface's declared FQN, value = [`interface_meta_stub`].
+/// Sources the transitive `__implements_chain` (so an interface's own `extends`
+/// ancestors appear) unioned with the directly-declared `__implements` list,
+/// dedup'd case-insensitively (first-seen casing wins, matching the declared
+/// case). Returns `None` when the component implements nothing. Shared by
+/// `getMetadata()` and `getComponentMetaData()` so both forms agree.
+pub fn build_implements_meta(s: &ValueMap) -> Option<CfmlValue> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = ValueMap::default();
+    // Read the directly-declared list first so its original-case FQNs win; the
+    // transitive chain (built during inheritance merge, lowercased) then adds
+    // only purely-inherited interface ancestors.
+    for key in ["__implements", "__implements_chain"] {
+        if let Some(CfmlValue::Array(arr)) = s.get(key) {
+            for v in arr.iter() {
+                let fqn = v.as_string();
+                if fqn.is_empty() || !seen.insert(fqn.to_lowercase()) {
+                    continue;
+                }
+                out.insert(fqn.clone(), interface_meta_stub(&fqn));
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(CfmlValue::strukt(out))
+    }
+}
+
 /// Marker key that tags a struct as a Lucee-style "magic" scope (currently the
 /// `cgi` scope): reading ANY missing key returns an empty string `""` rather
 /// than throwing / yielding null, while `structKeyExists` still reports the
