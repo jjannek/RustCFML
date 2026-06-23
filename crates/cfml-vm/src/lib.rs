@@ -3215,7 +3215,21 @@ impl CfmlVirtualMachine {
                                     locals.insert("__variables".to_string(), v);
                                 }
                             }
-                        } else if name_lower == "variables" {
+                        } else if name_lower == "variables"
+                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(&name_lower)
+                        {
+                            // Bare `variables = …` / `variables.x = …` round-trip into
+                            // the component/page `variables` scope. A user
+                            // `local.variables = …` (or `var variables = …`) emits
+                            // DeclareLocal first, so it lands in `declared_locals` and
+                            // falls through to the plain locals-insert below — keeping
+                            // a local literally named `variables` independent of the
+                            // scope (Lucee/ACF semantics; mirrors the `arguments`
+                            // branch). Without this guard, `local.variables =
+                            // ListToArray(...)` was silently DROPPED: this branch
+                            // matched on the name, then the `if let Struct` failed for
+                            // a non-struct value and nothing was stored.
                             if let CfmlValue::Struct(s) = val {
                                 if locals.contains_key("__variables") {
                                     // CFC method: write back to the __variables scope
@@ -3227,11 +3241,20 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                        } else if name_lower == "request" {
+                        } else if name_lower == "request"
+                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(&name_lower)
+                        {
+                            // Same declared-local guard as `variables`: a user
+                            // `local.request = …` stays a plain local, not a
+                            // write-back into the shared request scope.
                             if let CfmlValue::Struct(s) = &val {
                                 self.request_scope.with_write(|m| *m = s.snapshot());
                             }
-                        } else if name_lower == "application" {
+                        } else if name_lower == "application"
+                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(&name_lower)
+                        {
                             if let CfmlValue::Struct(s) = &val {
                                 if let Some(ref app_scope) = self.application_scope {
                                     // Same self-alias guard as request above.
@@ -3241,7 +3264,10 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                             }
-                        } else if name_lower == "session" {
+                        } else if name_lower == "session"
+                            && !declared_locals.contains(name.as_str())
+                            && !declared_locals.contains(&name_lower)
+                        {
                             if let CfmlValue::Struct(s) = &val {
                                 self.set_session_scope(s.snapshot())?;
                             }
@@ -3823,10 +3849,11 @@ impl CfmlVirtualMachine {
                         (CfmlValue::Double(d), CfmlValue::Int(i)) => {
                             CfmlValue::Double(d + *i as f64)
                         }
-                        (CfmlValue::String(s), CfmlValue::String(t)) => {
-                            CfmlValue::string(format!("{}{}", s, t))
-                        }
-                        // CFML: try numeric coercion
+                        // CFML `+` is ARITHMETIC ONLY (`&` is concatenation), so two
+                        // numeric strings like "2" + "1" must ADD to 3, not
+                        // concatenate to "21". There is deliberately no String+String
+                        // short-circuit — numeric strings fall through to coercion
+                        // below; only genuinely non-numeric operands concatenate.
                         _ => {
                             let a_num = to_number(&a);
                             let b_num = to_number(&b);
@@ -5331,6 +5358,38 @@ impl CfmlVirtualMachine {
                                 s.insert(index.as_string(), value);
                                 collection = CfmlValue::strukt(s);
                             }
+                        }
+                        CfmlValue::QueryColumn(arc) => {
+                            // Inner step of `q[col][row] = v`: GetIndex(query, col)
+                            // produced this column proxy; assign the 1-based row cell.
+                            // The column CoW-detaches here; the outer SetIndex's
+                            // Query arm writes the whole modified column back.
+                            let one_based: i64 = match &index {
+                                CfmlValue::Int(i) => *i,
+                                CfmlValue::Double(d) => *d as i64,
+                                other => other.as_string().trim().parse::<i64>().unwrap_or(0),
+                            };
+                            if one_based >= 1 {
+                                let idx = (one_based - 1) as usize;
+                                let col = Arc::make_mut(arc);
+                                if idx >= col.len() {
+                                    col.resize(idx + 1, CfmlValue::Null);
+                                }
+                                col[idx] = value;
+                            }
+                        }
+                        CfmlValue::Query(q) => {
+                            // Outer step of `q[col][row] = v`, or a whole-column
+                            // assign `q[col] = arrayOrColumn`. Replace the named
+                            // column in place on the shared query so every alias
+                            // (e.g. the cached query in request scope) observes it.
+                            let col_name = index.as_string();
+                            let new_values: Vec<CfmlValue> = match value {
+                                CfmlValue::QueryColumn(a) => a.as_ref().clone(),
+                                CfmlValue::Array(a) => a.snapshot(),
+                                other => vec![other],
+                            };
+                            q.set_column(&col_name, new_values);
                         }
                         _ => {}
                     }
@@ -13725,9 +13784,17 @@ impl CfmlVirtualMachine {
                         .map(|a| a.as_string())
                         .unwrap_or_default();
                     let old = s.get(&key).unwrap_or(CfmlValue::Null);
-                    let mut ns = s.snapshot();
-                    ns.shift_remove(&key);
-                    self.method_this_writeback = Some(CfmlValue::strukt(ns));
+                    if java_class == "java.util.concurrent.concurrenthashmap" {
+                        // Reference-type semantics: mutate the shared backing in
+                        // place so `outer.get(k).remove(...)` drops the entry from
+                        // the nested map still held inside `outer` (mirrors the
+                        // in-place put/clear above). No writeback needed.
+                        s.remove(&key);
+                    } else {
+                        let mut ns = s.snapshot();
+                        ns.shift_remove(&key);
+                        self.method_this_writeback = Some(CfmlValue::strukt(ns));
+                    }
                     return Ok(old);
                 }
 

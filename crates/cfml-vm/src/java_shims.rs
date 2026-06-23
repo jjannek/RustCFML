@@ -61,8 +61,19 @@ pub fn handle_java_messagedigest(
             }
         }
         "isequal" => {
+            // Real Java MessageDigest.isEqual compares two byte[] for content
+            // equality. Args here are almost always Binary (from `.getBytes()`),
+            // and Binary stringifies to the constant "<Binary>" — so comparing
+            // via as_string() made ANY two byte arrays compare equal, defeating
+            // JWT signature / password verification. Compare the raw bytes.
             if args.len() >= 2 {
-                Ok(CfmlValue::Bool(args[0].as_string() == args[1].as_string()))
+                fn to_bytes(v: &CfmlValue) -> Vec<u8> {
+                    match v {
+                        CfmlValue::Binary(b) => b.clone(),
+                        other => other.as_string().into_bytes(),
+                    }
+                }
+                Ok(CfmlValue::Bool(to_bytes(&args[0]) == to_bytes(&args[1])))
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -843,9 +854,15 @@ pub fn handle_java_concurrenthashmap(
                     if method == "putifabsent" && shim.contains_key(&key) {
                         return Ok(object.clone());
                     }
-                    let mut ns = shim.snapshot();
-                    ns.insert(key, v.clone());
-                    return Ok(CfmlValue::strukt(ns));
+                    // Mutate the shared backing IN PLACE (interior mutability) and
+                    // return the SAME handle. Real Java maps are reference types:
+                    // `outer.get(k).put(...)` must mutate the nested map still held
+                    // inside `outer`. Snapshotting into a fresh struct broke that —
+                    // the put landed only in a throwaway copy (the value returned by
+                    // `get`), so nested-map writes (e.g. Wheels Channel subscribers)
+                    // never persisted. Returning `object.clone()` shares the Arc, so
+                    // the VM's mutating-method write-back is a harmless re-assign.
+                    shim.insert(key, v.clone());
                 }
                 return Ok(object.clone());
             }
@@ -932,13 +949,14 @@ pub fn handle_java_concurrenthashmap(
         }
         "clear" => {
             if let CfmlValue::Struct(ref shim) = object {
-                let mut ns = ValueMap::default();
-                for (k, v) in shim.iter() {
-                    if k.starts_with("__") {
-                        ns.insert(k.clone(), v.clone());
+                // Remove the data keys in place (preserve the `__java_*` markers)
+                // so all aliases of the shared map observe the clear.
+                for k in shim.keys() {
+                    if !k.starts_with("__") {
+                        shim.remove(&k);
                     }
                 }
-                return Ok(CfmlValue::strukt(ns));
+                return Ok(object.clone());
             }
             Ok(CfmlValue::Null)
         }

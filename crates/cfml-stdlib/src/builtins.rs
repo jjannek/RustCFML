@@ -62,11 +62,75 @@ const REGEX_CACHE_CAP: usize = 4096;
 /// cache is bounded: if inserting would exceed `REGEX_CACHE_CAP` distinct
 /// patterns (e.g. an adversarial workload generating unique patterns) the cache
 /// is cleared first, trading a rare cold rebuild for a hard memory ceiling.
+/// Translate CFML/Java regex syntax that the Rust `regex` crate rejects into an
+/// equivalent it accepts, before compilation. Currently handles one construct
+/// that appears in real framework code (Wheels `autoLink`'s `[^\s\b]+`): a `\b`
+/// INSIDE a character class. Java/Lucee/ACF treat `\b` within `[...]` as the
+/// backspace char (U+0008); the Rust crate only accepts `\b` as a word boundary
+/// (outside a class) and errors on it inside one — and `cached_regex`'s callers
+/// silently swallow the compile error as "no match", so the whole pattern
+/// becomes a no-op. Rewrite the in-class `\b` to `\x08`; word-boundary `\b`
+/// (outside a class) is left untouched.
+fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
+    if !pat.contains("\\b") {
+        return std::borrow::Cow::Borrowed(pat);
+    }
+    let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::with_capacity(pat.len());
+    let mut in_class = false;
+    let mut class_pos = 0usize; // members seen in the current class (for leading-] / ^)
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            let n = chars[i + 1];
+            if in_class && n == 'b' {
+                out.push_str("\\x08");
+            } else {
+                out.push(c);
+                out.push(n);
+            }
+            if in_class {
+                class_pos += 1;
+            }
+            i += 2;
+            continue;
+        }
+        match c {
+            '[' if !in_class => {
+                in_class = true;
+                class_pos = 0;
+                out.push('[');
+            }
+            ']' if in_class => {
+                // A `]` as the first class member (or right after `^`) is literal;
+                // otherwise it closes the class.
+                if class_pos == 0 {
+                    out.push(']');
+                    class_pos += 1;
+                } else {
+                    in_class = false;
+                    out.push(']');
+                }
+            }
+            '^' if in_class && class_pos == 0 => out.push('^'),
+            _ => {
+                if in_class {
+                    class_pos += 1;
+                }
+                out.push(c);
+            }
+        }
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 fn cached_regex(pat: &str) -> Result<Regex, regex::Error> {
     if let Some(re) = REGEX_CACHE.read().unwrap().get(pat) {
         return Ok(re.clone());
     }
-    let re = Regex::new(pat)?;
+    let re = Regex::new(&translate_cfml_regex(pat))?;
     let mut cache = REGEX_CACHE.write().unwrap();
     if cache.len() >= REGEX_CACHE_CAP {
         cache.clear();
@@ -1599,14 +1663,29 @@ fn fn_html_code_format(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_encode_for_html(args: Vec<CfmlValue>) -> CfmlResult {
     let s = get_str(&args, 0);
-    Ok(CfmlValue::string(
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&#x27;")
-            .replace('/', "&#x2f;"),
-    ))
+    let mut result = String::new();
+    // OWASP/ESAPI HTMLEntityCodec for an HTML *content* context. The immune set
+    // is ESAPI's IMMUNE_HTML = `, . - _` PLUS space — that single extra immune
+    // char (space) is the only thing distinguishing it from the attribute codec
+    // (IMMUNE_HTMLATTR). Every other char below U+0100 is encoded: a named
+    // entity where one exists, else a lowercase hex numeric entity. Codepoints
+    // >= U+0100 pass through. Adobe CF and BoxLang match this; Lucee 7 is the
+    // outlier (encodes almost nothing). The old 6-char replace() chain left `(`,
+    // `)`, `=`, `[`, `]`, etc. raw — wrong by OWASP/Adobe/BoxLang, and it broke
+    // Wheels form helpers asserting e.g. `alert&#x28;&quot;XSS&quot;&#x29;`.
+    for c in s.chars() {
+        match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => result.push(c),
+            ',' | '.' | '-' | '_' | ' ' => result.push(c),
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '"' => result.push_str("&quot;"),
+            c if (c as u32) >= 0x100 => result.push(c),
+            c => result.push_str(&format!("&#x{:x};", c as u32)),
+        }
+    }
+    Ok(CfmlValue::string(result))
 }
 
 fn fn_ljustify(args: Vec<CfmlValue>) -> CfmlResult {
@@ -8156,10 +8235,10 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
     let conn = pool.get()
         .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to get SQLite connection from pool: {}", e)))?;
 
-    let bound_params = build_sqlite_params(params_arg, sql)?;
+    let (exec_sql, bound_params) = build_sqlite_params(params_arg, sql)?;
 
     if is_select_query(sql) {
-        let mut stmt = conn.prepare(sql)
+        let mut stmt = conn.prepare(&exec_sql)
             .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
 
         let column_count = stmt.column_count();
@@ -8183,7 +8262,7 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
         let rows = rows_result?;
         build_query_result(columns, rows, sql, return_type)
     } else {
-        let affected = conn.execute(sql, rusqlite::params_from_iter(bound_params.iter()))
+        let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
             .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
 
         let last_id = conn.last_insert_rowid();
@@ -8191,18 +8270,30 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
     }
 }
 
+/// Build the bound parameter values for a SQLite query, AND return the SQL to
+/// actually prepare/execute. For positional/array params the SQL is unchanged.
+/// For NAMED (struct) params each textual `:name` is rewritten to an anonymous
+/// positional `?`, with one bound value pushed per occurrence. This is the only
+/// way to handle a name that appears MORE THAN ONCE: rusqlite de-duplicates
+/// repeated `:name`s in a prepared statement (so `... :x ... :x ...` has a
+/// single parameter), but we push one value per textual occurrence — the
+/// mismatch errored at bind time ("Wrong number of parameters passed to query.
+/// Got 4, needed 3", hit by Wheels' DataChannel lastEventId poll). Rewriting to
+/// `?` makes each occurrence its own positional slot bound to the same value.
 #[cfg(feature = "sqlite")]
-fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<Vec<rusqlite::types::Value>, CfmlError> {
+fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<(String, Vec<rusqlite::types::Value>), CfmlError> {
     match params_arg {
-        CfmlValue::Null => Ok(vec![]),
+        CfmlValue::Null => Ok((sql.to_string(), vec![])),
         CfmlValue::Array(arr) => {
-            arr.iter().map(|v| Ok(cfml_to_sqlite(&v))).collect()
+            Ok((sql.to_string(), arr.iter().map(|v| cfml_to_sqlite(&v)).collect()))
         }
         CfmlValue::Struct(map) => {
             let mut result = Vec::new();
+            let mut out_sql = String::with_capacity(sql.len());
             let bytes = sql.as_bytes();
             let len = bytes.len();
             let mut i = 0;
+            let mut seg_start = 0; // byte offset of unflushed literal text
             while i < len {
                 if bytes[i] == b':' && (i == 0 || !bytes[i-1].is_ascii_alphanumeric()) {
                     let start = i + 1;
@@ -8223,11 +8314,19 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<Vec<rusqlite
                         // normalized by normalize_query_params() upstream.
                         let val = cfqueryparam_unwrap(&raw);
                         result.push(cfml_to_sqlite(&val));
+                        // Flush literal text before the placeholder, then emit `?`.
+                        // (Slice boundaries are ASCII positions → UTF-8 safe.)
+                        out_sql.push_str(&sql[seg_start..i]);
+                        out_sql.push('?');
                         i = end;
+                        seg_start = end;
                         continue;
                     }
                 }
                 if bytes[i] == b'\'' {
+                    // Skip a single-quoted string literal so a `:` inside it is
+                    // not treated as a placeholder. The literal stays part of the
+                    // current unflushed segment and is copied verbatim.
                     i += 1;
                     while i < len && bytes[i] != b'\'' {
                         i += 1;
@@ -8235,9 +8334,10 @@ fn build_sqlite_params(params_arg: &CfmlValue, sql: &str) -> Result<Vec<rusqlite
                 }
                 i += 1;
             }
-            Ok(result)
+            out_sql.push_str(&sql[seg_start..]);
+            Ok((out_sql, result))
         }
-        _ => Ok(vec![]),
+        _ => Ok((sql.to_string(), vec![])),
     }
 }
 
@@ -9805,10 +9905,10 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
 fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     use rusqlite::types::Value as SqlValue;
 
-    let bound_params = build_sqlite_params(params_arg, sql)?;
+    let (exec_sql, bound_params) = build_sqlite_params(params_arg, sql)?;
 
     if is_select_query(sql) {
-        let mut stmt = conn.prepare(sql)
+        let mut stmt = conn.prepare(&exec_sql)
             .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
         let column_count = stmt.column_count();
         let columns: Vec<String> = (0..column_count)
@@ -9829,7 +9929,7 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
         let rows = rows_result?;
         build_query_result(columns, rows, sql, return_type)
     } else {
-        let affected = conn.execute(sql, rusqlite::params_from_iter(bound_params.iter()))
+        let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
             .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
         let last_id = conn.last_insert_rowid();
         build_mutation_result(affected as i64, last_id, sql)

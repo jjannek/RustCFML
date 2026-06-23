@@ -15,6 +15,7 @@ include "harness.cfm";
 
 <!--- --- Core Language --- --->
 <cf_runtest file="core/test_variables.cfm">
+<cf_runtest file="core/test_local_scope_name_locals.cfm">
 <cf_runtest file="core/test_access_identifiers.cfm">
 <cf_runtest file="core/test_reserved_word_param_names.cfm">
 <cf_runtest file="core/test_function_scope_capture.cfm">
@@ -133,6 +134,8 @@ include "harness.cfm";
 <!--- struct holding it preserves the value. RustCFML 0.161.0 returned boxed cells. --->
 <cf_runtest file="types/test_query_cell_simple_value.cfm">
 <cf_runtest file="types/test_query_reference.cfm">
+<cf_runtest file="types/test_query_cell_assignment.cfm">
+<cf_runtest file="types/test_java_map_digest_reference.cfm">
 <cf_runtest file="types/test_binary.cfm">
 <cf_runtest file="types/test_hash_in_strings.cfm">
 <cf_runtest file="types/test_string_interpolation_nested_strings.cfm">
@@ -143,6 +146,9 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_string_functions.cfm">
 <cf_runtest file="stdlib/test_string_functions_regex.cfm">
 <cf_runtest file="stdlib/test_string_split_member.cfm">
+<cf_runtest file="stdlib/test_regex_backspace_in_class.cfm">
+<cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">
+<cf_runtest file="stdlib/test_encode_for_html_esapi.cfm">
 <cf_runtest file="stdlib/test_string_functions_encoding.cfm">
 <!--- EncodeForHTMLAttribute must encode attribute-dangerous chars (space, =) per OWASP/Lucee; RustCFML leaves them raw. --->
 <cf_runtest file="functions/test_encodeforhtmlattribute_space_equals.cfm">

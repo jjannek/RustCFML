@@ -862,6 +862,17 @@ impl CfmlValue {
                     a.set(idx, value);
                 }
             }
+            CfmlValue::Query(q) => {
+                // Dot-form column write-back `q.col = arrayOrColumn` (the outer
+                // step of `q.col[row] = v`). Replace the column in place on the
+                // shared query so all aliases observe it.
+                let new_values: Vec<CfmlValue> = match value {
+                    CfmlValue::QueryColumn(a) => a.as_ref().clone(),
+                    CfmlValue::Array(a) => a.snapshot(),
+                    other => vec![other],
+                };
+                q.set_column(&key, new_values);
+            }
             _ => {}
         }
     }
@@ -1592,6 +1603,28 @@ impl CfmlQuery {
     /// the row is out of range.
     pub fn set_cell(&self, row0: usize, column: String, value: CfmlValue) -> bool {
         self.0.write().set_cell_named(row0, &column, value)
+    }
+
+    /// Replace an entire column's values by name (case-insensitive), in place on
+    /// the shared backing so all aliases observe it. If the column doesn't
+    /// exist it is appended. The supplied vec is normalised to the query's
+    /// current row count (Null-padded or truncated). Used by indexed query-cell
+    /// write-back (`q[col][row] = v`), where the modified (CoW-detached) column
+    /// is written back wholesale, and by whole-column assignment (`q.col = arr`).
+    pub fn set_column(&self, name: &str, mut values: Vec<CfmlValue>) {
+        let mut g = self.0.write();
+        let rows = g.row_count();
+        if values.len() < rows {
+            values.resize(rows, CfmlValue::Null);
+        } else if values.len() > rows && rows > 0 {
+            values.truncate(rows);
+        }
+        if let Some(ci) = g.column_index_ci(name) {
+            g.data[ci] = Arc::new(values);
+        } else {
+            g.columns.push(name.to_string());
+            g.data.push(Arc::new(values));
+        }
     }
 
     pub fn sql(&self) -> Option<String> {

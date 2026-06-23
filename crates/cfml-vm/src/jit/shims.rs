@@ -400,7 +400,8 @@ pub extern "C" fn cfml_jit_add_boxed(a: i64, b: i64, _bail: *mut i64) -> i64 {
         (CfmlValue::Double(x), CfmlValue::Double(y)) => CfmlValue::Double(x + y),
         (CfmlValue::Int(i), CfmlValue::Double(d)) => CfmlValue::Double(*i as f64 + d),
         (CfmlValue::Double(d), CfmlValue::Int(i)) => CfmlValue::Double(d + *i as f64),
-        (CfmlValue::String(s), CfmlValue::String(t)) => CfmlValue::string(format!("{s}{t}")),
+        // CFML `+` is arithmetic only; no String+String concat short-circuit (must
+        // mirror the interpreter's Add op — numeric strings add, not concatenate).
         _ => {
             let x = to_number(&va);
             let y = to_number(&vb);
@@ -536,10 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn add_string_string_concats_per_interpreter() {
-        // The interpreter's Add takes a `(String, String) => format!(..)`
-        // branch *before* attempting numeric coercion; the shim mirrors
-        // it exactly so the JIT can't diverge here.
+    fn add_numeric_strings_adds_per_interpreter() {
+        // CFML `+` is ARITHMETIC ONLY (`&` concatenates), so two numeric
+        // strings "3" + "4" must ADD to 7, not concatenate to "34". The shim
+        // mirrors the interpreter's Add exactly (no String+String short-circuit)
+        // so the JIT can't diverge.
         let mut arena = Arena::new();
         let _g = ArenaGuard::install(&mut arena);
         let a = boxed::box_value(CfmlValue::string("3")) as i64;
@@ -547,7 +549,7 @@ mod tests {
         let mut bail = 0i64;
         let r = cfml_jit_add_boxed(a, b, &mut bail);
         let v = unsafe { materialize(r) };
-        assert!(matches!(v, CfmlValue::String(t) if t.as_str() == "34"));
+        assert!(matches!(v, CfmlValue::Double(d) if (d - 7.0).abs() < 1e-9));
         drop(_g);
         drop(unsafe { boxed::reclaim_tagged(a as usize) });
         drop(unsafe { boxed::reclaim_tagged(b as usize) });

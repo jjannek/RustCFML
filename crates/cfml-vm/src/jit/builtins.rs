@@ -368,18 +368,26 @@ extern "C" fn cfml_html_code_format_boxed(tagged: i64) -> i64 {
     super::arena::box_into_active(CfmlValue::string(format!("<pre>{inner}</pre>"))) as i64
 }
 
-/// Mirrors `fn_encode_for_html`: same as htmlEditFormat plus `'` and `/` escapes.
+/// Mirrors `fn_encode_for_html`: the OWASP/ESAPI HTMLEntityCodec for an HTML
+/// *content* context — every char below U+0100 is encoded except the immune set
+/// `, . - _` and space; named entity where one exists, else a lowercase hex
+/// numeric entity. MUST stay byte-identical to cfml-stdlib `fn_encode_for_html`.
 extern "C" fn cfml_encode_for_html_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
     let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
-    let s = v
-        .as_string()
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
-        .replace('/', "&#x2f;");
+    let mut s = String::new();
+    for c in v.as_string().chars() {
+        match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => s.push(c),
+            ',' | '.' | '-' | '_' | ' ' => s.push(c),
+            '&' => s.push_str("&amp;"),
+            '<' => s.push_str("&lt;"),
+            '>' => s.push_str("&gt;"),
+            '"' => s.push_str("&quot;"),
+            c if (c as u32) >= 0x100 => s.push(c),
+            c => s.push_str(&format!("&#x{:x};", c as u32)),
+        }
+    }
     super::arena::box_into_active(CfmlValue::string(s)) as i64
 }
 
