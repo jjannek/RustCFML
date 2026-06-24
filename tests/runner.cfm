@@ -20,6 +20,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_reserved_word_param_names.cfm">
 <cf_runtest file="core/test_function_scope_capture.cfm">
 <cf_runtest file="core/test_bare_call_caller_stack_leak.cfm">
+<cf_runtest file="core/test_boolean_literal_equality.cfm">
 <cf_runtest file="core/test_null_return_no_key.cfm">
 <cf_runtest file="core/test_bare_call_shadowing_semantics.cfm">
 <cf_runtest file="core/test_closure_env_leak.cfm">

@@ -19697,6 +19697,19 @@ where
     }
 }
 
+/// A boolean-literal string (`true`/`false`/`yes`/`no`, case-insensitive,
+/// trimmed) → its numeric value (1.0/0.0). CFML loose equality coerces these to
+/// numbers before comparing, so `1 == "yes"`, `0 == "false"`, `"no" == "false"`
+/// are all true while `2 == "true"` is false (2 ≠ 1). `None` for anything else,
+/// including the empty string (`isBoolean("")` is false → `"" == "false"` false).
+fn bool_literal_to_num(s: &str) -> Option<f64> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" => Some(1.0),
+        "false" | "no" => Some(0.0),
+        _ => None,
+    }
+}
+
 /// CFML equality comparison (case-insensitive for strings, type-coercing for numbers)
 fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
@@ -19721,13 +19734,34 @@ fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
         (CfmlValue::Double(x), CfmlValue::Double(y)) => x == y,
         (CfmlValue::Int(x), CfmlValue::Double(y)) => (*x as f64) == *y,
         (CfmlValue::Double(x), CfmlValue::Int(y)) => *x == (*y as f64),
-        (CfmlValue::String(x), CfmlValue::String(y)) => x.eq_ignore_ascii_case(y),
-        // String-number comparison: try to coerce
+        (CfmlValue::String(x), CfmlValue::String(y)) => {
+            // When EITHER side is a boolean-literal string, CFML compares the two
+            // numerically (the bool literal → 1/0): `"yes" == "true"` and
+            // `"1" == "true"` are true, `"yes" == "no"` is false. Otherwise a
+            // plain case-insensitive string compare.
+            if bool_literal_to_num(x).is_some() || bool_literal_to_num(y).is_some() {
+                let nx = bool_literal_to_num(x).or_else(|| x.trim().parse::<f64>().ok());
+                let ny = bool_literal_to_num(y).or_else(|| y.trim().parse::<f64>().ok());
+                if let (Some(a), Some(b)) = (nx, ny) {
+                    return a == b;
+                }
+            }
+            x.eq_ignore_ascii_case(y)
+        }
+        // String-number comparison: try to coerce. A boolean-literal string
+        // (true/yes/false/no) coerces to 1/0 so `1 == "yes"`, `0 == "false"`,
+        // `"no" == 0` hold (`2 == "true"` stays false — 2 ≠ 1).
         (CfmlValue::String(s), CfmlValue::Int(i)) | (CfmlValue::Int(i), CfmlValue::String(s)) => {
+            if let Some(n) = bool_literal_to_num(s) {
+                return n == *i as f64;
+            }
             s.trim().parse::<i64>().map_or(false, |n| n == *i)
         }
         (CfmlValue::String(s), CfmlValue::Double(d))
         | (CfmlValue::Double(d), CfmlValue::String(s)) => {
+            if let Some(n) = bool_literal_to_num(s) {
+                return n == *d;
+            }
             s.trim().parse::<f64>().map_or(false, |n| n == *d)
         }
         (CfmlValue::String(s), CfmlValue::Bool(b)) | (CfmlValue::Bool(b), CfmlValue::String(s)) => {
