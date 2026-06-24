@@ -887,10 +887,21 @@ impl CfmlValue {
     /// row (Lucee treats `q.col` as a proxy that behaves like the first row in
     /// scalar contexts: numeric coercion, comparison). For anything else,
     /// returns `self` unchanged.
+    ///
+    /// A NULL first cell (or an empty column) resolves to the empty string,
+    /// not `Null`: with full-null support off — the engine default — Lucee/ACF
+    /// read a NULL query cell as `""`, so `q.col EQ ""`, `isSimpleValue(q.col)`,
+    /// and `Len(q.col)` all behave as for an empty string. (Without this, an
+    /// aggregate over zero matching rows — `SELECT MAX(x) … WHERE id=0`, one
+    /// row, NULL cell — compared `!=` to `""` and reported as non-simple.)
     pub fn query_column_scalar(&self) -> &CfmlValue {
-        static NULL: CfmlValue = CfmlValue::Null;
+        static EMPTY: std::sync::LazyLock<CfmlValue> =
+            std::sync::LazyLock::new(|| CfmlValue::String(Arc::new(String::new())));
         match self {
-            CfmlValue::QueryColumn(a) => a.first().unwrap_or(&NULL),
+            CfmlValue::QueryColumn(a) => match a.first() {
+                Some(CfmlValue::Null) | None => &*EMPTY,
+                Some(v) => v,
+            },
             _ => self,
         }
     }

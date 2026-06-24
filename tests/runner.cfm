@@ -142,6 +142,7 @@ include "harness.cfm";
 <!--- A query cell must be a SIMPLE value: IsSimpleValue()=true and SerializeJSON of a --->
 <!--- struct holding it preserves the value. RustCFML 0.161.0 returned boxed cells. --->
 <cf_runtest file="types/test_query_cell_simple_value.cfm">
+<cf_runtest file="types/test_query_null_cell_scalar.cfm">
 <cf_runtest file="types/test_query_reference.cfm">
 <cf_runtest file="types/test_query_cell_assignment.cfm">
 <cf_runtest file="types/test_java_map_digest_reference.cfm">
