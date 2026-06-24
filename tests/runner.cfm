@@ -255,6 +255,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_method_ref_binding.cfm">
 <cf_runtest file="oop/test_returned_service_chain.cfm">
 <cf_runtest file="oop/test_mixin_writeback.cfm">
+<cf_runtest file="oop/test_nested_cfc_method_writeback.cfm">
 <cf_runtest file="oop/test_property_method_name_collision.cfm">
 <cf_runtest file="oop/test_new_named_args.cfm">
 <cf_runtest file="oop/test_dynamic_lhs_assign.cfm">
@@ -396,6 +397,7 @@ include "harness.cfm";
 <!--- --- Lifecycle / server request fixtures --- --->
 <cf_runtest file="lifecycle/test_session_app_namespace.cfm">
 <cf_runtest file="lifecycle/test_application_mapping_coverage.cfm">
+<cf_runtest file="lifecycle/test_application_pseudo_include.cfm">
 <cf_runtest file="lifecycle/test_application_lifecycle_case_override.cfm">
 <cf_runtest file="lifecycle/test_application_load_errors.cfm">
 <cf_runtest file="lifecycle/test_application_scope_custom_tag.cfm">

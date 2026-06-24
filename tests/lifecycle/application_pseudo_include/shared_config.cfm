@@ -1,0 +1,1 @@
+<cfset sharedFlag = "ok">

@@ -6731,12 +6731,21 @@ impl CfmlVirtualMachine {
                         if receiver_writeback_ok {
                         if let Some(ref path) = write_back {
                             let var_name = &path[0];
-                            // Load the component object, update __variables, store it back
-                            let load_path = if path.len() == 1 {
-                                path.clone()
-                            } else {
-                                path[..path.len() - 1].to_vec()
-                            };
+                            // Load the RECEIVER component (the full write_back
+                            // path points at it: `a.b.method()` → ["a","b"]),
+                            // update its __variables, store it back. This MUST use
+                            // the full path, mirroring the `this`-writeback above:
+                            // for a nested receiver (`user.author.addError()`) the
+                            // method's `variables` mutations belong to `user.author`,
+                            // NOT to `user`. The earlier `path[..len-1]` trim merged
+                            // them into the OUTER object, clobbering its scope — e.g.
+                            // `user.author`'s class data overwriting `user`'s, so
+                            // `user.$classData()` started reporting the author class
+                            // (Wheels model errorsSpec). The `__name` gate below still
+                            // skips non-component targets (e.g. a deep path that
+                            // navigates into the `arguments` SCOPE for
+                            // `arguments.cfc.getName()`), so no scope pollution.
+                            let load_path = path.clone();
                             if let Some(mut comp_obj) =
                                 self.scope_aware_load(&load_path[0], &locals)
                             {
@@ -6749,11 +6758,11 @@ impl CfmlVirtualMachine {
                                 if let Some(s) = comp_obj.as_cfml_struct() {
                                     // Only write a method's `variables` mutations back into
                                     // an actual CFC instance (carries `__name`). A deep
-                                    // write_back path like `arguments.cfc.getName()` resolves
-                                    // comp_obj to the `arguments` SCOPE, which is not a
-                                    // component — injecting a synthetic `__variables` there
-                                    // pollutes the scope and (via the arguments param-sync)
-                                    // clobbers the caller frame's real component scope.
+                                    // write_back path that navigates into a non-component
+                                    // (e.g. the `arguments` SCOPE) is skipped — injecting a
+                                    // synthetic `__variables` there pollutes the scope and
+                                    // (via the arguments param-sync) clobbers the caller
+                                    // frame's real component scope.
                                     if s.contains_key("__name") {
                                         let vs = s.get_or_insert_struct("__variables");
                                         vs.merge_from(&vars_wb);
@@ -18279,8 +18288,17 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        // Resolve relative includes/file-BIFs in the pseudo-constructor against
+        // the Application.cfc's own directory, not the request target page.
+        // CFML engines run an Application.cfc body in its own location; e.g.
+        // `<webroot>/Application.cfc` doing `include "../config/app.cfm"` must
+        // reach `<webroot>/../config`, regardless of which deep page (e.g.
+        // `/tests/runner.cfm`) triggered the request. Without this, the include
+        // resolves against the target page's dir and escapes to the wrong place.
+        let saved_source_file = self.source_file.replace(path.to_string());
         let exec_result =
             self.execute_function_with_args(&cfc_body, Vec::new(), Some(&empty_locals));
+        self.source_file = saved_source_file;
         if pushed_super {
             self.pseudo_ctor_super.pop();
         }
