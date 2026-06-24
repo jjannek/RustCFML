@@ -53,5 +53,21 @@ assert("set unknown routes to onMissingMethod", omm.setWidget("x"), "OMM:setWidg
 omm.setColor("red"); // declared property -> implicit setter
 assert("set known uses implicit setter", omm.color, "red");
 
+// --- closure captures the enclosing function's Function-valued PARAMETER ---
+makeMatcher = function(body) {
+    return function() { return body(); };
+};
+mm = makeMatcher(function() { return "captured"; });
+assert("closure captures Function param", mm(), "captured");
+
+// --- comparison: non-numeric string vs number falls back to lexical (Lucee) ---
+assertTrue("'SQLite' gt 0", "SQLite" > 0);
+assertFalse("'SQLite' lt 0", "SQLite" < 0);
+assertTrue("'5abc' gt 0 lexical", "5abc" > 0);
+assertFalse("'' gt 0", "" > 0);
+assertTrue("'5' gt 0 numeric", "5" > 0);
+assertFalse("'5' gt 10 numeric", "5" > 10);
+assertTrue("'10' gt '9' numeric strings", "10" > "9");
+
 suiteEnd();
 </cfscript>

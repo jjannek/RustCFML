@@ -6111,7 +6111,7 @@ impl CfmlVirtualMachine {
                             let mut m = env.write().unwrap();
                             for (k, v) in &locals {
                                 if let Some(cv) =
-                                    Self::closure_env_capture_value(k, v, &declared_locals)
+                                    Self::closure_env_capture_value(k, v, &declared_locals, &func.params)
                                 {
                                     m.insert(k.clone(), cv);
                                 }
@@ -6122,7 +6122,7 @@ impl CfmlVirtualMachine {
                             let mut seed = ValueMap::default();
                             for (k, v) in locals.iter() {
                                 if let Some(cv) =
-                                    Self::closure_env_capture_value(k, v, &declared_locals)
+                                    Self::closure_env_capture_value(k, v, &declared_locals, &func.params)
                                 {
                                     seed.insert(k.clone(), cv);
                                 }
@@ -15472,11 +15472,19 @@ impl CfmlVirtualMachine {
         name: &str,
         value: &CfmlValue,
         declared_locals: &std::collections::HashSet<String>,
+        params: &[String],
     ) -> Option<CfmlValue> {
         match value {
             CfmlValue::Function(f) => {
+                // A Function-valued var-local (PR #198) OR a Function-valued
+                // PARAMETER (a closure passed in, e.g. TestBox's registerMatcher
+                // `body`) must be captured so a nested closure can call it by bare
+                // name — Lucee resolves both. Named functions/real closures are
+                // reachable via user_functions and are skipped (the env -> Function
+                // -> captured_scope -> env cycle would leak otherwise).
                 let is_var_scoped = declared_locals.contains(name)
-                    || declared_locals.contains(&name.to_lowercase());
+                    || declared_locals.contains(&name.to_lowercase())
+                    || params.iter().any(|p| p.eq_ignore_ascii_case(name));
                 if !is_var_scoped {
                     return None;
                 }
@@ -19875,9 +19883,23 @@ fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
             x.to_lowercase().cmp(&y.to_lowercase()) as i32
         }
         _ => {
-            let x = to_number(a).unwrap_or(0.0);
-            let y = to_number(b).unwrap_or(0.0);
-            x.partial_cmp(&y).map_or(0, |o| o as i32)
+            // Mixed String/number (and other combos). Lucee: if BOTH operands are
+            // numerically parseable, numeric-compare; otherwise fall back to a
+            // case-insensitive LEXICAL compare of both stringified operands —
+            // `"SQLite" gt 0` is true ("sqlite" > "0"), NOT 0-coerced to false.
+            let num = |v: &CfmlValue| -> Option<f64> {
+                match v {
+                    CfmlValue::Int(i) => Some(*i as f64),
+                    CfmlValue::Double(d) => Some(*d),
+                    CfmlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                    CfmlValue::String(s) => s.trim().parse::<f64>().ok(),
+                    _ => None,
+                }
+            };
+            match (num(a), num(b)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).map_or(0, |o| o as i32),
+                _ => a.as_string().to_lowercase().cmp(&b.as_string().to_lowercase()) as i32,
+            }
         }
     }
 }
