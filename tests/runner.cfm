@@ -162,6 +162,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_java_files_shims.cfm">
 <cf_runtest file="stdlib/test_path_sanitization.cfm">
 <cf_runtest file="stdlib/test_structdelete_return_and_gettime.cfm">
+<cf_runtest file="stdlib/test_numberformat_mask_padding.cfm">
 <cf_runtest file="stdlib/test_jwt.cfm">
 <cf_runtest file="stdlib/test_arithmetic_numeric_strings.cfm">
 <cf_runtest file="stdlib/test_encode_for_html_esapi.cfm">

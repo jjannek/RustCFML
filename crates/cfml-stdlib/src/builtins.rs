@@ -1762,10 +1762,34 @@ fn fn_number_format(args: Vec<CfmlValue>) -> CfmlResult {
     let int_part = parts[0];
     let dec_part = if parts.len() > 1 { parts[1] } else { "" };
 
+    // Integer-part mask padding (Lucee/ACF): each digit position in the mask
+    // that the number doesn't fill becomes '0' for a `0` placeholder or a space
+    // for a `9`/`_` placeholder. NumberFormat(1,"09") -> "01",
+    // NumberFormat(5,"99") -> " 5". Only widens when the number is shorter than
+    // the mask, so masks the number already fills are untouched.
+    let int_mask: String = mask
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| matches!(c, '0' | '9' | '_'))
+        .collect();
+    let padded_int = if int_part.len() < int_mask.len() {
+        let pad = int_mask.len() - int_part.len();
+        let mut s = String::with_capacity(int_mask.len());
+        for i in 0..pad {
+            s.push(if int_mask.as_bytes()[i] == b'0' { '0' } else { ' ' });
+        }
+        s.push_str(int_part);
+        s
+    } else {
+        int_part.to_string()
+    };
+
     let int_formatted = if has_comma {
         add_thousands_separator(int_part)
     } else {
-        int_part.to_string()
+        padded_int
     };
 
     let mut result = if decimals > 0 {
