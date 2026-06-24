@@ -461,6 +461,177 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
     }
 }
 
+/// Extract a filesystem path string from an argument that may be either a
+/// java.nio.file.Path / java.io.File shim struct (carrying `__path`) or a
+/// plain string.
+fn java_path_arg(arg: &CfmlValue) -> Option<String> {
+    match arg {
+        CfmlValue::String(s) => Some(s.to_string()),
+        CfmlValue::Struct(shim) => match shim.get("__path") {
+            Some(CfmlValue::String(p)) => Some(p.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// java.nio.file.Files — static helper class. The CreateObject shim carries no
+/// state; the path is always passed as the first argument (a Path shim or a
+/// string). Only the members Wheels' plugin loader uses are implemented:
+/// isSymbolicLink (does NOT follow links) and delete (removes the link/file
+/// itself without following symlinks).
+pub fn handle_java_files(method: &str, args: Vec<CfmlValue>, _object: &CfmlValue) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.nio.file.files".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "issymboliclink" => {
+            if let Some(path) = args.first().and_then(java_path_arg) {
+                let is_link = std::fs::symlink_metadata(&path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                return Ok(CfmlValue::Bool(is_link));
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        "delete" => {
+            // Files.delete removes the symlink/file itself and does NOT follow
+            // links. On Unix std::fs::remove_file removes a symlink without
+            // touching its target; fall back to remove_dir for an empty dir.
+            if let Some(path) = args.first().and_then(java_path_arg) {
+                let p = std::path::Path::new(&path);
+                let meta = std::fs::symlink_metadata(p);
+                let res = match meta {
+                    Ok(m) if m.file_type().is_dir() => std::fs::remove_dir(p),
+                    _ => std::fs::remove_file(p),
+                };
+                if let Err(e) = res {
+                    return Err(CfmlError::runtime(format!(
+                        "java.nio.file.Files.delete failed for '{}': {}",
+                        path, e
+                    )));
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "exists" => {
+            // Files.exists(path) — follows symlinks like the real API default.
+            if let Some(path) = args.first().and_then(java_path_arg) {
+                return Ok(CfmlValue::Bool(std::path::Path::new(&path).exists()));
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        "isdirectory" => {
+            if let Some(path) = args.first().and_then(java_path_arg) {
+                return Ok(CfmlValue::Bool(std::path::Path::new(&path).is_dir()));
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// java.lang.ProcessBuilder — supports the `init(List<String> command)` →
+/// `start()` → Process pattern Wheels uses to shell out to `ln -s`. ACF/Lucee
+/// resolve ProcessBuilder's List ctor cleanly (unlike Files' varargs), so the
+/// tests deliberately go through it. We collapse start()+waitFor() by running
+/// the command to completion synchronously inside start() — the caller always
+/// calls waitFor() immediately, so this is behaviourally equivalent.
+pub fn handle_java_processbuilder(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            // command is supplied as an array (List) or as varargs strings.
+            let cmd: Vec<CfmlValue> = match args.first() {
+                Some(CfmlValue::Array(a)) => a.iter().collect(),
+                _ => args.clone(),
+            };
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.lang.processbuilder".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__command".to_string(), CfmlValue::array(cmd));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "command" => {
+            // ProcessBuilder.command(list) sets and returns the builder.
+            if let CfmlValue::Struct(ref shim) = object {
+                let cmd: Vec<CfmlValue> = match args.first() {
+                    Some(CfmlValue::Array(a)) => a.iter().collect(),
+                    _ => args.clone(),
+                };
+                shim.insert("__command".to_string(), CfmlValue::array(cmd));
+                return Ok(CfmlValue::Struct(shim.clone()));
+            }
+            Ok(object.clone())
+        }
+        "start" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                let parts: Vec<String> = match shim.get("__command") {
+                    Some(CfmlValue::Array(a)) => a.iter().map(|v| v.as_string()).collect(),
+                    _ => vec![],
+                };
+                if parts.is_empty() {
+                    return Err(CfmlError::runtime(
+                        "ProcessBuilder.start() called with empty command".to_string(),
+                    ));
+                }
+                let mut command = std::process::Command::new(&parts[0]);
+                command.args(&parts[1..]);
+                let exit_code = match command.status() {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(e) => {
+                        return Err(CfmlError::runtime(format!(
+                            "ProcessBuilder.start() failed to launch '{}': {}",
+                            parts[0], e
+                        )));
+                    }
+                };
+                let mut proc = ValueMap::default();
+                proc.insert(
+                    "__java_class".to_string(),
+                    CfmlValue::string("java.lang.process".to_string()),
+                );
+                proc.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                proc.insert("__exitcode".to_string(), CfmlValue::Int(exit_code as i64));
+                return Ok(CfmlValue::strukt(proc));
+            }
+            Ok(CfmlValue::Null)
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// java.lang.Process — the handle returned by ProcessBuilder.start(). Since we
+/// run the command synchronously, waitFor()/exitValue() just report the
+/// captured exit code.
+pub fn handle_java_process(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    match method {
+        "waitfor" | "exitvalue" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(code) = shim.get("__exitcode") {
+                    return Ok(code);
+                }
+            }
+            Ok(CfmlValue::Int(0))
+        }
+        "isalive" => Ok(CfmlValue::Bool(false)),
+        "destroy" | "destroyforcibly" => Ok(CfmlValue::Null),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
 pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValue) -> CfmlResult {
     match method {
         "init" => {

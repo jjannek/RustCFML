@@ -29,9 +29,10 @@ pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
     handle_java_class, handle_java_collections, handle_java_concurrenthashmap,
-    handle_java_concurrentlinkedqueue, handle_java_date, handle_java_file, handle_java_inetaddress,
-    handle_java_linkedhashmap, handle_java_map_entry, handle_java_messagedigest, handle_java_paths,
-    handle_java_pattern, handle_java_stringbuilder, handle_java_system, handle_java_thread,
+    handle_java_concurrentlinkedqueue, handle_java_date, handle_java_file, handle_java_files,
+    handle_java_inetaddress, handle_java_linkedhashmap, handle_java_map_entry,
+    handle_java_messagedigest, handle_java_paths, handle_java_pattern, handle_java_process,
+    handle_java_processbuilder, handle_java_stringbuilder, handle_java_system, handle_java_thread,
     handle_java_treemap, handle_java_uuid,
 };
 
@@ -9945,6 +9946,12 @@ impl CfmlVirtualMachine {
                                 "java.nio.file.paths" | "java.nio.file.path" => {
                                     handle_java_paths("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.nio.file.files" => {
+                                    handle_java_files("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.lang.processbuilder" => {
+                                    handle_java_processbuilder("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.util.regex.pattern" => {
                                     handle_java_pattern("init", empty_args, &CfmlValue::Null)
                                 }
@@ -13934,6 +13941,11 @@ impl CfmlVirtualMachine {
                     "java.nio.file.paths" | "java.nio.file.path" => {
                         handle_java_paths(&m, all_args, object)
                     }
+                    "java.nio.file.files" => handle_java_files(&m, all_args, object),
+                    "java.lang.processbuilder" => {
+                        handle_java_processbuilder(&m, all_args, object)
+                    }
+                    "java.lang.process" => handle_java_process(&m, all_args, object),
                     "java.util.regex.pattern" | "java.util.regex.matcher" => {
                         handle_java_pattern(&m, all_args, object)
                     }
