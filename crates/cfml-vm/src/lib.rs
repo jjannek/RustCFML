@@ -12364,7 +12364,7 @@ impl CfmlVirtualMachine {
                         CfmlValue::string(String::new()),
                     );
 
-                    let caller_snapshot = parent_locals.clone();
+                    let caller_snapshot = Self::caller_scope_from_locals(parent_locals);
                     let mut tag_locals = ValueMap::default();
                     tag_locals.insert("attributes".to_string(), attrs_val.clone());
                     tag_locals.insert(
@@ -12472,7 +12472,7 @@ impl CfmlVirtualMachine {
                         CfmlValue::string(String::new()),
                     );
 
-                    let caller_snapshot = parent_locals.clone();
+                    let caller_snapshot = Self::caller_scope_from_locals(parent_locals);
                     let mut tag_locals = ValueMap::default();
                     tag_locals.insert("attributes".to_string(), attrs_val.clone());
                     tag_locals.insert(
@@ -12556,7 +12556,7 @@ impl CfmlVirtualMachine {
                         exit_tag: _,
                     } = state;
 
-                    let caller_snapshot = parent_locals.clone();
+                    let caller_snapshot = Self::caller_scope_from_locals(parent_locals);
                     let mut tag_locals = start_locals;
                     if !tag_locals
                         .keys()
@@ -15183,6 +15183,23 @@ impl CfmlVirtualMachine {
     /// scopes (which could cause infinite recursion with shared environments).
     fn values_equal_shallow(a: &CfmlValue, b: &CfmlValue) -> bool {
         Self::values_equal_shallow_depth(a, b, 0)
+    }
+
+    /// Build the `caller` scope for a custom tag from the invoking frame's
+    /// locals. In CFML the custom-tag `caller` scope is the *variables* scope of
+    /// the calling template. At page level the locals frame already *is* that
+    /// variables scope, so it's used directly. Inside a CFC method the
+    /// component's variables live in the `__variables` sub-scope (that's where an
+    /// unscoped `<cfset x=...>` in the method lands); surface those so
+    /// `caller.x` resolves them — matching Lucee. Writes through `caller` are
+    /// diffed against this same view and re-applied via `scope_aware_store`,
+    /// which routes them back into `__variables` for the CFC-method case.
+    fn caller_scope_from_locals(parent_locals: &ValueMap) -> ValueMap {
+        if let Some(CfmlValue::Struct(vars)) = parent_locals.get("__variables") {
+            vars.snapshot()
+        } else {
+            parent_locals.clone()
+        }
     }
 
     fn caller_writeback_from_captured(
