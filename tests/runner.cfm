@@ -101,6 +101,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_local_shadows_arguments.cfm">
 <cf_runtest file="core/test_unscoped_nested_autoviv.cfm">
 <cf_runtest file="core/test_construction_ordering.cfm">
+<cf_runtest file="core/test_variables_this_live_alias.cfm">
 <cf_runtest file="core/test_isdefined_variables_scope.cfm">
 <cf_runtest file="core/test_argument_reference_nested.cfm">
 <cf_runtest file="core/test_language_features.cfm">

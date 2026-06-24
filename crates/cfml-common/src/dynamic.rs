@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use parking_lot::RwLock as PlRwLock;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 /// Build-hasher for all per-call scope maps, struct maps, and query-row maps.
 ///
@@ -239,6 +239,14 @@ impl FromIterator<CfmlValue> for CfmlArray {
 pub struct StructInner {
     pub map: ValueMap,
     pub shape_id: u64,
+    /// Live `variables.this` alias (Lucee/ACF semantics). When set on a CFC's
+    /// private `__variables` struct, a read of the `this` key resolves to the
+    /// upgraded handle — the component's live public scope — rather than a
+    /// stored value. Held as a `Weak` so it never forms a strong Arc cycle
+    /// (`instance -> __variables -> this -> instance`), which would leak the
+    /// instance forever (the v0.185.0 per-request serve-mode leak). `None` on
+    /// every non-component struct, so unrelated structs pay nothing.
+    pub this_alias: Option<Weak<PlRwLock<StructInner>>>,
 }
 
 static STRUCT_SHAPE_COUNTER: std::sync::atomic::AtomicU64 =
@@ -258,6 +266,7 @@ impl CfmlStruct {
         CfmlStruct(Arc::new(PlRwLock::new(StructInner {
             map: m,
             shape_id: next_shape_id(),
+            this_alias: None,
         })))
     }
 
@@ -302,20 +311,64 @@ impl CfmlStruct {
     /// Clone the value for `key` (case-sensitive), or `None`.
     #[inline]
     pub fn get(&self, key: &str) -> Option<CfmlValue> {
-        self.0.read().map.get(key).cloned()
+        if let Some(v) = self.0.read().map.get(key).cloned() {
+            return Some(v);
+        }
+        // Live `variables.this` alias (Lucee/ACF): a CFC `__variables` with no
+        // stored `this` key resolves it to the live public scope via a Weak
+        // back-edge. Only consulted on a miss, and only for the `this` key.
+        if key.eq_ignore_ascii_case("this") {
+            return self.this_alias_struct().map(CfmlValue::Struct);
+        }
+        None
+    }
+
+    /// Set (or refresh) the live `variables.this` alias to `target`'s backing
+    /// store, but only when it differs from what is already stored — avoids a
+    /// write lock on the hot `variables` read path once the alias is stamped.
+    /// Held as a `Weak`, so this never extends `target`'s lifetime. Does NOT
+    /// bump `shape_id`: the key set is unchanged (the alias is resolved lazily
+    /// on read, never materialized into the map), so JIT inline caches stay
+    /// valid.
+    pub fn set_this_alias_if_changed(&self, target: &CfmlStruct) {
+        // Fast path: already aliased to this exact backing store.
+        {
+            let g = self.0.read();
+            if let Some(w) = &g.this_alias {
+                if let Some(cur) = w.upgrade() {
+                    if Arc::ptr_eq(&cur, &target.0) {
+                        return;
+                    }
+                }
+            }
+        }
+        self.0.write().this_alias = Some(Arc::downgrade(&target.0));
+    }
+
+    /// Upgrade the live `variables.this` alias to a strong handle, if set and
+    /// still alive.
+    #[inline]
+    pub fn this_alias_struct(&self) -> Option<CfmlStruct> {
+        self.0.read().this_alias.as_ref().and_then(|w| w.upgrade()).map(CfmlStruct)
     }
 
     /// Clone the value for `key`, matching keys case-insensitively (CFML keys
     /// are case-insensitive). Returns the first matching entry's value.
     pub fn get_ci(&self, key: &str) -> Option<CfmlValue> {
-        let g = self.0.read();
-        if let Some(v) = g.map.get(key) {
-            return Some(v.clone());
+        {
+            let g = self.0.read();
+            if let Some(v) = g.map.get(key) {
+                return Some(v.clone());
+            }
+            if let Some((_, v)) = g.map.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                return Some(v.clone());
+            }
         }
-        g.map
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.clone())
+        // Live `variables.this` alias on a miss (see `get`).
+        if key.eq_ignore_ascii_case("this") {
+            return self.this_alias_struct().map(CfmlValue::Struct);
+        }
+        None
     }
 
     /// v0.99.5 — case-insensitive lookup that also returns the IndexMap
@@ -362,12 +415,19 @@ impl CfmlStruct {
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.read().map.contains_key(key)
+            || (key.eq_ignore_ascii_case("this") && self.this_alias_struct().is_some())
     }
 
     /// Case-insensitive key presence check.
     pub fn contains_key_ci(&self, key: &str) -> bool {
         let g = self.0.read();
-        g.map.contains_key(key) || g.map.keys().any(|k| k.eq_ignore_ascii_case(key))
+        if g.map.contains_key(key) || g.map.keys().any(|k| k.eq_ignore_ascii_case(key)) {
+            return true;
+        }
+        drop(g);
+        // `StructKeyExists(variables, "this")` must see the live alias (Lucee
+        // parity — Wheels Plugins.cfc gates the public mixin append on it).
+        key.eq_ignore_ascii_case("this") && self.this_alias_struct().is_some()
     }
 
     /// Insert (interior mutability — visible to all aliases). Returns the

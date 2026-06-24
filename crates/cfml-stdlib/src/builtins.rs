@@ -910,13 +910,24 @@ fn get_delimiter(args: &[CfmlValue], idx: usize) -> String {
 /// case-insensitively. Returns an owned `String` because the backing map is
 /// behind a lock and can't be borrowed out.
 fn struct_find_key_ci(s: &CfmlStruct, key: &str) -> Option<String> {
-    s.with_read(|m| {
+    let found = s.with_read(|m| {
         if m.contains_key(key) {
             return Some(key.to_string());
         }
         let key_lower = key.to_lowercase();
         m.keys().find(|k| k.eq_ignore_ascii_case(&key_lower)).cloned()
-    })
+    });
+    if found.is_some() {
+        return found;
+    }
+    // Live `variables.this` alias (Lucee/ACF): `StructKeyExists(variables,
+    // "this")` must be true on a CFC private scope so framework code can gate
+    // a public mixin append on it (Wheels Plugins.cfc). Checked outside the
+    // `with_read` guard above — parking_lot is not reentrant.
+    if key.eq_ignore_ascii_case("this") && s.this_alias_struct().is_some() {
+        return Some("this".to_string());
+    }
+    None
 }
 
 /// CFML list splitting: each character in `delimiters` is a separate delimiter.

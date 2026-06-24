@@ -2924,6 +2924,24 @@ impl CfmlVirtualMachine {
                         // other `variables` read paths (the LoadGlobal scope arm
                         // and scope_aware_load). (GitHub #177)
                         if let Some(CfmlValue::Struct(vars)) = locals.get("__variables") {
+                            // Lucee/ACF expose a LIVE `variables.this` alias: the
+                            // component's private scope carries a handle to its
+                            // public `this` scope, so `StructAppend(variables.this,
+                            // fns)` / `variables.this.x = v` mutate the live object
+                            // (Wheels plugin-mixin injection, Plugins.cfc:821). A
+                            // CFC's assembled `__variables` has NO stored `this`
+                            // key (it would form an Arc cycle instance -> __variables
+                            // -> this -> instance that refcounting never frees — the
+                            // v0.185.0 per-request serve-mode leak). Instead we stamp
+                            // a WEAK alias from `__variables` to the frame's live
+                            // `this` here at materialization, resolved on read (see
+                            // CfmlStruct::set_this_alias / get). Weak => no strong
+                            // cycle => no leak. The alias travels with the Arc clone,
+                            // so it survives being handed to another object (the
+                            // Wheels `$initializeMixins(variables)` cross-object case).
+                            if let Some(CfmlValue::Struct(this_s)) = locals.get("this") {
+                                vars.set_this_alias_if_changed(this_s);
+                            }
                             CfmlValue::Struct(vars.clone())
                         } else if !is_inside_function {
                             let mut merged = self.globals.clone();
