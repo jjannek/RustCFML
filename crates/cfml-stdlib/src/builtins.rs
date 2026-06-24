@@ -3070,7 +3070,19 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
                 Ok(CfmlValue::Bool(s.trim().parse::<i64>().is_ok()))
             }
             "boolean" => fn_is_boolean(vec![value.clone()]),
-            "date" => fn_is_date(vec![value.clone()]),
+            "date" | "datetime" => fn_is_date(vec![value.clone()]),
+            "time" => {
+                // Lucee: a bare time-of-day (6:15 PM, 18:15, 06:15:30) OR any
+                // parseable date/datetime ("2020-01-01" -> true) is a valid time;
+                // "25:99"/"hello" are not. (Wheels validatesFormat type="time".)
+                let s = value.as_string();
+                let s = s.trim();
+                let ok = parse_cfml_date(s).is_some()
+                    || ["%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"]
+                        .iter()
+                        .any(|fmt| NaiveTime::parse_from_str(s, fmt).is_ok());
+                Ok(CfmlValue::Bool(ok))
+            }
             "array" => fn_is_array(vec![value.clone()]),
             "struct" => fn_is_struct(vec![value.clone()]),
             "email" => {

@@ -213,6 +213,15 @@ assertFalse("isValid struct on array", isValid("struct", []));
 assertTrue("isValid query", isValid("query", queryNew("x")));
 assertFalse("isValid query on struct", isValid("query", {}));
 
+// time — bare time-of-day or any parseable date/datetime (Lucee parity)
+assertTrue("isValid time 12h", isValid("time", "6:15 PM"));
+assertTrue("isValid time 24h", isValid("time", "18:15"));
+assertTrue("isValid time padded", isValid("time", "06:15"));
+assertTrue("isValid time with seconds", isValid("time", "06:15:30"));
+assertTrue("isValid time accepts a date", isValid("time", "2020-01-01"));
+assertFalse("isValid time rejects out-of-range", isValid("time", "25:99"));
+assertFalse("isValid time rejects words", isValid("time", "hello"));
+
 // uuid
 assertTrue("isValid uuid", isValid("uuid", createUUID()));
 
