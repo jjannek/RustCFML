@@ -3019,7 +3019,13 @@ fn fn_is_date(args: Vec<CfmlValue>) -> CfmlResult {
     if !t.is_empty() && t.parse::<f64>().is_ok() {
         return Ok(CfmlValue::Bool(false));
     }
-    Ok(CfmlValue::Bool(parse_cfml_date(&s).is_some()))
+    // Lucee treats a bare time-of-day ("6:15 PM", "18:15") as a valid date (it
+    // resolves to today at that time). isValid("date"/"datetime") routes here, and
+    // Wheels' automatic SQLite datetime validation does validatesFormatOf type="date".
+    let is_time = ["%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"]
+        .iter()
+        .any(|fmt| NaiveTime::parse_from_str(t, fmt).is_ok());
+    Ok(CfmlValue::Bool(is_time || parse_cfml_date(&s).is_some()))
 }
 
 fn fn_is_query(args: Vec<CfmlValue>) -> CfmlResult {

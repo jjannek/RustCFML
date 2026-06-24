@@ -14990,7 +14990,22 @@ impl CfmlVirtualMachine {
                 }
                 if method_lower.starts_with("set") && method_lower.len() > 3 {
                     let prop_name = &method[3..];
-                    if let Some(value) = extra_args.first() {
+                    // Don't let the implicit setter shadow a dynamic-dispatch method:
+                    // if the property isn't already a member AND the component defines
+                    // onMissingMethod (e.g. a Wheels model's association `setProfile`),
+                    // fall through so onMissingMethod handles it (Lucee routes there).
+                    let is_known_member = s.iter().any(|(k, _)| k.eq_ignore_ascii_case(prop_name))
+                        || s.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case("__properties")
+                                && matches!(v, CfmlValue::Array(arr) if arr.iter().any(|p| {
+                                    matches!(p, CfmlValue::Struct(ps)
+                                        if ps.get_ci("name").map(|n| n.as_string().eq_ignore_ascii_case(prop_name)).unwrap_or(false))
+                                }))
+                        });
+                    let has_on_missing = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("onmissingmethod"));
+                    if !is_known_member && has_on_missing {
+                        // fall through to the onMissingMethod handler below
+                    } else if let Some(value) = extra_args.first() {
                         let modified = object.clone();
                         if let Some(ms) = modified.as_cfml_struct() {
                             let actual_key = ms

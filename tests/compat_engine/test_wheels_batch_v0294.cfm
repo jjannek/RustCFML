@@ -22,6 +22,10 @@ assertFalse("isDate(11)", isDate(11));
 assertFalse("isDate('11')", isDate("11"));
 assertTrue("isDate iso", isDate("2024-01-15"));
 assertTrue("isDate no-seconds 12h", isDate("11/01/1975 12:00 AM"));
+// Lucee: a bare time-of-day is a valid date (resolves to today at that time).
+assertTrue("isDate time 12h", isDate("6:15 PM"));
+assertTrue("isDate time 24h", isDate("18:15"));
+assertTrue("isValid date time-of-day", isValid("date", "6:15 PM"));
 
 // --- Canonicalize keeps literal + (no form-decode) ---
 assert("Canonicalize keeps +", canonicalize("Istok+Web", false, false), "Istok+Web");
@@ -42,6 +46,12 @@ assert("cfdirectory missing dir empty", dq.recordCount, 0);
 // --- cfsetting requesttimeout round-trips via getPageContext ---
 setting requestTimeout=666;
 assert("getRequestTimeout ms", getPageContext().getRequestTimeout(), 666000);
+
+// --- implicit set* must not shadow onMissingMethod for unknown properties ---
+omm = new compat_engine.fixtures.OnMissingSetter();
+assert("set unknown routes to onMissingMethod", omm.setWidget("x"), "OMM:setWidget");
+omm.setColor("red"); // declared property -> implicit setter
+assert("set known uses implicit setter", omm.color, "red");
 
 suiteEnd();
 </cfscript>
