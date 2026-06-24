@@ -951,6 +951,25 @@ fn cfml_list_split_keep_empty<'a>(list: &'a str, delimiters: &str) -> Vec<&'a st
     list.split(|c: char| delimiters.contains(c)).collect()
 }
 
+/// Map a 1-based CFML list element index (which counts only NON-EMPTY fields, like
+/// ListLen) to a position in the empty-preserving field vector. ListSetAt/InsertAt/
+/// DeleteAt index by non-empty element but keep all empty fields in the output.
+fn nth_nonempty_field_pos(fields: &[&str], index_1based: usize) -> Option<usize> {
+    if index_1based == 0 {
+        return None;
+    }
+    let mut seen = 0usize;
+    for (pos, f) in fields.iter().enumerate() {
+        if !f.is_empty() {
+            seen += 1;
+            if seen == index_1based {
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
 // Thread-local xorshift64 PRNG state for deterministic randomize()/rand() support
 thread_local! {
     static PRNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(0);
@@ -2986,7 +3005,20 @@ fn fn_is_boolean(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_date(args: Vec<CfmlValue>) -> CfmlResult {
+    // Lucee: a bare number (or numeric string) is NOT a date — only date/datetime
+    // STRINGS parse. parse_cfml_date intentionally accepts an OLE date serial for
+    // ParseDateTime/CreateDate, so IsDate must reject numerics up front.
+    match args.first().map(|v| v.query_column_scalar()) {
+        Some(CfmlValue::Int(_)) | Some(CfmlValue::Double(_)) | Some(CfmlValue::Bool(_)) => {
+            return Ok(CfmlValue::Bool(false));
+        }
+        _ => {}
+    }
     let s = get_str(&args, 0);
+    let t = s.trim();
+    if !t.is_empty() && t.parse::<f64>().is_ok() {
+        return Ok(CfmlValue::Bool(false));
+    }
     Ok(CfmlValue::Bool(parse_cfml_date(&s).is_some()))
 }
 
@@ -3085,6 +3117,8 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             }
             "array" => fn_is_array(vec![value.clone()]),
             "struct" => fn_is_struct(vec![value.clone()]),
+            "binary" => fn_is_binary(vec![value.clone()]),
+            "component" | "object" | "class" => fn_is_object(vec![value.clone()]),
             "email" => {
                 let s = value.as_string();
                 Ok(CfmlValue::Bool(EMAIL_REGEX.is_match(&s)))
@@ -3560,6 +3594,7 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
         "%Y-%m-%d %H:%M",
         "%m/%d/%Y %H:%M:%S",
         "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M %p",
         "%m/%d/%Y %H:%M",
         "%d %b %Y %H:%M:%S",
         "%b %d, %Y %H:%M:%S",
@@ -4328,38 +4363,49 @@ fn fn_list_get_at(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_list_set_at(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let index = (get_int(&args, 1) as usize).saturating_sub(1);
+    let index = get_int(&args, 1) as usize;
     let value = get_str(&args, 2);
     let delimiter = get_delimiter(&args, 3);
     let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
-    let mut items: Vec<String> = cfml_list_split(&list, &delimiter).iter().map(|s| s.to_string()).collect();
-    if index < items.len() {
-        items[index] = value;
+    // CFML indexes by NON-EMPTY element (like ListLen) but PRESERVES empty fields.
+    let mut items: Vec<String> =
+        cfml_list_split_keep_empty(&list, &delimiter).iter().map(|s| s.to_string()).collect();
+    if let Some(pos) = nth_nonempty_field_pos(
+        &items.iter().map(|s| s.as_str()).collect::<Vec<_>>(), index,
+    ) {
+        items[pos] = value;
     }
     Ok(CfmlValue::string(items.join(&first_delim)))
 }
 
 fn fn_list_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let index = (get_int(&args, 1) as usize).saturating_sub(1);
+    let index = get_int(&args, 1) as usize;
     let value = get_str(&args, 2);
     let delimiter = get_delimiter(&args, 3);
     let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
-    let mut items: Vec<String> = cfml_list_split(&list, &delimiter).iter().map(|s| s.to_string()).collect();
-    if index <= items.len() {
-        items.insert(index, value);
+    let mut items: Vec<String> =
+        cfml_list_split_keep_empty(&list, &delimiter).iter().map(|s| s.to_string()).collect();
+    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+    // Insert BEFORE the Nth non-empty element; if N is past the last element,
+    // append at the end (matches Lucee's append-on-overflow behavior).
+    let pos = nth_nonempty_field_pos(&refs, index).unwrap_or(items.len());
+    if pos <= items.len() {
+        items.insert(pos, value);
     }
     Ok(CfmlValue::string(items.join(&first_delim)))
 }
 
 fn fn_list_delete_at(args: Vec<CfmlValue>) -> CfmlResult {
     let list = get_str(&args, 0);
-    let index = (get_int(&args, 1) as usize).saturating_sub(1);
+    let index = get_int(&args, 1) as usize;
     let delimiter = get_delimiter(&args, 2);
     let first_delim = delimiter.chars().next().unwrap_or(',').to_string();
-    let mut items: Vec<String> = cfml_list_split(&list, &delimiter).iter().map(|s| s.to_string()).collect();
-    if index < items.len() {
-        items.remove(index);
+    let mut items: Vec<String> =
+        cfml_list_split_keep_empty(&list, &delimiter).iter().map(|s| s.to_string()).collect();
+    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+    if let Some(pos) = nth_nonempty_field_pos(&refs, index) {
+        items.remove(pos);
     }
     Ok(CfmlValue::string(items.join(&first_delim)))
 }
@@ -4853,14 +4899,17 @@ fn fn_query_set_cell(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_query_add_column(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Query(q) = &args[0] {
-            let mut data = q.with_read(|d| d.clone());
             let col_name = args[1].as_string();
             let values: Vec<CfmlValue> = match args.get(2) {
                 Some(CfmlValue::Array(arr)) => arr.snapshot(),
                 _ => Vec::new(),
             };
-            data.add_column(col_name, values);
-            return Ok(CfmlValue::Query(CfmlQuery::from_data(data)));
+            // Mutate the shared handle IN PLACE (CFML by-reference): callers that
+            // don't reassign the return (Wheels' afterFind $queryCallback) still
+            // see the new column, and subsequent per-row cell writes hit the same
+            // query rather than an orphaned clone.
+            q.with_write(|d| d.add_column(col_name, values));
+            return Ok(args[0].clone());
         }
     }
     Ok(CfmlValue::Null)
@@ -5969,15 +6018,11 @@ fn fn_get_directory_from_path(args: Vec<CfmlValue>) -> CfmlResult {
     if path.is_empty() {
         return Ok(CfmlValue::string(String::new()));
     }
-    let p = std::path::Path::new(&path);
-    match p.parent() {
-        Some(parent) => {
-            let mut dir = parent.to_string_lossy().to_string();
-            if !dir.is_empty() && !dir.ends_with(std::path::MAIN_SEPARATOR) {
-                dir.push(std::path::MAIN_SEPARATOR);
-            }
-            Ok(CfmlValue::string(dir))
-        }
+    // Lucee/ACF: everything up to AND INCLUDING the final separator, verbatim —
+    // NO normalization of redundant separators (Path::parent() collapses `//`,
+    // which broke Wheels' $fileExistsNoCase Replace() match). Honor both / and \.
+    match path.rfind(['/', '\\']) {
+        Some(idx) => Ok(CfmlValue::string(path[..=idx].to_string())),
         None => Ok(CfmlValue::string(path)),
     }
 }
@@ -6242,7 +6287,10 @@ fn fn_canonicalize(args: Vec<CfmlValue>) -> CfmlResult {
     for _ in 0..5 {
         let prev = s.clone();
         s = decode_html_entities(&s);
-        s = url_decode_string(&s);
+        // OWASP ESAPI Canonicalize does PERCENT decoding only — it does NOT treat
+        // `+` as a space (that's x-www-form-urlencoded, for urlDecode). A literal
+        // `+` (e.g. a Google Fonts "Istok+Web" URL) must survive.
+        s = url_decode_string_opt(&s, false);
         if s == prev {
             break;
         }
@@ -6251,6 +6299,10 @@ fn fn_canonicalize(args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn url_decode_string(s: &str) -> String {
+    url_decode_string_opt(s, true)
+}
+
+fn url_decode_string_opt(s: &str, plus_as_space: bool) -> String {
     let mut result = String::new();
     let mut bytes = Vec::new();
     let mut chars = s.chars().peekable();
@@ -6270,7 +6322,7 @@ fn url_decode_string(s: &str) -> String {
                     bytes.clear();
                 }
             }
-            '+' => {
+            '+' if plus_as_space => {
                 if !bytes.is_empty() {
                     if let Ok(decoded) = String::from_utf8(bytes.clone()) {
                         result.push_str(&decoded);
@@ -8334,8 +8386,10 @@ pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
                 .map(|(_, v)| v.as_string().to_lowercase())
                 .unwrap_or_else(|| "query".to_string());
             if rt == "struct" {
+                // Lucee accepts both `columnKey` and `keyColumn` (Wheels' Lucee
+                // engine adapter passes `keyColumn`).
                 let key = opts.iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("columnkey") || k.eq_ignore_ascii_case("columnKey"))
+                    .find(|(k, _)| k.eq_ignore_ascii_case("columnkey") || k.eq_ignore_ascii_case("keycolumn"))
                     .map(|(_, v)| v.as_string())
                     .unwrap_or_default();
                 if key.is_empty() { rt } else { format!("struct:{}", key) }

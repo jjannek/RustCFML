@@ -5526,6 +5526,10 @@ impl Parser {
                 name: "remote".to_string(),
                 location: self.current_location(),
             })),
+            Token::Package => Ok(Expression::Identifier(Identifier {
+                name: "package".to_string(),
+                location: self.current_location(),
+            })),
             Token::Extends => Ok(Expression::Identifier(Identifier {
                 name: "extends".to_string(),
                 location: self.current_location(),

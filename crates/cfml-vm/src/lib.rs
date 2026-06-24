@@ -1057,6 +1057,9 @@ pub struct CfmlVirtualMachine {
     pub cache: HashMap<String, (CfmlValue, Option<cfml_common::clock::Monotonic>)>,
     /// cfsetting enableCFOutputOnly counter (>0 means only cfoutput content is emitted)
     pub enable_cfoutput_only: i32,
+    /// cfsetting requesttimeout (seconds), stored as milliseconds. 0 = unset.
+    /// getPageContext().getRequestTimeout() reads it back (in ms, Lucee-style).
+    pub request_timeout_ms: i64,
     /// Sandbox mode: blocks host filesystem access, routes reads through VFS
     pub sandbox: bool,
     /// After a function call, holds modified complex-type argument values for
@@ -1395,6 +1398,7 @@ impl CfmlVirtualMachine {
             app_fn_table_dirty: false,
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
+            request_timeout_ms: 0,
             sandbox: false,
             arg_ref_writeback: None,
             pending_result_writeback: None,
@@ -10552,7 +10556,10 @@ impl CfmlVirtualMachine {
                                     .get_ci("returntype")
                                     .map(|v| v.as_string().to_lowercase())
                                     .unwrap_or_else(|| "query".to_string());
-                                let ck = opts.get_ci("columnkey").map(|v| v.as_string());
+                                // Lucee accepts both `columnKey` and `keyColumn`.
+                                let ck = opts.get_ci("columnkey")
+                                    .or_else(|| opts.get_ci("keycolumn"))
+                                    .map(|v| v.as_string());
                                 (rt, ck)
                             }
                             _ => ("query".to_string(), None),
@@ -10987,6 +10994,17 @@ impl CfmlVirtualMachine {
                                 self.enable_cfoutput_only += 1;
                             } else {
                                 self.enable_cfoutput_only = (self.enable_cfoutput_only - 1).max(0);
+                            }
+                        }
+                        // requesttimeout (seconds) — store as ms so
+                        // getPageContext().getRequestTimeout() reports Lucee-style ms.
+                        if let Some((_, v)) = opts
+                            .iter()
+                            .find(|(k, _)| k.to_lowercase() == "requesttimeout")
+                        {
+                            let secs = v.as_string().trim().parse::<f64>().unwrap_or(0.0);
+                            if secs > 0.0 {
+                                self.request_timeout_ms = (secs * 1000.0) as i64;
                             }
                         }
                     }
@@ -13663,6 +13681,15 @@ impl CfmlVirtualMachine {
             // resetPageContext() lands back here as a harmless no-op.
             "getcfmlfactory" => Ok(object.clone()),
             "resetpagecontext" | "releasepagecontext" => Ok(CfmlValue::Null),
+            // Lucee: getRequestTimeout() returns the timeout in MILLISECONDS
+            // (Wheels' engineAdapter divides by 1000). Set via cfsetting requesttimeout.
+            "getrequesttimeout" => Ok(CfmlValue::Int(self.request_timeout_ms)),
+            "setrequesttimeout" => {
+                if let Some(v) = extra_args.first() {
+                    self.request_timeout_ms = v.as_string().trim().parse::<i64>().unwrap_or(0);
+                }
+                Ok(CfmlValue::Null)
+            }
             "getrequest" | "gethttpservletrequest" => {
                 Ok(pc.get("__pc_request").unwrap_or(CfmlValue::Null))
             }
@@ -15262,6 +15289,8 @@ impl CfmlVirtualMachine {
                         return false;
                     }
                 }
+                // isDefined("q.col") — a query column counts as defined (Lucee).
+                CfmlValue::Query(q) => return q.has_column_ci(segment),
                 _ => return false,
             }
         }
@@ -17710,10 +17739,16 @@ impl CfmlVirtualMachine {
             .unwrap_or_else(|| "all".to_string());
         match self.resolve_directory_path_with_mappings(&dir) {
             Some(resolved) => self.sandbox_cfdirectory_list(&resolved, recurse, &filter, &list_info),
-            None => Err(CfmlError::runtime(format!(
-                "cfdirectory: directory not found: {}",
-                dir
-            ))),
+            // Lucee/ACF: `action="list"` on a missing directory returns an EMPTY
+            // query (recordcount=0), it does NOT throw. (Wheels' controller-
+            // discovery lists a non-existent nested controllers/ subdir.)
+            None => {
+                if list_info == "name" {
+                    Ok(Self::build_directory_name_query(&[], &dir))
+                } else {
+                    Ok(Self::build_directory_query(&[], &dir))
+                }
+            }
         }
     }
 

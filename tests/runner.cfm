@@ -430,6 +430,7 @@ include "harness.cfm";
 <cf_runtest file="compat_engine/test_array_functions.cfm">
 <cf_runtest file="compat_engine/test_list_functions.cfm">
 <cf_runtest file="compat_engine/test_query_functions.cfm">
+<cf_runtest file="compat_engine/test_wheels_batch_v0294.cfm">
 <cf_runtest file="compat_engine/test_date_functions.cfm">
 <cf_runtest file="compat_engine/test_type_checking.cfm">
 <cf_runtest file="compat_engine/test_json.cfm">
