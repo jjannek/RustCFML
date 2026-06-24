@@ -373,7 +373,9 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             }
             Ok(CfmlValue::string(String::new()))
         }
-        "getabsolute_path" | "getabsolutepath" | "getcanonicalpath" => {
+        "getabsolute_path" | "getabsolutepath" => {
+            // getAbsolutePath() makes the path absolute but does NOT collapse
+            // `.`/`..` segments (Java leaves them for getCanonicalPath).
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(CfmlValue::String(path)) = shim.get("__path") {
                     let p = std::path::Path::new(path.as_str());
@@ -385,6 +387,30 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
                             cwd.join(path.as_str()).to_string_lossy().to_string(),
                         ));
                     }
+                }
+            }
+            Ok(CfmlValue::string(String::new()))
+        }
+        "getcanonicalpath" => {
+            // getCanonicalPath() makes the path absolute AND lexically resolves
+            // `.` and `..` segments and strips a trailing separator (Wheels'
+            // path-traversal guard relies on this to detect escapes from the
+            // assets directory). We resolve lexically rather than via
+            // std::fs::canonicalize so it works for paths that don't exist on
+            // disk (the traversal targets in the security spec).
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    let abs = {
+                        let p = std::path::Path::new(path.as_str());
+                        if p.is_absolute() {
+                            std::path::PathBuf::from(path.as_str())
+                        } else if let Ok(cwd) = std::env::current_dir() {
+                            cwd.join(path.as_str())
+                        } else {
+                            std::path::PathBuf::from(path.as_str())
+                        }
+                    };
+                    return Ok(CfmlValue::string(lexically_normalize(&abs)));
                 }
             }
             Ok(CfmlValue::string(String::new()))
@@ -458,6 +484,39 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             Ok(CfmlValue::Null)
         }
         _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// Lexically resolve `.` and `..` components of an absolute path (no disk
+/// access), strip any trailing separator, and return the result as a string.
+/// Mirrors the lexical part of java.io.File.getCanonicalPath for the common
+/// case the path-traversal guard needs. A leading `..` (escaping the root) is
+/// dropped, matching Java's resolution against the filesystem root.
+fn lexically_normalize(path: &std::path::Path) -> String {
+    use std::path::Component;
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    let mut prefix = String::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(p) => prefix = p.as_os_str().to_string_lossy().to_string(),
+            Component::RootDir => {} // re-added when joining below
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(c) => out.push(c.to_os_string()),
+        }
+    }
+    let joined = out
+        .iter()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if prefix.is_empty() {
+        format!("/{}", joined)
+    } else {
+        // Windows-style prefix (e.g. C:) — keep it, separate with `\`.
+        format!("{}\\{}", prefix, joined.replace('/', "\\"))
     }
 }
 

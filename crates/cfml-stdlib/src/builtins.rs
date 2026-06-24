@@ -12481,10 +12481,16 @@ fn fn_list_index_exists(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_get_file_from_path(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
-    let file_name = std::path::Path::new(&path)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_default();
+    // Lucee/ACF treat BOTH `/` and `\` as path separators regardless of host
+    // OS, so the filename is the segment after the last separator of either
+    // kind. (Using std::path::Path::file_name alone misses `\` on Unix, leaving
+    // a Windows-style traversal string like `..\..\sam` intact — a path
+    // sanitisation gap.)
+    let file_name = path
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or("")
+        .to_string();
     Ok(CfmlValue::string(file_name))
 }
 
