@@ -14052,6 +14052,26 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::Bool(false));
                 }
+                "startswith" => {
+                    // Java/Lucee String.startsWith — case-SENSITIVE. Wheels'
+                    // $getObject branches on `objectName.startsWith("request.")`;
+                    // returning Null here (unimplemented) took the wrong branch
+                    // and the form-helper object lookup threw "does not exist".
+                    if let Some(prefix) = extra_args.first() {
+                        return Ok(CfmlValue::Bool(
+                            object.as_string().starts_with(prefix.as_string().as_str()),
+                        ));
+                    }
+                    return Ok(CfmlValue::Bool(false));
+                }
+                "endswith" => {
+                    if let Some(suffix) = extra_args.first() {
+                        return Ok(CfmlValue::Bool(
+                            object.as_string().ends_with(suffix.as_string().as_str()),
+                        ));
+                    }
+                    return Ok(CfmlValue::Bool(false));
+                }
                 "insert" => Some("insert"),
                 "removechars" => Some("removeChars"),
                 "repeatstring" | "repeat" => Some("repeatString"),
