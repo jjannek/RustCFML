@@ -8625,7 +8625,10 @@ fn cfml_to_sqlite(val: &CfmlValue) -> rusqlite::types::Value {
 fn sqlite_to_cfml(val: rusqlite::types::Value) -> CfmlValue {
     use rusqlite::types::Value as SqlValue;
     match val {
-        SqlValue::Null => CfmlValue::Null,
+        // Lucee/ACF default (full null support OFF): a NULL column reads back as
+        // an empty string in query-land, so `q.col EQ ""`, Len(q.col)=0 etc. hold.
+        // (Wheels nullifies an association FK then asserts the reloaded column == "".)
+        SqlValue::Null => CfmlValue::string(String::new()),
         SqlValue::Integer(i) => CfmlValue::Int(i),
         SqlValue::Real(d) => CfmlValue::Double(d),
         SqlValue::Text(s) => CfmlValue::string(s),
