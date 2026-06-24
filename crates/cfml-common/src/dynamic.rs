@@ -1462,7 +1462,13 @@ impl CfmlQueryData {
         let r = self.row_count();
         let mut col = values;
         if col.len() > r {
-            col.truncate(r);
+            // Lucee: adding a column with MORE values than the current row count
+            // EXTENDS the query — existing columns get Null-padded up to the new
+            // length so recordcount grows to fit the longest column.
+            let new_len = col.len();
+            for c in self.data.iter_mut() {
+                Arc::make_mut(c).resize_with(new_len, || CfmlValue::Null);
+            }
         } else if col.len() < r {
             col.resize_with(r, || CfmlValue::Null);
         }

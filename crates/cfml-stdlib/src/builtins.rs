@@ -4740,7 +4740,12 @@ fn fn_query_new(args: Vec<CfmlValue>) -> CfmlResult {
     }
     // queryNew("col1,col2") or queryNew(["col1","col2"])
     let columns: Vec<String> = match &args[0] {
-        CfmlValue::String(s) => s.split(',').map(|c| c.trim().to_string()).collect(),
+        // queryNew("") yields ZERO columns (Lucee), not one empty-named column.
+        CfmlValue::String(s) => s
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
         CfmlValue::Array(arr) => arr.iter().map(|v| v.as_string()).collect(),
         _ => Vec::new(),
     };
@@ -5124,6 +5129,37 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
     let mut meta = ValueMap::default();
     if let Some(val) = args.first() {
         match val {
+            // GetMetadata(query) -> an ARRAY of column-metadata structs in ordinal
+            // order ({name, typeName, isCaseSensitive}), matching Lucee/ACF. Wheels'
+            // $optionsForSelect reads `.name` from each entry to discover columns.
+            CfmlValue::Query(q) => {
+                let cols = q.columns();
+                let entries: Vec<CfmlValue> = q.with_read(|d| {
+                    cols.iter()
+                        .enumerate()
+                        .map(|(ci, name)| {
+                            // Infer a Lucee-ish typeName from the first non-null cell.
+                            let type_name = d
+                                .data
+                                .get(ci)
+                                .and_then(|col| col.iter().find(|v| !matches!(v, CfmlValue::Null)))
+                                .map(|v| match v {
+                                    CfmlValue::Int(_) | CfmlValue::Double(_) => "DOUBLE",
+                                    CfmlValue::Bool(_) => "BOOLEAN",
+                                    CfmlValue::Binary(_) => "OBJECT",
+                                    _ => "VARCHAR",
+                                })
+                                .unwrap_or("VARCHAR");
+                            let mut m = ValueMap::default();
+                            m.insert("name".to_string(), CfmlValue::string(name.clone()));
+                            m.insert("typeName".to_string(), CfmlValue::string(type_name.to_string()));
+                            m.insert("isCaseSensitive".to_string(), CfmlValue::Bool(false));
+                            CfmlValue::strukt(m)
+                        })
+                        .collect()
+                });
+                return Ok(CfmlValue::array(entries));
+            }
             CfmlValue::Struct(s) => {
                 // Extract __name
                 if let Some(name) = s.get("__name") {
