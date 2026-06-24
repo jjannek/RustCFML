@@ -3480,6 +3480,16 @@ impl CfmlVirtualMachine {
                     let leaf = path.rsplit('.').next().unwrap_or(path.as_str());
                     inherited_or_param_keys.remove(leaf);
                 }
+
+                BytecodeOp::DeleteScopeKey(scope) => {
+                    // `StructDelete(<scope>, keyExpr)` — pop the key and delete
+                    // `<scope>.<key>` from the live scope container (scopes are
+                    // snapshotted when passed as a builtin arg, so an in-place
+                    // struct mutation wouldn't reach them).
+                    let key = stack.pop().unwrap_or(CfmlValue::Null).as_string();
+                    let path = format!("{}.{}", scope, key);
+                    self.delete_scope_path(&path, &mut locals, effective_local_mode_modern);
+                }
                 BytecodeOp::ArrayAppendLocal(name) => {
                     // Fused arrayAppend(<ident>, value). The value is on top of
                     // the stack; the array lives in the named variable. With
@@ -6526,14 +6536,24 @@ impl CfmlVirtualMachine {
                                 // would clobber `a`'s identity. Skip when `a` and the
                                 // result are distinct CFC instances; allow same-instance,
                                 // non-CFC results (arrays/Java shims), or non-CFC `a`.
+                                let cur_val = self.scope_aware_load(var_name, &locals);
                                 let clobbers_foreign_cfc = matches!(
-                                    (self.scope_aware_load(var_name, &locals), &result),
+                                    (&cur_val, &result),
                                     (Some(CfmlValue::Struct(ref cur)), CfmlValue::Struct(ref res))
                                         if cur.contains_key("__variables")
                                             && res.contains_key("__variables")
                                             && !cur.ptr_eq(res)
                                 );
-                                if !clobbers_foreign_cfc {
+                                // structDelete on a struct receiver returns a
+                                // BOOLEAN and mutates the struct in place — writing
+                                // that boolean back would clobber the struct
+                                // variable with true/false. A struct mutator never
+                                // legitimately replaces its receiver with a bool.
+                                let bool_over_struct = matches!(
+                                    (&cur_val, &result),
+                                    (Some(CfmlValue::Struct(_)), CfmlValue::Bool(_))
+                                );
+                                if !clobbers_foreign_cfc && !bool_over_struct {
                                     self.scope_aware_store(var_name, result.clone(), &mut locals, effective_local_mode_modern);
                                 }
                             }
@@ -6576,7 +6596,11 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                 }
-                                if !skip_for_identity {
+                                // structDelete (deep receiver `a.b.delete(k)`)
+                                // returns a BOOLEAN and mutates in place; deep_set
+                                // of that bool would overwrite a.b with true/false.
+                                let bool_result = matches!(&result, CfmlValue::Bool(_));
+                                if !skip_for_identity && !bool_result {
                                     Self::deep_set(&mut root_obj, props, result.clone());
                                     self.scope_aware_store(var_name, root_obj, &mut locals, effective_local_mode_modern);
                                 }
@@ -15082,6 +15106,39 @@ impl CfmlVirtualMachine {
             return Ok(CfmlValue::string(object.as_string()));
         }
 
+        // Lucee parity: `dateValue.getTime()` (java.util.Date.getTime) returns
+        // epoch milliseconds. RustCFML dates are formatted strings, so parse the
+        // receiver as a CFML date (local time) and return its UNIX-epoch millis.
+        // Without this, `Now().getTime()` returned Null → the null-delete
+        // assignment guard wiped the assigned-into local (Wheels propertiesSpec
+        // "epoch works": `epochtime = Now().getTime()` then "Variable
+        // 'epochtime' is undefined"). Only applies when the receiver actually
+        // parses as a date, so a plain string falls through unchanged.
+        if method_lower == "gettime" {
+            let raw = object.as_string();
+            let s = raw.trim().trim_start_matches("{ts '").trim_end_matches("'}").trim();
+            // Try the datetime forms RustCFML emits (Now/createDateTime), then a
+            // date-only form (midnight). cfml-stdlib's full date parser isn't
+            // linkable here (it's an optional dep), and these cover the strings
+            // the engine produces for date values.
+            let parsed = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+                .ok()
+                .or_else(|| {
+                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .ok()
+                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                });
+            if let Some(dt) = parsed {
+                use chrono::TimeZone;
+                if let chrono::LocalResult::Single(local_dt) =
+                    chrono::Local.from_local_datetime(&dt)
+                {
+                    return Ok(CfmlValue::Double(local_dt.timestamp_millis() as f64));
+                }
+            }
+        }
+
         Ok(CfmlValue::Null)
     }
 
@@ -19795,6 +19852,7 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         BytecodeOp::SetProperty(_) => (0, 2), // obj + value → (modifies)
         BytecodeOp::SetDynamicVar => (1, 2),  // path + value → value
         BytecodeOp::UnsetPath(_) => (0, 0),   // value already popped by the guard
+        BytecodeOp::DeleteScopeKey(_) => (0, 1), // pops the key value
         BytecodeOp::GetKeys => (1, 1),
         BytecodeOp::ConcatArrays | BytecodeOp::MergeStructs => (1, 2),
         // Object

@@ -334,6 +334,15 @@ pub enum BytecodeOp {
     /// nothing — the guard's `Pop` already cleared the Null. Lucee semantics.
     UnsetPath(String),
 
+    /// Delete a dynamically-named key from a named scope: pops a key value off
+    /// the stack and removes `<scope>.<key>` from the real scope container.
+    /// Emitted for `StructDelete(<scope>, keyExpr)` (e.g. `StructDelete(request,
+    /// "$flag")`) — scopes are snapshotted when passed as a builtin argument, so
+    /// the in-place struct mutation that handles `StructDelete(localStruct, k)`
+    /// can't reach the live scope; this op deletes straight from it. Pushes
+    /// nothing.
+    DeleteScopeKey(String),
+
     // Object
     NewObject(usize),  // arg_count for constructor
     // arg_count for constructor + call-site argument names (empty string = positional).
@@ -627,8 +636,12 @@ impl CfmlCompiler {
         if let Expression::FunctionCall(call) = expr {
             if let Expression::Identifier(ident) = &*call.name {
                 let name_lower = ident.name.to_lowercase();
+                // NB: structDelete is intentionally absent — it mutates the
+                // shared struct handle in place AND returns a BOOLEAN (Lucee/ACF
+                // semantics), so storing its return value back over the first
+                // arg would clobber the struct variable with `true`/`false`.
                 return matches!(name_lower.as_str(),
-                    "structappend" | "structinsert" | "structdelete" | "structupdate" |
+                    "structappend" | "structinsert" | "structupdate" |
                     "structclear" | "arrayclear" | "arrayappend" | "arrayprepend" |
                     "arrayinsert" | "arrayinsertat" | "arraydeleteat" | "arraysort" |
                     "arrayresize" | "arrayswap" | "arrayreverse" | "arrayset" |
@@ -638,6 +651,26 @@ impl CfmlCompiler {
             }
         }
         false
+    }
+
+    /// When `expr` is `StructDelete(<reservedScope>, keyExpr [, …])`, returns the
+    /// scope name and the key expression. Used to delete straight from the live
+    /// scope (scopes don't share their backing when passed as a builtin arg).
+    fn structdelete_scope_target(expr: &Expression) -> Option<(String, &Expression)> {
+        if let Expression::FunctionCall(call) = expr {
+            if let Expression::Identifier(ident) = &*call.name {
+                if ident.name.eq_ignore_ascii_case("structdelete") && call.arguments.len() >= 2 {
+                    if let Expression::Identifier(scope) = &call.arguments[0] {
+                        if Self::is_reserved_scope_name(&scope.name)
+                            && !matches!(&call.arguments[1], Expression::NamedArgument(_))
+                        {
+                            return Some((scope.name.to_lowercase(), &call.arguments[1]));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// True when `expr` is exactly `arrayAppend(<ident>, value)` — a two-arg
@@ -1053,6 +1086,19 @@ impl CfmlCompiler {
                 // Pop collapses to a single Increment/Decrement.
                 else if self.try_emit_inc_dec_statement(&expr_stmt.expr, instructions) {
                     // emitted; no Pop needed — the op has no stack effect
+                }
+                // `StructDelete(<scope>, keyExpr)` — a scope (request/variables/
+                // session/…) is snapshotted when passed as a builtin arg, so the
+                // in-place struct mutation can't reach the live scope. Delete the
+                // key straight from the scope container instead. (Plain-struct
+                // StructDelete falls through to the generic path below, where the
+                // shared-Arc in-place mutation handles it; the boolean return is
+                // discarded by the trailing Pop.)
+                else if let Some((scope, key_expr)) =
+                    Self::structdelete_scope_target(&expr_stmt.expr)
+                {
+                    self.compile_expression(key_expr, instructions);
+                    instructions.push(BytecodeOp::DeleteScopeKey(scope));
                 }
                 // Check for mutating function calls: structAppend(a, b), structInsert(a, k, v), etc.
                 // These return the modified struct; store it back to the first arg's location.

@@ -2592,8 +2592,14 @@ fn fn_struct_delete(args: Vec<CfmlValue>) -> CfmlResult {
             // Mutate the shared handle in place (Lucee reference semantics):
             // aliases of the struct observe the deletion.
             let key = args[1].as_string();
+            let existed = struct_find_key_ci(s, &key).is_some();
             s.remove_ci(&key);
-            return Ok(CfmlValue::Struct(s.clone()));
+            // StructDelete returns a BOOLEAN, not the struct (Lucee/ACF). With
+            // indicateNotExisting=true it reports whether the key was present;
+            // otherwise it is always true. (Wheels' flashDelete returns this
+            // value directly and asserts toBeTrue.)
+            let indicate = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+            return Ok(CfmlValue::Bool(if indicate { existed } else { true }));
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -3566,9 +3572,12 @@ fn parse_cfml_date(s: &str) -> Option<NaiveDateTime> {
             let days = n.floor() as i64;
             let frac = n - n.floor();
             let secs = (frac * 86400.0) as u32;
+            // try_days/try_seconds return None on overflow instead of panicking
+            // ("TimeDelta::days out of bounds") — a bare epoch-millis value like
+            // 1.7e12 parsed as a date serial would otherwise crash the process.
             return base.and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.checked_add_signed(chrono::Duration::days(days)))
-                .and_then(|dt| dt.checked_add_signed(chrono::Duration::seconds(secs as i64)));
+                .and_then(|dt| chrono::Duration::try_days(days).and_then(|d| dt.checked_add_signed(d)))
+                .and_then(|dt| chrono::Duration::try_seconds(secs as i64).and_then(|d| dt.checked_add_signed(d)));
         }
     }
 
@@ -3835,13 +3844,15 @@ fn fn_date_add(args: Vec<CfmlValue>) -> CfmlResult {
         "yyyy" => add_months(&dt, number * 12),
         "q" => add_months(&dt, number * 3),
         "m" => add_months(&dt, number),
-        "y" | "d" => dt.checked_add_signed(chrono::Duration::days(number)),
-        "w" => dt.checked_add_signed(chrono::Duration::days(number)),
-        "ww" => dt.checked_add_signed(chrono::Duration::weeks(number)),
-        "h" => dt.checked_add_signed(chrono::Duration::hours(number)),
-        "n" => dt.checked_add_signed(chrono::Duration::minutes(number)),
-        "s" => dt.checked_add_signed(chrono::Duration::seconds(number)),
-        "l" => dt.checked_add_signed(chrono::Duration::milliseconds(number)),
+        // try_* variants return None on overflow rather than panicking, so an
+        // out-of-range delta surfaces as a clean "Date arithmetic overflow".
+        "y" | "d" => chrono::Duration::try_days(number).and_then(|x| dt.checked_add_signed(x)),
+        "w" => chrono::Duration::try_days(number).and_then(|x| dt.checked_add_signed(x)),
+        "ww" => chrono::Duration::try_weeks(number).and_then(|x| dt.checked_add_signed(x)),
+        "h" => chrono::Duration::try_hours(number).and_then(|x| dt.checked_add_signed(x)),
+        "n" => chrono::Duration::try_minutes(number).and_then(|x| dt.checked_add_signed(x)),
+        "s" => chrono::Duration::try_seconds(number).and_then(|x| dt.checked_add_signed(x)),
+        "l" => chrono::Duration::try_milliseconds(number).and_then(|x| dt.checked_add_signed(x)),
         _ => Some(dt),
     };
 
