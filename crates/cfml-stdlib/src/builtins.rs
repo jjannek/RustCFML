@@ -2450,6 +2450,35 @@ fn visible_struct_keys(s: &cfml_common::dynamic::CfmlStruct) -> Vec<String> {
     if is_java_shim {
         return keys.into_iter().filter(|k| !k.starts_with("__")).collect();
     }
+    // A CFC instance is materialised as a marker-bearing struct; its engine
+    // internals (__name/__variables/__properties/__metadata/__source_file/...)
+    // are NOT struct keys in Lucee/ACF — StructKeyList/StructKeyArray expose only
+    // public members. Without this filter, toXML/$structToXML descends into
+    // `__variables` and recurses without bound (Wheels renderWith(data=model)
+    // tripped the depth-256 guard). Mirrors the for-in CFC filter in cfml-vm:
+    // drop `__`-prefixed keys + `this`, and keep only public/remote methods.
+    let is_component = keys.iter().any(|k| k.eq_ignore_ascii_case("__variables"))
+        && keys
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case("__name") || k.eq_ignore_ascii_case("this"));
+    if is_component {
+        return keys
+            .into_iter()
+            .filter(|k| {
+                if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+                    return false;
+                }
+                match s.get(k) {
+                    Some(CfmlValue::Function(f)) => matches!(
+                        f.access,
+                        cfml_common::dynamic::CfmlAccess::Public
+                            | cfml_common::dynamic::CfmlAccess::Remote
+                    ),
+                    _ => true,
+                }
+            })
+            .collect();
+    }
     // The magic-scope marker (cgi) is engine-internal — never surface it.
     let has_magic = keys
         .iter()
@@ -2499,6 +2528,21 @@ fn fn_struct_key_exists(args: Vec<CfmlValue>) -> CfmlResult {
                 // parity) even though reading it yields "".
                 if key == cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER {
                     return Ok(CfmlValue::Bool(false));
+                }
+                // A CFC instance exposes only public members; its engine
+                // internals (__name/__variables/...) and private methods are
+                // not keys (Lucee/ACF parity). Defer to visible_struct_keys so
+                // StructKeyExists never disagrees with StructKeyList/for-in.
+                if found {
+                    let is_component = s.contains_key_ci("__variables")
+                        && (s.contains_key_ci("__name") || s.contains_key_ci("this"));
+                    if is_component
+                        && !visible_struct_keys(s)
+                            .iter()
+                            .any(|k| k.eq_ignore_ascii_case(&key))
+                    {
+                        return Ok(CfmlValue::Bool(false));
+                    }
                 }
                 return Ok(CfmlValue::Bool(found));
             }

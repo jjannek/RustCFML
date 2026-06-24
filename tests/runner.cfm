@@ -483,6 +483,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_local_arguments_scope_independence.cfm">
 <cf_runtest file="core/test_local_key_read.cfm">
 <cf_runtest file="oop/test_metadata_name_value.cfm">
+<cf_runtest file="oop/test_struct_keys_component.cfm">
 <!--- A parent's displayName attribute must NOT be copied onto a child's leaf metadata. --->
 <!--- RustCFML 0.161.0 propagates it; Lucee/ACF/BoxLang leave it absent on the leaf. --->
 <cf_runtest file="oop/test_getmetadata_inherited_displayname.cfm">
