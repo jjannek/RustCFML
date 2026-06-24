@@ -156,6 +156,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
 
     // ---- Output functions ----
     f.insert("writeOutput".into(), write_output);
+    // `echo()` — Lucee/ACF alias of writeOutput (writes to the page buffer).
+    f.insert("echo".into(), write_output);
     f.insert("writeDump".into(), write_dump);
     f.insert("dump".into(), write_dump);
     // `cfdump(var=…)` — the cf-prefixed script-call form of <cfdump>/writeDump.
@@ -8250,6 +8252,10 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
     let conn = pool.get()
         .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to get SQLite connection from pool: {}", e)))?;
 
+    // See `execute_sqlite_with_conn`: emulate MySQL `@@` system variables that
+    // SQLite cannot parse, so capability-detection selects don't crash.
+    let sql_owned = rewrite_mysql_system_vars(sql);
+    let sql = sql_owned.as_str();
     let (exec_sql, bound_params) = build_sqlite_params(params_arg, sql)?;
 
     if is_select_query(sql) {
@@ -8283,6 +8289,64 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
         let last_id = conn.last_insert_rowid();
         build_mutation_result(affected as i64, last_id, sql)
     }
+}
+
+/// Rewrite MySQL/MariaDB `@@`-prefixed session/system-variable references into
+/// SQLite-valid expressions so a FROM-less capability-detection select doesn't
+/// die with `unrecognized token: "@"` on the SQLite backend. Known variables
+/// are emulated; any other `@@name` becomes `NULL`. The original column alias
+/// is preserved because only the `@@name` token is replaced.
+///
+/// Only the double-at (`@@`) form is touched — a single `@name` is a valid
+/// SQLite named bind parameter and is left alone. References inside
+/// single-quoted string literals are skipped.
+#[cfg(feature = "sqlite")]
+fn rewrite_mysql_system_vars(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    // Fast path: nothing to do when there's no `@@` anywhere.
+    if !sql.contains("@@") {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut seg_start = 0; // start of unflushed verbatim text (ASCII boundary)
+    while i < len {
+        // Skip over single-quoted string literals so an `@@` inside one is left
+        // alone; the literal stays part of the unflushed verbatim segment.
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < len && bytes[i] != b'\'' {
+                i += 1;
+            }
+            i += 1; // consume the closing quote (or run off the end)
+            continue;
+        }
+        if bytes[i] == b'@' && i + 1 < len && bytes[i + 1] == b'@' {
+            let mut end = i + 2;
+            while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let name = sql[i + 2..end].to_ascii_lowercase();
+            // SQLite has no MySQL system variables — emulate the ones real apps
+            // probe, else NULL. `sql_mode` is empty so ONLY_FULL_GROUP_BY
+            // detection (ListFindNoCase) reports the relaxed/permissive mode.
+            let replacement = match name.as_str() {
+                "version" => "sqlite_version()",
+                "sql_mode" => "''",
+                _ => "NULL",
+            };
+            // Flush verbatim text before the token, then the replacement.
+            out.push_str(&sql[seg_start..i]);
+            out.push_str(replacement);
+            i = end;
+            seg_start = end;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&sql[seg_start..]);
+    out
 }
 
 /// Build the bound parameter values for a SQLite query, AND return the SQL to
@@ -9920,6 +9984,9 @@ fn execute_with_transaction(conn: &mut TransactionConn, sql: &str, params_arg: &
 fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     use rusqlite::types::Value as SqlValue;
 
+    // Emulate MySQL `@@` system variables SQLite can't parse (see helper).
+    let sql_owned = rewrite_mysql_system_vars(sql);
+    let sql = sql_owned.as_str();
     let (exec_sql, bound_params) = build_sqlite_params(params_arg, sql)?;
 
     if is_select_query(sql) {

@@ -613,15 +613,17 @@ fn jit_caller_invokes_boxed_returning_udf_and_matches_interpreter() {
 #[test]
 fn jit_caller_threads_boxed_arg_through_to_jitted_callee() {
     // A Boxed value crosses TWO UDF call boundaries:
-    //   passThrough(s) → echo(s) → s
+    //   passThrough(s) → ident(s) → s
     // Both functions specialise on Boxed args + Boxed returns. The runtime
     // tagged-pointer threads from caller's slot → dispatcher's i64 arg →
     // callee's slot → return → caller's stack as Boxed. No IR-level box
     // operations beyond the dispatch itself.
+    // (`ident` deliberately NOT named `echo` — that's now a writeOutput-alias
+    // BIF, and a UDF can't shadow a BIF.)
     let src = r#"
-        function echo(s) { return s; }
+        function ident(s) { return s; }
         function passThrough(s) {
-            var t = echo(s);
+            var t = ident(s);
             return t;
         }
         out = "";
@@ -636,7 +638,7 @@ fn jit_caller_threads_boxed_arg_through_to_jitted_callee() {
     );
     assert!(
         compiled >= 2,
-        "expected both echo and passThrough to JIT, got {compiled}"
+        "expected both ident and passThrough to JIT, got {compiled}"
     );
 }
 

@@ -33,6 +33,10 @@ enum ConditionType {
     QueryString,
     /// The client's remote IP address.
     RemoteAddr,
+    /// The request URI (the URL path, without scheme/host/query-string). This
+    /// is the condition type every Wheels app's `urlrewrite.xml` ships — it
+    /// guards the clean-URL rule against rewriting `/index.cfm`, `/images`, etc.
+    RequestUri,
     /// A condition type we don't understand. A rule carrying one of these can
     /// never be safely evaluated, so it must NOT match — otherwise dropping the
     /// condition would silently make the rule fire on every request (this is
@@ -279,6 +283,7 @@ fn parse_conditions(block: &str) -> Vec<RewriteCondition> {
             }
             Some("query-string") => ConditionType::QueryString,
             Some("remote-addr") => ConditionType::RemoteAddr,
+            Some("request-uri") => ConditionType::RequestUri,
             _ => ConditionType::Unsupported,
         };
 
@@ -361,6 +366,7 @@ fn check_condition(
     headers: &HashMap<String, String>,
     query_string: &str,
     remote_addr: &str,
+    request_uri: &str,
 ) -> bool {
     let actual = match &cond.cond_type {
         ConditionType::Method => method.to_string(),
@@ -376,11 +382,13 @@ fn check_condition(
         // tuckey treats these condition values as regex patterns matched
         // against the actual value: `equal` => the pattern is found,
         // `notequal` => it is not. This is NOT plain string equality.
-        ConditionType::QueryString | ConditionType::RemoteAddr => {
-            let actual = if matches!(cond.cond_type, ConditionType::QueryString) {
-                query_string
-            } else {
-                remote_addr
+        ConditionType::QueryString
+        | ConditionType::RemoteAddr
+        | ConditionType::RequestUri => {
+            let actual = match cond.cond_type {
+                ConditionType::QueryString => query_string,
+                ConditionType::RemoteAddr => remote_addr,
+                _ => request_uri,
             };
             let pattern = if cond.case_sensitive {
                 Regex::new(&cond.value)
@@ -441,7 +449,17 @@ pub fn apply_rewrite_rules(
         let conditions_pass = rule
             .conditions
             .iter()
-            .all(|c| check_condition(c, method, port, headers, query_string, remote_addr));
+            .all(|c| {
+                check_condition(
+                    c,
+                    method,
+                    port,
+                    headers,
+                    query_string,
+                    remote_addr,
+                    &current_path,
+                )
+            });
         if !conditions_pass {
             continue;
         }
@@ -530,5 +548,35 @@ mod tests {
             apply_rewrite_rules(&rules, "/foo/bar", "GET", 8500, &headers, "", "127.0.0.1");
         let result = result.expect("rule should match");
         assert_eq!(result.new_path, "/index.cfm/bar");
+    }
+
+    // Regression for GH #194: a rule with a `request-uri` condition (the shape
+    // every Wheels app's urlrewrite.xml ships) must fire for a clean URL and be
+    // skipped for the excluded paths. Before the `request-uri` type was
+    // implemented it fell to `Unsupported` and the rule never matched (clean
+    // URLs 404'd from v0.227.0).
+    #[test]
+    fn request_uri_condition_gates_clean_url_rewrite() {
+        let xml = r#"<urlrewrite>
+            <rule enabled="true">
+                <condition type="request-uri" operator="notequal">^/(index.cfm|images|files)</condition>
+                <from>^/(.*)$</from>
+                <to type="passthrough">/index.cfm/$1</to>
+            </rule>
+        </urlrewrite>"#;
+        let rules = parse_urlrewrite_xml_content(xml);
+        assert_eq!(rules.len(), 1);
+        let headers = HashMap::new();
+
+        // Clean URL: request-uri does NOT match the exclusion → condition passes → rewrites.
+        let hit = apply_rewrite_rules(&rules, "/hello", "GET", 8500, &headers, "", "127.0.0.1")
+            .expect("clean URL should rewrite");
+        assert_eq!(hit.new_path, "/index.cfm/hello");
+
+        // Already-rewritten path: request-uri matches the exclusion → notequal
+        // fails → condition fails → rule skipped, no rewrite.
+        let miss =
+            apply_rewrite_rules(&rules, "/index.cfm/posts", "GET", 8500, &headers, "", "127.0.0.1");
+        assert!(miss.is_none(), "excluded path must not be rewritten");
     }
 }

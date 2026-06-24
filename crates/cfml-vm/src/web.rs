@@ -194,12 +194,15 @@ pub fn build_web_scopes(
 
     let raw_body = String::from_utf8_lossy(body).to_string();
 
-    let form_scope = if method == "POST"
-        && content_type.starts_with("application/x-www-form-urlencoded")
+    // Populate the form scope from a form-encoded request body for ANY method
+    // that carries one — PUT, PATCH and DELETE submit forms just like POST
+    // (Lucee/ACF key off the content-type, not the method). GET and other
+    // bodyless requests fall through to an empty form scope.
+    let form_scope = if content_type.starts_with("application/x-www-form-urlencoded")
         && !raw_body.is_empty()
     {
         parse_query_string(&raw_body)
-    } else if method == "POST" && content_type.starts_with("multipart/form-data") {
+    } else if content_type.starts_with("multipart/form-data") {
         parse_multipart_sync(&content_type, body)
     } else {
         ValueMap::default()

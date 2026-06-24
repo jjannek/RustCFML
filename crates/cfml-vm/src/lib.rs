@@ -7601,7 +7601,7 @@ impl CfmlVirtualMachine {
 
             // writeOutput/writeDump must be handled before the builtin lookup
             // so output goes to output_buffer (not stdout via the builtin fn)
-            if name_lower == "writeoutput" {
+            if name_lower == "writeoutput" || name_lower == "echo" {
                 for arg in &args {
                     self.output_buffer.push_str(&arg.as_string());
                 }
