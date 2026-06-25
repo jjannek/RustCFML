@@ -191,6 +191,62 @@ async fn event_routing_and_ack_ref() {
 }
 
 #[tokio::test]
+async fn presence_state_diffs_and_roster() {
+    let server = start_server().await;
+    let base = format!("ws://127.0.0.1:{}/ws/presence", server.port);
+
+    // Collect every `user` meta out of a presence map (`{key:{metas:[{user}]}}`).
+    fn users(map: &serde_json::Value) -> Vec<String> {
+        let mut out = vec![];
+        if let Some(obj) = map.as_object() {
+            for v in obj.values() {
+                if let Some(metas) = v["metas"].as_array() {
+                    for m in metas {
+                        if let Some(u) = m["user"].as_str() {
+                            out.push(u.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    // A connects → onConnect tracks → A gets a presence_state snapshot with itself.
+    let (mut a, _) = connect_async(format!("{base}?user=alice")).await.expect("A connects");
+    let a_state = next_json(&mut a).await;
+    assert_eq!(a_state["ev"], "presence_state", "tracker gets a state snapshot");
+    assert_eq!(users(&a_state["d"]), vec!["alice"], "snapshot has the tracker");
+
+    // B connects → B gets the full snapshot; A gets a join diff for bob.
+    let (mut b, _) = connect_async(format!("{base}?user=bob")).await.expect("B connects");
+    let b_state = next_json(&mut b).await;
+    assert_eq!(b_state["ev"], "presence_state");
+    assert_eq!(users(&b_state["d"]), vec!["alice", "bob"], "B sees both");
+
+    let a_join = next_json(&mut a).await;
+    assert_eq!(a_join["ev"], "presence_diff");
+    assert_eq!(users(&a_join["d"]["joins"]), vec!["bob"], "A learns bob joined");
+    assert_eq!(users(&a_join["d"]["leaves"]), Vec::<String>::new());
+
+    // io().presence() roster via an on="roster" handler → returned as an ack.
+    b.send(Message::Text(r#"{"ev":"roster"}"#.into())).await.unwrap();
+    let roster = next_json(&mut b).await;
+    assert_eq!(roster["t"], "ack", "roster returned as an ack");
+    assert_eq!(users(&roster["d"]), vec!["alice", "bob"], "roster lists everyone");
+
+    // B disconnects → A gets a leave diff for bob (auto-untrack on teardown).
+    drop(b);
+    let a_leave = next_json(&mut a).await;
+    assert_eq!(a_leave["ev"], "presence_diff");
+    assert_eq!(users(&a_leave["d"]["leaves"]), vec!["bob"], "A learns bob left");
+    assert_eq!(users(&a_leave["d"]["joins"]), Vec::<String>::new());
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn binary_frames_round_trip() {
     let server = start_server().await;
     let url = format!("ws://127.0.0.1:{}/ws/raw", server.port);

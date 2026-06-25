@@ -133,6 +133,11 @@ Cloudflare Durable Objects + WebSocket Hibernation — separate design; steal on
 - **Docs:** `docs/websockets.md` gained an "Event routing" section + `ref` in the wire/ack docs; roadmap updated.
 - **Gates:** all green — `cargo test --workspace` (0 fail), `cargo run -- tests/runner.cfm` (4779/4779), serve cold+warm (4829/4829), wasm32 build, `wasm-pack build crates/wasm --target web`.
 
+**Presence (P11)** shipped (committed as part of v0.300.0 / a follow-up). Phoenix-style track/list + state-snapshot + join/leave diffs, **channel-scoped, single-node** (cluster-correct for free once the distributed Broker lands — no API change):
+- Registry (`websocket.rs`): `Inner.presence: HashMap<(channel,key), BTreeMap<ConnId, meta>>` + `ConnEntry.presence_keys`. Methods `track(conn,key,meta)` (emits `presence_state` snapshot to self, `presence_diff` join to others), `untrack(conn,key)`, `presence_state(channel) -> {key:{metas:[…]}}`, `presence_diff_frame(...)`. `unregister` now auto-untracks + broadcasts leave diffs (locks released before broadcast — parking_lot RwLock is non-reentrant). Frame type `t="presence"`, `ev="presence_state"|"presence_diff"`.
+- CFML surface: `socket.track(meta)` (key=conn id) / `socket.track(key,meta)` (group tabs) / `socket.untrack([key])`; `io([channel]).presence()`; `wsPresence([channel])` flat BIF (was a no-op stub) — all return `{key:{metas:[…]}}`.
+- Tests: `presence_state_diffs_and_roster` (websocket_raw.rs, now 7 live tests) + `presence_track_snapshot_and_leave_on_disconnect` unit test (websocket.rs, 5 unit tests) + `presence.cfc` fixture. Docs: `docs/websockets.md` "Presence" section + socket/io tables + roadmap.
+
 ### Deviation from the plan (decided, not an oversight)
 
 - **No literal `Broker` trait object yet.** Decision 3's *substance* shipped — node-qualified `ConnId` (`{nodeId}:{uuid}`), monotonic message-id wire, and **all** fan-out funnels through `WebSocketRegistry::{emit_to,broadcast,to_room}`. A `Broker` trait with only a single-node `LocalAdapter` would be empty ceremony; introduce it **in Phase 2** when the distributed adapter gives it a second implementation. `FrameSink` already abstracts per-connection delivery, so the cross-node seam is: add remote routing inside those three registry methods (local id → local `sink.send`; remote nodeId → broker publish).
@@ -141,7 +146,7 @@ Cloudflare Durable Objects + WebSocket Hibernation — separate design; steal on
 
 - **`on="event"` annotation routing** — ✅ DONE (see "Phase 2 progress" above).
 - **Distributed Broker** — extend the three registry fan-out methods to publish/subscribe across the existing shared-session cluster (memberlist + Memcached/Automerge, feature-gated in `crates/cli`); replicate room membership + presence. `socketioxide` Redis adapter is an alternative for the Phase-3 transport.
-- **Presence** — `socket.track(meta)` + `io(channel).presence()`; add `presence_state`/`presence_diff` frame types (the `WireEnvelope.t` field already enumerates `presence`). Cluster-correct via the Broker.
+- **Presence** — ✅ DONE single-node (see "Presence (P11)" above). Cluster-correctness comes with the distributed Broker.
 - **Auth** — `canJoin(socket, room)` hook gating `join`; `secured="role"` method/component annotation checked via the same `__funcmeta`/`getMetadata` reflection before dispatch.
 - **Resumability replay** — wire already carries per-message `id`; accept `lastEventId` at the handshake (query param, already captured) + best-effort in-memory history, opt-in `{history=N}`.
 

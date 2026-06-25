@@ -147,6 +147,7 @@ The live handle passed to every lifecycle method:
 | `socket.join( room )` / `socket.leave( room )` | Room membership. |
 | `socket.rooms()` | Array of rooms this socket is in. |
 | `socket.to( room )` | Returns a scoped emitter → `.emit()` / `.send()` / `.except()`. |
+| `socket.track( [key], meta )` / `socket.untrack( [key] )` | Presence — see below. |
 | `socket.close( [code], [reason] )` | Close this connection. |
 | `socket.data` | A **live, mutable struct** for per-connection state (see below). |
 | `socket.param( name )` / `socket.params()` | Handshake query parameters (`?userId=42`). |
@@ -180,6 +181,48 @@ On disconnect the engine removes the connection from **every** room
 automatically, whether or not you define `onDisconnect` — the most common
 realtime leak is impossible by default.
 
+## Presence
+
+Presence answers "who's here?" — *set my bit of state, read everyone else's*.
+A connection **tracks** itself with some metadata; the engine keeps a per-channel
+roster and ships **diffs** as people come and go (the Phoenix Presence model).
+
+```cfml
+function onConnect( socket ) {
+    socket.track( { user = socket.param( "userId" ), status = "online" } );
+}
+```
+
+- **`socket.track( meta )`** — adds this connection to the roster keyed by its
+  own id. **`socket.track( key, meta )`** groups several connections under one
+  key (e.g. a user's multiple tabs/devices → one roster entry with many `metas`).
+  Re-tracking under the same key updates the meta.
+- **`socket.untrack()`** / **`socket.untrack( key )`** — removes it. Disconnect
+  untracks automatically, so the roster never leaks a ghost.
+
+When a connection tracks, **it** receives the full roster as a `presence_state`
+frame, and **everyone else** gets a `presence_diff` join. Leaves (including
+disconnects) broadcast a `presence_diff` leave. Read the roster anytime:
+
+```cfml
+io().presence();            // inside a handler — the current channel's roster
+io( "/chat" ).presence();   // by channel, from anywhere
+wsPresence( "/chat" );      // flat-BIF equivalent
+```
+
+The roster shape (also the payload of a `presence_state` frame):
+
+```jsonc
+{
+  "user-42": { "metas": [ { "user": "user-42", "status": "online" } ] },
+  "user-99": { "metas": [ { "user": "user-99", "status": "away" } ] }
+}
+```
+
+A `presence_diff` frame carries `{ "joins": { … }, "leaves": { … } }` in the same
+per-key shape. Presence is channel-scoped; multi-node correctness arrives with the
+distributed broker (later in Phase 2) with no API change.
+
 ## Emit from anywhere
 
 You don't need a `socket` handle to push to clients. Any ordinary `.cfm` page,
@@ -202,6 +245,7 @@ io( "/chat" ).to( "lobby" ).emit( "announcement", data );  // a room
 io( "/chat" ).to( "lobby" ).except( cid ).emit( "x", d );  // exclude one connection
 io( "/chat" ).in( "lobby" ).count();                       // member count
 io( "/chat" ).sockets();                                   // connection ids
+io( "/chat" ).presence();                                  // the presence roster
 ```
 
 Inside a channel handler, `io()` with **no argument** refers to the current
@@ -284,11 +328,11 @@ the Rust integration suite in `crates/cli/tests/websocket_raw.rs`.)
 
 ## Roadmap
 
-Phase 1 (this page) covers the raw-WebSocket core. `on="event"` annotation
-routing (above) and ack `ref` correlation have since landed from Phase 2.
+Phase 1 (this page) covers the raw-WebSocket core. From Phase 2, `on="event"`
+annotation routing, ack `ref` correlation, and **presence** (above) have landed.
 Planned:
 
-- **Phase 2 (remaining)** — presence (`track`/list/diff), `canJoin`/`secured=` authorization, multi-node fan-out over the shared-session cluster, and `lastEventId` resumability.
+- **Phase 2 (remaining)** — `canJoin`/`secured=` authorization, multi-node fan-out over the shared-session cluster (presence/rooms become cluster-correct then, no API change), and `lastEventId` resumability.
 - **Phase 3** — a **socket.io** transport (Engine.IO handshake, namespaces, acks, polling fallback) plus a **socket.io-lucee compatibility layer** so existing socket.io CFML apps run with minimal change.
 - **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
 

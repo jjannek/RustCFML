@@ -7806,13 +7806,25 @@ impl CfmlVirtualMachine {
                 }
                 return Ok(CfmlValue::Bool(false));
             }
-            // wsSubscribe/wsUnsubscribe/wsPresence — Phase 2 surface; accepted as
-            // no-ops in Phase 1 so feature-detecting code doesn't error.
+            // wsSubscribe/wsUnsubscribe — Phase 2 surface; accepted as no-ops so
+            // feature-detecting code doesn't error (clients join rooms only via
+            // server-side socket.join, design principle P6).
             if matches!(name_lower.as_str(), "wssubscribe" | "wsunsubscribe") {
                 return Ok(CfmlValue::Null);
             }
+            // wsPresence([channel]) — flat accessor for the presence roster
+            // (parallel to wsPublish). Returns `{}` when no registry/channel.
             if name_lower == "wspresence" {
-                return Ok(CfmlValue::array(Vec::new()));
+                let named = self.pending_ws_named.take();
+                let channel = self
+                    .ws_arg(&args, &named, "channel", 0)
+                    .map(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.current_ws_channel.clone());
+                return match (channel, self.server_state.as_ref()) {
+                    (Some(channel), Some(ss)) => Ok(ss.websocket.presence_state(&channel)),
+                    _ => Ok(CfmlValue::strukt(ValueMap::default())),
+                };
             }
 
             // __writeText: same as writeOutput but suppressed when enableCFOutputOnly > 0

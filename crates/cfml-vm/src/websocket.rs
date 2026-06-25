@@ -16,7 +16,7 @@
 //! routes through the registry so a distributed `Broker` (Phase 2) can slot in
 //! at the same call sites with no id/wire changes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -101,6 +101,10 @@ struct ConnEntry {
     /// CFID from the handshake cookie — identity is resolved once at connect
     /// and then ambient on the socket (design principle P6).
     session_id: Option<String>,
+    /// Presence keys this connection has tracked itself under (design principle
+    /// P11). Recorded so disconnect can emit leave diffs and never leak a stale
+    /// roster entry.
+    presence_keys: HashSet<String>,
 }
 
 // `CfmlStruct` is not `Debug`, so derive can't reach through `data`. The other
@@ -124,6 +128,11 @@ struct Inner {
     rooms: HashMap<(String, String), HashSet<ConnId>>,
     /// Discovered channel → CFC file path (bytecode-cached at dispatch time).
     channels: HashMap<String, String>,
+    /// Presence roster: `(channel, key)` → `conn → meta`. A key (e.g. a user id)
+    /// can have several metas — one per connection/device — exactly like Phoenix
+    /// Presence. `BTreeMap` keeps the metas list deterministic. The distributed
+    /// `Broker` merges remote presence on top (Phase 2).
+    presence: HashMap<(String, String), BTreeMap<ConnId, CfmlValue>>,
 }
 
 /// The realtime connection registry. Lives on `ServerState` so it crosses
@@ -216,6 +225,7 @@ impl WebSocketRegistry {
                 data: CfmlStruct::empty(),
                 params,
                 session_id,
+                presence_keys: HashSet::new(),
             },
         );
         conn_id
@@ -226,17 +236,41 @@ impl WebSocketRegistry {
     /// presence diffs. Cleanup is unconditional (design principle P10: the #1
     /// realtime leak is impossible by default).
     pub fn unregister(&self, conn_id: &str) -> Option<(String, Vec<String>)> {
-        let mut inner = self.inner.write();
-        let entry = inner.conns.remove(conn_id)?;
-        let channel = entry.channel.clone();
-        let rooms: Vec<String> = entry.rooms.iter().cloned().collect();
-        for room in &rooms {
-            if let Some(set) = inner.rooms.get_mut(&(channel.clone(), room.clone())) {
-                set.remove(conn_id);
-                if set.is_empty() {
-                    inner.rooms.remove(&(channel.clone(), room.clone()));
+        // Mutate under the write lock, then release it *before* broadcasting the
+        // presence-leave diffs — `broadcast` takes a read lock and parking_lot's
+        // RwLock is not reentrant.
+        let (channel, rooms, leaves) = {
+            let mut inner = self.inner.write();
+            let entry = inner.conns.remove(conn_id)?;
+            let channel = entry.channel.clone();
+            let rooms: Vec<String> = entry.rooms.iter().cloned().collect();
+            for room in &rooms {
+                if let Some(set) = inner.rooms.get_mut(&(channel.clone(), room.clone())) {
+                    set.remove(conn_id);
+                    if set.is_empty() {
+                        inner.rooms.remove(&(channel.clone(), room.clone()));
+                    }
                 }
             }
+            // Drop every presence entry this connection held, capturing the
+            // removed metas so the channel learns it left (design principle P10).
+            let mut leaves = Vec::new();
+            for key in entry.presence_keys.iter() {
+                let map_key = (channel.clone(), key.clone());
+                if let Some(map) = inner.presence.get_mut(&map_key) {
+                    if let Some(meta) = map.remove(conn_id) {
+                        leaves.push((key.clone(), meta));
+                    }
+                    if map.is_empty() {
+                        inner.presence.remove(&map_key);
+                    }
+                }
+            }
+            (channel, rooms, leaves)
+        };
+        for (key, meta) in leaves {
+            let frame = self.presence_diff_frame(&channel, false, &key, &meta);
+            self.broadcast(&channel, frame, None);
         }
         Some((channel, rooms))
     }
@@ -352,6 +386,122 @@ impl WebSocketRegistry {
         let inner = self.inner.read();
         if let Some(entry) = inner.conns.get(conn_id) {
             entry.sink.close(code, reason);
+        }
+    }
+
+    // ── presence (design principle P11) ───────────────────────────────────
+
+    /// Track `conn_id` in its channel's presence roster under `key`, carrying
+    /// `meta`. The tracking connection immediately gets the full `presence_state`
+    /// snapshot (so it sees who is already here); everyone else gets a
+    /// `presence_diff` join. Re-tracking under the same key replaces the meta
+    /// (an update). Cluster-correctness comes free once the distributed `Broker`
+    /// fans these through the shared-session cluster.
+    pub fn track(&self, conn_id: &str, key: &str, meta: CfmlValue) {
+        let channel = {
+            let mut inner = self.inner.write();
+            let channel = match inner.conns.get(conn_id) {
+                Some(e) => e.channel.clone(),
+                None => return,
+            };
+            if let Some(e) = inner.conns.get_mut(conn_id) {
+                e.presence_keys.insert(key.to_string());
+            }
+            inner
+                .presence
+                .entry((channel.clone(), key.to_string()))
+                .or_default()
+                .insert(conn_id.to_string(), meta.clone());
+            channel
+        };
+        // Snapshot to the tracking connection, join diff to the rest.
+        let state = self.presence_state(&channel);
+        let state_frame = WireEnvelope {
+            t: "presence".to_string(),
+            ch: channel.clone(),
+            ev: Some("presence_state".to_string()),
+            d: state,
+            id: self.next_id(),
+            ref_id: None,
+        };
+        self.emit_to(conn_id, state_frame);
+        let join = self.presence_diff_frame(&channel, true, key, &meta);
+        self.broadcast(&channel, join, Some(conn_id));
+    }
+
+    /// Remove `conn_id`'s presence under `key` and broadcast a `presence_diff`
+    /// leave to the channel. No-op if it wasn't tracked.
+    pub fn untrack(&self, conn_id: &str, key: &str) {
+        let removed = {
+            let mut inner = self.inner.write();
+            let channel = match inner.conns.get(conn_id) {
+                Some(e) => e.channel.clone(),
+                None => return,
+            };
+            if let Some(e) = inner.conns.get_mut(conn_id) {
+                e.presence_keys.remove(key);
+            }
+            let map_key = (channel.clone(), key.to_string());
+            let meta = inner.presence.get_mut(&map_key).and_then(|m| m.remove(conn_id));
+            if inner.presence.get(&map_key).is_some_and(|m| m.is_empty()) {
+                inner.presence.remove(&map_key);
+            }
+            meta.map(|m| (channel, m))
+        };
+        if let Some((channel, meta)) = removed {
+            let leave = self.presence_diff_frame(&channel, false, key, &meta);
+            self.broadcast(&channel, leave, None);
+        }
+    }
+
+    /// The full presence roster for a channel as a CFML struct:
+    /// `{ "<key>": { metas: [ meta, … ] }, … }`. Same shape as a
+    /// `presence_state` frame's payload.
+    pub fn presence_state(&self, channel: &str) -> CfmlValue {
+        let channel = channel.to_lowercase();
+        let inner = self.inner.read();
+        let mut out = ValueMap::default();
+        for ((ch, key), metas) in inner.presence.iter() {
+            if ch != &channel {
+                continue;
+            }
+            let arr: Vec<CfmlValue> = metas.values().cloned().collect();
+            let mut entry = ValueMap::default();
+            entry.insert("metas".to_string(), CfmlValue::array(arr));
+            out.insert(key.clone(), CfmlValue::strukt(entry));
+        }
+        CfmlValue::strukt(out)
+    }
+
+    /// Build a `presence_diff` frame. `join == true` puts the affected key under
+    /// `joins`, otherwise under `leaves` — the side not in play is an empty struct
+    /// (stable shape for clients).
+    fn presence_diff_frame(
+        &self,
+        channel: &str,
+        join: bool,
+        key: &str,
+        meta: &CfmlValue,
+    ) -> WireEnvelope {
+        let mut side = ValueMap::default();
+        let mut entry = ValueMap::default();
+        entry.insert("metas".to_string(), CfmlValue::array(vec![meta.clone()]));
+        side.insert(key.to_string(), CfmlValue::strukt(entry));
+        let mut d = ValueMap::default();
+        if join {
+            d.insert("joins".to_string(), CfmlValue::strukt(side));
+            d.insert("leaves".to_string(), CfmlValue::strukt(ValueMap::default()));
+        } else {
+            d.insert("joins".to_string(), CfmlValue::strukt(ValueMap::default()));
+            d.insert("leaves".to_string(), CfmlValue::strukt(side));
+        }
+        WireEnvelope {
+            t: "presence".to_string(),
+            ch: channel.to_string(),
+            ev: Some("presence_diff".to_string()),
+            d: CfmlValue::strukt(d),
+            id: self.next_id(),
+            ref_id: None,
         }
     }
 
@@ -474,6 +624,30 @@ impl CfmlNative for SocketHandle {
                     .map(CfmlValue::string)
                     .collect(),
             )),
+            // Presence (P11). `track(meta)` keys on the connection id;
+            // `track(key, meta)` groups several connections (e.g. a user's tabs)
+            // under one key. The tracking client gets a `presence_state`
+            // snapshot, others a `presence_diff` join.
+            "track" => {
+                let (key, meta) = match args.as_slice() {
+                    [CfmlValue::Struct(_), ..] => (self.conn_id.clone(), arg_value(&args, 0)),
+                    [k, m, ..] => (k.as_string(), m.clone()),
+                    [k] => (k.as_string(), CfmlValue::strukt(ValueMap::default())),
+                    [] => (self.conn_id.clone(), CfmlValue::strukt(ValueMap::default())),
+                };
+                self.registry.track(&self.conn_id, &key, meta);
+                Ok(CfmlValue::Null)
+            }
+            "untrack" => {
+                let key = if args.is_empty() {
+                    self.conn_id.clone()
+                } else {
+                    arg_string(&args, 0)
+                };
+                self.registry.untrack(&self.conn_id, &key);
+                Ok(CfmlValue::Null)
+            }
+            "presence" => Ok(self.registry.presence_state(&self.channel)),
             "to" | "in" => {
                 let emitter = ServerEmitter {
                     channel: self.channel.clone(),
@@ -619,6 +793,9 @@ impl CfmlNative for ServerEmitter {
                 };
                 Ok(CfmlValue::array(ids.into_iter().map(CfmlValue::string).collect()))
             }
+            // The full presence roster for the channel (room scoping is ignored —
+            // presence is channel-level in this phase).
+            "presence" => Ok(self.registry.presence_state(&self.channel)),
             other => Err(CfmlError::runtime(format!("WsEmitter has no method [{}]", other))),
         }
     }
@@ -687,6 +864,41 @@ mod tests {
         assert!(rooms.contains(&"lobby".to_string()));
         assert_eq!(reg.room_count("/chat", "lobby"), 0);
         assert_eq!(reg.channel_count("/chat"), 0);
+    }
+
+    #[test]
+    fn presence_track_snapshot_and_leave_on_disconnect() {
+        let reg = Arc::new(WebSocketRegistry::new("n1"));
+        let (a, a_dyn) = sink();
+        let (b, b_dyn) = sink();
+        let id_a = reg.register("/chat", a_dyn, None, ValueMap::default());
+        let id_b = reg.register("/chat", b_dyn, None, ValueMap::default());
+
+        // A tracks → A gets a presence_state, B gets a join diff.
+        let mut meta_a = ValueMap::default();
+        meta_a.insert("user".into(), CfmlValue::string("alice"));
+        reg.track(&id_a, "alice", CfmlValue::strukt(meta_a));
+        assert_eq!(a.frames.lock().unwrap().last().unwrap().ev.as_deref(), Some("presence_state"));
+        assert_eq!(b.frames.lock().unwrap().last().unwrap().ev.as_deref(), Some("presence_diff"));
+
+        // Roster lists alice.
+        let state = reg.presence_state("/chat");
+        let CfmlValue::Struct(s) = state else { panic!("state is a struct") };
+        assert!(s.get_ci("alice").is_some(), "alice is present");
+
+        // A disconnects → B gets a leave diff and the roster empties.
+        b.frames.lock().unwrap().clear();
+        reg.unregister(&id_a);
+        let last = b.frames.lock().unwrap().last().unwrap().clone();
+        assert_eq!(last.ev.as_deref(), Some("presence_diff"));
+        if let CfmlValue::Struct(d) = &last.d {
+            let CfmlValue::Struct(leaves) = d.get_ci("leaves").unwrap() else { panic!() };
+            assert!(leaves.get_ci("alice").is_some(), "leave diff names alice");
+        } else {
+            panic!("diff payload is a struct");
+        }
+        let CfmlValue::Struct(empty) = reg.presence_state("/chat") else { panic!() };
+        assert_eq!(empty.keys().len(), 0, "roster empty after disconnect");
     }
 
     #[test]
