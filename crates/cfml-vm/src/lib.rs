@@ -10313,65 +10313,29 @@ impl CfmlVirtualMachine {
                         }
                     };
 
-                    let method_lower = method_name.to_lowercase();
-                    if let CfmlValue::Struct(ref comp_struct) = component {
-                        let method_func = comp_struct
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
-                            .map(|(_, v)| v.clone());
-
-                        if let Some(func @ CfmlValue::Function(_)) = method_func {
-                            let call_args = self.build_invoke_call_args(&func, invoke_args);
-
-                            let mut method_locals = ValueMap::default();
-                            method_locals.insert("this".to_string(), component.clone());
-                            // Inject __variables from component so unscoped references resolve
-                            if let CfmlValue::Struct(ref cs) = component {
-                                if let Some(vars) = cs.get("__variables") {
-                                    method_locals.insert("__variables".to_string(), vars.clone());
-                                }
-                            }
-                            return self.call_function(&func, call_args, &method_locals);
-                        } else {
-                            // An undeclared method must follow the same dispatch
-                            // rules as a direct dot-call: if the component defines
-                            // onMissingMethod, route through it (Lucee/ACF/BoxLang
-                            // all do). Wheels dispatches association cascade methods
-                            // (deleteAll<assoc> etc.) by name via cfinvoke and relies
-                            // on this landing in the model's onMissingMethod.
-                            let omm = comp_struct
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("onmissingmethod"))
-                                .map(|(_, v)| v.clone());
-                            if let Some(handler @ CfmlValue::Function(_)) = omm {
-                                // cfinvoke marshals its args into a struct; pass it
-                                // straight through as missingMethodArguments (already
-                                // keyed by name, mirroring the dot-call fallback).
-                                let missing_args = match invoke_args {
-                                    s @ CfmlValue::Struct(_) => s,
-                                    _ => CfmlValue::strukt(ValueMap::default()),
-                                };
-                                let mut method_locals = ValueMap::default();
-                                method_locals.insert("this".to_string(), component.clone());
-                                if let CfmlValue::Struct(ref cs) = component {
-                                    if let Some(vars) = cs.get("__variables") {
-                                        method_locals.insert("__variables".to_string(), vars.clone());
-                                    }
-                                }
-                                return self.call_function(
-                                    &handler,
-                                    vec![
-                                        CfmlValue::string(method_name.clone()),
-                                        missing_args,
-                                    ],
-                                    &method_locals,
-                                );
-                            }
-                            return Err(CfmlError::runtime(format!(
-                                "Method '{}' not found in component",
-                                method_name
-                            )));
-                        }
+                    if let CfmlValue::Struct(_) = component {
+                        // Dispatch through call_member_function so the method runs
+                        // against the receiver's LIVE this/__variables (shared Arc)
+                        // — an unscoped write inside the method then persists into
+                        // the receiver, exactly like a direct `obj.method()`. It
+                        // also handles the onMissingMethod fallback (Wheels
+                        // dispatches association cascade methods by name via
+                        // cfinvoke) and the "no such method" error. Args are passed
+                        // as parallel (values, names) so undeclared named keys still
+                        // surface in the callee's `arguments` scope.
+                        let (mut values, names) = self.invoke_args_to_named(invoke_args);
+                        let r = self.call_member_function(
+                            &component,
+                            &method_name,
+                            &mut values,
+                            Some(&names),
+                        );
+                        // cfinvoke has no target variable to receive a value-type
+                        // writeback; the component's mutations already persist via
+                        // its shared Arc backing. Drop any pending writeback so it
+                        // can't leak into a later unrelated CallMethod.
+                        self.method_this_writeback = None;
+                        return r;
                     }
                     return Err(CfmlError::runtime(
                         "Invalid component for cfinvoke".to_string(),
@@ -10422,33 +10386,20 @@ impl CfmlVirtualMachine {
                         }
                     };
 
-                    let method_lower = method_name.to_lowercase();
-                    if let CfmlValue::Struct(ref comp_struct) = component {
-                        let method_func = comp_struct
-                            .iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case(&method_lower))
-                            .map(|(_, v)| v.clone());
-
-                        if let Some(func @ CfmlValue::Function(_)) = method_func {
-                            let call_args = self.build_invoke_call_args(&func, invoke_args);
-
-                            let mut method_locals = ValueMap::default();
-                            method_locals.insert("this".to_string(), component.clone());
-                            // Inject __variables from component so unscoped references resolve
-                            if let CfmlValue::Struct(ref cs) = component {
-                                if let Some(vars) = cs.get("__variables") {
-                                    method_locals.insert("__variables".to_string(), vars.clone());
-                                }
-                            }
-                            return self.call_function(&func, call_args, &method_locals);
-                        } else {
-                            let mut err = CfmlError::runtime(format!(
-                                "Method '{}' not found on component",
-                                method_name
-                            ));
-                            err.stack_trace = self.build_stack_trace();
-                            return Err(err);
-                        }
+                    if let CfmlValue::Struct(_) = component {
+                        // See the __cfinvoke branch: dispatch through
+                        // call_member_function so the method runs against the
+                        // receiver's LIVE this/__variables (unscoped writes
+                        // persist) and undeclared named keys reach `arguments`.
+                        let (mut values, names) = self.invoke_args_to_named(invoke_args);
+                        let r = self.call_member_function(
+                            &component,
+                            &method_name,
+                            &mut values,
+                            Some(&names),
+                        );
+                        self.method_this_writeback = None;
+                        return r;
                     } else {
                         return Err(CfmlError::runtime(
                             "invoke() first argument must be a component or component name".into(),
@@ -13624,6 +13575,48 @@ impl CfmlVirtualMachine {
             self.pending_extra_named_args = Some(extras);
         }
         positional
+    }
+
+    /// Convert a `cfinvoke`/`invoke` argument struct into the parallel
+    /// `(values, names)` shape that `call_member_function` consumes. Numeric
+    /// string keys ("1","2",…) are POSITIONAL (1-based) and emitted first with
+    /// an EMPTY name, densely placed by index (Null-padding gaps); non-numeric
+    /// keys are NAMED. An `argumentCollection` key is passed through verbatim so
+    /// `reorder_named_args_with_extras` spreads it (numeric inner keys
+    /// positional, the rest named). Routing through `call_member_function`
+    /// (instead of a hand-built positional call against a detached clone) makes
+    /// the invoked method run against the receiver's LIVE `this`/`__variables`,
+    /// so an unscoped write inside the method persists into the receiver —
+    /// matching a direct `obj.method()` dot-call.
+    fn invoke_args_to_named(&self, invoke_args: CfmlValue) -> (Vec<CfmlValue>, Vec<String>) {
+        let CfmlValue::Struct(arg_map) = invoke_args else {
+            return match invoke_args {
+                CfmlValue::Null => (Vec::new(), Vec::new()),
+                other => (vec![other], vec![String::new()]),
+            };
+        };
+        let mut numeric: Vec<(usize, CfmlValue)> = Vec::new();
+        let mut named: Vec<(String, CfmlValue)> = Vec::new();
+        for (k, v) in arg_map.iter() {
+            if let Ok(n) = k.trim().parse::<usize>() {
+                if n >= 1 {
+                    numeric.push((n, v.clone()));
+                    continue;
+                }
+            }
+            named.push((k.clone(), v.clone()));
+        }
+        let max_n = numeric.iter().map(|(n, _)| *n).max().unwrap_or(0);
+        let mut values: Vec<CfmlValue> = vec![CfmlValue::Null; max_n];
+        for (n, v) in numeric {
+            values[n - 1] = v;
+        }
+        let mut names: Vec<String> = vec![String::new(); max_n];
+        for (k, v) in named {
+            values.push(v);
+            names.push(k);
+        }
+        (values, names)
     }
 
     /// Build the `local` scope view for the current call frame. CFML

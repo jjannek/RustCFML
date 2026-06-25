@@ -712,6 +712,7 @@ include "harness.cfm";
 <!--- constructor-argument injection (Preside FeatureService boot). --->
 <cf_runtest file="oop/test_javadoc_param_annotations.cfm">
 <cf_runtest file="oop/test_cfinvoke_sibling_scope.cfm">
+<cf_runtest file="oop/test_cfinvoke_overlay_writeback.cfm">
 <cf_runtest file="oop/test_mixin_private_scope_dispatch.cfm">
 
 <!--- --- Lucee-compat regression tests (PRs #153/#154/#155/#156) --- --->
