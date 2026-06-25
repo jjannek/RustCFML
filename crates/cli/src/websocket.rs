@@ -229,7 +229,8 @@ async fn driver(
 
     // onConnect reject gate. A `false` return (or a throw) rejects the
     // handshake; an array return is the set of rooms to auto-join (P6).
-    let connect = dispatch(&state, &info, &conn_id, session_id.clone(), "onConnect", None).await;
+    let connect =
+        dispatch(&state, &info, &conn_id, session_id.clone(), "onConnect", None, None).await;
     let mut rejected = false;
     match connect {
         Ok(Some(v)) => {
@@ -264,18 +265,41 @@ async fn driver(
         };
         match msg {
             Message::Text(t) => {
-                let payload = if info.json {
-                    parse_json(t.as_str())
+                // For an `encoding="json"` channel an inbound object may name an
+                // event (`{"ev":"say","d":{…}}`) → routed to an `on="say"`
+                // handler with `d` as the payload; otherwise the whole parsed
+                // value goes to `onMessage` (unchanged). `id` echoes back as the
+                // ack's `ref` for client-side correlation.
+                let (event, payload, reply_ref) = if info.json {
+                    route_inbound(parse_json(t.as_str()))
                 } else {
-                    CfmlValue::string(t.as_str().to_string())
+                    (None, CfmlValue::string(t.as_str().to_string()), None)
                 };
-                let r = dispatch(&state, &info, &conn_id, session_id.clone(), "onMessage", Some(payload)).await;
-                handle_message_result(&state, &info, &conn_id, &session_id, r).await;
+                let r = dispatch(
+                    &state,
+                    &info,
+                    &conn_id,
+                    session_id.clone(),
+                    "onMessage",
+                    event.as_deref(),
+                    Some(payload),
+                )
+                .await;
+                handle_message_result(&state, &info, &conn_id, &session_id, reply_ref, r).await;
             }
             Message::Binary(b) => {
                 let payload = CfmlValue::Binary(b.to_vec());
-                let r = dispatch(&state, &info, &conn_id, session_id.clone(), "onMessage", Some(payload)).await;
-                handle_message_result(&state, &info, &conn_id, &session_id, r).await;
+                let r = dispatch(
+                    &state,
+                    &info,
+                    &conn_id,
+                    session_id.clone(),
+                    "onMessage",
+                    None,
+                    Some(payload),
+                )
+                .await;
+                handle_message_result(&state, &info, &conn_id, &session_id, None, r).await;
             }
             Message::Close(_) => break,
             Message::Ping(_) | Message::Pong(_) => {}
@@ -289,6 +313,7 @@ async fn driver(
         &conn_id,
         session_id.clone(),
         "onDisconnect",
+        None,
         Some(CfmlValue::string(close_reason)),
     )
     .await;
@@ -306,11 +331,12 @@ async fn handle_message_result(
     info: &ChannelInfo,
     conn_id: &str,
     session_id: &Option<String>,
+    reply_ref: Option<String>,
     result: Result<Option<CfmlValue>, String>,
 ) {
     let registry = state.server_state.websocket.clone();
     match result {
-        Ok(ack) => deliver_ack(&registry, conn_id, &info.channel, Ok(ack)),
+        Ok(ack) => deliver_ack(&registry, conn_id, &info.channel, reply_ref, Ok(ack)),
         Err(msg) => {
             let mut err = cfml_common::dynamic::ValueMap::default();
             err.insert("message".to_string(), CfmlValue::string(msg));
@@ -321,6 +347,7 @@ async fn handle_message_result(
                 conn_id,
                 session_id.clone(),
                 "onError",
+                None,
                 Some(CfmlValue::strukt(err)),
             )
             .await;
@@ -330,16 +357,20 @@ async fn handle_message_result(
 
 /// Ship a non-null handler return value back to the sender as an `ack` frame
 /// (design principle P5 — the handler's return value is the client's ack).
+/// When the inbound frame carried an `id`, it rides back as the ack's `ref` so
+/// the client can correlate the reply to its request.
 fn deliver_ack(
     registry: &Arc<WebSocketRegistry>,
     conn_id: &str,
     channel: &str,
+    reply_ref: Option<String>,
     result: Result<Option<CfmlValue>, String>,
 ) {
     if let Ok(Some(v)) = result {
         if !matches!(v, CfmlValue::Null) {
             let mut frame = registry.msg(channel, Some("ack".to_string()), v);
             frame.t = "ack".to_string();
+            frame.ref_id = reply_ref;
             registry.emit_to(conn_id, frame);
         }
     }
@@ -357,13 +388,38 @@ fn is_reject(v: &CfmlValue) -> bool {
     }
 }
 
+/// Split an inbound JSON object into `(event, payload, ack-ref)`. An object
+/// carrying a non-empty `ev` is an event frame: it routes to the matching
+/// `on="<ev>"` handler with `d` as the payload, and its `id` becomes the ack's
+/// `ref`. Anything else (a plain struct, an array, a scalar) keeps the legacy
+/// behaviour — the whole value is handed to `onMessage` with no event.
+fn route_inbound(parsed: CfmlValue) -> (Option<String>, CfmlValue, Option<String>) {
+    if let CfmlValue::Struct(ref s) = parsed {
+        let ev = s
+            .get_ci("ev")
+            .map(|v| v.as_string())
+            .filter(|s| !s.is_empty());
+        if ev.is_some() {
+            let payload = s.get_ci("d").unwrap_or(CfmlValue::Null);
+            let id = s
+                .get_ci("id")
+                .map(|v| v.as_string())
+                .filter(|s| !s.is_empty());
+            return (ev, payload, id);
+        }
+    }
+    (None, parsed, None)
+}
+
 /// Run one channel dispatch on a blocking worker (the VM is synchronous).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &Arc<AppState>,
     info: &ChannelInfo,
     conn_id: &str,
     session_id: Option<String>,
     method: &'static str,
+    event: Option<&str>,
     payload: Option<CfmlValue>,
 ) -> Result<Option<CfmlValue>, String> {
     let server_state = state.server_state.clone();
@@ -372,6 +428,7 @@ async fn dispatch(
     let channel = info.channel.clone();
     let cfc_path = info.cfc_path.clone();
     let conn_id = conn_id.to_string();
+    let event = event.map(|e| e.to_string());
     tokio::task::spawn_blocking(move || {
         run_dispatch(
             server_state,
@@ -382,6 +439,7 @@ async fn dispatch(
             conn_id,
             session_id,
             method,
+            event,
             payload,
         )
     })
@@ -399,6 +457,7 @@ fn run_dispatch(
     conn_id: String,
     session_id: Option<String>,
     method: &str,
+    event: Option<String>,
     payload: Option<CfmlValue>,
 ) -> Result<Option<CfmlValue>, String> {
     // Fresh VM, wired like a request VM (same `register_vm_runtime` path).
@@ -423,7 +482,7 @@ fn run_dispatch(
         args.push(p);
     }
 
-    vm.dispatch_ws_event(&channel, &cfc_path, method, args)
+    vm.dispatch_ws_event(&channel, &cfc_path, method, event.as_deref(), args)
         .map_err(|e| format!("{e}"))
 }
 

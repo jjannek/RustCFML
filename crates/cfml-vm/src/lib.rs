@@ -19182,16 +19182,49 @@ impl CfmlVirtualMachine {
         args.get(idx).cloned()
     }
 
+    /// Pick the channel-CFC function to dispatch a frame to. When the inbound
+    /// frame names an `event`, prefer a function annotated `on="<event>"`
+    /// (case-insensitive) — surfaced as the `__funcmeta_<name>` struct emitted
+    /// by the compiler. Falling back to the conventional lifecycle `method`
+    /// (`onMessage`) keeps un-annotated channels working unchanged.
+    fn resolve_ws_handler(
+        s: &CfmlStruct,
+        method: &str,
+        event: Option<&str>,
+    ) -> Option<CfmlValue> {
+        if let Some(ev) = event.filter(|e| !e.is_empty()) {
+            for (k, v) in s.iter() {
+                let Some(fname) = k.strip_prefix("__funcmeta_") else {
+                    continue;
+                };
+                let CfmlValue::Struct(ref fm) = v else { continue };
+                let routes_here = fm.iter().any(|(mk, mv)| {
+                    mk.eq_ignore_ascii_case("on") && mv.as_string().eq_ignore_ascii_case(ev)
+                });
+                if routes_here {
+                    if let Some(f @ CfmlValue::Function(_)) = s.get_ci(fname) {
+                        return Some(f);
+                    }
+                }
+            }
+        }
+        match s.get_ci(method) {
+            Some(f @ CfmlValue::Function(_)) => Some(f),
+            _ => None,
+        }
+    }
+
     pub fn dispatch_ws_event(
         &mut self,
         channel: &str,
         cfc_path: &str,
         method: &str,
+        event: Option<&str>,
         args: Vec<CfmlValue>,
     ) -> Result<Option<CfmlValue>, CfmlError> {
         // Make `io()` (no arg) resolve to this channel for the dispatch.
         let prev_channel = self.current_ws_channel.replace(channel.to_string());
-        let result = self.dispatch_ws_event_inner(cfc_path, method, args);
+        let result = self.dispatch_ws_event_inner(cfc_path, method, event, args);
         self.current_ws_channel = prev_channel;
         result
     }
@@ -19200,6 +19233,7 @@ impl CfmlVirtualMachine {
         &mut self,
         cfc_path: &str,
         method: &str,
+        event: Option<&str>,
         args: Vec<CfmlValue>,
     ) -> Result<Option<CfmlValue>, CfmlError> {
         let locals = ValueMap::default();
@@ -19209,20 +19243,16 @@ impl CfmlVirtualMachine {
         };
         let instance = self.resolve_inheritance(template, &locals);
         // Honour `extends="rust:Name"` channels (same as `new`).
-        let mut template = self.attach_native_parent(instance)?;
+        let template = self.attach_native_parent(instance)?;
 
         let s = match &template {
             CfmlValue::Struct(ref s) => s.clone(),
             _ => return Ok(None),
         };
 
-        let func_val = s
-            .iter()
-            .find(|(k, v)| k.eq_ignore_ascii_case(method) && matches!(v, CfmlValue::Function(_)))
-            .map(|(_, v)| v.clone());
-        let func = match func_val {
-            Some(f @ CfmlValue::Function(_)) => f,
-            _ => return Ok(None),
+        let func = match Self::resolve_ws_handler(&s, method, event) {
+            Some(f) => f,
+            None => return Ok(None),
         };
 
         // Bind `this` + __variables exactly as call_lifecycle_method does.

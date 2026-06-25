@@ -24,6 +24,14 @@ component socket="/echo" encoding="json" {
         return { ok = true };
     }
 
+    // Event routing: an inbound `{"ev":"say","d":{…},"id":"…"}` frame is
+    // dispatched here (by the `on="say"` annotation) rather than to onMessage.
+    // The non-null return rides back as an ack whose `ref` echoes the inbound id.
+    function handleSay( socket, data ) on="say" {
+        socket.emit( "sayEcho", { text = data.text, routed = "say" } );
+        return { routed = "say" };
+    }
+
     function onError( socket, err ) {
         socket.emit( "errored", { message = err.message } );
     }

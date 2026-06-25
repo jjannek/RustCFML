@@ -147,6 +147,50 @@ async fn handshake_param_and_onerror() {
 }
 
 #[tokio::test]
+async fn event_routing_and_ack_ref() {
+    let server = start_server().await;
+    let url = format!("ws://127.0.0.1:{}/ws/echo", server.port);
+    let (mut a, _) = connect_async(&url).await.expect("connect");
+    let _welcome = next_json(&mut a).await;
+
+    // An inbound frame naming an event routes to the `on="say"` handler (not
+    // onMessage), and its `id` rides back on the ack's `ref`.
+    a.send(Message::Text(r#"{"ev":"say","d":{"text":"hi"},"id":"req-1"}"#.into()))
+        .await
+        .unwrap();
+
+    let f1 = next_json(&mut a).await;
+    let f2 = next_json(&mut a).await;
+    let by_ev = |ev: &str| -> &serde_json::Value {
+        if f1["ev"] == ev {
+            &f1
+        } else {
+            &f2
+        }
+    };
+
+    let say_echo = by_ev("sayEcho");
+    assert_eq!(say_echo["ev"], "sayEcho", "on=\"say\" handler ran: {f1:?} {f2:?}");
+    assert_eq!(say_echo["d"]["routed"], "say", "routed via the on= annotation");
+    assert_eq!(say_echo["d"]["text"], "hi", "payload came from the `d` field");
+
+    let ack = if f1["t"] == "ack" { &f1 } else { &f2 };
+    assert_eq!(ack["t"], "ack", "non-null return delivered as ack");
+    assert_eq!(ack["ref"], "req-1", "ack correlates to the inbound id");
+    assert_eq!(ack["d"]["routed"], "say");
+
+    // A frame with no `ev` still falls through to onMessage (unchanged).
+    a.send(Message::Text(r#"{"text":"plain"}"#.into())).await.unwrap();
+    let g1 = next_json(&mut a).await;
+    let g2 = next_json(&mut a).await;
+    let events: Vec<&str> =
+        [&g1, &g2].iter().map(|f| f["ev"].as_str().unwrap_or("")).collect();
+    assert!(events.contains(&"echo"), "no-ev frame still hits onMessage: {events:?}");
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn binary_frames_round_trip() {
     let server = start_server().await;
     let url = format!("ws://127.0.0.1:{}/ws/raw", server.port);

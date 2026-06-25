@@ -97,6 +97,43 @@ function onConnect( socket ) {
 Clients can **never** join rooms themselves — only server code calls
 `socket.join()` — so authorization is enforced at join time.
 
+## Event routing (`on="event"`)
+
+For an `encoding="json"` channel, an inbound frame can name an **event** and be
+routed to a dedicated handler instead of the catch-all `onMessage`. Annotate a
+function with `on="<event>"`:
+
+```cfml
+component socket="/chat" encoding="json" {
+
+    function say( socket, data ) on="say" {
+        socket.broadcast( "said", data );
+        return { delivered = true };          // → ack (see below)
+    }
+
+    function typing( socket, data ) on="typing" {
+        socket.to( data.room ).emit( "typing", { who = socket.id() } );
+    }
+
+    function onMessage( socket, message ) {   // fallback: any frame with no matching event
+        // ...
+    }
+}
+```
+
+A client sends an event frame matching the wire shape — `ev` is the event name,
+`d` the payload, and an optional `id` rides back on the ack's `ref` so the
+client can correlate the reply:
+
+```js
+ws.send(JSON.stringify({ ev: "say", d: { text: "hi" }, id: "req-1" }));
+// → handler `say(socket, { text:"hi" })` runs; ack frame comes back with ref:"req-1"
+```
+
+Routing is case-insensitive. A frame with **no** `ev` (or whose event matches no
+`on=` handler) falls through to `onMessage`, so un-annotated channels behave
+exactly as before. The handler receives the `d` payload as its second argument.
+
 ## The `socket` object
 
 The live handle passed to every lifecycle method:
@@ -189,8 +226,8 @@ your handler can validate it.
 
 ## Acknowledgements
 
-The return value of `onMessage` (and any handler) is shipped back to the sending
-client as an `ack` frame (`ev:"ack"`). Return nothing for no ack:
+The return value of `onMessage` (and any `on="event"` handler) is shipped back
+to the sending client as an `ack` frame (`ev:"ack"`). Return nothing for no ack:
 
 ```cfml
 function onMessage( socket, message ) {
@@ -198,6 +235,9 @@ function onMessage( socket, message ) {
     return { ok = true, id = id };     // client receives this as the ack
 }
 ```
+
+When the inbound frame carried an `id`, the ack echoes it back as `ref` so the
+client can match the reply to its request.
 
 ## Wire format
 
@@ -208,9 +248,10 @@ when clustering is enabled later):
 {
   "t":  "msg",        // frame type: msg | ack | ...
   "ch": "/chat",      // channel
-  "ev": "message",    // event name (absent for a raw send())
+  "ev": "message",    // event name (routes to on="message"; absent for a raw send())
   "d":  { },          // payload
-  "id": "node:42"     // node-qualified, monotonic message id
+  "id": "node:42",    // node-qualified, monotonic message id
+  "ref":"req-1"       // ack correlation — echoes an inbound frame's id (acks only)
 }
 ```
 
@@ -243,9 +284,11 @@ the Rust integration suite in `crates/cli/tests/websocket_raw.rs`.)
 
 ## Roadmap
 
-Phase 1 (this page) covers the raw-WebSocket core. Planned:
+Phase 1 (this page) covers the raw-WebSocket core. `on="event"` annotation
+routing (above) and ack `ref` correlation have since landed from Phase 2.
+Planned:
 
-- **Phase 2** — `on="event"` annotation routing (`function say(socket,msg) on="message" {}`), presence (`track`/list/diff), `canJoin`/`secured=` authorization, multi-node fan-out over the shared-session cluster, and `lastEventId` resumability.
+- **Phase 2 (remaining)** — presence (`track`/list/diff), `canJoin`/`secured=` authorization, multi-node fan-out over the shared-session cluster, and `lastEventId` resumability.
 - **Phase 3** — a **socket.io** transport (Engine.IO handshake, namespaces, acks, polling fallback) plus a **socket.io-lucee compatibility layer** so existing socket.io CFML apps run with minimal change.
 - **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
 

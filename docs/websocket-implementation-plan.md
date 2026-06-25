@@ -101,3 +101,50 @@ Cloudflare Durable Objects + WebSocket Hibernation — separate design; steal on
 - **Write-safety** — per-connection serialized dispatch + single outbound `mpsc` consumer; never expose a frame receive-loop to CFML (engine owns it).
 - **`socketioxide` footguns** (from the survey): one handler per event name (replaces silently); `Vec<u8>` serializes as a JSON number array unless `bytes::Bytes` — handle in the adapter.
 - **Case-insensitivity** — lowercase-normalize channel/room/event keys (consistent with the engine's `IndexMap` scope-key policy).
+
+---
+
+## As-built status (v0.299.0 — Phase 1 shipped) & Phase 2 handoff
+
+> This section records what actually landed vs the plan above, and the exact
+> entry points for Phase 2. Written so a fresh session can continue without
+> prior chat context. **Where this differs from the plan above, this section is
+> authoritative** (the plan was written pre-implementation).
+
+### What shipped (Phase 1, v0.299.0)
+
+| Area | As-built location |
+|---|---|
+| Registry, rooms, wire, NativeObjects | `crates/cfml-vm/src/websocket.rs` — `WebSocketRegistry`, `WireEnvelope`, `FrameSink` trait, `SocketHandle`, `ServerEmitter`. Single `parking_lot::RwLock<Inner>`; `NativeObject` returns wrap `std::sync::RwLock`. |
+| Registry on server | `ServerState.websocket: Arc<WebSocketRegistry>` (`lib.rs`, node_id = a uuid minted in `with_config`). |
+| Emit BIFs + dispatch | `lib.rs` `call_function`, in the `name_lower` special-case block right after `writeOutput`: `io`, `wsPublish`, `assertBroadcast`, no-op `wsSubscribe/wsUnsubscribe/wsPresence`. Named args via the `pending_ws_named` stash (set in the CallNamed path next to `pending_dump_named`). `current_ws_channel` makes `io()` no-arg resolve to the channel under dispatch. `ws_test_log` backs `assertBroadcast`. `ws_arg()` helper resolves named-or-positional. |
+| Lifecycle dispatch | `lib.rs` `dispatch_ws_event(channel, cfc_path, method, args)` — `resolve_component_template` + `resolve_inheritance` (+ `attach_native_parent`), then calls the lifecycle method **preserving the return value** (ack-by-return / `onConnect` reject gate). Fresh instance per message. |
+| Builtin stubs | `cfml-stdlib/src/builtins.rs` `fn_ws_stub` (registered so names resolve; real behaviour is VM-intercepted). `fn_serialize_json`/`fn_deserialize_json` made `pub` for the driver. |
+| axum upgrade + driver | `crates/cli/src/websocket.rs` — `GET /ws/{channel}` (route added in `lib.rs` router), per-connection bounded-mpsc outbound pump (binary frames for raw `send`), inbound→`spawn_blocking` `run_dispatch`, `encoding="json"` parse, handshake-param capture, `onError` on throw, auto-cleanup on drop. cli deps: axum `ws` feature, `bytes`, `futures-util`; dev `tokio-tungstenite`. |
+| Tests / example | `crates/cli/tests/websocket_raw.rs` (5 live tests + `tests/fixtures/ws_app/`), `tests/websocket/test_ws_harness.cfm` (in `tests/runner.cfm`), `examples/websocket_chat/`, `docs/websockets.md`. |
+
+**Already working that the plan lists under Phase 2:** rooms + `join`/`leave`/`rooms`/`socket.to(room)` + `io().to(room).except(id).emit()` + the self-id room. So Phase 2 is really: `on="event"` routing, distributed Broker, presence, auth, replay.
+
+### Phase 2 progress — `on="event"` routing + ack `ref` (landed post-v0.299.0, NOT yet tagged)
+
+- **`on="event"` annotation routing** shipped. `VM::resolve_ws_handler(struct, method, event)` (`lib.rs`, just above `dispatch_ws_event`) scans the instantiated channel CFC's `__funcmeta_<name>` structs for one whose metadata `on` equals the inbound event (case-insensitive) and dispatches there; missing/blank event falls back to `onMessage`. `dispatch_ws_event` gained an `event: Option<&str>` arg (only external caller is the driver). No parser/compiler changes — `on="say"` already parses into `func.metadata` → `__funcmeta_say`.
+- **Driver** (`cli/src/websocket.rs`): `route_inbound(parsed)` splits a JSON channel's inbound object into `(event, payload, ack-ref)` — an object with a non-empty `ev` routes to the `on=` handler with `d` as the payload and its `id` echoed back as the ack's `ref`; everything else keeps the old whole-value-→-`onMessage` path. `dispatch`/`run_dispatch`/`handle_message_result`/`deliver_ack` thread the event + reply-ref through.
+- **Tests:** `event_routing_and_ack_ref` in `crates/cli/tests/websocket_raw.rs` (6 live tests now) + `handleSay` `on="say"` handler in the `ws_app/echo.cfc` fixture. Asserts on= dispatch, `d`-payload unwrap, ack `ref` correlation, and the no-`ev` fallthrough.
+- **Docs:** `docs/websockets.md` gained an "Event routing" section + `ref` in the wire/ack docs; roadmap updated.
+- **Gates:** all green — `cargo test --workspace` (0 fail), `cargo run -- tests/runner.cfm` (4779/4779), serve cold+warm (4829/4829), wasm32 build, `wasm-pack build crates/wasm --target web`.
+
+### Deviation from the plan (decided, not an oversight)
+
+- **No literal `Broker` trait object yet.** Decision 3's *substance* shipped — node-qualified `ConnId` (`{nodeId}:{uuid}`), monotonic message-id wire, and **all** fan-out funnels through `WebSocketRegistry::{emit_to,broadcast,to_room}`. A `Broker` trait with only a single-node `LocalAdapter` would be empty ceremony; introduce it **in Phase 2** when the distributed adapter gives it a second implementation. `FrameSink` already abstracts per-connection delivery, so the cross-node seam is: add remote routing inside those three registry methods (local id → local `sink.send`; remote nodeId → broker publish).
+
+### Phase 2 entry points (verified)
+
+- **`on="event"` annotation routing** — ✅ DONE (see "Phase 2 progress" above).
+- **Distributed Broker** — extend the three registry fan-out methods to publish/subscribe across the existing shared-session cluster (memberlist + Memcached/Automerge, feature-gated in `crates/cli`); replicate room membership + presence. `socketioxide` Redis adapter is an alternative for the Phase-3 transport.
+- **Presence** — `socket.track(meta)` + `io(channel).presence()`; add `presence_state`/`presence_diff` frame types (the `WireEnvelope.t` field already enumerates `presence`). Cluster-correct via the Broker.
+- **Auth** — `canJoin(socket, room)` hook gating `join`; `secured="role"` method/component annotation checked via the same `__funcmeta`/`getMetadata` reflection before dispatch.
+- **Resumability replay** — wire already carries per-message `id`; accept `lastEventId` at the handshake (query param, already captured) + best-effort in-memory history, opt-in `{history=N}`.
+
+### Verification gates (unchanged, all green at v0.299.0)
+
+`cargo test --workspace` · `cargo run -- tests/runner.cfm` (CLI) · serve cold+warm · `cargo build -p cfml-worker -p rustcfml-wasm --target wasm32-unknown-unknown` · `wasm-pack build crates/wasm --target web`. **Known-flaky:** `stdlib/test_cfhttp.cfm` hits httpbin.org — its env failure flips the suite count 585↔586; not a regression.
