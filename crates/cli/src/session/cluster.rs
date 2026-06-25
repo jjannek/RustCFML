@@ -23,13 +23,17 @@ mod inner {
         serde::{decode_from_slice, encode_to_vec},
     };
     use cfml_common::dynamic::ValueMap;
-    use cfml_vm::{SessionData, session_store::SessionStore};
-    
+    use cfml_vm::{
+        SessionData,
+        session_store::SessionStore,
+        websocket::{Broker, BrokerMsg, WebSocketRegistry},
+    };
+
     use memberlist::{
         Options,
         agnostic::tokio::TokioRuntime,
         bytes::Bytes,
-        delegate::{CompositeDelegate, NodeDelegate},
+        delegate::{CompositeDelegate, EventKind, NodeDelegate, SubscribleEventDelegate},
         net::{
             NetTransportOptions,
             resolver::socket_addr::SocketAddrResolver,
@@ -71,8 +75,22 @@ mod inner {
     // Wire frames
     // ─────────────────────────────────────────────
 
+    /// One gossip frame on the shared cluster. The cluster multiplexes two
+    /// independent subsystems over a single `memberlist` instance/port: session
+    /// replication (`Session`) and WebSocket fan-out (`Ws`).
     #[derive(Clone, Serialize, Deserialize)]
     enum ClusterMsg {
+        Session(SessionMsg),
+        /// A `serde_json`-encoded `cfml_vm::websocket::BrokerMsg`. JSON (not the
+        /// surrounding bincode) because the frame payload is a `CfmlValue`, whose
+        /// `Deserialize` is `deserialize_any` — it needs a self-describing format;
+        /// bincode would fail. Mirrors how `SessionData` is JSON-encoded inside
+        /// the Automerge doc.
+        Ws(String),
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    enum SessionMsg {
         /// A change to a session's Automerge doc — incremental bytes from
         /// `AutoCommit::save_incremental()` since the last broadcast.
         Delta { id: String, change: Vec<u8> },
@@ -103,6 +121,9 @@ mod inner {
         node_name: String,
         /// Outbound message queue — drained by the background sender task.
         tx: mpsc::Sender<ClusterMsg>,
+        /// The WebSocket registry, so inbound `Ws` frames and peer departures
+        /// reach it. `None` if the cluster carries sessions only.
+        ws_registry: Option<Arc<WebSocketRegistry>>,
     }
 
     impl SharedState {
@@ -113,12 +134,28 @@ mod inner {
             }
         }
 
-        /// Apply an incoming live message to local state. Returns nothing —
-        /// the live message is NOT re-broadcast (every peer received the
-        /// original from its sender).
-        fn apply_incoming(&self, msg: ClusterMsg) {
+        /// Route an incoming gossip frame to the right subsystem.
+        fn dispatch(&self, msg: ClusterMsg) {
             match msg {
-                ClusterMsg::Delta { id, change } => {
+                ClusterMsg::Session(s) => self.apply_session(s),
+                ClusterMsg::Ws(json) => {
+                    let Some(reg) = &self.ws_registry else { return };
+                    match serde_json::from_str::<BrokerMsg>(&json) {
+                        Ok(m) => reg.apply_broker_msg(m),
+                        Err(e) => {
+                            eprintln!("[cluster/ws] malformed broker message: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Apply an incoming live session message to local state. Returns
+        /// nothing — the live message is NOT re-broadcast (every peer received
+        /// the original from its sender).
+        fn apply_session(&self, msg: SessionMsg) {
+            match msg {
+                SessionMsg::Delta { id, change } => {
                     if self
                         .tombstones
                         .lock()
@@ -139,7 +176,7 @@ mod inner {
                         }
                     }
                 }
-                ClusterMsg::Tombstone { id } => {
+                SessionMsg::Tombstone { id } => {
                     if let Ok(mut docs) = self.docs.lock() {
                         docs.remove(&id);
                     }
@@ -243,7 +280,7 @@ mod inner {
                     return;
                 }
             };
-            self.shared.apply_incoming(decoded);
+            self.shared.dispatch(decoded);
         }
 
         async fn broadcast_messages<F>(
@@ -348,20 +385,26 @@ mod inner {
         candidate.ip().is_loopback() || candidate.ip().is_unspecified()
     }
 
-    pub struct ClusterStore {
+    /// A live node in the shared gossip cluster. Owns the cluster state and
+    /// joins the `memberlist` once; both the session store ([`Self::session_store`])
+    /// and the WebSocket fan-out broker ([`Self::ws_broker`]) are thin handles
+    /// derived from it, so a single cluster/port carries both subsystems.
+    pub struct ClusterNode {
         shared: Arc<SharedState>,
     }
 
-    impl ClusterStore {
-        /// Build a clustered session store and join the gossip cluster.
-        /// Must be called from within a Tokio runtime.
+    impl ClusterNode {
+        /// Join the gossip cluster and start its background tasks. Must be
+        /// called from within a Tokio runtime.
         ///
         /// `discovery` drives both initial bootstrap and ongoing peer
-        /// re-discovery. See `crate::session::discovery::Discovery`.
-        pub async fn new(
+        /// re-discovery. `ws_registry`, when present, receives inbound WebSocket
+        /// fan-out frames and peer-departure (`NodeGone`) eviction.
+        pub async fn start(
             listen_addr: &str,
             discovery: crate::session::discovery::Discovery,
             node_name: String,
+            ws_registry: Option<Arc<WebSocketRegistry>>,
         ) -> Result<Self, String> {
             let bind: SocketAddr = listen_addr
                 .parse()
@@ -374,6 +417,7 @@ mod inner {
                 tombstones: Mutex::new(HashMap::new()),
                 node_name: node_name.clone(),
                 tx,
+                ws_registry: ws_registry.clone(),
             });
 
             let node_id = NodeId::try_from(node_name.clone())
@@ -388,10 +432,16 @@ mod inner {
             >::new(node_id)
             .with_bind_addresses(binds);
 
+            // An event subscriber so we learn when peers leave — a departed node's
+            // WebSocket presence-roster entries must be evicted (`NodeGone`).
+            let (ev_delegate, ev_subscriber) =
+                SubscribleEventDelegate::<NodeId, SocketAddr>::unbounded();
+
             let delegate = CompositeDelegate::<NodeId, SocketAddr>::default()
                 .with_node_delegate(ClusterDelegate {
                     shared: shared.clone(),
-                });
+                })
+                .with_event_delegate(ev_delegate);
 
             let memberlist =
                 TokioTcpMemberlist::with_delegate(delegate, net_opts, Options::lan())
@@ -399,6 +449,19 @@ mod inner {
                     .map_err(|e| format!("memberlist init failed: {}", e))?;
 
             let memberlist = Arc::new(memberlist);
+
+            // Drain membership events: on a peer leaving, evict the WebSocket
+            // roster entries it owned (conn ids carry its `{node}:` prefix).
+            if let Some(reg) = ws_registry.clone() {
+                tokio::spawn(async move {
+                    while let Ok(ev) = ev_subscriber.recv().await {
+                        if ev.kind() == EventKind::Leave {
+                            let gone = ev.node_state().id().to_string();
+                            reg.drop_node(&gone);
+                        }
+                    }
+                });
+            }
 
             // Initial discovery + join.
             let initial = discovery.discover().await;
@@ -552,6 +615,24 @@ mod inner {
             Ok(Self { shared })
         }
 
+        /// A session store backed by this cluster node.
+        pub fn session_store(&self) -> ClusterStore {
+            ClusterStore { shared: self.shared.clone() }
+        }
+
+        /// A WebSocket fan-out broker backed by this cluster node. Install it on
+        /// the registry via `WebSocketRegistry::set_broker`.
+        pub fn ws_broker(&self) -> Arc<dyn Broker> {
+            Arc::new(ClusterWsBroker { shared: self.shared.clone() })
+        }
+    }
+
+    /// Thin session-store handle over a [`ClusterNode`].
+    pub struct ClusterStore {
+        shared: Arc<SharedState>,
+    }
+
+    impl ClusterStore {
         /// Encode the local doc's incremental change since the last call
         /// and enqueue a Delta for broadcast.
         fn broadcast_delta(&self, id: &str, doc: &mut automerge::AutoCommit) {
@@ -559,10 +640,10 @@ mod inner {
             if change.is_empty() {
                 return;
             }
-            let msg = ClusterMsg::Delta {
+            let msg = ClusterMsg::Session(SessionMsg::Delta {
                 id: id.to_string(),
                 change,
-            };
+            });
             // try_send: if the queue is full, drop the message — anti-entropy
             // will catch it on the next push/pull.
             if let Err(e) = self.shared.tx.try_send(msg) {
@@ -574,7 +655,7 @@ mod inner {
         }
 
         fn broadcast_tombstone(&self, id: &str) {
-            let msg = ClusterMsg::Tombstone { id: id.to_string() };
+            let msg = ClusterMsg::Session(SessionMsg::Tombstone { id: id.to_string() });
             let _ = self.shared.tx.try_send(msg);
         }
     }
@@ -691,7 +772,39 @@ mod inner {
                 .min()
         }
     }
+
+    /// WebSocket fan-out broker over the shared cluster. Each published
+    /// [`BrokerMsg`] is `serde_json`-encoded (the payload is a dynamic
+    /// `CfmlValue`) and enqueued as `ClusterMsg::Ws` on the same outbound queue
+    /// the session store uses — one gossip cluster, two subsystems.
+    pub struct ClusterWsBroker {
+        shared: Arc<SharedState>,
+    }
+
+    impl std::fmt::Debug for ClusterWsBroker {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ClusterWsBroker")
+                .field("node", &self.shared.node_name)
+                .finish()
+        }
+    }
+
+    impl Broker for ClusterWsBroker {
+        fn publish(&self, msg: BrokerMsg) {
+            let json = match serde_json::to_string(&msg) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("[cluster/ws] failed to encode broker message: {}", e);
+                    return;
+                }
+            };
+            // try_send: drop on overflow (best-effort fan-out, like the session
+            // path) — a dropped WS frame is a missed realtime message, not state
+            // corruption, and history/replay covers reconnects.
+            let _ = self.shared.tx.try_send(ClusterMsg::Ws(json));
+        }
+    }
 }
 
 #[cfg(feature = "cluster")]
-pub use inner::ClusterStore;
+pub use inner::ClusterNode;

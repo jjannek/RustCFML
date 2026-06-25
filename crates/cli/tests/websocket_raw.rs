@@ -408,6 +408,86 @@ async fn unknown_channel_is_404() {
     drop(server);
 }
 
+// ── Phase 2: distributed Broker (real 2-process gossip cluster) ───────────
+//
+// End-to-end verification that WebSocket fan-out crosses nodes over the shared
+// `memberlist` gossip cluster: a broadcast on node A reaches a client connected
+// to node B. Spawns two clustered `rustcfml --serve` processes that gossip on
+// loopback.
+//
+// `#[ignore]` by default — it is timing-sensitive (waits on gossip convergence)
+// and spins up two full server processes, so it is unsuitable for the routine
+// parallel test run. The deterministic cross-node semantics are covered without
+// this by `cfml-vm`'s `two_node_cluster_fan_out_and_presence` /
+// `broker_msg_round_trips_through_json` unit tests; this exercises the *real
+// transport + cli wiring*. Run it explicitly:
+//   cargo test -p rustcfml-cli --features cluster --test websocket_raw -- --ignored
+#[cfg(feature = "cluster")]
+fn start_cluster_node(http_port: u16, gossip_port: u16, peer_gossip: u16, node: &str) -> Child {
+    use std::io::Write;
+    let cfg_path = std::env::temp_dir().join(format!("rustcfml_ws_cluster_{node}_{gossip_port}.json"));
+    let cfg = format!(
+        r#"{{"sessionStorage":"clusterCache","caches":{{"clusterCache":{{"provider":"cluster","storage":true,"properties":{{"listenAddr":"127.0.0.1:{gossip_port}","nodeName":"{node}","seeds":["127.0.0.1:{peer_gossip}"]}}}}}}}}"#
+    );
+    std::fs::File::create(&cfg_path).unwrap().write_all(cfg.as_bytes()).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
+        .arg("--serve")
+        .arg(fixtures_dir())
+        .arg("--port")
+        .arg(http_port.to_string())
+        .arg("--cfconfig")
+        .arg(&cfg_path)
+        .spawn()
+        .expect("spawn clustered rustcfml --serve");
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", http_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child
+}
+
+#[tokio::test]
+#[ignore = "real 2-process gossip cluster; timing-sensitive — run with --features cluster -- --ignored"]
+#[cfg(feature = "cluster")]
+async fn cluster_broadcast_reaches_client_on_other_node() {
+    let (ga, gb) = (free_port(), free_port());
+    let (ha, hb) = (free_port(), free_port());
+    let mut node_a = start_cluster_node(ha, ga, gb, "nodeA");
+    let mut node_b = start_cluster_node(hb, gb, ga, "nodeB");
+    // Give the gossip cluster time to converge (LAN profile is sub-second, but
+    // both processes also need their channel CFCs ready).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (mut a, _) = connect_async(format!("ws://127.0.0.1:{ha}/ws/echo"))
+        .await
+        .expect("client A connects to node A");
+    let (mut b, _) = connect_async(format!("ws://127.0.0.1:{hb}/ws/echo"))
+        .await
+        .expect("client B connects to node B");
+
+    // A sends a message → echo.onMessage broadcasts "said" channel-wide → it must
+    // cross the cluster and arrive at B (connected to the other node).
+    a.send(Message::Text("{\"hello\":\"world\"}".into())).await.unwrap();
+
+    // B's stream begins with its own onConnect "welcome"; wait for the "said".
+    let said = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let f = next_json(&mut b).await;
+            if f["ev"] == "said" {
+                return f;
+            }
+        }
+    })
+    .await
+    .expect("cross-node broadcast did not reach the client on node B");
+    assert_eq!(said["d"]["hello"], "world", "payload survives the cross-node hop");
+
+    let _ = node_a.kill();
+    let _ = node_b.kill();
+}
+
 /// Minimal HTTP GET without pulling in a full client crate — just enough to
 /// fetch a tiny CFML page body.
 async fn reqwest_get(url: &str) -> String {

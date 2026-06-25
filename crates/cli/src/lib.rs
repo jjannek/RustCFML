@@ -1051,7 +1051,11 @@ fn build_discovery(
 /// Resolution order: `sessionStorage` name in cfconfig → look up `caches`
 /// entry → dispatch on `provider` (or Lucee `class`). Falls back to
 /// `MemoryStore` if no config is present or the named cache is not found.
-async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::session_store::SessionStore> {
+async fn build_session_store(
+    cfconfig: &RustCfmlConfig,
+    #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
+    ws_registry: &Arc<cfml_vm::websocket::WebSocketRegistry>,
+) -> Arc<dyn cfml_vm::session_store::SessionStore> {
     let storage_name = cfconfig.session_storage.trim();
     if storage_name.is_empty() || storage_name.eq_ignore_ascii_case("memory") {
         return Arc::new(cfml_vm::session_store::MemoryStore::new());
@@ -1180,19 +1184,26 @@ async fn build_session_store(cfconfig: &RustCfmlConfig) -> Arc<dyn cfml_vm::sess
             };
             let discovery = build_discovery(&cache_cfg.properties, &listen_addr);
             let label = discovery.label();
-            let result = session::cluster::ClusterStore::new(
+            // Unify the WebSocket registry's node id with the cluster node name
+            // BEFORE any connection: cross-node ids and `NodeGone` eviction key
+            // off this match. Must happen before the registry mints conn ids.
+            ws_registry.set_node_id(node_name.clone());
+            let result = session::cluster::ClusterNode::start(
                 &listen_addr,
                 discovery,
                 node_name.clone(),
+                Some(ws_registry.clone()),
             )
             .await;
             match result {
-                Ok(store) => {
+                Ok(node) => {
                     println!(
-                        "[session] Using cluster session store (listen={}, discovery={})",
+                        "[session] Using cluster session store (listen={}, discovery={}); WebSocket fan-out clustered",
                         listen_addr, label
                     );
-                    Arc::new(store)
+                    // Install the distributed fan-out adapter on the registry.
+                    ws_registry.set_broker(node.ws_broker());
+                    Arc::new(node.session_store())
                 }
                 Err(e) => {
                     eprintln!(
@@ -1319,7 +1330,7 @@ async fn async_run_server(
     cfconfig: Arc<RustCfmlConfig>,
 ) {
     let mut server_state = ServerState::with_config(production, cfconfig.clone());
-    server_state.sessions = build_session_store(&cfconfig).await;
+    server_state.sessions = build_session_store(&cfconfig, &server_state.websocket).await;
     server_state.webroot = Some(
         fs::canonicalize(doc_root).unwrap_or_else(|_| doc_root.to_path_buf()),
     );

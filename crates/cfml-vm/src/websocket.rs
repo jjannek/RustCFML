@@ -23,6 +23,7 @@ use std::sync::Arc;
 use cfml_common::dynamic::{CfmlNative, CfmlStruct, CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 /// `CfmlValue::NativeObject` wraps `std::sync::RwLock` (not parking_lot's),
 /// so emitter/handle objects handed back to CFML must use this one.
 use std::sync::RwLock as StdRwLock;
@@ -46,12 +47,71 @@ pub trait FrameSink: Send + Sync + std::fmt::Debug {
     fn close(&self, code: u16, reason: String);
 }
 
+/// The cross-node fan-out primitive (decision 3: cluster-ready from day one).
+/// A single-node server never installs one — the registry's broker stays
+/// `None` and every method is byte-for-byte the Phase-1 local path. When the
+/// distributed adapter (in `crates/cli`, over the shared-session `memberlist`
+/// gossip cluster) is installed via [`WebSocketRegistry::set_broker`], the
+/// three fan-out methods additionally `publish` to peers, who re-deliver to
+/// their own local connections (the Socket.IO Redis-adapter model). Like
+/// [`FrameSink`], this is **pure** — no axum/tokio/cluster types leak into
+/// `cfml-vm`, so the `wasm32` builds (`cfml-worker`/`rustcfml-wasm`) stay green.
+pub trait Broker: Send + Sync + std::fmt::Debug {
+    /// Hand a fan-out event to every *other* node. Implementations must be
+    /// non-blocking (the registry is called from synchronous VM code) — enqueue
+    /// and return; drop on overflow, exactly like the session cluster.
+    fn publish(&self, msg: BrokerMsg);
+}
+
+/// A cross-node fan-out event. Carries live [`CfmlValue`] payloads in-process;
+/// the cli adapter serializes it (via `serde_json`, since [`CfmlValue`]'s
+/// `Deserialize` is `deserialize_any` and needs a self-describing format —
+/// bincode would fail) before it crosses the gossip wire, and feeds received
+/// ones straight into [`WebSocketRegistry::apply_broker_msg`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum BrokerMsg {
+    /// Re-run a channel-wide broadcast on the receiving node's local conns.
+    Broadcast {
+        channel: String,
+        frame: WireEnvelope,
+        except: Option<String>,
+    },
+    /// Re-run a room fan-out on the receiving node's local room members.
+    ToRoom {
+        channel: String,
+        room: String,
+        frame: WireEnvelope,
+        except: Option<String>,
+    },
+    /// Deliver to a specific (node-qualified) connection — only the owning node
+    /// has it locally; everyone else no-ops.
+    EmitTo { conn_id: String, frame: WireEnvelope },
+    /// Replicate a presence-roster entry. Roster state only — the client-facing
+    /// `presence_diff` rides the separate `Broadcast` of the diff frame, so this
+    /// merges state without re-broadcasting (no double delivery).
+    PresenceTrack {
+        channel: String,
+        key: String,
+        conn_id: String,
+        meta: CfmlValue,
+    },
+    /// Remove a replicated presence-roster entry (roster state only).
+    PresenceUntrack {
+        channel: String,
+        key: String,
+        conn_id: String,
+    },
+    /// A peer left the cluster — evict every roster entry it owned (its
+    /// node-qualified conn ids) and emit leave diffs to local clients.
+    NodeGone { node_id: String },
+}
+
 /// One realtime frame on the wire. Raw-WS transports serialize this to JSON;
 /// the socket.io transport (Phase 3) maps the same fields onto Engine.IO
 /// packets. Designed once so ids never have to change when the distributed
 /// `Broker` switches on. `d` stays a live [`CfmlValue`] until the driver
 /// serializes it, so `encoding="json"` round-trips structs/arrays unchanged.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WireEnvelope {
     /// Frame type: `msg|ack|join|leave|presence|err|ping|pong`.
     pub t: String,
@@ -150,36 +210,73 @@ struct Inner {
 /// later if profiling demands it.
 #[derive(Debug)]
 pub struct WebSocketRegistry {
-    node_id: Arc<str>,
+    /// Node-qualifies conn ids and message ids. Interior-mutable so the cli can
+    /// unify it with the cluster node name at startup (before any connection) —
+    /// `NodeGone` eviction keys off this matching the gossip node id. Set-once;
+    /// the read cost is negligible at WebSocket frame rates.
+    node_id: RwLock<Arc<str>>,
     inner: RwLock<Inner>,
     seq: AtomicU64,
     /// Cheap, lock-free gate so the broadcast/to_room hot path never takes the
     /// write lock for history when no channel has opted in.
     history_enabled: AtomicBool,
+    /// The cross-node fan-out adapter, installed by the cli when a distributed
+    /// cluster is active (see [`Broker`]). `None` on a single node.
+    broker: RwLock<Option<Arc<dyn Broker>>>,
+    /// Lock-free gate so the fan-out hot path never takes the broker read lock
+    /// when no broker is installed (the common single-node case).
+    has_broker: AtomicBool,
 }
 
 impl WebSocketRegistry {
     pub fn new(node_id: impl Into<Arc<str>>) -> Self {
         Self {
-            node_id: node_id.into(),
+            node_id: RwLock::new(node_id.into()),
             inner: RwLock::new(Inner::default()),
             seq: AtomicU64::new(1),
             history_enabled: AtomicBool::new(false),
+            broker: RwLock::new(None),
+            has_broker: AtomicBool::new(false),
         }
     }
 
-    pub fn node_id(&self) -> &str {
-        &self.node_id
+    /// Install the distributed fan-out adapter. Called once at server start when
+    /// a clustered session store is active; absent that, the registry is
+    /// single-node and this is never called.
+    pub fn set_broker(&self, broker: Arc<dyn Broker>) {
+        *self.broker.write() = Some(broker);
+        self.has_broker.store(true, Ordering::Relaxed);
+    }
+
+    /// Publish a fan-out event to peers, if a broker is installed. Lock-free
+    /// no-op on a single node.
+    fn publish(&self, msg: BrokerMsg) {
+        if !self.has_broker.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(b) = self.broker.read().as_ref() {
+            b.publish(msg);
+        }
+    }
+
+    pub fn node_id(&self) -> String {
+        self.node_id.read().to_string()
+    }
+
+    /// Override the node id. Call once at startup, before accepting connections,
+    /// to align with the gossip cluster's node name (single-node never calls it).
+    pub fn set_node_id(&self, node_id: impl Into<Arc<str>>) {
+        *self.node_id.write() = node_id.into();
     }
 
     /// Mint the next monotonic, node-qualified message id.
     pub fn next_id(&self) -> String {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        format!("{}:{}", self.node_id, n)
+        format!("{}:{}", self.node_id.read(), n)
     }
 
     fn new_conn_id(&self) -> ConnId {
-        format!("{}:{}", self.node_id, uuid::Uuid::new_v4())
+        format!("{}:{}", self.node_id.read(), uuid::Uuid::new_v4())
     }
 
     /// Build a `msg` envelope with a fresh id.
@@ -283,7 +380,14 @@ impl WebSocketRegistry {
         };
         for (key, meta) in leaves {
             let frame = self.presence_diff_frame(&channel, false, &key, &meta);
+            // Broadcast auto-publishes the leave diff to remote clients; the
+            // PresenceUntrack drops the entry from remote rosters too.
             self.broadcast(&channel, frame, None);
+            self.publish(BrokerMsg::PresenceUntrack {
+                channel: channel.clone(),
+                key,
+                conn_id: conn_id.to_string(),
+            });
         }
         Some((channel, rooms))
     }
@@ -353,24 +457,45 @@ impl WebSocketRegistry {
 
     // ── delivery ──────────────────────────────────────────────────────────
 
-    /// Deliver to a single connection (by id). Local-only in Phase 1; remote
-    /// ids route through the `Broker` once it lands.
+    /// Deliver to a single connection (by id). If the connection is local, send
+    /// directly; otherwise (a node-qualified id we don't own) route it to the
+    /// owning node through the `Broker`. On a single node every id is local.
     pub fn emit_to(&self, conn_id: &str, frame: WireEnvelope) {
-        let inner = self.inner.read();
-        if let Some(entry) = inner.conns.get(conn_id) {
-            entry.sink.send(frame);
+        {
+            let inner = self.inner.read();
+            if let Some(entry) = inner.conns.get(conn_id) {
+                entry.sink.send(frame);
+                return;
+            }
         }
+        // Not ours — only the owning node has it. No-op on a single node.
+        self.publish(BrokerMsg::EmitTo {
+            conn_id: conn_id.to_string(),
+            frame,
+        });
     }
 
     /// Deliver to every connection on `channel`, optionally excluding one id
-    /// (self-echo control — design principle P4).
+    /// (self-echo control — design principle P4). Channel-wide fan-out is
+    /// recorded for resumability and published to peers (cluster fan-out); peers
+    /// re-deliver via [`broadcast_local`](Self::broadcast_local).
     pub fn broadcast(&self, channel: &str, frame: WireEnvelope, except: Option<&str>) {
+        // Record on the originating node only (replay is same-node, decision 3);
+        // peers re-fan-out via broadcast_local, which never records.
+        self.record_history(&channel.to_lowercase(), &frame);
+        self.publish(BrokerMsg::Broadcast {
+            channel: channel.to_string(),
+            frame: frame.clone(),
+            except: except.map(str::to_string),
+        });
+        self.broadcast_local(channel, frame, except);
+    }
+
+    /// Local-only channel broadcast — no history, no publish. Used by the
+    /// originating node (after recording + publishing) and by every peer that
+    /// receives a `Broadcast` message (re-fan-out to its own conns).
+    pub fn broadcast_local(&self, channel: &str, frame: WireEnvelope, except: Option<&str>) {
         let channel = channel.to_lowercase();
-        // Channel-wide fan-out is recorded for resumability; per-connection
-        // sends (acks, presence_state-to-self) are not (they aren't shared
-        // history). Record under the write lock, then deliver under a read lock
-        // — never held simultaneously.
-        self.record_history(&channel, &frame);
         let inner = self.inner.read();
         for (id, entry) in inner.conns.iter() {
             if entry.channel != channel {
@@ -384,12 +509,32 @@ impl WebSocketRegistry {
     }
 
     /// Deliver to every member of `(channel, room)`, optionally excluding one id.
+    /// Recorded as channel history (replay is channel-wide) and published to
+    /// peers; peers re-deliver via [`to_room_local`](Self::to_room_local).
     pub fn to_room(&self, channel: &str, room: &str, frame: WireEnvelope, except: Option<&str>) {
+        self.record_history(&channel.to_lowercase(), &frame);
+        self.publish(BrokerMsg::ToRoom {
+            channel: channel.to_string(),
+            room: room.to_string(),
+            frame: frame.clone(),
+            except: except.map(str::to_string),
+        });
+        self.to_room_local(channel, room, frame, except);
+    }
+
+    /// Local-only room fan-out — no history, no publish. Used by the originating
+    /// node and by peers receiving a `ToRoom` message. A peer only knows its own
+    /// local room members (membership is not replicated; delivery is re-fan-out),
+    /// so each node delivers to whoever it has in the room.
+    pub fn to_room_local(
+        &self,
+        channel: &str,
+        room: &str,
+        frame: WireEnvelope,
+        except: Option<&str>,
+    ) {
         let channel = channel.to_lowercase();
         let room = room.to_lowercase();
-        // Room fan-out is channel history too — replay is channel-wide (the
-        // socket re-establishes its rooms via onConnect auto-join on reconnect).
-        self.record_history(&channel, &frame);
         let inner = self.inner.read();
         if let Some(set) = inner.rooms.get(&(channel, room)) {
             for id in set.iter() {
@@ -462,7 +607,7 @@ impl WebSocketRegistry {
             Some(p) => p,
             None => return false,
         };
-        if node != &*self.node_id {
+        if node != &**self.node_id.read() {
             return false;
         }
         let channel_id = channel.to_string();
@@ -544,7 +689,16 @@ impl WebSocketRegistry {
         };
         self.emit_to(conn_id, state_frame);
         let join = self.presence_diff_frame(&channel, true, key, &meta);
+        // The join diff reaches remote clients via this broadcast's auto-publish;
+        // the separate PresenceTrack replicates the *roster* so remote
+        // `presence_state()` is cluster-correct (it merges state, no re-broadcast).
         self.broadcast(&channel, join, Some(conn_id));
+        self.publish(BrokerMsg::PresenceTrack {
+            channel,
+            key: key.to_string(),
+            conn_id: conn_id.to_string(),
+            meta,
+        });
     }
 
     /// Remove `conn_id`'s presence under `key` and broadcast a `presence_diff`
@@ -569,6 +723,11 @@ impl WebSocketRegistry {
         if let Some((channel, meta)) = removed {
             let leave = self.presence_diff_frame(&channel, false, key, &meta);
             self.broadcast(&channel, leave, None);
+            self.publish(BrokerMsg::PresenceUntrack {
+                channel,
+                key: key.to_string(),
+                conn_id: conn_id.to_string(),
+            });
         }
     }
 
@@ -620,6 +779,99 @@ impl WebSocketRegistry {
             d: CfmlValue::strukt(d),
             id: self.next_id(),
             ref_id: None,
+        }
+    }
+
+    // ── distributed broker inbound (Phase 2 — cluster fan-out) ────────────
+
+    /// Apply a [`BrokerMsg`] received from a peer node. The cli cluster adapter
+    /// decodes the gossip frame and hands it here; this is the *only* inbound
+    /// entry point. Every variant routes to a local-only method so re-delivery
+    /// never re-publishes (no fan-out loop).
+    pub fn apply_broker_msg(&self, msg: BrokerMsg) {
+        match msg {
+            BrokerMsg::Broadcast { channel, frame, except } => {
+                self.broadcast_local(&channel, frame, except.as_deref());
+            }
+            BrokerMsg::ToRoom { channel, room, frame, except } => {
+                self.to_room_local(&channel, &room, frame, except.as_deref());
+            }
+            BrokerMsg::EmitTo { conn_id, frame } => {
+                // Deliver only if we own the connection; other nodes no-op.
+                let inner = self.inner.read();
+                if let Some(entry) = inner.conns.get(&conn_id) {
+                    entry.sink.send(frame);
+                }
+            }
+            BrokerMsg::PresenceTrack { channel, key, conn_id, meta } => {
+                self.apply_remote_track(channel, key, conn_id, meta);
+            }
+            BrokerMsg::PresenceUntrack { channel, key, conn_id } => {
+                self.apply_remote_untrack(channel, key, conn_id);
+            }
+            BrokerMsg::NodeGone { node_id } => self.drop_node(&node_id),
+        }
+    }
+
+    /// Merge a remote presence-roster entry. Roster state only — the
+    /// client-facing `presence_diff` arrived via the peer's separate `Broadcast`
+    /// of the diff frame, so we must NOT re-broadcast here (that would double the
+    /// diff for our local clients). `presence_state()` now reflects the merged
+    /// cluster-wide roster.
+    fn apply_remote_track(&self, channel: String, key: String, conn_id: String, meta: CfmlValue) {
+        let channel = channel.to_lowercase();
+        let mut inner = self.inner.write();
+        inner
+            .presence
+            .entry((channel, key))
+            .or_default()
+            .insert(conn_id, meta);
+    }
+
+    /// Remove a remote presence-roster entry (roster state only; the leave diff
+    /// rode the peer's `Broadcast`).
+    fn apply_remote_untrack(&self, channel: String, key: String, conn_id: String) {
+        let channel = channel.to_lowercase();
+        let map_key = (channel, key);
+        let mut inner = self.inner.write();
+        if let Some(map) = inner.presence.get_mut(&map_key) {
+            map.remove(&conn_id);
+            if map.is_empty() {
+                inner.presence.remove(&map_key);
+            }
+        }
+    }
+
+    /// A peer left the cluster: evict every roster entry it owned (conn ids with
+    /// its `{node_id}:` prefix) and emit a leave diff to our local clients so
+    /// their rosters converge. Membership/rooms for that node need no cleanup —
+    /// we never replicated remote room membership (delivery is re-fan-out).
+    pub fn drop_node(&self, node_id: &str) {
+        let prefix = format!("{}:", node_id);
+        let leaves: Vec<(String, String, CfmlValue)> = {
+            let mut inner = self.inner.write();
+            let mut leaves = Vec::new();
+            let mut empty_keys = Vec::new();
+            for ((channel, key), map) in inner.presence.iter_mut() {
+                let gone: Vec<ConnId> =
+                    map.keys().filter(|c| c.starts_with(&prefix)).cloned().collect();
+                for c in gone {
+                    if let Some(meta) = map.remove(&c) {
+                        leaves.push((channel.clone(), key.clone(), meta));
+                    }
+                }
+                if map.is_empty() {
+                    empty_keys.push((channel.clone(), key.clone()));
+                }
+            }
+            for k in empty_keys {
+                inner.presence.remove(&k);
+            }
+            leaves
+        };
+        for (channel, key, meta) in leaves {
+            let leave = self.presence_diff_frame(&channel, false, &key, &meta);
+            self.broadcast_local(&channel, leave, None);
         }
     }
 
@@ -1082,5 +1334,218 @@ mod tests {
         let id_a = reg.register("/chat", a_dyn, None, ValueMap::default());
         // Auto-joined a room named after its own id.
         assert_eq!(reg.room_count("/chat", &id_a), 1);
+    }
+
+    // ── distributed Broker (Phase 2) ──────────────────────────────────────
+
+    #[derive(Debug, Default)]
+    struct CapturingBroker {
+        published: Arc<Mutex<Vec<BrokerMsg>>>,
+    }
+
+    impl Broker for CapturingBroker {
+        fn publish(&self, msg: BrokerMsg) {
+            self.published.lock().unwrap().push(msg);
+        }
+    }
+
+    fn broker() -> (Arc<CapturingBroker>, Arc<dyn Broker>) {
+        let b = Arc::new(CapturingBroker::default());
+        let dyn_b: Arc<dyn Broker> = b.clone();
+        (b, dyn_b)
+    }
+
+    #[test]
+    fn no_broker_means_no_publish_and_local_delivery_unchanged() {
+        // The single-node path is byte-for-byte the same: broadcast still
+        // delivers locally and nothing is published (no broker installed).
+        let reg = Arc::new(WebSocketRegistry::new("n1"));
+        let (a, a_dyn) = sink();
+        let _id = reg.register("/chat", a_dyn, None, ValueMap::default());
+        let frame = reg.msg("/chat", Some("e".into()), CfmlValue::Null);
+        reg.broadcast("/chat", frame, None);
+        assert_eq!(a.frames.lock().unwrap().len(), 1, "local delivery still happens");
+    }
+
+    #[test]
+    fn fan_out_publishes_to_broker() {
+        let reg = Arc::new(WebSocketRegistry::new("n1"));
+        let (b, b_dyn) = broker();
+        reg.set_broker(b_dyn);
+        let (_s, s_dyn) = sink();
+        let id = reg.register("/chat", s_dyn, None, ValueMap::default());
+        reg.join(&id, "lobby");
+
+        reg.broadcast("/chat", reg.msg("/chat", Some("e".into()), CfmlValue::Null), None);
+        reg.to_room("/chat", "lobby", reg.msg("/chat", Some("e".into()), CfmlValue::Null), None);
+        // emit_to a *local* conn must NOT publish (it's delivered directly).
+        reg.emit_to(&id, reg.msg("/chat", None, CfmlValue::Null));
+        // emit_to a remote (unknown) conn routes through the broker.
+        reg.emit_to("n2:ghost", reg.msg("/chat", None, CfmlValue::Null));
+
+        let pubd = b.published.lock().unwrap();
+        assert!(matches!(pubd[0], BrokerMsg::Broadcast { .. }), "broadcast published");
+        assert!(matches!(pubd[1], BrokerMsg::ToRoom { .. }), "to_room published");
+        // 3rd publish is the remote EmitTo; the local emit_to did not publish.
+        assert!(
+            matches!(pubd.last().unwrap(), BrokerMsg::EmitTo { conn_id, .. } if conn_id == "n2:ghost"),
+            "remote emit_to routed via broker"
+        );
+        assert!(
+            !pubd.iter().any(|m| matches!(m, BrokerMsg::EmitTo { conn_id, .. } if conn_id == &id)),
+            "local emit_to never published"
+        );
+    }
+
+    #[test]
+    fn apply_broadcast_delivers_locally_without_republishing() {
+        let reg = Arc::new(WebSocketRegistry::new("n2"));
+        let (b, b_dyn) = broker();
+        reg.set_broker(b_dyn);
+        let (a, a_dyn) = sink();
+        let _id = reg.register("/chat", a_dyn, None, ValueMap::default());
+
+        // A frame minted on node n1 arrives via the broker.
+        let frame = WireEnvelope {
+            t: "msg".into(),
+            ch: "/chat".into(),
+            ev: Some("say".into()),
+            d: CfmlValue::string("hi"),
+            id: "n1:7".into(),
+            ref_id: None,
+        };
+        reg.apply_broker_msg(BrokerMsg::Broadcast {
+            channel: "/chat".into(),
+            frame,
+            except: None,
+        });
+        assert_eq!(a.frames.lock().unwrap().len(), 1, "remote frame delivered to local conn");
+        assert!(b.published.lock().unwrap().is_empty(), "re-delivery must not re-publish");
+    }
+
+    #[test]
+    fn presence_track_publishes_roster_and_remote_merge_is_visible() {
+        let reg = Arc::new(WebSocketRegistry::new("n1"));
+        let (b, b_dyn) = broker();
+        reg.set_broker(b_dyn);
+        let (_a, a_dyn) = sink();
+        let id_a = reg.register("/chat", a_dyn, None, ValueMap::default());
+
+        let mut meta = ValueMap::default();
+        meta.insert("user".into(), CfmlValue::string("alice"));
+        reg.track(&id_a, "alice", CfmlValue::strukt(meta));
+        assert!(
+            b.published.lock().unwrap().iter().any(|m| matches!(m, BrokerMsg::PresenceTrack { .. })),
+            "track replicates the roster entry"
+        );
+
+        // A remote node's user shows up in our roster after a PresenceTrack apply.
+        let mut bob = ValueMap::default();
+        bob.insert("user".into(), CfmlValue::string("bob"));
+        reg.apply_broker_msg(BrokerMsg::PresenceTrack {
+            channel: "/chat".into(),
+            key: "bob".into(),
+            conn_id: "n2:xyz".into(),
+            meta: CfmlValue::strukt(bob),
+        });
+        let CfmlValue::Struct(roster) = reg.presence_state("/chat") else { panic!() };
+        assert!(roster.get_ci("alice").is_some(), "local alice present");
+        assert!(roster.get_ci("bob").is_some(), "remote bob merged into roster");
+
+        // The owning node leaving evicts its entries and emits a local leave diff.
+        reg.drop_node("n2");
+        let CfmlValue::Struct(after) = reg.presence_state("/chat") else { panic!() };
+        assert!(after.get_ci("bob").is_none(), "bob evicted on node-gone");
+        assert!(after.get_ci("alice").is_some(), "alice (local) survives");
+    }
+
+    /// A broker that forwards every published message straight into a peer
+    /// registry's `apply_broker_msg` — an in-process stand-in for the gossip
+    /// transport. Deterministically exercises the full cross-node path (no
+    /// timing). Two registries wired to each other model a two-node cluster.
+    #[derive(Debug)]
+    struct LoopbackBroker {
+        peer: Arc<WebSocketRegistry>,
+    }
+    impl Broker for LoopbackBroker {
+        fn publish(&self, msg: BrokerMsg) {
+            self.peer.apply_broker_msg(msg);
+        }
+    }
+
+    #[test]
+    fn broker_msg_round_trips_through_json() {
+        // The cluster adapter encodes BrokerMsg with serde_json (CfmlValue's
+        // Deserialize is deserialize_any → needs a self-describing format). Guard
+        // that the frame + a struct payload survive the round trip intact.
+        let mut payload = ValueMap::default();
+        payload.insert("text".into(), CfmlValue::string("hi"));
+        payload.insert("n".into(), CfmlValue::Int(42));
+        let msg = BrokerMsg::Broadcast {
+            channel: "/chat".into(),
+            frame: WireEnvelope {
+                t: "msg".into(),
+                ch: "/chat".into(),
+                ev: Some("say".into()),
+                d: CfmlValue::strukt(payload),
+                id: "nodeA:7".into(),
+                ref_id: Some("nodeA:6".into()),
+            },
+            except: Some("nodeA:abc".into()),
+        };
+        let json = serde_json::to_string(&msg).expect("encode");
+        let back: BrokerMsg = serde_json::from_str(&json).expect("decode");
+        match back {
+            BrokerMsg::Broadcast { channel, frame, except } => {
+                assert_eq!(channel, "/chat");
+                assert_eq!(frame.id, "nodeA:7");
+                assert_eq!(frame.ref_id.as_deref(), Some("nodeA:6"));
+                assert_eq!(except.as_deref(), Some("nodeA:abc"));
+                let CfmlValue::Struct(d) = frame.d else { panic!("payload struct") };
+                assert_eq!(d.get_ci("text").unwrap().as_string(), "hi");
+                assert_eq!(d.get_ci("n").unwrap().as_string(), "42");
+            }
+            _ => panic!("variant preserved"),
+        }
+    }
+
+    #[test]
+    fn two_node_cluster_fan_out_and_presence() {
+        let a = Arc::new(WebSocketRegistry::new("nodeA"));
+        let b = Arc::new(WebSocketRegistry::new("nodeB"));
+        // Bidirectional loopback (an Arc cycle — fine, the test process exits).
+        a.set_broker(Arc::new(LoopbackBroker { peer: b.clone() }));
+        b.set_broker(Arc::new(LoopbackBroker { peer: a.clone() }));
+
+        let (sa, sa_dyn) = sink();
+        let (sb, sb_dyn) = sink();
+        let id_a = a.register("/chat", sa_dyn, None, ValueMap::default());
+        let id_b = b.register("/chat", sb_dyn, None, ValueMap::default());
+
+        // Broadcast from node A reaches the client on node B.
+        a.broadcast("/chat", a.msg("/chat", Some("say".into()), CfmlValue::string("hi")), None);
+        assert_eq!(sa.frames.lock().unwrap().len(), 1, "local A client receives");
+        assert_eq!(sb.frames.lock().unwrap().len(), 1, "remote B client receives via broker");
+
+        // Room fan-out crosses nodes: both join "lobby" on their own node.
+        a.join(&id_a, "lobby");
+        b.join(&id_b, "lobby");
+        sa.frames.lock().unwrap().clear();
+        sb.frames.lock().unwrap().clear();
+        a.to_room("/chat", "lobby", a.msg("/chat", Some("e".into()), CfmlValue::Null), None);
+        assert_eq!(sa.frames.lock().unwrap().len(), 1, "A lobby member receives");
+        assert_eq!(sb.frames.lock().unwrap().len(), 1, "B lobby member receives cross-node");
+
+        // Presence roster is cluster-correct: A's tracked user shows on node B.
+        let mut meta = ValueMap::default();
+        meta.insert("user".into(), CfmlValue::string("alice"));
+        a.track(&id_a, "alice", CfmlValue::strukt(meta));
+        let CfmlValue::Struct(roster_b) = b.presence_state("/chat") else { panic!() };
+        assert!(roster_b.get_ci("alice").is_some(), "alice present in node B roster");
+
+        // A client disconnecting on node A drops it from node B's roster too.
+        a.unregister(&id_a);
+        let CfmlValue::Struct(roster_b2) = b.presence_state("/chat") else { panic!() };
+        assert!(roster_b2.get_ci("alice").is_none(), "alice gone from B after A-side disconnect");
     }
 }

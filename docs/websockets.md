@@ -390,6 +390,36 @@ when clustering is enabled later):
 }
 ```
 
+## Clustering / multi-node
+
+When the server runs as part of a **clustered session store** (`--features
+cluster`, with `sessionStorage` pointing at a `provider: "cluster"` cache),
+WebSocket fan-out automatically rides the same gossip cluster — no extra config.
+A `wsPublish` / `io().broadcast()` / `socket.to(room)` on one node reaches
+clients connected to **any** node, and the presence roster is cluster-wide. The
+CFML API is identical to single-node; nothing in your channel code changes.
+
+How it works: every channel-wide broadcast and room fan-out is published to peer
+nodes over the cluster, and each node re-delivers to its own connected clients
+(the Socket.IO Redis-adapter model — no sticky sessions needed). Connection ids
+are node-qualified, so a send to a specific connection routes to its owning node.
+Presence `track`/`untrack` is replicated, and when a node leaves the cluster its
+roster entries are evicted (a leave diff is emitted to remaining clients).
+
+Caveats (best-effort, in line with the realtime contract):
+
+- **Fan-out is best-effort.** A cross-node frame dropped under load is a missed
+  realtime message, not state corruption — exactly like a single dropped frame to
+  a slow client.
+- **`lastEventId` replay stays node-local.** History is retained on the node that
+  produced the frames; a client that reconnects to a *different* node receives a
+  `reset` hint (no replay) rather than a gap. Pin reconnects to the same node, or
+  treat `reset` as "resync from scratch".
+- **Room `count()` / `sockets()` are node-local.** They report this node's members
+  only — room *membership* is not replicated (delivery does not need it). For a
+  cluster-wide "who's here", use **presence** (`io(channel).presence()`), which is
+  replicated.
+
 ## Concurrency & safety
 
 The engine owns the connection's event loop, so your handlers never see frame
@@ -419,12 +449,13 @@ the Rust integration suite in `crates/cli/tests/websocket_raw.rs`.)
 
 ## Roadmap
 
-Phase 1 (this page) covers the raw-WebSocket core. From Phase 2, `on="event"`
-annotation routing, ack `ref` correlation, **presence**, **authorization**
-(`secured=` / `canJoin`, above), and **`lastEventId` resumability** (`history=`,
-above) have landed. Planned:
+Phase 1 (this page) covers the raw-WebSocket core. **Phase 2 is complete:**
+`on="event"` annotation routing, ack `ref` correlation, **presence**,
+**authorization** (`secured=` / `canJoin`, above), **`lastEventId` resumability**
+(`history=`, above), and **multi-node fan-out** over the shared-session cluster
+([Clustering / multi-node](#clustering--multi-node), above) have all landed.
+Planned:
 
-- **Phase 2 (remaining)** — multi-node fan-out over the shared-session cluster (presence/rooms become cluster-correct, and resumability durable, then — no API change).
 - **Phase 3** — a **socket.io** transport (Engine.IO handshake, namespaces, acks, polling fallback) plus a **socket.io-lucee compatibility layer** so existing socket.io CFML apps run with minimal change.
 - **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
 
