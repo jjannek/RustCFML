@@ -39,6 +39,9 @@ whitebackground.png
 /PERFORMANCE_TUNING.md
 /REFERENCE_SEMANTICS_PLAN.md
 /moopareview.md
+# WebSocket plan/design are working docs (user-facing docs/websockets.md IS tracked)
+/docs/websocket-design.md
+/docs/websocket-implementation-plan.md
 
 # Sibling standalone worker repo — accidentally committed here in the past,
 # now lives at github.com/RustCFML/Rust-CFML-Cloudflare-worker
