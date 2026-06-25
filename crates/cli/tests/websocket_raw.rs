@@ -247,6 +247,67 @@ async fn presence_state_diffs_and_roster() {
 }
 
 #[tokio::test]
+async fn secured_annotation_gates_handlers() {
+    let server = start_server().await;
+    let base = format!("ws://127.0.0.1:{}/ws/auth", server.port);
+
+    // An admin can call the admin-only handler.
+    let (mut admin, _) = connect_async(format!("{base}?role=admin")).await.expect("admin connects");
+    assert_eq!(next_json(&mut admin).await["ev"], "ready");
+    admin.send(Message::Text(r#"{"ev":"admin"}"#.into())).await.unwrap();
+    let f1 = next_json(&mut admin).await;
+    let f2 = next_json(&mut admin).await;
+    let evs: Vec<&str> = [&f1, &f2].iter().map(|f| f["ev"].as_str().unwrap_or("")).collect();
+    assert!(evs.contains(&"adminOk"), "admin reached the secured handler: {evs:?}");
+
+    // A guest is denied the admin-only handler (secured=\"admin\").
+    let (mut guest, _) = connect_async(format!("{base}?role=guest")).await.expect("guest connects");
+    assert_eq!(next_json(&mut guest).await["ev"], "ready");
+    guest.send(Message::Text(r#"{"ev":"admin"}"#.into())).await.unwrap();
+    let denied = next_json(&mut guest).await;
+    assert_eq!(denied["ev"], "denied", "guest blocked from admin handler");
+    assert!(
+        denied["d"]["message"].as_str().unwrap().contains("Not authorized"),
+        "onError saw the authorization failure: {denied:?}"
+    );
+
+    // A guest *is* authenticated, so a bare-`secured` handler lets them through.
+    guest.send(Message::Text(r#"{"ev":"member"}"#.into())).await.unwrap();
+    let m1 = next_json(&mut guest).await;
+    let m2 = next_json(&mut guest).await;
+    let mevs: Vec<&str> = [&m1, &m2].iter().map(|f| f["ev"].as_str().unwrap_or("")).collect();
+    assert!(mevs.contains(&"memberOk"), "authenticated guest passed bare secured: {mevs:?}");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn canjoin_gates_room_joins() {
+    let server = start_server().await;
+    let base = format!("ws://127.0.0.1:{}/ws/auth", server.port);
+    let (mut ws, _) = connect_async(format!("{base}?role=admin")).await.expect("connect");
+    assert_eq!(next_json(&mut ws).await["ev"], "ready");
+
+    // An allowed room joins fine.
+    ws.send(Message::Text(r#"{"ev":"join","d":{"room":"public-1"}}"#.into())).await.unwrap();
+    let f1 = next_json(&mut ws).await;
+    let f2 = next_json(&mut ws).await;
+    let evs: Vec<&str> = [&f1, &f2].iter().map(|f| f["ev"].as_str().unwrap_or("")).collect();
+    assert!(evs.contains(&"joined"), "allowed room joined: {evs:?}");
+
+    // A disallowed room is rejected by canJoin → the handler throws → onError.
+    ws.send(Message::Text(r#"{"ev":"join","d":{"room":"private-x"}}"#.into())).await.unwrap();
+    let denied = next_json(&mut ws).await;
+    assert_eq!(denied["ev"], "denied");
+    assert!(
+        denied["d"]["message"].as_str().unwrap().contains("canJoin"),
+        "canJoin rejection surfaced: {denied:?}"
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn binary_frames_round_trip() {
     let server = start_server().await;
     let url = format!("ws://127.0.0.1:{}/ws/raw", server.port);

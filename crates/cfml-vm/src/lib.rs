@@ -904,6 +904,11 @@ pub struct CfmlVirtualMachine {
     /// `dispatch_ws_event`). Lets `io()` with no argument resolve to "the
     /// current channel" inside a handler. `None` on a normal HTTP/CLI request.
     current_ws_channel: Option<String>,
+    /// The channel CFC instance currently under WebSocket dispatch (set only for
+    /// the duration of a handler call). Lets `socket.join()` consult the
+    /// channel's `canJoin(socket, room)` authorization hook via VM re-entry.
+    /// `None` on a normal HTTP/CLI request, so non-WS method calls pay nothing.
+    current_ws_instance: Option<CfmlValue>,
     /// Every `wsPublish(...)` call this VM made, recorded as a struct
     /// `{channel, event, data, to, except}`. Powers connection-free testing
     /// (design principle P14): `assertBroadcast(channel, event, predicate)`
@@ -1382,6 +1387,7 @@ impl CfmlVirtualMachine {
             pending_dump_named: None,
             pending_ws_named: None,
             current_ws_channel: None,
+            current_ws_instance: None,
             ws_test_log: Vec::new(),
             response_body: None,
             redirect_url: None,
@@ -2343,6 +2349,15 @@ impl CfmlVirtualMachine {
                     CfmlValue::Null
                 }
             }
+            // Rust-backed object property (e.g. live `socket.data`). Mirrors the
+            // GetProperty opcode's NativeObject arm so the fused
+            // LoadLocalProperty path (`socket.data`, receiver is a bare local)
+            // also reaches the trait getter.
+            CfmlValue::NativeObject(o) => o
+                .read()
+                .ok()
+                .and_then(|g| g.get_property(name))
+                .unwrap_or(CfmlValue::Null),
             _ => obj.get(name).unwrap_or(CfmlValue::Null),
         }
     }
@@ -5835,6 +5850,21 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                 }
+                            }
+                            // A Rust-backed object exposes properties through the
+                            // `CfmlNative::get_property` hook (e.g. the live
+                            // `socket.data` struct). Property access (`obj.x`, no
+                            // call) never reaches `call_member_function`, so this
+                            // is the only place the trait getter is consulted —
+                            // without it `socket.data` read as Null and the
+                            // documented live-state write silently vanished.
+                            CfmlValue::NativeObject(o) => {
+                                let val = o
+                                    .read()
+                                    .ok()
+                                    .and_then(|g| g.get_property(&name))
+                                    .unwrap_or(CfmlValue::Null);
+                                stack.push(val);
                             }
                             _ => {
                                 stack.push(obj.get(&name).unwrap_or(CfmlValue::Null));
@@ -13237,6 +13267,30 @@ impl CfmlVirtualMachine {
             let root = self
                 .scope_aware_load(scope, locals)
                 .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()));
+            // A Rust-backed object root (e.g. the live `socket` handle): descend
+            // through its `CfmlNative` accessors instead of rebuilding the path
+            // as a plain struct — otherwise `socket.data.x = v` would replace the
+            // NativeObject local with a struct and lose the live handle. The
+            // property the getter returns (`socket.data`) is reference-typed, so
+            // mutating it in place persists for the connection.
+            if let CfmlValue::NativeObject(obj) = &root {
+                let seg = parts[1];
+                if parts.len() == 2 {
+                    if let Ok(mut g) = obj.write() {
+                        let _ = g.set_property(seg, value);
+                    }
+                    return;
+                }
+                let prop = obj.read().ok().and_then(|g| g.get_property(seg));
+                if let Some(CfmlValue::Struct(s)) = prop {
+                    let mut cur = s;
+                    for key in &parts[2..parts.len() - 1] {
+                        cur = cur.get_or_insert_struct(key);
+                    }
+                    cur.insert(parts[parts.len() - 1].to_string(), value);
+                }
+                return;
+            }
             let root = if matches!(root, CfmlValue::Struct(_)) {
                 root
             } else {
@@ -14031,6 +14085,42 @@ impl CfmlVirtualMachine {
             );
             err.stack_trace = self.build_stack_trace();
             return Err(err);
+        }
+
+        // WebSocket `canJoin(socket, room)` authorization gate. When a channel
+        // handler calls `socket.join(room)` and the channel CFC defines a
+        // `canJoin` method, consult it first: a falsey return (or a throw)
+        // rejects the join loudly so a join derived from untrusted input can't
+        // slip through. Only active during WS dispatch (`current_ws_instance`),
+        // so ordinary method calls pay just one `Option` check.
+        if method_lower == "join" && self.current_ws_instance.is_some() {
+            let is_socket = matches!(object, CfmlValue::NativeObject(o)
+                if o.read().ok().map(|g| g.class_name() == "Socket").unwrap_or(false));
+            if is_socket {
+                let instance = self.current_ws_instance.clone();
+                if let Some(CfmlValue::Struct(ref cs)) = instance {
+                    if let Some(canjoin @ CfmlValue::Function(_)) = cs.get_ci("canJoin") {
+                        let room = extra_args.first().cloned().unwrap_or(CfmlValue::Null);
+                        let mut pl = ValueMap::default();
+                        if let Some(v) = cs.get_ci("__variables") {
+                            pl.insert("__variables".to_string(), v);
+                        }
+                        pl.insert("this".to_string(), instance.clone().unwrap());
+                        // Guard against canJoin → join recursion: hide the
+                        // instance for the duration of the hook.
+                        let saved = self.current_ws_instance.take();
+                        let verdict =
+                            self.call_function(&canjoin, vec![object.clone(), room.clone()], &pl);
+                        self.current_ws_instance = saved;
+                        if !verdict?.is_true() {
+                            return Err(self.wrap_error(CfmlError::runtime(format!(
+                                "join to room [{}] denied by canJoin",
+                                room.as_string()
+                            ))));
+                        }
+                    }
+                }
+            }
         }
 
         // Native-object dispatch short-circuits the rest of the function.
@@ -19226,6 +19316,59 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// The `secured` annotation on a channel handler, if any — read from the
+    /// `__funcmeta_<name>` struct the compiler emits. `Some("")` for a bare
+    /// `secured` (authenticated-only), `Some("a,b")` for role lists.
+    fn ws_secured_annotation(s: &CfmlStruct, fname: &str) -> Option<String> {
+        let fmeta = s.get_ci(&format!("__funcmeta_{}", fname))?;
+        let CfmlValue::Struct(fm) = fmeta else { return None };
+        let val = fm
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("secured"))
+            .map(|(_, v)| v.as_string())?;
+        // `secured="false"` opts out explicitly.
+        if val.eq_ignore_ascii_case("false") {
+            return None;
+        }
+        // A bare `secured` is captured as "true" → authenticated-only (empty list).
+        Some(if val.eq_ignore_ascii_case("true") { String::new() } else { val })
+    }
+
+    /// Read `socket.data` off the live socket NativeObject passed as the first
+    /// handler argument (so `secured=` can inspect the identity the channel
+    /// attached at connect).
+    fn ws_socket_data(socket: &CfmlValue) -> Option<CfmlValue> {
+        match socket {
+            CfmlValue::NativeObject(o) => o.read().ok().and_then(|g| g.get_property("data")),
+            _ => None,
+        }
+    }
+
+    /// Authorize against the socket's `data`. Empty `secured` → require a truthy
+    /// `data.authenticated`. A comma list → require `data.roles` (array) or
+    /// `data.role` (string) to include at least one listed role (case-insensitive).
+    fn ws_secured_ok(secured: &str, data: Option<&CfmlValue>) -> bool {
+        let Some(CfmlValue::Struct(ds)) = data else {
+            return false; // no identity attached → denied
+        };
+        let want: Vec<String> = secured
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if want.is_empty() {
+            return ds.get_ci("authenticated").map(|v| v.is_true()).unwrap_or(false);
+        }
+        let mut have: Vec<String> = Vec::new();
+        if let Some(CfmlValue::Array(arr)) = ds.get_ci("roles") {
+            have.extend(arr.iter().map(|r| r.as_string().to_lowercase()));
+        }
+        if let Some(r) = ds.get_ci("role") {
+            have.push(r.as_string().to_lowercase());
+        }
+        want.iter().any(|w| have.contains(w))
+    }
+
     pub fn dispatch_ws_event(
         &mut self,
         channel: &str,
@@ -19267,6 +19410,25 @@ impl CfmlVirtualMachine {
             None => return Ok(None),
         };
 
+        // Authorization (P-auth): a handler annotated `secured` / `secured="role,…"`
+        // is gated on the socket's identity BEFORE it runs. Identity is whatever
+        // the channel put on `socket.data` (e.g. in onConnect from the session):
+        // bare `secured` requires `data.authenticated`; `secured="a,b"` requires
+        // `data.roles`/`data.role` to include one listed role. A failure returns
+        // an error — for an event/onMessage handler the driver routes it to
+        // onError; for onConnect it rejects the handshake.
+        if let CfmlValue::Function(f) = &func {
+            if let Some(secured) = Self::ws_secured_annotation(&s, &f.name) {
+                let data = args.first().and_then(Self::ws_socket_data);
+                if !Self::ws_secured_ok(&secured, data.as_ref()) {
+                    return Err(self.wrap_error(CfmlError::runtime(format!(
+                        "Not authorized to call WebSocket handler [{}]",
+                        f.name
+                    ))));
+                }
+            }
+        }
+
         // Bind `this` + __variables exactly as call_lifecycle_method does.
         let mut parent_locals = ValueMap::default();
         if let Some(vars) = s
@@ -19278,7 +19440,10 @@ impl CfmlVirtualMachine {
         }
         parent_locals.insert("this".to_string(), template.clone());
 
+        // Expose the instance so `socket.join()` can reach `canJoin` (P6 auth).
+        let prev_instance = self.current_ws_instance.replace(template.clone());
         let result = self.call_function(&func, args, &parent_locals);
+        self.current_ws_instance = prev_instance;
 
         // Propagate variables/this mutations back into the (transient) instance.
         if let Some(vars_wb) = self.method_variables_writeback.take() {

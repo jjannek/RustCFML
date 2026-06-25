@@ -97,6 +97,50 @@ function onConnect( socket ) {
 Clients can **never** join rooms themselves — only server code calls
 `socket.join()` — so authorization is enforced at join time.
 
+## Authorization
+
+Two declarative gates, both reading the identity you attach to `socket.data` at
+connect (a real app resolves this from the session — see `socket.sessionId()`):
+
+```cfml
+function onConnect( socket ) {
+    var user = lookUpUser( socket.sessionId() );   // your own resolution
+    socket.data.authenticated = !isNull( user );
+    socket.data.roles = isNull( user ) ? [] : user.roles;   // e.g. ["admin"]
+}
+```
+
+**`secured` on a handler** gates it *before it runs*:
+
+```cfml
+function purge( socket, data ) on="purge" secured="admin" {  // needs the admin role
+    ...
+}
+function whoami( socket, data ) on="whoami" secured {        // any authenticated socket
+    return io().presence();
+}
+```
+
+- bare `secured` → requires a truthy `socket.data.authenticated`.
+- `secured="admin,editor"` → requires `socket.data.roles` (array) or
+  `socket.data.role` (string) to include one of the listed roles (case-insensitive).
+- `secured="false"` → explicitly opts out.
+
+A denied call doesn't run the handler — it surfaces through `onError(socket, err)`
+(an `onConnect` denial rejects the handshake), so the client gets a clean error
+rather than silence.
+
+**`canJoin( socket, room )`** gates room joins. Whenever server code calls
+`socket.join( room )`, the channel's `canJoin` (if defined) is consulted first; a
+falsey return (or a throw) rejects the join *loudly* — so a join derived from
+client-supplied input can't slip a user into a room they shouldn't see:
+
+```cfml
+function canJoin( socket, room ) {
+    return room.startsWith( "public-" ) || socket.data.roles.contains( "admin" );
+}
+```
+
 ## Event routing (`on="event"`)
 
 For an `encoding="json"` channel, an inbound frame can name an **event** and be
@@ -329,10 +373,10 @@ the Rust integration suite in `crates/cli/tests/websocket_raw.rs`.)
 ## Roadmap
 
 Phase 1 (this page) covers the raw-WebSocket core. From Phase 2, `on="event"`
-annotation routing, ack `ref` correlation, and **presence** (above) have landed.
-Planned:
+annotation routing, ack `ref` correlation, **presence**, and **authorization**
+(`secured=` / `canJoin`, above) have landed. Planned:
 
-- **Phase 2 (remaining)** — `canJoin`/`secured=` authorization, multi-node fan-out over the shared-session cluster (presence/rooms become cluster-correct then, no API change), and `lastEventId` resumability.
+- **Phase 2 (remaining)** — multi-node fan-out over the shared-session cluster (presence/rooms become cluster-correct then, no API change), and `lastEventId` resumability.
 - **Phase 3** — a **socket.io** transport (Engine.IO handshake, namespaces, acks, polling fallback) plus a **socket.io-lucee compatibility layer** so existing socket.io CFML apps run with minimal change.
 - **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
 
