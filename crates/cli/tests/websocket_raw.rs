@@ -308,6 +308,51 @@ async fn canjoin_gates_room_joins() {
 }
 
 #[tokio::test]
+async fn history_replays_missed_messages_on_reconnect() {
+    let server = start_server().await;
+    let base = format!("ws://127.0.0.1:{}/ws/history", server.port);
+
+    // A and B connect to the `history="50"` channel.
+    let (mut a, _) = connect_async(&base).await.expect("A connects");
+    let (mut b, _) = connect_async(&base).await.expect("B connects");
+
+    // A emits three `say` events → each is broadcast channel-wide as `said`
+    // (io().emit reaches A and B). Capture the wire ids B sees — those are the
+    // resumability cursors.
+    let mut ids = Vec::new();
+    for n in 1..=3 {
+        a.send(Message::Text(format!(r#"{{"ev":"say","d":{{"n":{n}}}}}"#).into()))
+            .await
+            .unwrap();
+        let _a_said = next_json(&mut a).await; // drain A's own copy
+        let said = next_json(&mut b).await;
+        assert_eq!(said["ev"], "said");
+        assert_eq!(said["d"]["n"], n);
+        ids.push(said["id"].as_str().unwrap().to_string());
+    }
+
+    // B drops and reconnects with a cursor at the 2nd message.
+    drop(b);
+    let url = format!("{base}?lastEventId={}", ids[1]);
+    let (mut b2, _) = connect_async(&url).await.expect("B reconnects");
+
+    // Replay: B2 receives exactly the 3rd message (newer than the cursor),
+    // keeping its original id so the client can keep advancing.
+    let replayed = next_json(&mut b2).await;
+    assert_eq!(replayed["ev"], "said");
+    assert_eq!(replayed["d"]["n"], 3, "only the missed (3rd) message replays");
+    assert_eq!(replayed["id"], ids[2], "replayed frame keeps its original id");
+
+    // Live traffic resumes after replay.
+    a.send(Message::Text(r#"{"ev":"say","d":{"n":4}}"#.into())).await.unwrap();
+    let _a_said4 = next_json(&mut a).await;
+    let live = next_json(&mut b2).await;
+    assert_eq!(live["d"]["n"], 4, "live traffic resumes after replay");
+
+    drop(server);
+}
+
+#[tokio::test]
 async fn binary_frames_round_trip() {
     let server = start_server().await;
     let url = format!("ws://127.0.0.1:{}/ws/raw", server.port);

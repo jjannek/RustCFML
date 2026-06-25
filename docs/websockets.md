@@ -327,6 +327,53 @@ function onMessage( socket, message ) {
 When the inbound frame carried an `id`, the ack echoes it back as `ref` so the
 client can match the reply to its request.
 
+## Resumability (`history` / `lastEventId`)
+
+A client that briefly drops off the network can reconnect and **replay the
+messages it missed**, in order, before live traffic resumes. Opt in per channel
+with the `history="N"` attribute — the engine then retains the last `N`
+channel-wide frames:
+
+```cfml
+component socket="/feed" encoding="json" history="100" {
+    function publish( socket, data ) on="post" {
+        io().emit( "post", data );   // channel-wide → retained in history
+    }
+}
+```
+
+Every outbound frame carries a monotonic `id` (`{nodeId}:{seq}`). The client
+remembers the `id` of the last frame it processed and, on reconnect, sends it as
+a `lastEventId` query parameter:
+
+```js
+const last = localStorage.getItem("lastEventId");
+const url  = "/ws/feed" + (last ? "?lastEventId=" + encodeURIComponent(last) : "");
+const ws   = new WebSocket(url);
+ws.onmessage = e => { const f = JSON.parse(e.data); if (f.id) localStorage.setItem("lastEventId", f.id); /* … */ };
+```
+
+The engine replays every retained frame newer than that cursor (keeping each
+frame's original `id`, so the client keeps advancing). What gets retained is the
+**channel-wide fan-out** — `io().emit()`, `io().to(room).emit()`,
+`socket.broadcast()`. Per-connection sends (acks, a `presence_state` snapshot) are
+not history and are never replayed.
+
+If the cursor is older than the oldest frame still retained, the client has
+provably lost messages: the engine first sends a `{ "t": "reset" }` frame so the
+app knows to resync from its own source of truth, then replays what it still has.
+
+```jsonc
+{ "t": "reset", "ch": "/feed", "id": "node:512" }   // gap — you missed messages; resync
+```
+
+**Caveats (this phase).** History is **best-effort, in-memory, and per node**:
+it is lost on restart, capped at `N` frames, and a `lastEventId` minted by a
+*different* node (after a failover) is skipped (the client gets the `reset` hint).
+Replay is channel-wide, not room-precise — the socket re-establishes its rooms via
+`onConnect` auto-join anyway. Cluster-correct, durable resumability arrives with
+the distributed broker (later in Phase 2) with no API change.
+
 ## Wire format
 
 Raw-WS frames are JSON with a stable shape (designed once so ids never change
@@ -373,10 +420,11 @@ the Rust integration suite in `crates/cli/tests/websocket_raw.rs`.)
 ## Roadmap
 
 Phase 1 (this page) covers the raw-WebSocket core. From Phase 2, `on="event"`
-annotation routing, ack `ref` correlation, **presence**, and **authorization**
-(`secured=` / `canJoin`, above) have landed. Planned:
+annotation routing, ack `ref` correlation, **presence**, **authorization**
+(`secured=` / `canJoin`, above), and **`lastEventId` resumability** (`history=`,
+above) have landed. Planned:
 
-- **Phase 2 (remaining)** — multi-node fan-out over the shared-session cluster (presence/rooms become cluster-correct then, no API change), and `lastEventId` resumability.
+- **Phase 2 (remaining)** — multi-node fan-out over the shared-session cluster (presence/rooms become cluster-correct, and resumability durable, then — no API change).
 - **Phase 3** — a **socket.io** transport (Engine.IO handshake, namespaces, acks, polling fallback) plus a **socket.io-lucee compatibility layer** so existing socket.io CFML apps run with minimal change.
 - **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
 

@@ -16,8 +16,8 @@
 //! routes through the registry so a distributed `Broker` (Phase 2) can slot in
 //! at the same call sites with no id/wire changes.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cfml_common::dynamic::{CfmlNative, CfmlStruct, CfmlValue, ValueMap};
@@ -133,6 +133,15 @@ struct Inner {
     /// Presence. `BTreeMap` keeps the metas list deterministic. The distributed
     /// `Broker` merges remote presence on top (Phase 2).
     presence: HashMap<(String, String), BTreeMap<ConnId, CfmlValue>>,
+    /// Best-effort, in-memory resumability history (design principle P12): per
+    /// channel, a bounded ring of the channel-wide fan-out frames in send order.
+    /// A reconnecting client replays everything newer than its `lastEventId`.
+    /// Opt-in per channel via the `history="N"` component attribute — only
+    /// channels with a non-zero cap retain anything. The distributed `Broker`
+    /// makes this cluster-correct (Phase 2); single-node + same-node-only today.
+    history: HashMap<String, VecDeque<WireEnvelope>>,
+    /// Per-channel retention cap for `history` (0 / absent = disabled).
+    history_cap: HashMap<String, usize>,
 }
 
 /// The realtime connection registry. Lives on `ServerState` so it crosses
@@ -144,6 +153,9 @@ pub struct WebSocketRegistry {
     node_id: Arc<str>,
     inner: RwLock<Inner>,
     seq: AtomicU64,
+    /// Cheap, lock-free gate so the broadcast/to_room hot path never takes the
+    /// write lock for history when no channel has opted in.
+    history_enabled: AtomicBool,
 }
 
 impl WebSocketRegistry {
@@ -152,6 +164,7 @@ impl WebSocketRegistry {
             node_id: node_id.into(),
             inner: RwLock::new(Inner::default()),
             seq: AtomicU64::new(1),
+            history_enabled: AtomicBool::new(false),
         }
     }
 
@@ -353,6 +366,11 @@ impl WebSocketRegistry {
     /// (self-echo control — design principle P4).
     pub fn broadcast(&self, channel: &str, frame: WireEnvelope, except: Option<&str>) {
         let channel = channel.to_lowercase();
+        // Channel-wide fan-out is recorded for resumability; per-connection
+        // sends (acks, presence_state-to-self) are not (they aren't shared
+        // history). Record under the write lock, then deliver under a read lock
+        // — never held simultaneously.
+        self.record_history(&channel, &frame);
         let inner = self.inner.read();
         for (id, entry) in inner.conns.iter() {
             if entry.channel != channel {
@@ -369,6 +387,9 @@ impl WebSocketRegistry {
     pub fn to_room(&self, channel: &str, room: &str, frame: WireEnvelope, except: Option<&str>) {
         let channel = channel.to_lowercase();
         let room = room.to_lowercase();
+        // Room fan-out is channel history too — replay is channel-wide (the
+        // socket re-establishes its rooms via onConnect auto-join on reconnect).
+        self.record_history(&channel, &frame);
         let inner = self.inner.read();
         if let Some(set) = inner.rooms.get(&(channel, room)) {
             for id in set.iter() {
@@ -387,6 +408,103 @@ impl WebSocketRegistry {
         if let Some(entry) = inner.conns.get(conn_id) {
             entry.sink.close(code, reason);
         }
+    }
+
+    // ── resumability / history (design principle P12) ─────────────────────
+
+    /// Enable (or update) the retained-history cap for a channel. Called once at
+    /// channel discovery / first connect from the `history="N"` attribute. A cap
+    /// of 0 leaves history disabled — the common case stays lock-free.
+    pub fn set_history_cap(&self, channel: &str, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        self.history_enabled.store(true, Ordering::Relaxed);
+        self.inner
+            .write()
+            .history_cap
+            .insert(channel.to_lowercase(), cap);
+    }
+
+    /// Append a channel-wide fan-out frame to the channel's history ring,
+    /// trimming to the cap. No-op unless the channel opted in. Takes the write
+    /// lock briefly; callers must not hold any registry lock across this.
+    fn record_history(&self, channel: &str, frame: &WireEnvelope) {
+        if !self.history_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let channel = channel.to_lowercase();
+        let mut inner = self.inner.write();
+        let cap = inner.history_cap.get(&channel).copied().unwrap_or(0);
+        if cap == 0 {
+            return;
+        }
+        let ring = inner.history.entry(channel).or_default();
+        ring.push_back(frame.clone());
+        while ring.len() > cap {
+            ring.pop_front();
+        }
+    }
+
+    /// Replay the channel-history frames a reconnecting connection missed, in
+    /// order, ahead of live traffic. `last_event_id` is the client's cursor
+    /// (`{nodeId}:{seq}`): every retained frame with a larger `seq` is re-sent
+    /// to `conn_id`, keeping its original id so the client can keep advancing.
+    ///
+    /// Best-effort, single-node: a `last_event_id` minted by a *different* node
+    /// (failover) is skipped — cluster-correct replay arrives with the
+    /// distributed `Broker`. If the cursor is older than the oldest retained
+    /// frame the client has provably lost messages, so a `t="reset"` hint frame
+    /// is sent first (Socket.IO "recovered: false"). Returns `false` when replay
+    /// was skipped (unparseable id or cross-node), `true` otherwise.
+    pub fn replay_since(&self, channel: &str, last_event_id: &str, conn_id: &str) -> bool {
+        let (node, last_seq) = match parse_event_id(last_event_id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if node != &*self.node_id {
+            return false;
+        }
+        let channel_id = channel.to_string();
+        let (reset, frames): (bool, Vec<WireEnvelope>) = {
+            let channel_l = channel.to_lowercase();
+            let inner = self.inner.read();
+            match inner.history.get(&channel_l) {
+                Some(ring) if !ring.is_empty() => {
+                    let oldest = ring
+                        .iter()
+                        .filter_map(|f| parse_event_id(&f.id).map(|(_, s)| s))
+                        .min()
+                        .unwrap_or(0);
+                    let frames = ring
+                        .iter()
+                        .filter(|f| {
+                            parse_event_id(&f.id).map(|(_, s)| s > last_seq).unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    (last_seq < oldest, frames)
+                }
+                _ => (false, Vec::new()),
+            }
+        };
+        if reset {
+            self.emit_to(
+                conn_id,
+                WireEnvelope {
+                    t: "reset".to_string(),
+                    ch: channel_id,
+                    ev: None,
+                    d: CfmlValue::Null,
+                    id: self.next_id(),
+                    ref_id: None,
+                },
+            );
+        }
+        for f in frames {
+            self.emit_to(conn_id, f);
+        }
+        true
     }
 
     // ── presence (design principle P11) ───────────────────────────────────
@@ -570,6 +688,15 @@ impl SocketHandle {
     pub fn new(conn_id: ConnId, channel: String, registry: Arc<WebSocketRegistry>) -> Self {
         Self { conn_id, channel, registry }
     }
+}
+
+/// Split a `{nodeId}:{seq}` wire/cursor id into its node prefix and numeric
+/// sequence. The node prefix is everything before the final `:` (node ids are
+/// uuids and carry no colons, so the split is unambiguous).
+fn parse_event_id(id: &str) -> Option<(&str, u64)> {
+    let (node, seq) = id.rsplit_once(':')?;
+    let seq = seq.parse::<u64>().ok()?;
+    Some((node, seq))
 }
 
 fn arg_string(args: &[CfmlValue], idx: usize) -> String {
@@ -899,6 +1026,53 @@ mod tests {
         }
         let CfmlValue::Struct(empty) = reg.presence_state("/chat") else { panic!() };
         assert_eq!(empty.keys().len(), 0, "roster empty after disconnect");
+    }
+
+    #[test]
+    fn replay_since_seq_compare_and_node_skip() {
+        let reg = Arc::new(WebSocketRegistry::new("n1"));
+        reg.set_history_cap("/chat", 50);
+        let (sender, sender_dyn) = sink();
+        let id_s = reg.register("/chat", sender_dyn, None, ValueMap::default());
+
+        // Three channel-wide broadcasts are retained in history.
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let frame = reg.msg("/chat", Some("say".into()), CfmlValue::Int(n));
+            ids.push(frame.id.clone());
+            reg.broadcast("/chat", frame, None);
+        }
+        // (sender received all three live)
+        assert_eq!(sender.frames.lock().unwrap().len(), 3);
+
+        // A reconnecting client replays only frames newer than its cursor.
+        let (rejoin, rejoin_dyn) = sink();
+        let id_r = reg.register("/chat", rejoin_dyn, None, ValueMap::default());
+        assert!(reg.replay_since("/chat", &ids[0], &id_r), "same-node replay runs");
+        let got: Vec<i64> = rejoin
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| if let CfmlValue::Int(i) = f.d { Some(i) } else { None })
+            .collect();
+        assert_eq!(got, vec![1, 2], "only frames after the cursor replay, in order");
+
+        // A cursor minted by a different node (failover) is skipped entirely.
+        let (other, other_dyn) = sink();
+        let id_o = reg.register("/chat", other_dyn, None, ValueMap::default());
+        assert!(!reg.replay_since("/chat", "n2:1", &id_o), "cross-node cursor skipped");
+        assert_eq!(other.frames.lock().unwrap().len(), 0, "nothing replayed cross-node");
+
+        // A cursor older than the retained window gets a reset hint first.
+        let (gap, gap_dyn) = sink();
+        let id_g = reg.register("/chat", gap_dyn, None, ValueMap::default());
+        assert!(reg.replay_since("/chat", "n1:0", &id_g));
+        let frames = gap.frames.lock().unwrap();
+        assert_eq!(frames.first().unwrap().t, "reset", "gap signalled with a reset frame");
+
+        // Keep the connections referenced to end-of-test (avoid clippy noise).
+        let _ = (id_s, id_r, id_o, id_g);
     }
 
     #[test]

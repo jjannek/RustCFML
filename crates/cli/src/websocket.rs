@@ -64,6 +64,9 @@ struct ChannelInfo {
     cfc_path: String,
     /// `encoding="json"` → inbound text is parsed to a struct before dispatch.
     json: bool,
+    /// `history="N"` → retain the last N channel-wide frames for `lastEventId`
+    /// resumability. 0 = disabled (no retention, no replay).
+    history: usize,
 }
 
 /// Resolve `/ws/<name>` to a channel CFC under `<docroot>/websockets/`.
@@ -87,25 +90,33 @@ fn resolve_channel(state: &AppState, name: &str) -> Option<ChannelInfo> {
     // Cheap source scan for the channel attributes (avoids spinning a VM just
     // to read metadata at handshake). `socket="/foo"` overrides the wire id;
     // `encoding="json"` flips inbound parsing.
-    let (channel, json) = match state.vfs.read(&cfc_path) {
+    let (channel, json, history) = match state.vfs.read(&cfc_path) {
         Ok(bytes) => {
             let src = String::from_utf8_lossy(&bytes);
             let lower = src.to_lowercase();
             let json = lower.contains("encoding=\"json\"") || lower.contains("encoding='json'");
-            let channel = extract_socket_attr(&src)
+            let channel = extract_attr(&src, "socket")
                 .unwrap_or_else(|| format!("/{}", name.to_lowercase()));
-            (channel, json)
+            // `history="N"` opts the channel into resumability; non-numeric or
+            // absent leaves it disabled.
+            let history = extract_attr(&src, "history")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            (channel, json, history)
         }
-        Err(_) => (format!("/{}", name.to_lowercase()), false),
+        Err(_) => (format!("/{}", name.to_lowercase()), false, 0),
     };
-    Some(ChannelInfo { channel, cfc_path, json })
+    Some(ChannelInfo { channel, cfc_path, json, history })
 }
 
-/// Pull the value of a `socket="…"` component attribute out of CFC source.
-fn extract_socket_attr(src: &str) -> Option<String> {
+/// Pull the value of a `name="…"` component attribute out of CFC source. Used
+/// at handshake time to read channel metadata (`socket=`, `history=`) without
+/// spinning up a VM.
+fn extract_attr(src: &str, name: &str) -> Option<String> {
+    let needle = format!("{}=", name.to_lowercase());
     let lower = src.to_lowercase();
-    let pos = lower.find("socket=")?;
-    let rest = &src[pos + "socket=".len()..];
+    let pos = lower.find(&needle)?;
+    let rest = &src[pos + needle.len()..];
     let rest = rest.trim_start();
     let quote = rest.chars().next()?;
     if quote != '"' && quote != '\'' {
@@ -195,6 +206,8 @@ async fn driver(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SinkCmd>(OUTBOUND_QUEUE);
     let frame_sink: Arc<dyn FrameSink> = Arc::new(ChannelSink { tx });
     let conn_id = registry.register(&info.channel, frame_sink, session_id.clone(), params);
+    // Opt the channel into resumability history (no-op when history=0).
+    registry.set_history_cap(&info.channel, info.history);
 
     // Outbound pump: drain the queue, serialize, write to the socket.
     let pump = tokio::spawn(async move {
@@ -251,6 +264,21 @@ async fn driver(
         // Give the pump a moment to flush the close, then drop it.
         pump.abort();
         return;
+    }
+
+    // Resumability replay (P12): a reconnecting client sends `?lastEventId=…`;
+    // queue the channel frames it missed ahead of live traffic. Done after the
+    // onConnect accept + auto-join so the socket's rooms are re-established first.
+    if info.history > 0 {
+        if let Some(last) = registry.params_of(&conn_id).and_then(|p| {
+            p.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("lastEventId"))
+                .map(|(_, v)| v.as_string())
+        }) {
+            if !last.is_empty() {
+                registry.replay_since(&info.channel, &last, &conn_id);
+            }
+        }
     }
 
     // Inbound loop. Ping/Pong are answered by axum and never reach CFML (P10).
