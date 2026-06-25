@@ -476,6 +476,17 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("collectionEvery".into(), fn_list_each);   // VM intercepts
     f.insert("each".into(), fn_list_each);              // VM intercepts (alias for collectionEach)
 
+    // ---- WebSocket / realtime BIFs (VM-intercepted in cfml-vm/src/lib.rs) ----
+    // Registered so the names resolve to callable functions; the real behaviour
+    // reaches the connection registry on ServerState, so it is intercepted in
+    // the VM before these stub bodies ever run.
+    f.insert("io".into(), fn_ws_stub); // VM intercepts
+    f.insert("wsPublish".into(), fn_ws_stub); // VM intercepts
+    f.insert("wsSubscribe".into(), fn_ws_stub); // VM intercepts
+    f.insert("wsUnsubscribe".into(), fn_ws_stub); // VM intercepts
+    f.insert("wsPresence".into(), fn_ws_stub); // VM intercepts
+    f.insert("assertBroadcast".into(), fn_ws_stub); // VM intercepts (test harness)
+
     // ---- JSON functions ----
     f.insert("serializeJSON".into(), fn_serialize_json);
     f.insert("deserializeJSON".into(), fn_deserialize_json);
@@ -4624,10 +4635,24 @@ fn fn_list_filter(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 // ===============================================
+// WEBSOCKET / REALTIME (stubs — VM-intercepted)
+// ===============================================
+
+/// Placeholder body for the realtime BIFs (`io`, `wsPublish`, ...). These are
+/// always intercepted in the VM (which holds the connection registry on
+/// ServerState), so this only runs if the engine reached a realtime BIF with no
+/// VM context at all — an internal wiring error.
+fn fn_ws_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Err(CfmlError::runtime(
+        "WebSocket realtime functions require a running server (no VM context)".to_string(),
+    ))
+}
+
+// ===============================================
 // JSON FUNCTIONS
 // ===============================================
 
-fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
+pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     let mut visited: Vec<usize> = Vec::new();
     let body = serialize_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited);
     let flags = security_flags();
@@ -4742,7 +4767,7 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
     format!("{{{}}}", items.join(","))
 }
 
-fn fn_deserialize_json(args: Vec<CfmlValue>) -> CfmlResult {
+pub fn fn_deserialize_json(args: Vec<CfmlValue>) -> CfmlResult {
     let json = get_str(&args, 0);
     match serde_json::from_str::<serde_json::Value>(&json) {
         Ok(value) => Ok(serde_json_to_cfml(value)),

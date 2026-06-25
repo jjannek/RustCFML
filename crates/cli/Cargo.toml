@@ -33,7 +33,9 @@ log = { workspace = true }
 env_logger = "0.11"
 clap = { version = "4.0", features = ["derive"] }
 anyhow = { workspace = true }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
 regex = "1"
 multer = "3"
@@ -55,6 +57,10 @@ cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # build that opts out of cfml-vm defaults can still flip the JIT back on
 # explicitly from the CLI side. Runtime kill-switch: `RUSTCFML_JIT=0`.
 jit = ["cfml-vm/jit"]
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

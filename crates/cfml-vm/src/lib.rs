@@ -25,6 +25,7 @@ pub mod jit;
 mod s3_vfs;
 pub mod session_store;
 pub mod web;
+pub mod websocket;
 pub use application_store::{ApplicationStore, MemoryApplicationStore};
 pub use session_store::{MemoryStore, SessionStore};
 use java_shims::{
@@ -706,6 +707,12 @@ pub struct ServerState {
     /// `session.reapBatchMax` (oldest dropped beyond the cap).
     pub pending_session_ends:
         Arc<Mutex<HashMap<String, std::collections::VecDeque<ValueMap>>>>,
+    /// Realtime connection registry (WebSocket / socket.io). Lives here so it
+    /// crosses requests — emit-from-anywhere (`wsPublish`/`io()`) is the
+    /// defining ergonomic for a request/response engine. Behind the
+    /// node-qualified-id seam so a distributed `Broker` can slot in later
+    /// without touching the wire. See `crates/cfml-vm/src/websocket.rs`.
+    pub websocket: Arc<websocket::WebSocketRegistry>,
 }
 
 impl ServerState {
@@ -732,6 +739,9 @@ impl ServerState {
             app_cfconfig_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
+            websocket: Arc::new(websocket::WebSocketRegistry::new(
+                uuid::Uuid::new_v4().to_string(),
+            )),
         }
     }
 
@@ -884,6 +894,24 @@ pub struct CfmlVirtualMachine {
     /// top). Builtins normally drop arg names, so the CallNamed handler stashes
     /// them here when dispatching writeDump; the intercept reads + clears them.
     pending_dump_named: Option<Vec<(String, CfmlValue)>>,
+    /// Named args captured for the next realtime BIF (`wsPublish`/`io`).
+    /// Same mechanism as `pending_dump_named`: builtins drop arg names, so the
+    /// CallNamed handler stashes them here and the intercept reads + clears them
+    /// (so `wsPublish(channel="/chat", event="x", data=d, except=cid, to=room)`
+    /// works). A purely positional call leaves this `None`.
+    pending_ws_named: Option<Vec<(String, CfmlValue)>>,
+    /// The WebSocket channel currently being dispatched (set for the duration of
+    /// `dispatch_ws_event`). Lets `io()` with no argument resolve to "the
+    /// current channel" inside a handler. `None` on a normal HTTP/CLI request.
+    current_ws_channel: Option<String>,
+    /// Every `wsPublish(...)` call this VM made, recorded as a struct
+    /// `{channel, event, data, to, except}`. Powers connection-free testing
+    /// (design principle P14): `assertBroadcast(channel, event, predicate)`
+    /// scans this without needing a live socket, mirroring the
+    /// `writeOutput`/`cfthread` VM-intercept pattern. Always recorded (even when
+    /// a real registry is also delivering), so the same code is testable from
+    /// `tests/runner.cfm` under the CLI.
+    pub ws_test_log: Vec<CfmlValue>,
     /// Body override set by cfcontent (variable/file)
     pub response_body: Option<CfmlValue>,
     /// Redirect URL set by cflocation
@@ -1352,6 +1380,9 @@ impl CfmlVirtualMachine {
             web_context: false,
             dump_assets_emitted: false,
             pending_dump_named: None,
+            pending_ws_named: None,
+            current_ws_channel: None,
+            ws_test_log: Vec::new(),
             response_body: None,
             redirect_url: None,
             http_request_data: None,
@@ -4720,6 +4751,23 @@ impl CfmlVirtualMachine {
                                 if named.is_empty() { None } else { Some(named) };
                         }
 
+                        // wsPublish/io: same story — stash named pairs so the
+                        // realtime intercept can read channel/event/data/except/to
+                        // by name (the design's canonical call form).
+                        if matches!(&func_ref, CfmlValue::Function(f)
+                            if f.name.eq_ignore_ascii_case("wspublish")
+                                || f.name.eq_ignore_ascii_case("io"))
+                        {
+                            let named: Vec<(String, CfmlValue)> = expanded_names
+                                .iter()
+                                .zip(expanded_values.iter())
+                                .filter(|(n, _)| !n.is_empty())
+                                .map(|(n, v)| (n.clone(), v.clone()))
+                                .collect();
+                            self.pending_ws_named =
+                                if named.is_empty() { None } else { Some(named) };
+                        }
+
                         // Tag-call builtins (e.g. `cfdirectory(action=..., name=...)`)
                         // take a single struct-of-options at the bytecode level —
                         // bundle the named args into one struct here. `name`/
@@ -7635,6 +7683,136 @@ impl CfmlVirtualMachine {
                     self.output_buffer.push_str(&arg.as_string());
                 }
                 return Ok(CfmlValue::Null);
+            }
+
+            // ── Realtime / WebSocket BIFs (emit-from-anywhere, design P1) ──
+            // `io([channel])` → a scoped emitter NativeObject; `wsPublish(...)`
+            // → fan-out to a channel/room. Both reach the registry on
+            // ServerState so they work from any .cfm, cfthread, or scheduled
+            // task — not just inside a socket handler.
+            if name_lower == "io" {
+                let named = self.pending_ws_named.take();
+                let channel = self
+                    .ws_arg(&args, &named, "channel", 0)
+                    .map(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.current_ws_channel.clone());
+                let channel = match channel {
+                    Some(c) => c,
+                    None => {
+                        return Err(self.wrap_error(CfmlError::runtime(
+                            "io() needs a channel argument outside a socket handler"
+                                .to_string(),
+                        )))
+                    }
+                };
+                let registry = match self.server_state.as_ref() {
+                    Some(ss) => ss.websocket.clone(),
+                    None => {
+                        return Err(self.wrap_error(CfmlError::runtime(
+                            "io() is only available in serve mode".to_string(),
+                        )))
+                    }
+                };
+                let emitter = crate::websocket::ServerEmitter::new(channel, registry);
+                return Ok(CfmlValue::NativeObject(std::sync::Arc::new(
+                    std::sync::RwLock::new(emitter),
+                )));
+            }
+            if name_lower == "wspublish" {
+                let named = self.pending_ws_named.take();
+                let channel = self
+                    .ws_arg(&args, &named, "channel", 0)
+                    .map(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.current_ws_channel.clone())
+                    .unwrap_or_default();
+                let event = self.ws_arg(&args, &named, "event", 1).map(|v| v.as_string());
+                let data = self.ws_arg(&args, &named, "data", 2).unwrap_or(CfmlValue::Null);
+                let to = self
+                    .ws_arg(&args, &named, "to", 3)
+                    .map(|v| v.as_string())
+                    .filter(|s| !s.is_empty());
+                let except = self
+                    .ws_arg(&args, &named, "except", 4)
+                    .map(|v| v.as_string())
+                    .filter(|s| !s.is_empty());
+
+                // Always record for connection-free testing (P14).
+                let mut entry = ValueMap::default();
+                entry.insert("channel".to_string(), CfmlValue::string(channel.clone()));
+                entry.insert(
+                    "event".to_string(),
+                    event.clone().map(CfmlValue::string).unwrap_or(CfmlValue::Null),
+                );
+                entry.insert("data".to_string(), data.clone());
+                entry.insert(
+                    "to".to_string(),
+                    to.clone().map(CfmlValue::string).unwrap_or(CfmlValue::Null),
+                );
+                entry.insert(
+                    "except".to_string(),
+                    except.clone().map(CfmlValue::string).unwrap_or(CfmlValue::Null),
+                );
+                self.ws_test_log.push(CfmlValue::strukt(entry));
+
+                // Deliver if a live registry is present.
+                if let Some(ss) = self.server_state.as_ref() {
+                    let registry = ss.websocket.clone();
+                    let frame = registry.msg(&channel, event, data);
+                    match &to {
+                        Some(room) => {
+                            registry.to_room(&channel, room, frame, except.as_deref())
+                        }
+                        None => registry.broadcast(&channel, frame, except.as_deref()),
+                    }
+                }
+                return Ok(CfmlValue::Null);
+            }
+            // assertBroadcast(channel, event[, predicate]) — test helper. True
+            // iff a recorded wsPublish matched channel (+event when given), and
+            // — when `predicate` is a closure — the closure returns true for its
+            // data payload.
+            if name_lower == "assertbroadcast" {
+                let want_channel = args.first().map(|v| v.as_string()).unwrap_or_default();
+                let want_event = args.get(1).map(|v| v.as_string()).filter(|s| !s.is_empty());
+                let predicate = args.get(2).cloned();
+                let log = self.ws_test_log.clone();
+                for entry in &log {
+                    let s = match entry {
+                        CfmlValue::Struct(s) => s,
+                        _ => continue,
+                    };
+                    let ch = s.get("channel").map(|v| v.as_string()).unwrap_or_default();
+                    if !ch.eq_ignore_ascii_case(&want_channel) {
+                        continue;
+                    }
+                    if let Some(ref we) = want_event {
+                        let ev = s.get("event").map(|v| v.as_string()).unwrap_or_default();
+                        if !ev.eq_ignore_ascii_case(we) {
+                            continue;
+                        }
+                    }
+                    match &predicate {
+                        Some(p @ CfmlValue::Function(_)) => {
+                            let data = s.get("data").unwrap_or(CfmlValue::Null);
+                            let r = self.call_function(p, vec![data], &ValueMap::default())?;
+                            if r.is_true() {
+                                return Ok(CfmlValue::Bool(true));
+                            }
+                        }
+                        _ => return Ok(CfmlValue::Bool(true)),
+                    }
+                }
+                return Ok(CfmlValue::Bool(false));
+            }
+            // wsSubscribe/wsUnsubscribe/wsPresence — Phase 2 surface; accepted as
+            // no-ops in Phase 1 so feature-detecting code doesn't error.
+            if matches!(name_lower.as_str(), "wssubscribe" | "wsunsubscribe") {
+                return Ok(CfmlValue::Null);
+            }
+            if name_lower == "wspresence" {
+                return Ok(CfmlValue::array(Vec::new()));
             }
 
             // __writeText: same as writeOutput but suppressed when enableCFOutputOnly > 0
@@ -18947,6 +19125,120 @@ impl CfmlVirtualMachine {
         let result = self.call_function(&func, vec![target_page], &parent_locals);
 
         // Propagate variables/this mutations back into the template.
+        if let Some(vars_wb) = self.method_variables_writeback.take() {
+            if let Some(ts) = template.as_cfml_struct() {
+                let vs = ts.get_or_insert_struct("__variables");
+                vs.merge_from(&vars_wb);
+            }
+        }
+        if let Some(modified_this) = self.method_this_writeback.take() {
+            if let Some(ts) = template.as_cfml_struct() {
+                if let CfmlValue::Struct(ref modified_s) = modified_this {
+                    for (k, v) in modified_s.iter() {
+                        if k != "__variables" && k != "__extends" {
+                            ts.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        result.map(Some)
+    }
+
+    /// Dispatch a WebSocket channel lifecycle/event method.
+    ///
+    /// Instantiates the channel CFC at `cfc_path` (running its
+    /// pseudo-constructor, exactly like `new Chat()` / an HTTP request would),
+    /// then invokes `method` — `onConnect` / `onMessage` / `onDisconnect` /
+    /// `onError` — with `args` (the live `socket` NativeObject first). Returns
+    /// the handler's CFML return value so the driver can honour **ack-by-return**
+    /// and the `onConnect` **reject gate** (a `false` return rejects the
+    /// handshake). `Ok(None)` means the channel defines no such method — a
+    /// no-op, never an error (lifecycle methods are all optional, design
+    /// principle P3).
+    ///
+    /// A fresh instance per message is intentional: per-connection state lives
+    /// on `socket.data` (held by the registry across messages), not in the
+    /// CFC's `variables` scope — so re-running the body each message is correct
+    /// and matches the established fresh-VM-per-request model.
+    /// Resolve a realtime-BIF argument by name (when the call used named args,
+    /// stashed in `pending_ws_named`) or by positional index otherwise. A named
+    /// call never falls back to positional — the positional slots are
+    /// meaningless once arguments are passed by name.
+    fn ws_arg(
+        &self,
+        args: &[CfmlValue],
+        named: &Option<Vec<(String, CfmlValue)>>,
+        key: &str,
+        idx: usize,
+    ) -> Option<CfmlValue> {
+        if let Some(pairs) = named {
+            return pairs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.clone());
+        }
+        args.get(idx).cloned()
+    }
+
+    pub fn dispatch_ws_event(
+        &mut self,
+        channel: &str,
+        cfc_path: &str,
+        method: &str,
+        args: Vec<CfmlValue>,
+    ) -> Result<Option<CfmlValue>, CfmlError> {
+        // Make `io()` (no arg) resolve to this channel for the dispatch.
+        let prev_channel = self.current_ws_channel.replace(channel.to_string());
+        let result = self.dispatch_ws_event_inner(cfc_path, method, args);
+        self.current_ws_channel = prev_channel;
+        result
+    }
+
+    fn dispatch_ws_event_inner(
+        &mut self,
+        cfc_path: &str,
+        method: &str,
+        args: Vec<CfmlValue>,
+    ) -> Result<Option<CfmlValue>, CfmlError> {
+        let locals = ValueMap::default();
+        let template = match self.resolve_component_template(cfc_path, &locals) {
+            Some(t) => t,
+            None => return Err(self.component_load_error(cfc_path)),
+        };
+        let instance = self.resolve_inheritance(template, &locals);
+        // Honour `extends="rust:Name"` channels (same as `new`).
+        let mut template = self.attach_native_parent(instance)?;
+
+        let s = match &template {
+            CfmlValue::Struct(ref s) => s.clone(),
+            _ => return Ok(None),
+        };
+
+        let func_val = s
+            .iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case(method) && matches!(v, CfmlValue::Function(_)))
+            .map(|(_, v)| v.clone());
+        let func = match func_val {
+            Some(f @ CfmlValue::Function(_)) => f,
+            _ => return Ok(None),
+        };
+
+        // Bind `this` + __variables exactly as call_lifecycle_method does.
+        let mut parent_locals = ValueMap::default();
+        if let Some(vars) = s
+            .iter()
+            .find(|(k, _)| *k == "__variables")
+            .map(|(_, v)| v.clone())
+        {
+            parent_locals.insert("__variables".to_string(), vars);
+        }
+        parent_locals.insert("this".to_string(), template.clone());
+
+        let result = self.call_function(&func, args, &parent_locals);
+
+        // Propagate variables/this mutations back into the (transient) instance.
         if let Some(vars_wb) = self.method_variables_writeback.take() {
             if let Some(ts) = template.as_cfml_struct() {
                 let vs = ts.get_or_insert_struct("__variables");

@@ -100,6 +100,7 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 | **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
 | **[Java Shims](docs/java-shims.md)** | Emulated Java classes for `createObject("java", …)` — what's supported and known gaps |
 | **[Threading](docs/threads.md)** | `cfthread` on real OS threads — shared vs copied scopes, join/terminate, caveats |
+| **[WebSockets](docs/websockets.md)** | Realtime channel components, rooms, `socket`/`io()`/`wsPublish`, the JSON codec, ack-by-return |
 | **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
 | **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
 | **[Architecture](docs/architecture.md)** | Compilation pipeline and crate layout |
@@ -135,6 +136,7 @@ RustCFML is designed to deploy as a single artifact in several shapes — see **
 - **Batteries-included web server** — `Application.cfc` lifecycle, [sessions](docs/sessions.md) (in-process, Memcached, or clustered), cookies, authentication, URL rewriting, and file uploads.
 - **Data & integration** — `queryExecute` over SQLite, MySQL, PostgreSQL, and MSSQL with pooling and `cftransaction`; in-memory **Query-of-Queries** (`dbtype="query"`) on a pure-Rust SQL engine — see the perf table below; `cfhttp`; `cfmail`; and S3-compatible object storage (AWS S3, Cloudflare R2, MinIO).
 - **Real concurrency** — `cfthread` runs bodies on real OS threads with shared `application`/`request`/`session` scopes and `cflock`. See **[Threading](docs/threads.md)**.
+- **Native WebSockets** — realtime channels on the same port as HTTP: one CFC per channel with convention lifecycle methods, rooms, ack-by-return, and emit-from-anywhere (`wsPublish`/`io()`). See **[WebSockets](docs/websockets.md)**.
 - **Run anywhere** — native binaries, self-contained single-file apps, and a WebAssembly target that runs on Cloudflare Workers.
 - **Extensible** — drop in first-class built-ins and classes written in Rust ([native modules](docs/native-modules.md)).
 

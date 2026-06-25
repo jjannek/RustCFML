@@ -1,0 +1,221 @@
+//! Phase 1 raw-WebSocket integration tests.
+//!
+//! CFML can't act as a WS client, so these are the source of truth for the
+//! realtime engine (the design's verification strategy). Each test spawns the
+//! built `rustcfml` binary in serve mode against the `tests/fixtures/ws_app`
+//! channel CFCs and drives it with a real `tokio-tungstenite` client.
+//!
+//! Acceptance (per docs/websocket-implementation-plan.md, Phase 1):
+//!   * connect, send, receive an echo and a broadcast to a second client;
+//!   * `onConnect` rejection closes the handshake;
+//!   * disconnect auto-removes from rooms (no panic / clean teardown);
+//!   * a `.cfm` page calling `wsPublish` reaches a connected client.
+
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ws_app")
+}
+
+/// A spawned server that is killed on drop.
+struct Server {
+    child: Child,
+    port: u16,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+async fn start_server() -> Server {
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_rustcfml"))
+        .arg("--serve")
+        .arg(fixtures_dir())
+        .arg("--port")
+        .arg(port.to_string())
+        .spawn()
+        .expect("spawn rustcfml --serve");
+    // Wait for the port to accept connections.
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Server { child, port }
+}
+
+/// Receive the next text frame, parsed as JSON, within a timeout.
+async fn next_json<S>(stream: &mut S) -> serde_json::Value
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let fut = async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(t))) => {
+                    return serde_json::from_str::<serde_json::Value>(&t).unwrap();
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .expect("timed out waiting for a frame")
+}
+
+#[tokio::test]
+async fn connect_echo_broadcast_and_publish() {
+    let server = start_server().await;
+    let base = format!("ws://127.0.0.1:{}/ws/echo", server.port);
+
+    // Client A connects → onConnect emits a "welcome".
+    let (mut a, _) = connect_async(&base).await.expect("client A connects");
+    let welcome = next_json(&mut a).await;
+    assert_eq!(welcome["ev"], "welcome", "first frame is the welcome event");
+    assert!(welcome["d"]["id"].is_string(), "welcome carries the socket id");
+
+    // Client B connects too.
+    let (mut b, _) = connect_async(&base).await.expect("client B connects");
+    let _b_welcome = next_json(&mut b).await;
+
+    // A sends a JSON message → A gets an "echo" + an "ack"; B gets "said".
+    a.send(Message::Text(r#"{"text":"hello"}"#.into())).await.unwrap();
+
+    // A's two frames (echo + ack), order not guaranteed across the two sends.
+    let f1 = next_json(&mut a).await;
+    let f2 = next_json(&mut a).await;
+    let events: Vec<&str> = [&f1, &f2].iter().map(|f| f["ev"].as_str().unwrap()).collect();
+    assert!(events.contains(&"echo"), "sender receives an echo: {events:?}");
+    assert!(events.contains(&"ack"), "non-null return delivered as ack: {events:?}");
+    let echo = if f1["ev"] == "echo" { &f1 } else { &f2 };
+    assert_eq!(echo["d"]["text"], "hello", "echo carries the parsed payload");
+
+    // B receives the broadcast (and NOT its own).
+    let said = next_json(&mut b).await;
+    assert_eq!(said["ev"], "said");
+    assert_eq!(said["d"]["text"], "hello");
+
+    // Emit-from-anywhere: an HTTP page hitting wsPublish reaches client A.
+    let http = format!("http://127.0.0.1:{}/publish.cfm?msg=ping", server.port);
+    let body = reqwest_get(&http).await;
+    assert_eq!(body.trim(), "published");
+    let announce = next_json(&mut a).await;
+    assert_eq!(announce["ev"], "announcement");
+    assert_eq!(announce["d"]["text"], "ping");
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn handshake_param_and_onerror() {
+    let server = start_server().await;
+
+    // Handshake query param is exposed via socket.param().
+    let url = format!("ws://127.0.0.1:{}/ws/echo?user=alice", server.port);
+    let (mut a, _) = connect_async(&url).await.expect("connect with query param");
+    let welcome = next_json(&mut a).await;
+    assert_eq!(welcome["ev"], "welcome");
+    assert_eq!(welcome["d"]["user"], "alice", "socket.param('user') round-trips");
+
+    // A handler throw fires onError, which emits an "errored" event.
+    a.send(Message::Text(r#"{"boom":true}"#.into())).await.unwrap();
+    let errored = next_json(&mut a).await;
+    assert_eq!(errored["ev"], "errored", "onError fired and emitted");
+    assert!(
+        errored["d"]["message"].as_str().unwrap().contains("boom"),
+        "onError received the thrown message: {errored:?}"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn binary_frames_round_trip() {
+    let server = start_server().await;
+    let url = format!("ws://127.0.0.1:{}/ws/raw", server.port);
+    let (mut ws, _) = connect_async(&url).await.expect("connect raw channel");
+
+    let payload = vec![0u8, 1, 2, 250, 255];
+    ws.send(Message::Binary(payload.clone().into())).await.unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(b))) => return b.to_vec(),
+                Some(Ok(_)) => continue,
+                other => panic!("expected a binary frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for binary echo");
+    assert_eq!(got, payload, "binary payload echoes back as binary");
+    drop(server);
+}
+
+#[tokio::test]
+async fn onconnect_rejection_closes_handshake() {
+    let server = start_server().await;
+    let url = format!("ws://127.0.0.1:{}/ws/guarded", server.port);
+    // The upgrade itself succeeds (HTTP 101), but onConnect returns false so
+    // the server immediately closes. The client sees the stream end with a
+    // close, not a welcome.
+    let (mut ws, _) = connect_async(&url).await.expect("upgrade ok");
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => return true,
+                Some(Ok(_)) => return false, // any data frame = not rejected
+                Some(Err(_)) => return true,
+            }
+        }
+    })
+    .await
+    .expect("timed out");
+    assert!(closed, "rejected connection should be closed, not fed data");
+    drop(server);
+}
+
+#[tokio::test]
+async fn unknown_channel_is_404() {
+    let server = start_server().await;
+    let url = format!("ws://127.0.0.1:{}/ws/nope", server.port);
+    let res = connect_async(&url).await;
+    assert!(res.is_err(), "unknown channel should fail the upgrade (404)");
+    drop(server);
+}
+
+/// Minimal HTTP GET without pulling in a full client crate — just enough to
+/// fetch a tiny CFML page body.
+async fn reqwest_get(url: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let url = url.strip_prefix("http://").unwrap();
+    let (host_port, path) = url.split_once('/').unwrap();
+    let mut stream = tokio::net::TcpStream::connect(host_port).await.unwrap();
+    let req = format!(
+        "GET /{path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    // Body is after the blank line.
+    text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+}

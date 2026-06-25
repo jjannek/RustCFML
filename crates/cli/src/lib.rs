@@ -1,5 +1,6 @@
 mod rewrite;
 mod session;
+mod websocket;
 
 use clap::Parser;
 use std::collections::HashMap;
@@ -1400,6 +1401,9 @@ async fn async_run_server(
     });
 
     let app = axum::Router::new()
+        // Raw-WebSocket upgrade for channel CFCs under <docroot>/websockets/.
+        // Everything else falls through to the normal request handler.
+        .route("/ws/{channel}", axum::routing::get(websocket::ws_handler))
         .fallback(handle_request)
         .with_state(app_state);
 
