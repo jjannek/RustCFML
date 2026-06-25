@@ -1,5 +1,6 @@
 mod rewrite;
 mod session;
+mod socketio;
 mod websocket;
 
 use clap::Parser;
@@ -1411,11 +1412,18 @@ async fn async_run_server(
         cfconfig,
     });
 
+    // socket.io transport (Phase 3): a tower layer that owns `/socket.io/` and
+    // passes everything else through to the router below. Channel CFCs are
+    // reached as socket.io namespaces (`/chat`) — the same CFCs the raw `/ws/`
+    // route serves, sharing one registry.
+    let socketio_layer = socketio::build_layer(app_state.clone());
+
     let app = axum::Router::new()
         // Raw-WebSocket upgrade for channel CFCs under <docroot>/websockets/.
         // Everything else falls through to the normal request handler.
         .route("/ws/{channel}", axum::routing::get(websocket::ws_handler))
         .fallback(handle_request)
+        .layer(socketio_layer)
         .with_state(app_state);
 
     match socket {

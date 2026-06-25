@@ -6,12 +6,15 @@ container, no embedded Jetty, no Node sidecar. You write a **channel component**
 (one CFC = one channel) with convention-named lifecycle methods, and the engine
 bridges each inbound frame to a fresh VM exactly as it does an HTTP request.
 
-> **Status:** Phase 1 (raw WebSocket). Rooms, `join`/`leave`, the fluent `io()`
-> emitter, ack-by-return, binary + JSON codecs, and emit-from-anywhere are all
-> live. The socket.io transport, presence, multi-node fan-out, and the
-> socket.io-lucee compatibility layer are on the roadmap — see
-> [Roadmap](#roadmap). Design rationale lives in
-> [`websocket-design.md`](websocket-design.md).
+> **Status:** Phase 1 + 2 + the **socket.io transport** are live. Rooms,
+> `join`/`leave`, the fluent `io()` emitter, ack-by-return, binary + JSON
+> codecs, emit-from-anywhere, `on="event"` routing, presence, authorization,
+> `lastEventId` resumability, and **multi-node fan-out** all work — over **two
+> wires**: the [raw WebSocket](#quick-start) endpoint (`/ws/<channel>`) and a
+> [socket.io endpoint](#socketio-transport) (`/socket.io/`, namespace per
+> channel) for the stock socket.io client. The remaining roadmap item is the
+> **socket.io-lucee compatibility layer** — see [Roadmap](#roadmap). Design
+> rationale lives in [`websocket-design.md`](websocket-design.md).
 
 ## Quick start
 
@@ -374,10 +377,60 @@ Replay is channel-wide, not room-precise — the socket re-establishes its rooms
 `onConnect` auto-join anyway. Cluster-correct, durable resumability arrives with
 the distributed broker (later in Phase 2) with no API change.
 
+## socket.io transport
+
+Every channel CFC is **also** reachable over [socket.io](https://socket.io)
+(Engine.IO v4: namespaces, acks, binary, and automatic polling↔websocket
+fallback) at the `/socket.io/` endpoint — served from the same process and port,
+sharing the **same registry** as the raw endpoint. You write the channel CFC
+once; it answers both wires. Use this when you want the battle-tested socket.io
+JS client (reconnection, backoff, presence, transports) for free.
+
+The mapping is convention-only:
+
+- A channel is a socket.io **namespace**: `websockets/chat.cfc` → namespace
+  `/chat`. The client connects with `io("/chat")`.
+- A client **`emit("event", data)`** dispatches the channel's `on="event"`
+  handler (falling back to `onMessage` for the conventional `"message"` event),
+  exactly like the raw transport's event routing.
+- The handler's **return value is the native socket.io ack** (the client's
+  `emit(..., (ack) => …)` callback / `emitWithAck` promise) — ack-by-return, with
+  no separate frame.
+- Server pushes (`socket.emit`, `socket.broadcast`, `io().to(room).emit`,
+  `wsPublish`, presence) arrive as socket.io **events** named by the frame's
+  event (a raw `socket.send()` → the `"message"` event).
+- `onConnect`/`onDisconnect`/`onError` and the `onConnect` reject gate behave
+  identically. Auth (`secured=` / `canJoin`), rooms, presence, and `lastEventId`
+  replay (via the socket.io `query` option) all work unchanged.
+
+```js
+import { io } from "socket.io-client";
+
+const sock = io(`${location.origin}/chat`, { query: { user: "alice" } });
+
+sock.on("welcome", (d) => console.log("connected as", d.id));
+sock.on("message", (d) => console.log(d.from, d.text));
+
+// emit with a native ack (the handler's return value)
+const ack = await sock.emitWithAck("say", { text: "hello" });
+console.log(ack.delivered);
+```
+
+> Identity at the handshake: the `CFID` cookie (if same-origin) attaches the
+> session, and socket.io `query` params are readable via `socket.param(name)` —
+> the same as the raw transport. Because the connect handler runs as soon as the
+> socket connects, a client should wait for the `connect` event before its first
+> `emit` (the socket.io client does this by default).
+
+Multi-channel / multi-segment namespaces and the imperative socket.io-lucee CFML
+surface (`new SocketIoServer()` / `io.on("connect", …)`) are **not** part of this
+transport — that compatibility layer is the remaining [roadmap](#roadmap) item.
+
 ## Wire format
 
 Raw-WS frames are JSON with a stable shape (designed once so ids never change
-when clustering is enabled later):
+when clustering is enabled later). The socket.io transport maps the same `ev`/`d`
+onto socket.io event packets, so the field names below are the raw-WS encoding:
 
 ```jsonc
 {
@@ -445,7 +498,9 @@ assertBroadcast( "/chat", "nope" );                                     // false
 ```
 
 (Live-socket behaviour — echo, broadcast, rooms, reject, binary — is covered by
-the Rust integration suite in `crates/cli/tests/websocket_raw.rs`.)
+the Rust integration suites in `crates/cli/tests/websocket_raw.rs` (raw WS) and
+`crates/cli/tests/websocket_socketio.rs` (the socket.io transport: connect, emit,
+native ack, server-pushed events, broadcast, reject).)
 
 ## Roadmap
 
@@ -454,9 +509,12 @@ Phase 1 (this page) covers the raw-WebSocket core. **Phase 2 is complete:**
 **authorization** (`secured=` / `canJoin`, above), **`lastEventId` resumability**
 (`history=`, above), and **multi-node fan-out** over the shared-session cluster
 ([Clustering / multi-node](#clustering--multi-node), above) have all landed.
-Planned:
 
-- **Phase 3** — a **socket.io** transport (Engine.IO handshake, namespaces, acks, polling fallback) plus a **socket.io-lucee compatibility layer** so existing socket.io CFML apps run with minimal change.
+**Phase 3 is in progress.** The **socket.io transport** (Engine.IO v4 handshake,
+namespaces, acks, polling↔ws fallback) is live — see
+[socket.io transport](#socketio-transport), above. Planned:
+
+- **Phase 3 (remaining)** — a **socket.io-lucee compatibility layer** (the imperative `new SocketIoServer()` / `io.on("connect", …)` / `socket.on/emit/joinRoom` surface) so existing socket.io CFML apps (e.g. `preside-ext-socket-io`) run with minimal change, over the same transport and registry.
 - **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
 
 See [`websocket-implementation-plan.md`](websocket-implementation-plan.md) for

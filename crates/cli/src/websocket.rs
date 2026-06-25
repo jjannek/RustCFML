@@ -56,23 +56,30 @@ impl FrameSink for ChannelSink {
 }
 
 /// Per-channel resolution: the CFC file backing `/ws/<name>` and whether it
-/// declared `encoding="json"`.
-struct ChannelInfo {
+/// declared `encoding="json"`. Shared with the socket.io transport
+/// (`crate::socketio`), hence `pub(crate)`.
+#[derive(Clone)]
+pub(crate) struct ChannelInfo {
     /// Wire/registry channel id, e.g. `/chat`.
-    channel: String,
+    pub(crate) channel: String,
     /// Absolute path to the channel CFC.
-    cfc_path: String,
+    pub(crate) cfc_path: String,
     /// `encoding="json"` → inbound text is parsed to a struct before dispatch.
-    json: bool,
+    pub(crate) json: bool,
     /// `history="N"` → retain the last N channel-wide frames for `lastEventId`
     /// resumability. 0 = disabled (no retention, no replay).
-    history: usize,
+    pub(crate) history: usize,
+    /// Named events declared via the `function … on="event"` annotation. The
+    /// socket.io transport registers a `socket.on(<event>)` handler for each
+    /// (it has no catch-all); the raw-WS transport ignores this (it routes any
+    /// inbound `ev` dynamically). Always includes the conventional `"message"`.
+    pub(crate) events: Vec<String>,
 }
 
 /// Resolve `/ws/<name>` to a channel CFC under `<docroot>/websockets/`.
 /// Convention discovery (Lucee style); the explicit `component socket="…"`
 /// attribute is honoured for the wire channel id when present.
-fn resolve_channel(state: &AppState, name: &str) -> Option<ChannelInfo> {
+pub(crate) fn resolve_channel(state: &AppState, name: &str) -> Option<ChannelInfo> {
     // Strip any leading slash a client may send; channel id is normalised to
     // a single leading slash.
     let name = name.trim_start_matches('/');
@@ -90,7 +97,7 @@ fn resolve_channel(state: &AppState, name: &str) -> Option<ChannelInfo> {
     // Cheap source scan for the channel attributes (avoids spinning a VM just
     // to read metadata at handshake). `socket="/foo"` overrides the wire id;
     // `encoding="json"` flips inbound parsing.
-    let (channel, json, history) = match state.vfs.read(&cfc_path) {
+    let (channel, json, history, events) = match state.vfs.read(&cfc_path) {
         Ok(bytes) => {
             let src = String::from_utf8_lossy(&bytes);
             let lower = src.to_lowercase();
@@ -102,11 +109,34 @@ fn resolve_channel(state: &AppState, name: &str) -> Option<ChannelInfo> {
             let history = extract_attr(&src, "history")
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(0);
-            (channel, json, history)
+            (channel, json, history, extract_event_names(&src))
         }
-        Err(_) => (format!("/{}", name.to_lowercase()), false, 0),
+        Err(_) => (format!("/{}", name.to_lowercase()), false, 0, Vec::new()),
     };
-    Some(ChannelInfo { channel, cfc_path, json, history })
+    Some(ChannelInfo { channel, cfc_path, json, history, events })
+}
+
+/// Scan CFC source for the named events declared via the
+/// `function … on="event"` handler annotation. The socket.io transport needs
+/// the concrete set up front because socketioxide 0.16 has no catch-all event
+/// handler — it registers one `socket.on(<event>)` per name. Always returns the
+/// conventional `"message"` (mapped to `onMessage` with no event) so a stock
+/// `socket.emit("message", …)` works. Lowercased + de-duplicated.
+pub(crate) fn extract_event_names(src: &str) -> Vec<String> {
+    let mut events = vec!["message".to_string()];
+    // `\bon\s*=\s*["']…["']` — the `\b` keeps `encoding=`/`position=` etc. from
+    // matching (the `on` inside them is not on a word boundary).
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\bon\s*=\s*["']([^"']+)["']"#).expect("valid event-name regex")
+    });
+    for cap in re.captures_iter(src) {
+        let ev = cap[1].trim().to_lowercase();
+        if !ev.is_empty() && !events.contains(&ev) {
+            events.push(ev);
+        }
+    }
+    events
 }
 
 /// Pull the value of a `name="…"` component attribute out of CFC source. Used
@@ -133,7 +163,7 @@ fn extract_attr(src: &str, name: &str) -> Option<String> {
 
 /// Read the CFID session id out of the request cookies (handshake-time
 /// identity, design principle P6).
-fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get("cookie")?.to_str().ok()?;
     cookie.split(';').find_map(|c| {
         let c = c.trim();
@@ -162,7 +192,7 @@ pub async fn ws_handler(
 /// Parse a raw query string (`a=1&b=hi%20there`) into a CFML struct for
 /// `socket.param(name)`. Minimal percent / `+` decoding — handshake params are
 /// simple key/value pairs.
-fn parse_query(query: Option<&str>) -> cfml_common::dynamic::ValueMap {
+pub(crate) fn parse_query(query: Option<&str>) -> cfml_common::dynamic::ValueMap {
     let mut map = cfml_common::dynamic::ValueMap::default();
     let Some(q) = query else { return map };
     for pair in q.split('&').filter(|s| !s.is_empty()) {
@@ -406,7 +436,7 @@ fn deliver_ack(
 
 /// Reject iff the value is a boolean-false (or false-ish scalar). `Null`,
 /// arrays and structs are NOT rejections — only an explicit `return false`.
-fn is_reject(v: &CfmlValue) -> bool {
+pub(crate) fn is_reject(v: &CfmlValue) -> bool {
     match v {
         CfmlValue::Bool(b) => !b,
         CfmlValue::Int(i) => *i == 0,
@@ -441,7 +471,7 @@ fn route_inbound(parsed: CfmlValue) -> (Option<String>, CfmlValue, Option<String
 
 /// Run one channel dispatch on a blocking worker (the VM is synchronous).
 #[allow(clippy::too_many_arguments)]
-async fn dispatch(
+pub(crate) async fn dispatch(
     state: &Arc<AppState>,
     info: &ChannelInfo,
     conn_id: &str,

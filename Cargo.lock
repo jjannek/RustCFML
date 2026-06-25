@@ -912,7 +912,7 @@ dependencies = [
  "sha1 0.10.6",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.28.0",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1274,7 +1274,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cfml-codegen"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-common"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "indexmap",
  "js-sys",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-compiler"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "cfml-common",
  "log",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-config"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "indexmap",
  "log",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-qoq"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "cfml-common",
  "indexmap",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-stdlib"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "aes",
  "argon2",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-vm"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "anyhow",
  "cfml-codegen",
@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-worker"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "cfml-codegen",
  "cfml-common",
@@ -2253,6 +2253,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "engineioxide"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a36d7cb810f4501c85c13211064288cdc870742a072005de2851096d4956acb6"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "engineioxide-core",
+ "futures-core",
+ "futures-util",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "engineioxide-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a6512b1bc8dfb74d61b55878d712082be39a960abee8590f310723587de343e"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "rand 0.9.2",
+ "serde",
 ]
 
 [[package]]
@@ -5217,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "rustcfml-cli"
-version = "0.304.0"
+version = "0.305.0"
 dependencies = [
  "anyhow",
  "automerge",
@@ -5244,8 +5283,9 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
+ "socketioxide",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.28.0",
  "uuid",
 ]
 
@@ -5785,6 +5825,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "socketioxide"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22bbd5602e94b08333c98a2f31ab7df6dced9f38562ff03aa671db1936e2f112"
+dependencies = [
+ "bytes",
+ "engineioxide",
+ "futures-core",
+ "futures-util",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "hyper 1.8.1",
+ "matchit 0.8.4",
+ "pin-project-lite",
+ "rustversion",
+ "serde",
+ "socketioxide-core",
+ "socketioxide-parser-common",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "socketioxide-core"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93414eb4c54a5fd9dddc1fb80b56a00a3b0cbec60f5d7e3c479ccea73ac258b0"
+dependencies = [
+ "arbitrary",
+ "bytes",
+ "engineioxide-core",
+ "futures-core",
+ "serde",
+ "smallvec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "socketioxide-parser-common"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9847d1b4ee0e5d419c78a9a3f29b204aeb0970303595fc24be045f244f076938"
+dependencies = [
+ "bytes",
+ "itoa",
+ "serde",
+ "serde_json",
+ "socketioxide-core",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6250,6 +6343,18 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite 0.26.2",
+]
+
+[[package]]
+name = "tokio-tungstenite"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
@@ -6257,7 +6362,7 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite",
+ "tungstenite 0.28.0",
 ]
 
 [[package]]
@@ -6379,6 +6484,23 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.4.0",
+ "httparse",
+ "log",
+ "rand 0.9.2",
+ "sha1 0.10.6",
+ "thiserror 2.0.18",
+ "utf-8",
+]
 
 [[package]]
 name = "tungstenite"
