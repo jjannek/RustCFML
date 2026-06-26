@@ -502,6 +502,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_getmetadata_inherited_displayname.cfm">
 <cf_runtest file="tags/test_tags_script_syntax_body.cfm">
 <cf_runtest file="functions/test_expandpath_trailing_slash.cfm">
+<cf_runtest file="functions/test_expandpath_leading_slash_caller_independent.cfm">
 <cf_runtest file="core/test_forin_member_loop_var.cfm">
 <cf_runtest file="core/test_forin_keyword_member_access.cfm">
 <!--- - forin_string_list: for-in over a comma-delimited STRING must iterate --->

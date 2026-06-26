@@ -10004,7 +10004,11 @@ impl CfmlVirtualMachine {
                         .unwrap_or_else(|| std::path::Path::new("."));
 
                     let resolved = if rel.starts_with('/') {
-                        // Try mappings first
+                        // Leading slash means "webroot-relative" in CFML — it is
+                        // caller-independent and must NOT resolve against the
+                        // calling template/CFC's own directory. Try mappings
+                        // first, then the serve-mode webroot, then (CLI mode)
+                        // the entry template's parent directory.
                         let mut found = None;
                         for mapping in &self.mappings {
                             let prefix = mapping.name.trim_end_matches('/');
@@ -10017,9 +10021,35 @@ impl CfmlVirtualMachine {
                                 break;
                             }
                         }
-                        found.unwrap_or_else(|| base_dir.join(rel.trim_start_matches('/')))
+                        found.unwrap_or_else(|| {
+                            let stripped = rel.trim_start_matches('/');
+                            if let Some(webroot) =
+                                self.server_state.as_ref().and_then(|s| s.webroot.as_ref())
+                            {
+                                webroot.join(stripped)
+                            } else if let Some(ref base) = self.base_template_path {
+                                std::path::Path::new(base)
+                                    .parent()
+                                    .unwrap_or_else(|| std::path::Path::new("."))
+                                    .join(stripped)
+                            } else {
+                                base_dir.join(stripped)
+                            }
+                        })
                     } else {
                         base_dir.join(&rel)
+                    };
+
+                    // Make the path absolute. Lucee/ACF/BoxLang always return an
+                    // absolute path from expandPath, even when the target does
+                    // not exist (canonicalize below only kicks in for existing
+                    // paths). Anchor a still-relative result to the CWD.
+                    let resolved = if resolved.is_absolute() {
+                        resolved
+                    } else if let Ok(cwd) = std::env::current_dir() {
+                        cwd.join(&resolved)
+                    } else {
+                        resolved
                     };
 
                     // Canonicalize if it exists, otherwise return the joined path

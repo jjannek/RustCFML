@@ -1000,48 +1000,14 @@ impl CfmlCompiler {
             Expression::ArrayAccess(access) => {
                 // For nested access like loading "s.a[0]", we load s.a then get index 0.
                 // The index must use the FULL expression compiler — a complex index
-                // (interpolation `"total#t#"`, concat, a call) would otherwise hit
-                // compile_expression_static's Null fallback and read the wrong cell.
+                // (interpolation `"total#t#"`, concat, a call) would otherwise fall
+                // back to a Null and read the wrong cell.
                 self.emit_load_for_writeback(&access.array, instructions);
                 self.compile_expression(&access.index, instructions);
                 instructions.push(BytecodeOp::GetIndex);
             }
             _ => {
                 // Can't load this expression for writeback
-                instructions.push(BytecodeOp::Null);
-            }
-        }
-    }
-
-    /// Static helper to compile an expression into instructions (for use in static methods)
-    fn compile_expression_static(expr: &Expression, instructions: &mut Vec<BytecodeOp>) {
-        match expr {
-            Expression::Literal(lit) => {
-                match &lit.value {
-                    LiteralValue::String(s) => instructions.push(BytecodeOp::String(s.clone())),
-                    LiteralValue::Int(i) => instructions.push(BytecodeOp::Integer(*i)),
-                    LiteralValue::Double(d) => instructions.push(BytecodeOp::Double(*d)),
-                    LiteralValue::Bool(b) => instructions.push(if *b { BytecodeOp::True } else { BytecodeOp::False }),
-                    LiteralValue::Null => instructions.push(BytecodeOp::Null),
-                }
-            }
-            Expression::Identifier(ident) => {
-                instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
-            }
-            Expression::This(_) => {
-                instructions.push(BytecodeOp::LoadLocal("this".to_string()));
-            }
-            Expression::MemberAccess(access) => {
-                Self::compile_expression_static(&access.object, instructions);
-                instructions.push(BytecodeOp::GetProperty(access.member.clone()));
-            }
-            Expression::ArrayAccess(access) => {
-                Self::compile_expression_static(&access.array, instructions);
-                Self::compile_expression_static(&access.index, instructions);
-                instructions.push(BytecodeOp::GetIndex);
-            }
-            _ => {
-                // For complex expressions, emit Null as fallback
                 instructions.push(BytecodeOp::Null);
             }
         }

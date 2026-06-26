@@ -4367,21 +4367,15 @@ impl Parser {
 
     /// If the current token begins a (possibly dotted) return-type annotation
     /// that is immediately followed by `function`, advance past the whole
-    /// annotation so `function` becomes the current token. Returns whether it
-    /// skipped one. A single-token check (`type function`) misses dotted
+    /// annotation and return the captured (possibly dotted) return-type string,
+    /// so the declared return type in `access returnType function name(...)` is
+    /// not dropped (it must surface as `meta.returnType` in getMetadata()).
+    /// Returns `None` (consuming nothing) when no return type precedes
+    /// `function`. A single-token check (`type function`) misses dotted
     /// component-path return types like
     /// `testbox.system.mockutils.MockGenerator function getMockGenerator()`
     /// (MockBox / any CFC returning a typed object) — silently dropping the
     /// whole method declaration. (GitHub #177)
-    fn skip_dotted_return_type_before_function(&mut self) -> bool {
-        self.capture_dotted_return_type_before_function().is_some()
-    }
-
-    /// Like [`skip_dotted_return_type_before_function`], but returns the captured
-    /// (possibly dotted) return-type string when one precedes `function`, so the
-    /// declared return type in `access returnType function name(...)` is not
-    /// dropped (it must surface as `meta.returnType` in getMetadata()). Returns
-    /// `None` (consuming nothing) when no return type precedes `function`.
     fn capture_dotted_return_type_before_function(&mut self) -> Option<String> {
         if !self.is_return_type_token(0) {
             return None;

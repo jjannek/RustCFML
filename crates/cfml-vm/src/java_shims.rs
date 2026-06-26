@@ -2684,7 +2684,7 @@ pub fn handle_java_dateformat(
         })
         .unwrap_or(default)
     };
-    let mut make_formatter = |kind: &str, ds: i64, ts: i64, loc: String| {
+    let make_formatter = |kind: &str, ds: i64, ts: i64, loc: String| {
         let mut shim = jshim("java.text.dateformat");
         shim.insert("__df_kind".to_string(), CfmlValue::string(kind.to_string()));
         shim.insert("__df_date_style".to_string(), CfmlValue::Int(ds));

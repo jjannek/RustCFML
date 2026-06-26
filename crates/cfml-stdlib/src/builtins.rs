@@ -6165,15 +6165,12 @@ fn fn_get_file_info(args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::strukt(info))
 }
 
-fn fn_expand_path(args: Vec<CfmlValue>) -> CfmlResult {
-    let path = get_str(&args, 0);
-    match std::fs::canonicalize(&path) {
-        Ok(abs) => Ok(CfmlValue::string(abs.to_string_lossy().to_string())),
-        Err(_) => {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            Ok(CfmlValue::string(cwd.join(&path).to_string_lossy().to_string()))
-        }
-    }
+fn fn_expand_path(_args: Vec<CfmlValue>) -> CfmlResult {
+    // Stub — the VM intercepts expandPath to resolve the path against the
+    // serve-mode webroot / CLI entry-template dir / this.mappings (it needs
+    // VM state the plain builtin can't see). Registered only so the name
+    // resolves as a known function; this body never runs.
+    Ok(CfmlValue::string(String::new()))
 }
 
 fn fn_get_directory_from_path(args: Vec<CfmlValue>) -> CfmlResult {
@@ -6459,10 +6456,6 @@ fn fn_canonicalize(args: Vec<CfmlValue>) -> CfmlResult {
         }
     }
     Ok(CfmlValue::string(s))
-}
-
-fn url_decode_string(s: &str) -> String {
-    url_decode_string_opt(s, true)
 }
 
 fn url_decode_string_opt(s: &str, plus_as_space: bool) -> String {
