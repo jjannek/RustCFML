@@ -625,6 +625,7 @@ include "harness.cfm";
 <!--- Lucee/ACF/BoxLang now accepted by RustCFML. --->
 <cf_runtest file="core/test_reserved_word_identifiers.cfm">
 <cf_runtest file="core/test_quoted_catch_type.cfm">
+<cf_runtest file="core/test_catch_reserved_dotted_type.cfm">
 <!--- Multi-catch must select exactly ONE clause by declared type (was: every --->
 <!--- clause body ran unconditionally, type ignored); unmatched types propagate. --->
 <cf_runtest file="core/test_multi_catch_type_dispatch.cfm">

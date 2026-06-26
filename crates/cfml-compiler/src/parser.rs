@@ -2172,13 +2172,13 @@ impl Parser {
                 self.advance();
                 s
             } else {
-                let mut id = self.extract_identifier()?;
-                while self.check(&Token::Dot) && self.is_identifier_like_at(1) {
-                    self.advance(); // consume dot
-                    let part = self.extract_identifier()?;
-                    id = format!("{}.{}", id, part);
-                }
-                id
+                // A dotted exception type may contain reserved words as segments
+                // (`cfflow.workflow.does.not.exist`) — Lucee/ACF/BoxLang allow it.
+                // extract_dotted_identifier extracts each `.segment` via
+                // extract_property_name, which accepts the full reserved-word set
+                // (not/eq/is/…). Within a catch head a `.` always continues the
+                // type (the variable name is whitespace-separated, never dotted).
+                self.extract_dotted_identifier()?
             };
 
             let (var_type, var_name) = if self.check(&Token::RParen) {
