@@ -74,6 +74,12 @@ pub(crate) struct ChannelInfo {
     /// (it has no catch-all); the raw-WS transport ignores this (it routes any
     /// inbound `ev` dynamically). Always includes the conventional `"message"`.
     pub(crate) events: Vec<String>,
+    /// Whisper / client-event names declared via the `clientEvents="a,b"`
+    /// component attribute (Phase 4). The socket.io transport registers a
+    /// relay-only `socket.on(client-<name>)` for each (it has no catch-all); the
+    /// raw-WS transport ignores this (it relays any inbound `client-*` event
+    /// dynamically). Each name is normalised to its full `client-…` wire form.
+    pub(crate) client_events: Vec<String>,
 }
 
 /// Resolve `/ws/<name>` to a channel CFC under `<docroot>/websockets/`.
@@ -97,7 +103,7 @@ pub(crate) fn resolve_channel(state: &AppState, name: &str) -> Option<ChannelInf
     // Cheap source scan for the channel attributes (avoids spinning a VM just
     // to read metadata at handshake). `socket="/foo"` overrides the wire id;
     // `encoding="json"` flips inbound parsing.
-    let (channel, json, history, events) = match state.vfs.read(&cfc_path) {
+    let (channel, json, history, events, client_events) = match state.vfs.read(&cfc_path) {
         Ok(bytes) => {
             let src = String::from_utf8_lossy(&bytes);
             let lower = src.to_lowercase();
@@ -109,11 +115,11 @@ pub(crate) fn resolve_channel(state: &AppState, name: &str) -> Option<ChannelInf
             let history = extract_attr(&src, "history")
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(0);
-            (channel, json, history, extract_event_names(&src))
+            (channel, json, history, extract_event_names(&src), extract_client_events(&src))
         }
-        Err(_) => (format!("/{}", name.to_lowercase()), false, 0, Vec::new()),
+        Err(_) => (format!("/{}", name.to_lowercase()), false, 0, Vec::new(), Vec::new()),
     };
-    Some(ChannelInfo { channel, cfc_path, json, history, events })
+    Some(ChannelInfo { channel, cfc_path, json, history, events, client_events })
 }
 
 /// Scan CFC source for the named events declared via the
@@ -137,6 +143,29 @@ pub(crate) fn extract_event_names(src: &str) -> Vec<String> {
         }
     }
     events
+}
+
+/// Scan CFC source for whisper / client-event names declared via the
+/// `clientEvents="typing,cursor"` component attribute (Phase 4). socket.io has
+/// no catch-all, so the engine must subscribe to the concrete relay events up
+/// front. Names are comma-split, lowercased, and normalised to the full
+/// `client-…` wire form (so both `"typing"` and `"client-typing"` work). The
+/// raw-WS transport ignores this list — it relays any inbound `client-*` event.
+pub(crate) fn extract_client_events(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(raw) = extract_attr(src, "clientEvents") else { return out };
+    for name in raw.split(',') {
+        let name = name.trim().to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let full =
+            if name.starts_with("client-") { name } else { format!("client-{}", name) };
+        if !out.contains(&full) {
+            out.push(full);
+        }
+    }
+    out
 }
 
 /// Pull the value of a `name="…"` component attribute out of CFC source. Used
@@ -328,10 +357,24 @@ async fn driver(
                 // handler with `d` as the payload; otherwise the whole parsed
                 // value goes to `onMessage` (unchanged). `id` echoes back as the
                 // ack's `ref` for client-side correlation.
-                let (event, payload, reply_ref) = if info.json {
-                    route_inbound(parse_json(t.as_str()))
+                let parsed = if info.json {
+                    Some(parse_json(t.as_str()))
                 } else {
-                    (None, CfmlValue::string(t.as_str().to_string()), None)
+                    None
+                };
+                // Whisper (Phase 4): a `client-*` event is relayed to peers by
+                // the hub with NO CFML running and no history — typing/cursor
+                // chatter stays out of the request path. Only on a JSON channel
+                // (the envelope is what carries the event name + optional room).
+                if let Some(parsed) = &parsed {
+                    if let Some((ev, data, room)) = as_client_event(parsed) {
+                        relay_client_event(&registry, &info.channel, &conn_id, ev, data, room);
+                        continue;
+                    }
+                }
+                let (event, payload, reply_ref) = match parsed {
+                    Some(p) => route_inbound(p),
+                    None => (None, CfmlValue::string(t.as_str().to_string()), None),
                 };
                 let r = dispatch(
                     &state,
@@ -467,6 +510,47 @@ fn route_inbound(parsed: CfmlValue) -> (Option<String>, CfmlValue, Option<String
         }
     }
     (None, parsed, None)
+}
+
+/// Recognise an inbound whisper frame (Phase 4). A `client-`-prefixed event
+/// name (Pusher convention, case-insensitive) marks a *client event* that the
+/// hub relays straight to peers without running any CFML. Returns
+/// `(event, payload, room)` — `room` (the optional `room` field) narrows the
+/// relay to a single room the sender must belong to; absent → channel-wide.
+/// Anything that is not a `client-*` event returns `None` (normal dispatch).
+fn as_client_event(parsed: &CfmlValue) -> Option<(String, CfmlValue, Option<String>)> {
+    let CfmlValue::Struct(s) = parsed else { return None };
+    let ev = s.get_ci("ev").map(|v| v.as_string()).filter(|s| !s.is_empty())?;
+    if !ev.to_ascii_lowercase().starts_with("client-") {
+        return None;
+    }
+    let data = s.get_ci("d").unwrap_or(CfmlValue::Null);
+    let room = s.get_ci("room").map(|v| v.as_string()).filter(|s| !s.is_empty());
+    Some((ev, data, room))
+}
+
+/// Relay a whisper to peers (no CFML, no history). Room-targeted whispers are
+/// membership-checked: a client may only whisper into a room it has joined
+/// (otherwise the frame is silently dropped — a client can't inject into
+/// arbitrary rooms). Shared with the socket.io transport.
+pub(crate) fn relay_client_event(
+    registry: &Arc<WebSocketRegistry>,
+    channel: &str,
+    sender: &str,
+    event: String,
+    data: CfmlValue,
+    room: Option<String>,
+) {
+    let mut frame = registry.msg(channel, Some(event), data);
+    frame.t = "client".to_string();
+    match room {
+        Some(r) => {
+            if registry.rooms_of(sender).iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+                registry.relay(channel, Some(&r), frame, Some(sender));
+            }
+        }
+        None => registry.relay(channel, None, frame, Some(sender)),
+    }
 }
 
 /// Run one channel dispatch on a blocking worker (the VM is synchronous).

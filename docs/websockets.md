@@ -6,15 +6,18 @@ container, no embedded Jetty, no Node sidecar. You write a **channel component**
 (one CFC = one channel) with convention-named lifecycle methods, and the engine
 bridges each inbound frame to a fresh VM exactly as it does an HTTP request.
 
-> **Status:** Phase 1 + 2 + the **socket.io transport** are live. Rooms,
+> **Status:** Phases 1–3 are complete and Phase 4 is under way. Rooms,
 > `join`/`leave`, the fluent `io()` emitter, ack-by-return, binary + JSON
 > codecs, emit-from-anywhere, `on="event"` routing, presence, authorization,
-> `lastEventId` resumability, and **multi-node fan-out** all work — over **two
+> `lastEventId` resumability, **multi-node fan-out**, and
+> [whisper / client events](#whisper--client-events) all work — over **two
 > wires**: the [raw WebSocket](#quick-start) endpoint (`/ws/<channel>`) and a
 > [socket.io endpoint](#socketio-transport) (`/socket.io/`, namespace per
-> channel) for the stock socket.io client. The remaining roadmap item is the
-> **socket.io-lucee compatibility layer** — see [Roadmap](#roadmap). Design
-> rationale lives in [`websocket-design.md`](websocket-design.md).
+> channel), the latter also exposing a
+> [socket.io-lucee compatibility layer](#socketio-lucee-compatibility-layer) so
+> existing socket.io CFML apps run unchanged. Remaining: domain auto-broadcast
+> and naming-convention sugar — see [Roadmap](#roadmap). Design rationale lives
+> in [`websocket-design.md`](websocket-design.md).
 
 ## Quick start
 
@@ -51,12 +54,20 @@ ws.onmessage = (e) => {
 ws.onopen = () => ws.send(JSON.stringify({ text: "hello" }));
 ```
 
-A complete runnable demo (two-tab chat) lives in
-[`examples/websocket_chat/`](../examples/websocket_chat/):
+Two runnable examples ship in the repo:
 
 ```bash
+# Minimal two-tab chat (~25 lines of CFML) — start here.
 rustcfml --serve examples/websocket_chat   # then open http://localhost:8500/ in two tabs
+
+# Kitchen-sink demo — one channel exercising the whole surface (lifecycle,
+# on= routing, every socket.* method, presence, canJoin, whisper, history,
+# emit-from-anywhere) with a live wire-log UI.
+rustcfml --serve examples/websocket_demo
 ```
+
+See [`examples/websocket_chat/`](../examples/websocket_chat/) and
+[`examples/websocket_demo/`](../examples/websocket_demo/).
 
 ## Channels & discovery
 
@@ -180,6 +191,57 @@ ws.send(JSON.stringify({ ev: "say", d: { text: "hi" }, id: "req-1" }));
 Routing is case-insensitive. A frame with **no** `ev` (or whose event matches no
 `on=` handler) falls through to `onMessage`, so un-annotated channels behave
 exactly as before. The handler receives the `d` payload as its second argument.
+
+## Whisper / client events
+
+Some realtime chatter — typing indicators, cursor positions, presence pings — is
+high-frequency and low-value: you want to relay it to other clients without
+spinning up a VM or running any handler. A **whisper** does exactly that. Any
+inbound event whose name starts with `client-` (the Pusher convention) is
+relayed by the hub straight to peers, with **no CFML code running** and **no
+history retained**.
+
+```js
+// browser — no server handler, no ack comes back
+ws.send( JSON.stringify({ ev: "client-typing", d: { who: "alice" } }) );
+```
+
+Every *other* client on the channel receives it as a `t:"client"` frame:
+
+```jsonc
+{ "t": "client", "ch": "/chat", "ev": "client-typing", "d": { "who": "alice" }, "id": "node:51" }
+```
+
+The sender never receives its own whisper. By default a whisper fans out
+**channel-wide** (everyone else on the channel). Add a `room` to scope it to a
+single room — the sender must already be a member of that room, so a client
+can't whisper into a room it hasn't joined (anything else is silently dropped):
+
+```js
+ws.send( JSON.stringify({ ev: "client-cursor", d: { x: x, y: y }, room: "doc-42" }) );
+```
+
+Whispers require an `encoding="json"` channel (the JSON envelope is what carries
+the event name and optional `room`). They cross nodes like any broadcast, but are
+ephemeral — never added to the `history` replay log, and no handler ever sees them.
+
+### Whisper over socket.io
+
+socket.io has no catch-all event handler, so the relayed client-event names must
+be **declared up front** via a `clientEvents` attribute (comma-separated; the
+`client-` prefix is optional and added for you):
+
+```cfml
+component socket="/chat" encoding="json" clientEvents="typing,cursor" {
+    // ...no handler for the client events — the hub relays them
+}
+```
+
+A socket.io client then `socket.emit("client-typing", { who: "alice" })` and
+peers receive a `client-typing` event. Over socket.io the relay is channel-wide
+(the payload is the event data itself, with no envelope to carry a `room`);
+room-scoped whispers are a raw-WebSocket refinement. The raw-WS transport relays
+any `client-*` event dynamically and ignores `clientEvents`.
 
 ## The `socket` object
 
@@ -513,7 +575,7 @@ onto socket.io event packets, so the field names below are the raw-WS encoding:
 
 ```jsonc
 {
-  "t":  "msg",        // frame type: msg | ack | ...
+  "t":  "msg",        // frame type: msg | ack | client (whisper) | presence | reset | ...
   "ch": "/chat",      // channel
   "ev": "message",    // event name (routes to on="message"; absent for a raw send())
   "d":  { },          // payload
@@ -599,9 +661,12 @@ compatibility layer** (the imperative `new SocketIoServer()` /
 `io.of(ns).on("connect", …)` / `socket.on/emit/joinRoom` surface) ships on top of
 it — see [socket.io-lucee compatibility layer](#socketio-lucee-compatibility-layer),
 above — so existing socket.io CFML apps (e.g. `preside-ext-socket-io`) run with
-minimal change, over the same transport and registry. Planned:
+minimal change, over the same transport and registry.
 
-- **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
+**Phase 4 is in progress.** **Whisper / client events** have landed — see
+[Whisper / client events](#whisper--client-events), above. Planned:
+
+- **Phase 4 (remaining)** — declarative conveniences: model/domain-event auto-broadcast, optional `/topic`·`/user` naming conventions.
 
 See [`websocket-implementation-plan.md`](websocket-implementation-plan.md) for
 the full build order.

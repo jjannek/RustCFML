@@ -29,7 +29,9 @@ use socketioxide::extract::{AckSender, Data, SocketRef};
 use socketioxide::layer::SocketIoLayer;
 use socketioxide::SocketIo;
 
-use crate::websocket::{dispatch, dispatch_sio, is_reject, resolve_channel, SioDispatch};
+use crate::websocket::{
+    dispatch, dispatch_sio, is_reject, relay_client_event, resolve_channel, SioDispatch,
+};
 use crate::AppState;
 
 /// The [`FrameSink`] handed to the registry for one socket.io connection. A
@@ -223,6 +225,30 @@ async fn on_connect(socket: SocketRef, state: Arc<AppState>) {
                             .await;
                         }
                     }
+                }
+            },
+        );
+    }
+
+    // Whisper / client-events (Phase 4): a `client-*` event is relayed to peers
+    // by the hub with NO CFML running. socketioxide has no catch-all, so the
+    // relay events are declared via `clientEvents="…"` and subscribed up front
+    // (channel-wide; room-targeting is a raw-WS refinement — the socket.io
+    // payload is the data itself, with no envelope to carry a room).
+    for ev in &info.client_events {
+        let ev_name = ev.clone();
+        let registry = registry.clone();
+        let channel = info.channel.clone();
+        let conn_id = conn_id.clone();
+        socket.on(
+            ev_name.clone(),
+            move |_s: SocketRef, Data::<CfmlValue>(payload): Data<CfmlValue>| {
+                let registry = registry.clone();
+                let channel = channel.clone();
+                let conn_id = conn_id.clone();
+                let ev_name = ev_name.clone();
+                async move {
+                    relay_client_event(&registry, &channel, &conn_id, ev_name, payload, None);
                 }
             },
         );

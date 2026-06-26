@@ -19,6 +19,7 @@
   <p class="sys">Open this page in two tabs and chat between them. Backed by
      <code>/websockets/chat.cfc</code> over a raw WebSocket.</p>
   <div id="log"></div>
+  <div id="typing" class="sys" style="height:1.2em"></div>
   <form id="f">
     <input id="msg" placeholder="Say something…" autocomplete="off" />
     <button>Send</button>
@@ -40,8 +41,17 @@
 
   ws.onopen = () => line("connected", "sys");
   ws.onclose = () => line("disconnected", "sys");
+  // Typing indicator via a "whisper": a client-* event is relayed to the other
+  // tabs by the engine with NO server code running (no handler, no history).
+  let typingTimer = null, clearTyping = null;
   ws.onmessage = (e) => {
     const frame = JSON.parse(e.data);
+    if (frame.t === "client" && frame.ev === "client-typing" && frame.d.id !== myId) {
+      document.getElementById("typing").textContent = `${frame.d.id} is typing…`;
+      clearTimeout(clearTyping);
+      clearTyping = setTimeout(() => document.getElementById("typing").textContent = "", 2500);
+      return;
+    }
     switch (frame.ev) {
       case "welcome":
         myId = frame.d.id;
@@ -64,6 +74,13 @@
       ws.send(JSON.stringify({ text: input.value }));
       input.value = "";
     }
+  });
+
+  // As you type, whisper a throttled "client-typing" to the other tabs.
+  document.getElementById("msg").addEventListener("input", () => {
+    if (ws.readyState !== WebSocket.OPEN || typingTimer) return;
+    ws.send(JSON.stringify({ ev: "client-typing", d: { id: myId } }));
+    typingTimer = setTimeout(() => typingTimer = null, 1500);
   });
 </script>
 </body>

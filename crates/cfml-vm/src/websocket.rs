@@ -555,6 +555,42 @@ impl WebSocketRegistry {
         }
     }
 
+    /// Relay a client-originated "whisper" frame (a `client-*` event) to other
+    /// connections **without running any CFML code and without recording
+    /// history** (design principle: typing/cursor chatter never enters the
+    /// request path — Phase 4). Like a normal broadcast it crosses nodes via the
+    /// `Broker` (peers re-fan-out), but it is ephemeral, so it is never added to
+    /// the replay log. `room = Some(r)` narrows the fan-out to a single room;
+    /// `None` is channel-wide. `except` is the sender (whispers are never echoed
+    /// to their author).
+    pub fn relay(
+        &self,
+        channel: &str,
+        room: Option<&str>,
+        frame: WireEnvelope,
+        except: Option<&str>,
+    ) {
+        match room {
+            Some(r) => {
+                self.publish(BrokerMsg::ToRoom {
+                    channel: channel.to_string(),
+                    room: r.to_string(),
+                    frame: frame.clone(),
+                    except: except.map(str::to_string),
+                });
+                self.to_room_local(channel, r, frame, except);
+            }
+            None => {
+                self.publish(BrokerMsg::Broadcast {
+                    channel: channel.to_string(),
+                    frame: frame.clone(),
+                    except: except.map(str::to_string),
+                });
+                self.broadcast_local(channel, frame, except);
+            }
+        }
+    }
+
     // ── resumability / history (design principle P12) ─────────────────────
 
     /// Enable (or update) the retained-history cap for a channel. Called once at
@@ -1225,6 +1261,32 @@ mod tests {
         reg.broadcast("/chat", frame, Some(&id_a));
         assert_eq!(a.frames.lock().unwrap().len(), 0, "sender excluded");
         assert_eq!(b.frames.lock().unwrap().len(), 1, "other receives");
+    }
+
+    #[test]
+    fn relay_whisper_skips_history_and_excludes_sender() {
+        // A `client-*` whisper relays to others (channel-wide or room-scoped)
+        // but is NEVER added to the replay log (it is ephemeral).
+        let reg = Arc::new(WebSocketRegistry::new("n1"));
+        reg.set_history_cap("/chat", 50);
+        let (a, a_dyn) = sink();
+        let (b, b_dyn) = sink();
+        let id_a = reg.register("/chat", a_dyn, None, ValueMap::default());
+        let _id_b = reg.register("/chat", b_dyn, None, ValueMap::default());
+
+        let mut frame = reg.msg("/chat", Some("client-typing".into()), CfmlValue::Bool(true));
+        frame.t = "client".into();
+        reg.relay("/chat", None, frame, Some(&id_a));
+
+        assert_eq!(a.frames.lock().unwrap().len(), 0, "whisper not echoed to sender");
+        assert_eq!(b.frames.lock().unwrap().len(), 1, "peer receives the whisper");
+        assert_eq!(b.frames.lock().unwrap()[0].t, "client", "frame typed as a client relay");
+
+        // A reconnecting client must NOT replay the whisper (history untouched).
+        let (rejoin, rejoin_dyn) = sink();
+        let id_r = reg.register("/chat", rejoin_dyn, None, ValueMap::default());
+        reg.replay_since("/chat", "n1:0", &id_r);
+        assert_eq!(rejoin.frames.lock().unwrap().len(), 0, "whisper never retained");
     }
 
     #[test]

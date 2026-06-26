@@ -272,6 +272,30 @@ async fn socketio_connect_emit_ack_event_and_broadcast() {
 }
 
 #[tokio::test]
+async fn socketio_whisper_relays_to_peers() {
+    let server = start_server().await;
+
+    // Two clients on the /whisper namespace (both auto-join "lobby" in onConnect).
+    let mut a = sio_connect(server.port, "/whisper", "").await;
+    let _ = expect_event(&mut a, "ready").await;
+    let mut b = sio_connect(server.port, "/whisper", "").await;
+    let _ = expect_event(&mut b, "ready").await;
+
+    // A whispers `client-typing` (declared via `clientEvents="typing"`). The hub
+    // relays it to B with NO CFML running — socketioxide has no catch-all, so the
+    // event was subscribed up front from the declaration.
+    sio_emit(&mut a, "/whisper", "client-typing", json!({ "on": true }), None).await;
+    let typing = expect_event(&mut b, "client-typing").await;
+    assert_eq!(typing["on"], json!(true), "whisper relayed to the peer");
+
+    // Connection intact + the whisper bypassed CFML: a normal "message" still
+    // runs onMessage, broadcasting "said" to B.
+    sio_emit(&mut a, "/whisper", "message", json!({ "text": "hi" }), None).await;
+    let said = expect_event(&mut b, "said").await;
+    assert_eq!(said["text"], json!("hi"), "normal handler still runs after a whisper");
+}
+
+#[tokio::test]
 async fn socketio_onconnect_reject_closes_socket() {
     let server = start_server().await;
     let q = "&".to_string();

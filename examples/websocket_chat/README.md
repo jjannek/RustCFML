@@ -23,6 +23,10 @@ cargo run --release -- --serve examples/websocket_chat
   everyone else in the channel; `io().to("lobby").emit(...)` to a room from
   anywhere.
 - The handler's **return value becomes the client's ack** (`ev:"ack"`).
+- The **typing indicator** is a *whisper*: as you type, the page sends a
+  `client-typing` event that the engine relays to the other tabs **with no
+  server code running** (no handler, no history) — see the
+  [whisper docs](../../docs/websockets.md#whisper--client-events).
 
 ## Emit from anywhere
 

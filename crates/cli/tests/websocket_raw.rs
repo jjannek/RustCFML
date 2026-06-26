@@ -408,6 +408,50 @@ async fn unknown_channel_is_404() {
     drop(server);
 }
 
+#[tokio::test]
+async fn whisper_relays_to_peers_without_running_cfml() {
+    let server = start_server().await;
+    let base = format!("ws://127.0.0.1:{}/ws/whisper", server.port);
+
+    // A and B both connect and auto-join "lobby" in onConnect.
+    let (mut a, _) = connect_async(&base).await.expect("A connects");
+    assert_eq!(next_json(&mut a).await["ev"], "ready");
+    let (mut b, _) = connect_async(&base).await.expect("B connects");
+    assert_eq!(next_json(&mut b).await["ev"], "ready");
+
+    // 1. Room-targeted whisper to "lobby" (A is a member) → reaches B.
+    a.send(Message::Text(r#"{"ev":"client-typing","d":{"phase":"room"},"room":"lobby"}"#.into()))
+        .await
+        .unwrap();
+    // 2. Room-targeted whisper to a room A is NOT in → silently dropped.
+    a.send(Message::Text(r#"{"ev":"client-cursor","d":{"x":1},"room":"nope"}"#.into()))
+        .await
+        .unwrap();
+    // 3. Channel-wide whisper → reaches B.
+    a.send(Message::Text(r#"{"ev":"client-typing","d":{"phase":"all"}}"#.into()))
+        .await
+        .unwrap();
+
+    // B sees the room whisper, then the channel-wide one — never the dropped
+    // cursor (proving the membership check), and each is a `t:"client"` frame.
+    let first = next_json(&mut b).await;
+    assert_eq!(first["t"], "client", "relayed as a client whisper frame");
+    assert_eq!(first["ev"], "client-typing");
+    assert_eq!(first["d"]["phase"], "room", "room-targeted whisper delivered");
+    let second = next_json(&mut b).await;
+    assert_eq!(second["d"]["phase"], "all", "cursor→nope was dropped, not relayed");
+
+    // The hub ran no CFML for the whispers: a normal message still triggers the
+    // onMessage broadcast, proving the connection is intact and whispers bypass
+    // the handler entirely.
+    a.send(Message::Text(r#"{"text":"hi"}"#.into())).await.unwrap();
+    let said = next_json(&mut b).await;
+    assert_eq!(said["ev"], "said");
+    assert_eq!(said["d"]["text"], "hi");
+
+    drop(server);
+}
+
 // ── Phase 2: distributed Broker (real 2-process gossip cluster) ───────────
 //
 // End-to-end verification that WebSocket fan-out crosses nodes over the shared
