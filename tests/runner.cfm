@@ -185,6 +185,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_type_checking.cfm">
 <cf_runtest file="stdlib/test_conversion.cfm">
 <cf_runtest file="stdlib/test_json.cfm">
+<cf_runtest file="stdlib/test_serialize.cfm">
 <cf_runtest file="stdlib/test_file_io.cfm">
 <!--- Relative file-BIF paths resolve against the calling template's dir --->
 <!--- (ExpandPath parity), not the entry template / cwd — GitHub #171. --->

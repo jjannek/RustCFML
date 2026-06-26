@@ -507,6 +507,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("serializeJSON".into(), fn_serialize_json);
     f.insert("deserializeJSON".into(), fn_deserialize_json);
     f.insert("isJSON".into(), fn_is_json);
+    // CFML-literal serialisation (Lucee/ACF): produces a string that
+    // `evaluate()` reads back. Distinct from JSON — strings escape `"` by
+    // doubling it (`""`) CFML-literal style, not with backslashes.
+    f.insert("serialize".into(), fn_serialize);
 
     // ---- Query functions ----
     f.insert("queryNew".into(), fn_query_new);
@@ -4779,6 +4783,106 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
             !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
         })
         .map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(&v, visited)))
+        .collect();
+    format!("{{{}}}", items.join(","))
+}
+
+/// `Serialize(value)` — Lucee/ACF CFML-literal serialisation. Produces a string
+/// that `Evaluate()` reads back into an equivalent value (the inverse pairing
+/// Lucee documents). The output is a CFML expression literal, NOT JSON:
+///   - strings are double-quoted with the embedded `"` doubled (`""`), the
+///     CFML-literal escape — no backslash escaping; newlines/tabs/backslashes
+///     are emitted verbatim;
+///   - structs render as `{"key":value,...}` (keys always quoted);
+///   - arrays as `[a,b,c]`;
+///   - null as `nullValue()`, queries as `query("col":[...],...)`.
+/// Unlike Lucee — which uppercases and reorders struct keys as a side effect of
+/// its internal storage — RustCFML preserves key case and insertion order
+/// engine-wide (ordered, case-preserving `IndexMap`), the same convention its
+/// `serializeJSON` already follows. Both forms still round-trip via `evaluate`.
+pub fn fn_serialize(args: Vec<CfmlValue>) -> CfmlResult {
+    let mut visited: Vec<usize> = Vec::new();
+    let body = serialize_cfml_value(args.first().unwrap_or(&CfmlValue::Null), &mut visited);
+    Ok(CfmlValue::string(body))
+}
+
+/// Escape a string for the CFML double-quoted literal form: only `"` is special
+/// and is escaped by doubling it. Everything else is literal.
+fn cfml_literal_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn serialize_cfml_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
+    match val {
+        CfmlValue::Null => "nullValue()".to_string(),
+        CfmlValue::Bool(b) => b.to_string(),
+        CfmlValue::Int(i) => i.to_string(),
+        CfmlValue::Double(d) => d.to_string(),
+        CfmlValue::String(s) => cfml_literal_string(s),
+        CfmlValue::Array(arr) => {
+            let ptr = arr.backing_ptr();
+            if visited.contains(&ptr) {
+                return "nullValue()".to_string();
+            }
+            visited.push(ptr);
+            let items: Vec<String> = arr.iter().map(|v| serialize_cfml_value(&v, visited)).collect();
+            visited.pop();
+            format!("[{}]", items.join(","))
+        }
+        CfmlValue::Struct(s) => {
+            let ptr = s.backing_ptr();
+            if visited.contains(&ptr) {
+                return "nullValue()".to_string();
+            }
+            visited.push(ptr);
+            let out = serialize_cfml_struct(s, visited);
+            visited.pop();
+            out
+        }
+        CfmlValue::Query(q) => {
+            q.with_read(|d| {
+                let cols: Vec<String> = d.columns.iter().enumerate().map(|(ci, col)| {
+                    let vals: Vec<String> = d.data[ci].iter()
+                        .map(|v| serialize_cfml_value(v, visited)).collect();
+                    format!("{}:[{}]", cfml_literal_string(col), vals.join(","))
+                }).collect();
+                format!("query({})", cols.join(","))
+            })
+        }
+        CfmlValue::QueryColumn(_) => serialize_cfml_value(val.query_column_scalar(), visited),
+        CfmlValue::NativeObject(obj) => {
+            let name = obj.read().map(|g| g.class_name().to_string())
+                .unwrap_or_else(|_| "poisoned".to_string());
+            cfml_literal_string(&format!("<NativeObject:{}>", name))
+        }
+        _ => "nullValue()".to_string(),
+    }
+}
+
+fn serialize_cfml_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
+    // Mirror serialize_struct's CFC/arguments filtering so component instances
+    // serialize only their data members (never engine internals or methods).
+    let is_cfc = s.contains_key("__variables")
+        && (s.contains_key("this") || s.contains_key("__name"));
+    let is_args = s.contains_key("__arguments_scope");
+    let items: Vec<String> = s
+        .iter()
+        .filter(|(k, _)| k.as_str() != cfml_common::dynamic::EMPTY_DEFAULT_SCOPE_MARKER)
+        .filter(|(k, _)| {
+            !is_args
+                || (k.as_str() != "__arguments_scope"
+                    && k.as_str() != "__arguments_params")
+        })
+        .filter(|(k, v)| {
+            if !is_cfc {
+                return true;
+            }
+            if k.starts_with("__") || k.eq_ignore_ascii_case("this") {
+                return false;
+            }
+            !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
+        })
+        .map(|(k, v)| format!("{}:{}", cfml_literal_string(&k), serialize_cfml_value(&v, visited)))
         .collect();
     format!("{{{}}}", items.join(","))
 }
