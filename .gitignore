@@ -42,6 +42,9 @@ whitebackground.png
 # WebSocket plan/design are working docs (user-facing docs/websockets.md IS tracked)
 /docs/websocket-design.md
 /docs/websocket-implementation-plan.md
+# Observability plan/design are working docs (never meant to be committed)
+/docs/observability-design.md
+/docs/observability-implementation-plan.md
 
 # Sibling standalone worker repo — accidentally committed here in the past,
 # now lives at github.com/RustCFML/Rust-CFML-Cloudflare-worker
