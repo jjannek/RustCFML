@@ -1,8 +1,8 @@
 # RustCFML WebSocket Chat (demo)
 
 A minimal multi-tab chat over a raw WebSocket, demonstrating the RustCFML
-realtime engine (Phase 1). Parity with the SocketBox / Preside socket.io demo
-chats, in ~25 lines of CFML.
+realtime engine — parity with the SocketBox / Preside socket.io demo chats, in
+~25 lines of CFML.
 
 ## Run
 
@@ -39,4 +39,4 @@ wsPublish( channel="/chat", event="message", data={ from="system", text="Mainten
 io( "/chat" ).to( "lobby" ).emit( "message", { from="system", text="…" } );
 ```
 
-See `docs/websocket-design.md` for the full design.
+See [`docs/websockets.md`](../../docs/websockets.md) for the full guide.

@@ -6,8 +6,7 @@ container, no embedded Jetty, no Node sidecar. You write a **channel component**
 (one CFC = one channel) with convention-named lifecycle methods, and the engine
 bridges each inbound frame to a fresh VM exactly as it does an HTTP request.
 
-> **Status:** Phases 1–3 are complete and Phase 4 is under way. Rooms,
-> `join`/`leave`, the fluent `io()` emitter, ack-by-return, binary + JSON
+> Rooms, `join`/`leave`, the fluent `io()` emitter, ack-by-return, binary + JSON
 > codecs, emit-from-anywhere, `on="event"` routing, presence, authorization,
 > `lastEventId` resumability, **multi-node fan-out**, and
 > [whisper / client events](#whisper--client-events) all work — over **two
@@ -15,9 +14,7 @@ bridges each inbound frame to a fresh VM exactly as it does an HTTP request.
 > [socket.io endpoint](#socketio-transport) (`/socket.io/`, namespace per
 > channel), the latter also exposing a
 > [socket.io-lucee compatibility layer](#socketio-lucee-compatibility-layer) so
-> existing socket.io CFML apps run unchanged. Remaining: domain auto-broadcast
-> and naming-convention sugar — see [Roadmap](#roadmap). Design rationale lives
-> in [`websocket-design.md`](websocket-design.md).
+> existing socket.io CFML apps run unchanged.
 
 ## Quick start
 
@@ -329,8 +326,8 @@ The roster shape (also the payload of a `presence_state` frame):
 ```
 
 A `presence_diff` frame carries `{ "joins": { … }, "leaves": { … } }` in the same
-per-key shape. Presence is channel-scoped; multi-node correctness arrives with the
-distributed broker (later in Phase 2) with no API change.
+per-key shape. Presence is channel-scoped and the roster is replicated across a
+multi-node cluster (see [Clustering / multi-node](#clustering--multi-node)).
 
 ## Emit from anywhere
 
@@ -432,12 +429,11 @@ app knows to resync from its own source of truth, then replays what it still has
 { "t": "reset", "ch": "/feed", "id": "node:512" }   // gap — you missed messages; resync
 ```
 
-**Caveats (this phase).** History is **best-effort, in-memory, and per node**:
-it is lost on restart, capped at `N` frames, and a `lastEventId` minted by a
-*different* node (after a failover) is skipped (the client gets the `reset` hint).
-Replay is channel-wide, not room-precise — the socket re-establishes its rooms via
-`onConnect` auto-join anyway. Cluster-correct, durable resumability arrives with
-the distributed broker (later in Phase 2) with no API change.
+**Caveats.** History is **best-effort, in-memory, and per node**: it is lost on
+restart, capped at `N` frames, and a `lastEventId` minted by a *different* node
+(after a failover) is skipped (the client gets the `reset` hint). Replay is
+channel-wide, not room-precise — the socket re-establishes its rooms via
+`onConnect` auto-join anyway.
 
 ## socket.io transport
 
@@ -646,27 +642,12 @@ native ack, server-pushed events, broadcast, reject), and
 surface: connect listener, per-socket `socket.on` with native ack, broadcast,
 room-scoped `namespace.emit`).)
 
-## Roadmap
+## Not yet supported
 
-Phase 1 (this page) covers the raw-WebSocket core. **Phase 2 is complete:**
-`on="event"` annotation routing, ack `ref` correlation, **presence**,
-**authorization** (`secured=` / `canJoin`, above), **`lastEventId` resumability**
-(`history=`, above), and **multi-node fan-out** over the shared-session cluster
-([Clustering / multi-node](#clustering--multi-node), above) have all landed.
+A couple of declarative conveniences are not built yet:
 
-**Phase 3 is complete.** The **socket.io transport** (Engine.IO v4 handshake,
-namespaces, acks, polling↔ws fallback) is live — see
-[socket.io transport](#socketio-transport), above — and the **socket.io-lucee
-compatibility layer** (the imperative `new SocketIoServer()` /
-`io.of(ns).on("connect", …)` / `socket.on/emit/joinRoom` surface) ships on top of
-it — see [socket.io-lucee compatibility layer](#socketio-lucee-compatibility-layer),
-above — so existing socket.io CFML apps (e.g. `preside-ext-socket-io`) run with
-minimal change, over the same transport and registry.
+- **Domain-event auto-broadcast** — a `component broadcast=true` / model mixin
+  that publishes automatically on `save`/`delete`.
+- **Naming-convention sugar** — optional `/topic`·`/user` channel conventions.
 
-**Phase 4 is in progress.** **Whisper / client events** have landed — see
-[Whisper / client events](#whisper--client-events), above. Planned:
-
-- **Phase 4 (remaining)** — declarative conveniences: model/domain-event auto-broadcast, optional `/topic`·`/user` naming conventions.
-
-See [`websocket-implementation-plan.md`](websocket-implementation-plan.md) for
-the full build order.
+Everything else described on this page is implemented and tested.
