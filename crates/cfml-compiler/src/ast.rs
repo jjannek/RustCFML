@@ -467,6 +467,9 @@ pub enum BinaryOpType {
     // Comparison
     Equal,
     NotEqual,
+    /// `===` / `!==` strict (same-type) equality — no cross-type coercion.
+    StrictEqual,
+    StrictNotEqual,
     Greater,
     GreaterEqual,
     Less,

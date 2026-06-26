@@ -248,6 +248,9 @@ pub enum BytecodeOp {
     // Comparison
     Eq,
     Neq,
+    /// `===` / `!==` strict (same-type) equality — no cross-type coercion.
+    StrictEq,
+    StrictNeq,
     Lt,
     Lte,
     Gt,
@@ -3326,6 +3329,8 @@ impl CfmlCompiler {
                     BinaryOpType::Concat => BytecodeOp::Concat,
                     BinaryOpType::Equal => BytecodeOp::Eq,
                     BinaryOpType::NotEqual => BytecodeOp::Neq,
+                    BinaryOpType::StrictEqual => BytecodeOp::StrictEq,
+                    BinaryOpType::StrictNotEqual => BytecodeOp::StrictNeq,
                     BinaryOpType::Less => BytecodeOp::Lt,
                     BinaryOpType::LessEqual => BytecodeOp::Lte,
                     BinaryOpType::Greater => BytecodeOp::Gt,

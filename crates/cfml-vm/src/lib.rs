@@ -4087,6 +4087,12 @@ impl CfmlVirtualMachine {
                 BytecodeOp::Neq => {
                     compare_op(&mut stack, |a, b| !cfml_equal(a, b));
                 }
+                BytecodeOp::StrictEq => {
+                    compare_op(&mut stack, |a, b| cfml_strict_equal(a, b));
+                }
+                BytecodeOp::StrictNeq => {
+                    compare_op(&mut stack, |a, b| !cfml_strict_equal(a, b));
+                }
                 BytecodeOp::Lt => {
                     compare_op(&mut stack, |a, b| cfml_compare(a, b) < 0);
                 }
@@ -20656,6 +20662,43 @@ fn cfml_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
     }
 }
 
+/// Strict (`===` / `!==`) equality — Lucee/ACF/BoxLang "same-type" equality.
+/// Unlike `cfml_equal` (loose `==`), there is NO cross-type coercion: a number
+/// never equals a string, a boolean never equals a number or string.
+///   - numeric (Int/Double) compare numerically: `1 === 1.0` is true;
+///   - strings compare case-insensitively but otherwise exactly — no numeric
+///     coercion, no trimming: `"a" === "A"` is true, `"1" === "1.0"` is false;
+///   - booleans compare directly;
+///   - null === null is true;
+///   - reference types (array/struct/query/native object) compare by identity
+///     (same backing store), matching Lucee — `a === a` true, but two
+///     structurally-equal-but-distinct arrays are not strictly equal.
+/// Verified against Lucee 7.
+fn cfml_strict_equal(a: &CfmlValue, b: &CfmlValue) -> bool {
+    // A QueryColumn proxy behaves as its first-row value in scalar comparison.
+    let (a, b) = (a.query_column_scalar(), b.query_column_scalar());
+    match (a, b) {
+        (CfmlValue::Null, CfmlValue::Null) => true,
+        // Numeric category — int and double are the same type for this purpose.
+        (CfmlValue::Int(x), CfmlValue::Int(y)) => x == y,
+        (CfmlValue::Double(x), CfmlValue::Double(y)) => x == y,
+        (CfmlValue::Int(x), CfmlValue::Double(y)) => (*x as f64) == *y,
+        (CfmlValue::Double(x), CfmlValue::Int(y)) => *x == (*y as f64),
+        // String category — case-insensitive, but no numeric/bool coercion.
+        (CfmlValue::String(x), CfmlValue::String(y)) => x.eq_ignore_ascii_case(y),
+        // Boolean category.
+        (CfmlValue::Bool(x), CfmlValue::Bool(y)) => x == y,
+        // Reference types — identity (same shared backing store).
+        (CfmlValue::Array(x), CfmlValue::Array(y)) => x.backing_ptr() == y.backing_ptr(),
+        (CfmlValue::Struct(x), CfmlValue::Struct(y)) => x.backing_ptr() == y.backing_ptr(),
+        (CfmlValue::Query(x), CfmlValue::Query(y)) => x.backing_ptr() == y.backing_ptr(),
+        (CfmlValue::NativeObject(x), CfmlValue::NativeObject(y)) => Arc::ptr_eq(x, y),
+        // Any other (cross-type, or reference type without cheap identity) is
+        // not strictly equal.
+        _ => false,
+    }
+}
+
 /// CFML comparison ordering
 fn cfml_compare(a: &CfmlValue, b: &CfmlValue) -> i32 {
     // A QueryColumn proxy behaves as its first-row value in scalar comparison.
@@ -20735,6 +20778,8 @@ fn stack_effect(op: &BytecodeOp) -> (usize, usize) {
         | BytecodeOp::Concat
         | BytecodeOp::Eq
         | BytecodeOp::Neq
+        | BytecodeOp::StrictEq
+        | BytecodeOp::StrictNeq
         | BytecodeOp::Lt
         | BytecodeOp::Lte
         | BytecodeOp::Gt

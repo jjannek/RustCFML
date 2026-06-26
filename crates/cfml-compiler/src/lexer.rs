@@ -214,7 +214,13 @@ impl Lexer {
 
             '=' => {
                 if self.match_char('=') {
-                    self.add_token(Token::EqualEqual);
+                    // `===` strict-equality (Lucee/ACF/BoxLang): same-type
+                    // equality, no cross-type coercion. `==` stays loose.
+                    if self.match_char('=') {
+                        self.add_token(Token::EqualEqualEqual);
+                    } else {
+                        self.add_token(Token::EqualEqual);
+                    }
                 } else if self.match_char('>') {
                     self.add_token(Token::FatArrow);
                 } else {
@@ -223,7 +229,11 @@ impl Lexer {
             }
             '!' => {
                 if self.match_char('=') {
-                    self.add_token(Token::BangEqual);
+                    if self.match_char('=') {
+                        self.add_token(Token::BangEqualEqual);
+                    } else {
+                        self.add_token(Token::BangEqual);
+                    }
                 } else {
                     self.add_token(Token::Bang);
                 }

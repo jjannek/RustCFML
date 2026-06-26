@@ -54,6 +54,7 @@ include "harness.cfm";
 <!--- views came back empty on an otherwise-booting framework (PR #108). --->
 <cf_runtest file="core/test_savecontent_scoped_target.cfm">
 <cf_runtest file="core/test_operators.cfm">
+<cf_runtest file="core/test_strict_equality.cfm">
 <cf_runtest file="core/test_subscript_autovivify.cfm">
 <!--- Scope-qualified nested auto-vivification (variables.$class.name = ...): the residual --->
 <!--- auto-viv gap that blocked Wheels $initControllerClass. Fixed in the compiler by routing --->

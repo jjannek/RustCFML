@@ -4917,7 +4917,23 @@ impl Parser {
 
         loop {
             // `EQUAL` / `EQUALS` (verbose alias for EQ) and `==`/`EQ`.
-            if self.match_token(&Token::EqualEqual)
+            if self.match_token(&Token::EqualEqualEqual) {
+                let right = Box::new(self.parse_comparison()?);
+                left = Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(left),
+                    operator: BinaryOpType::StrictEqual,
+                    right,
+                    location: self.current_location(),
+                }));
+            } else if self.match_token(&Token::BangEqualEqual) {
+                let right = Box::new(self.parse_comparison()?);
+                left = Expression::BinaryOp(Box::new(BinaryOp {
+                    left: Box::new(left),
+                    operator: BinaryOpType::StrictNotEqual,
+                    right,
+                    location: self.current_location(),
+                }));
+            } else if self.match_token(&Token::EqualEqual)
                 || self.match_token(&Token::EqKeyword)
                 || self.match_word("equal")
                 || self.match_word("equals")
