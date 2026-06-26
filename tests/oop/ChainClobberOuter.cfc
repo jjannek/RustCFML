@@ -18,4 +18,11 @@ component accessors="true" {
 		return "Outer";
 	}
 
+	// Returns a fresh array — used to prove that `outer.getItems().sort()`
+	// (an in-place array member fn chained on a method that returns an array)
+	// does not write the sorted array back onto `outer`.
+	function getItems(){
+		return [ "b", "a", "c" ];
+	}
+
 }

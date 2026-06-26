@@ -6635,20 +6635,28 @@ impl CfmlVirtualMachine {
                             // Direct variable write-back: var.method(args)
                             let var_name = &path[0];
                             if Self::is_mutating_method(&method_name) {
-                                // Chained-CFC identity guard: for `a.getDep().mutate()`
-                                // the result is a foreign CFC (codegen propagates
-                                // write_back=["a"] to the outer call). Writing it back
-                                // would clobber `a`'s identity. Skip when `a` and the
-                                // result are distinct CFC instances; allow same-instance,
-                                // non-CFC results (arrays/Java shims), or non-CFC `a`.
+                                // Chained-receiver clobber guard: for `a.getThing().mutate()`
+                                // the mutating call runs on what `getThing()` *returned*,
+                                // not on `a` — but codegen propagates write_back=["a"] to
+                                // the outer call. Writing the result back to `a` would
+                                // replace the component with that return value. Skip
+                                // whenever `a` currently holds a CFC instance and the
+                                // result is not that *same* instance — covers a foreign
+                                // CFC (`a.getDep().mutate()`), an array (`a.getArr().sort()`
+                                // clobbering `a` with the sorted array), or any scalar.
+                                // (A CFC's own in-place state mutation rides the separate
+                                // `this`-writeback below, not this value-writeback.)
                                 let cur_val = self.scope_aware_load(var_name, &locals);
-                                let clobbers_foreign_cfc = matches!(
+                                let cur_is_cfc = matches!(
+                                    &cur_val,
+                                    Some(CfmlValue::Struct(ref cur)) if cur.contains_key("__variables")
+                                );
+                                let result_same_instance = matches!(
                                     (&cur_val, &result),
                                     (Some(CfmlValue::Struct(ref cur)), CfmlValue::Struct(ref res))
-                                        if cur.contains_key("__variables")
-                                            && res.contains_key("__variables")
-                                            && !cur.ptr_eq(res)
+                                        if cur.ptr_eq(res)
                                 );
+                                let clobbers_cfc = cur_is_cfc && !result_same_instance;
                                 // structDelete on a struct receiver returns a
                                 // BOOLEAN and mutates the struct in place — writing
                                 // that boolean back would clobber the struct
@@ -6658,7 +6666,7 @@ impl CfmlVirtualMachine {
                                     (&cur_val, &result),
                                     (Some(CfmlValue::Struct(_)), CfmlValue::Bool(_))
                                 );
-                                if !clobbers_foreign_cfc && !bool_over_struct {
+                                if !clobbers_cfc && !bool_over_struct {
                                     self.scope_aware_store(var_name, result.clone(), &mut locals, effective_local_mode_modern);
                                 }
                             }
@@ -6667,22 +6675,17 @@ impl CfmlVirtualMachine {
                             let var_name = &path[0];
                             if let Some(mut root_obj) = self.scope_aware_load(var_name, &locals) {
                                 let props = &path[1..];
-                                // Chained-CFC identity guard (deep path): for
-                                // `a.b.getDep().mutate()` the mutating call runs on a
-                                // foreign CFC and returns it; codegen propagates
-                                // write_back=["a","b"], so deep_set would overwrite a.b
-                                // with that foreign CFC (e.g.
+                                // Chained-receiver clobber guard (deep path): for
+                                // `a.b.getThing().mutate()` the mutating call runs on
+                                // what `getThing()` returned, not on `a.b` — but codegen
+                                // propagates write_back=["a","b"], so deep_set would
+                                // overwrite `a.b` with the result (e.g.
                                 // `injector.getScopeStorage().put(...)` clobbering
-                                // `variables.injector` with the ScopeStorage put()
-                                // returns). Skip when the current leaf and the result
-                                // are distinct CFC instances. Non-CFC results
-                                // (arrays/Java shims, e.g. `a.b.append(x)`) are ungated.
-                                let result_is_cfc = matches!(
-                                    &result,
-                                    CfmlValue::Struct(s) if s.contains_key("__variables")
-                                );
+                                // `variables.injector`, or `a.b.getArr().sort()` clobbering
+                                // `a.b` with the sorted array). Skip when the current leaf
+                                // is a CFC and the result is not that *same* instance.
                                 let mut skip_for_identity = false;
-                                if result_is_cfc {
+                                {
                                     let mut node = root_obj.clone();
                                     let mut reached = true;
                                     for part in props {
@@ -6692,10 +6695,12 @@ impl CfmlVirtualMachine {
                                         }
                                     }
                                     if reached {
-                                        if let (CfmlValue::Struct(cur), CfmlValue::Struct(res)) =
-                                            (&node, &result)
-                                        {
-                                            if cur.contains_key("__variables") && !cur.ptr_eq(res) {
+                                        if let CfmlValue::Struct(cur) = &node {
+                                            let same_instance = matches!(
+                                                &result,
+                                                CfmlValue::Struct(res) if cur.ptr_eq(res)
+                                            );
+                                            if cur.contains_key("__variables") && !same_instance {
                                                 skip_for_identity = true;
                                             }
                                         }

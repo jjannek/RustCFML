@@ -33,5 +33,18 @@ dh.setInner( new DeepInner() );
 dh.getInner().setStore( new DeepStore() );
 assert("deep chained mutating call does not clobber the 2-segment base", dh.probe(), "Inner");
 
+// In-place array member fn chained on a method that RETURNS AN ARRAY:
+// `o.getItems().sort()` sorts the returned array, but codegen propagates the
+// writeback path (["o"]) to the outer .sort(), so the sorted array was written
+// back onto `o` — clobbering the component with an array (so the next `o.X()`
+// call failed). The guard now skips the writeback when the base holds a CFC and
+// the result isn't that same instance. (Surfaced via `new SocketIoServer()`'s
+// `arrayToList(io.getRegisteredNamespaces().sort(...))`.)
+o2 = new ChainClobberOuter();
+sorted = o2.getItems().sort( "textnocase" );
+assert("chained array sort returns the sorted array", arrayToList( sorted ), "a,b,c");
+assert("base still a component after chained array sort", isObject( o2 ), true);
+assert("base method still callable after chained array sort", o2.whoAmI(), "Outer");
+
 suiteEnd();
 </cfscript>
