@@ -5590,6 +5590,18 @@ fn fn_is_instance_of(args: Vec<CfmlValue>) -> CfmlResult {
                 }
             }
         }
+
+        // Check package-qualified interface FQNs (issue #206) — an unqualified
+        // implements="X" on a component loaded via a package path resolves to
+        // "<pkg>.X", so isInstanceOf(obj, "<pkg>.X") must match. Path-aware
+        // (exact FQN), matching Lucee: "wrong.pkg.X" does NOT match.
+        if let Some(CfmlValue::Array(ifaces)) = s.get("__implements_fqns") {
+            for item in ifaces.iter() {
+                if item.as_string().to_lowercase() == type_lower {
+                    return Ok(CfmlValue::Bool(true));
+                }
+            }
+        }
     }
 
     Ok(CfmlValue::Bool(false))

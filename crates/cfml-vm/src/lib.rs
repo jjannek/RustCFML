@@ -17714,7 +17714,24 @@ impl CfmlVirtualMachine {
             .map(|v| v.as_string())
             .unwrap_or_else(|| "Anonymous".to_string());
 
+        // Resolve unqualified `implements="X"` names relative to the implementing
+        // component's OWN directory (issue #206) — exactly how `extends` resolves
+        // a sibling parent. Without this, a component loaded via a package path
+        // (e.g. `pkg.Mock implements="IFace"`) resolved `IFace` against the
+        // current execution's source_file (the entry template's dir) and failed
+        // with "Interface 'IFace' not found". Point source_file at the component's
+        // CFC for the duration of resolution, then restore it.
+        let old_source_file = match component.get("__source_file") {
+            Some(CfmlValue::String(src)) => {
+                let prev = self.source_file.clone();
+                self.source_file = Some(src.to_string());
+                Some(prev)
+            }
+            _ => None,
+        };
+
         let mut all_interfaces = Vec::new();
+        let mut error: Option<CfmlError> = None;
 
         for iface_val in iface_names.iter() {
             let iface_name = iface_val.as_string();
@@ -17730,25 +17747,39 @@ impl CfmlVirtualMachine {
 
             // Validate methods
             let mut visited = std::collections::HashSet::new();
-            let required_methods =
-                self.resolve_interface_methods(&iface_name, locals, &mut visited)?;
-
-            for method_name in &required_methods {
-                // Check if component has this method (case-insensitive)
-                let has_method = component.iter().any(|(k, v)| {
-                    k.eq_ignore_ascii_case(&method_name)
-                        && matches!(v, CfmlValue::Function(_))
-                });
-                if !has_method {
-                    return Err(CfmlError::runtime(format!(
-                        "Component '{}' does not implement method '{}' required by interface '{}'",
-                        comp_name, method_name, iface_name
-                    )));
+            match self.resolve_interface_methods(&iface_name, locals, &mut visited) {
+                Ok(required_methods) => {
+                    for method_name in &required_methods {
+                        // Check if component has this method (case-insensitive)
+                        let has_method = component.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case(method_name)
+                                && matches!(v, CfmlValue::Function(_))
+                        });
+                        if !has_method {
+                            error = Some(CfmlError::runtime(format!(
+                                "Component '{}' does not implement method '{}' required by interface '{}'",
+                                comp_name, method_name, iface_name
+                            )));
+                            break;
+                        }
+                    }
                 }
+                Err(e) => error = Some(e),
+            }
+            if error.is_some() {
+                break;
             }
         }
 
-        Ok(all_interfaces)
+        // Restore source_file regardless of outcome.
+        if let Some(prev) = old_source_file {
+            self.source_file = prev;
+        }
+
+        match error {
+            Some(e) => Err(e),
+            None => Ok(all_interfaces),
+        }
     }
 
     /// Validate a freshly-instantiated component against its declared interfaces
@@ -17762,12 +17793,40 @@ impl CfmlVirtualMachine {
         locals: &ValueMap,
     ) -> Result<CfmlValue, CfmlError> {
         if let CfmlValue::Struct(ref s) = instance {
-            let all_ifaces = self.validate_interface_implementation(&s.snapshot(), locals)?;
-            if !all_ifaces.is_empty() {
-                let mut m = s.snapshot();
-                let chain: Vec<CfmlValue> =
-                    all_ifaces.into_iter().map(CfmlValue::string).collect();
-                m.insert("__implements_chain".to_string(), CfmlValue::array(chain));
+            let snap = s.snapshot();
+            let all_ifaces = self.validate_interface_implementation(&snap, locals)?;
+
+            // Package-qualify each unqualified declared interface (issue #206).
+            // An unqualified `implements="X"` resolves relative to the component's
+            // own directory, so isInstanceOf(obj, "pkg.X") must match. Lucee is
+            // path-aware here (isInstanceOf(obj, "wrong.pkg.X") is false), so we
+            // store the RESOLVED dotted FQN — the component's package prefix plus
+            // the declared name — in a dedicated `__implements_fqns` key read only
+            // by isInstanceOf. The metadata `implements` struct keeps the declared
+            // (unqualified) form, matching Lucee/ACF.
+            let pkg = snap.get("__name").map(|v| v.as_string()).and_then(|n| {
+                n.rfind('.').map(|i| n[..i].to_string()).filter(|p| !p.is_empty())
+            });
+            let mut fqns: Vec<CfmlValue> = Vec::new();
+            if let (Some(p), Some(CfmlValue::Array(decl))) = (&pkg, snap.get("__implements")) {
+                for v in decl.iter() {
+                    let nm = v.as_string();
+                    if !nm.is_empty() && !nm.contains('.') {
+                        fqns.push(CfmlValue::string(format!("{}.{}", p, nm)));
+                    }
+                }
+            }
+
+            if !all_ifaces.is_empty() || !fqns.is_empty() {
+                let mut m = snap;
+                if !all_ifaces.is_empty() {
+                    let chain: Vec<CfmlValue> =
+                        all_ifaces.into_iter().map(CfmlValue::string).collect();
+                    m.insert("__implements_chain".to_string(), CfmlValue::array(chain));
+                }
+                if !fqns.is_empty() {
+                    m.insert("__implements_fqns".to_string(), CfmlValue::array(fqns));
+                }
                 return Ok(CfmlValue::strukt(m));
             }
         }
