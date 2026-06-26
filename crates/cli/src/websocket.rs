@@ -544,6 +544,54 @@ fn run_dispatch(
         .map_err(|e| format!("{e}"))
 }
 
+/// What an imperative socket.io-lucee dispatch should run.
+pub(crate) enum SioDispatch {
+    /// A namespace-level listener (`connect` / `disconnect` / `disconnecting`),
+    /// invoked with a fresh socket facade.
+    NsEvent(&'static str),
+    /// A per-socket inbound event listener, invoked with the client payload;
+    /// its return value rides back as the socket.io ack.
+    SocketEvent { event: String, payload: CfmlValue },
+}
+
+/// Run one imperative socket.io-lucee dispatch on a blocking worker. Parallel to
+/// [`dispatch`] but for the compat surface: it resolves the stored handler from
+/// the process-wide `socketio_compat` store (not a convention CFC) and invokes
+/// it on a fresh VM.
+pub(crate) async fn dispatch_sio(
+    state: &Arc<AppState>,
+    ns: &str,
+    conn_id: &str,
+    session_id: Option<String>,
+    kind: SioDispatch,
+) -> Result<Option<CfmlValue>, String> {
+    let server_state = state.server_state.clone();
+    let vfs = state.vfs.clone();
+    let sandbox = state.sandbox;
+    let ns = ns.to_string();
+    let conn_id = conn_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let empty = crate::CfmlCompiler::new()
+            .compile(crate::CfmlParser::new(String::new()).parse().expect("empty source parses"));
+        let mut vm = CfmlVirtualMachine::new(empty);
+        vm.vfs = vfs;
+        vm.sandbox = sandbox;
+        crate::register_vm_runtime(&mut vm);
+        vm.apply_cfconfig(&server_state.cfconfig);
+        vm.session_id = session_id;
+        vm.server_state = Some(server_state);
+        let r = match kind {
+            SioDispatch::NsEvent(event) => vm.dispatch_sio_ns(&conn_id, &ns, event),
+            SioDispatch::SocketEvent { event, payload } => {
+                vm.dispatch_sio_event(&conn_id, &ns, &event, payload)
+            }
+        };
+        r.map_err(|e| format!("{e}"))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("socket.io dispatch task panicked: {e}")))
+}
+
 /// Serialize a wire frame to JSON text using the engine's own `serializeJSON`
 /// (so `encoding="json"` payloads round-trip with CFML semantics).
 fn serialize_frame(frame: &WireEnvelope) -> String {

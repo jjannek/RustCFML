@@ -29,7 +29,7 @@ use socketioxide::extract::{AckSender, Data, SocketRef};
 use socketioxide::layer::SocketIoLayer;
 use socketioxide::SocketIo;
 
-use crate::websocket::{dispatch, is_reject, resolve_channel};
+use crate::websocket::{dispatch, dispatch_sio, is_reject, resolve_channel, SioDispatch};
 use crate::AppState;
 
 /// The [`FrameSink`] handed to the registry for one socket.io connection. A
@@ -41,10 +41,38 @@ use crate::AppState;
 #[derive(Debug)]
 struct SocketIoSink {
     socket: SocketRef,
+    /// When `Some`, outbound frames are buffered instead of emitted. The
+    /// imperative compat path uses this to hold frames emitted *during* the
+    /// connect listener (e.g. a `welcome` greeting) until the socketioxide
+    /// `on(event)` handlers the listener registered are wired up — otherwise a
+    /// client that emits in reaction to the greeting would race ahead of its
+    /// (not-yet-registered) handler, and socketioxide (no catch-all) would drop
+    /// the event. `None` for the fluent/convention path (emit immediately).
+    buffer: std::sync::Mutex<Option<Vec<WireEnvelope>>>,
 }
 
-impl FrameSink for SocketIoSink {
-    fn send(&self, frame: WireEnvelope) {
+impl SocketIoSink {
+    fn new(socket: SocketRef) -> Self {
+        Self { socket, buffer: std::sync::Mutex::new(None) }
+    }
+
+    /// Start buffering outbound frames (idempotent).
+    fn buffer_mode(&self) {
+        let mut b = self.buffer.lock().unwrap();
+        if b.is_none() {
+            *b = Some(Vec::new());
+        }
+    }
+
+    /// Stop buffering and emit everything captured so far, in order.
+    fn flush(&self) {
+        let drained = self.buffer.lock().unwrap().take();
+        for frame in drained.into_iter().flatten() {
+            self.emit_now(frame);
+        }
+    }
+
+    fn emit_now(&self, frame: WireEnvelope) {
         let event = frame.ev.clone().unwrap_or_else(|| {
             if frame.t == "msg" {
                 "message".to_string()
@@ -54,6 +82,19 @@ impl FrameSink for SocketIoSink {
         });
         // `emit` errors only if the socket is already closed → nothing to do.
         let _ = self.socket.emit(event.as_str(), &frame.d);
+    }
+}
+
+impl FrameSink for SocketIoSink {
+    fn send(&self, frame: WireEnvelope) {
+        {
+            let mut b = self.buffer.lock().unwrap();
+            if let Some(buf) = b.as_mut() {
+                buf.push(frame);
+                return;
+            }
+        }
+        self.emit_now(frame);
     }
     fn close(&self, _code: u16, _reason: String) {
         // socket.io has no close-code channel like raw WS; just disconnect.
@@ -83,8 +124,17 @@ pub(crate) fn build_layer(state: Arc<AppState>) -> SocketIoLayer {
 /// run the `onConnect` reject gate (+ auto-join + resumability replay), then
 /// wire up the per-event handlers and the disconnect teardown.
 async fn on_connect(socket: SocketRef, state: Arc<AppState>) {
-    // Namespace `/chat` → channel CFC `chat`. An unknown channel is refused.
     let ns = socket.ns().to_string();
+    // The imperative socket.io-lucee surface owns this namespace if a
+    // `SocketIoServer` registered it (via `io.of(ns)`). Otherwise fall through
+    // to the convention `websockets/<name>.cfc` discovery. The two surfaces
+    // share this one transport + the one WebSocketRegistry.
+    if cfml_vm::socketio_compat::compat().is_imperative_ns(&ns) {
+        on_connect_imperative(socket, state, ns).await;
+        return;
+    }
+
+    // Namespace `/chat` → channel CFC `chat`. An unknown channel is refused.
     let name = ns.trim_start_matches('/');
     let info = match resolve_channel(&state, name) {
         Some(i) => i,
@@ -101,7 +151,7 @@ async fn on_connect(socket: SocketRef, state: Arc<AppState>) {
     let params = crate::websocket::parse_query(parts.uri.query());
 
     let registry = state.server_state.websocket.clone();
-    let sink: Arc<dyn FrameSink> = Arc::new(SocketIoSink { socket: socket.clone() });
+    let sink: Arc<dyn FrameSink> = Arc::new(SocketIoSink::new(socket.clone()));
     let conn_id = registry.register(&info.channel, sink, session_id.clone(), params);
     registry.set_history_cap(&info.channel, info.history);
 
@@ -240,6 +290,117 @@ async fn on_connect(socket: SocketRef, state: Arc<AppState>) {
                     Some(CfmlValue::string("client closed".to_string())),
                 )
                 .await;
+                state.server_state.websocket.unregister(&conn_id);
+            }
+        });
+    }
+}
+
+/// One socket.io connection on an *imperative* (socket.io-lucee compat)
+/// namespace: register with the shared registry, run the namespace `connect`
+/// listener (which builds the socket facade and registers per-socket event
+/// listeners engine-side), then wire socketioxide handlers for those events and
+/// the disconnect teardown. Fan-out (`socket.emit`/`broadcast`, `namespace.emit`)
+/// rides the same WebSocketRegistry as the fluent API.
+async fn on_connect_imperative(socket: SocketRef, state: Arc<AppState>, ns: String) {
+    let parts = socket.req_parts();
+    let session_id = crate::websocket::session_id_from_headers(&parts.headers);
+    let params = crate::websocket::parse_query(parts.uri.query());
+
+    let registry = state.server_state.websocket.clone();
+    // Buffer outbound frames emitted during connect (e.g. a `welcome` greeting)
+    // until the per-event handlers are wired (see `SocketIoSink::buffer`).
+    let sink = Arc::new(SocketIoSink::new(socket.clone()));
+    sink.buffer_mode();
+    // The namespace doubles as the registry channel, so `$sioBroadcast` /
+    // `$sioSend` route by it just like the fluent `io(channel)`.
+    let conn_id =
+        registry.register(&ns, sink.clone() as Arc<dyn FrameSink>, session_id.clone(), params);
+    cfml_vm::socketio_compat::compat().register_conn(&conn_id, &ns);
+
+    // Run the namespace `connect` listener (builds the socket facade; may call
+    // `socket.on(event, ...)`, stored engine-side keyed by this connection).
+    let _ = dispatch_sio(
+        &state,
+        &ns,
+        &conn_id,
+        session_id.clone(),
+        SioDispatch::NsEvent("connect"),
+    )
+    .await;
+
+    // socketioxide 0.16 has no catch-all, so subscribe to exactly the events the
+    // connect listener registered. (A `socket.on` made *after* connect won't be
+    // wired — register all handlers in the connect listener, the socket.io-lucee
+    // convention.)
+    let events = cfml_vm::socketio_compat::compat().socket_events(&conn_id);
+    for event in events {
+        let state = state.clone();
+        let ns = ns.clone();
+        let conn_id = conn_id.clone();
+        let session_id = session_id.clone();
+        let ev = event.clone();
+        socket.on(
+            event,
+            move |_s: SocketRef, Data::<CfmlValue>(payload): Data<CfmlValue>, ack: AckSender| {
+                let state = state.clone();
+                let ns = ns.clone();
+                let conn_id = conn_id.clone();
+                let session_id = session_id.clone();
+                let ev = ev.clone();
+                async move {
+                    let r = dispatch_sio(
+                        &state,
+                        &ns,
+                        &conn_id,
+                        session_id,
+                        SioDispatch::SocketEvent { event: ev, payload },
+                    )
+                    .await;
+                    // Non-null return → the client's ack (P5).
+                    if let Ok(Some(v)) = r {
+                        if !matches!(v, CfmlValue::Null) {
+                            let _ = ack.send(&v);
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    // Handlers are wired — release the frames buffered during connect (the
+    // greeting now reaches the client, which can safely emit in response).
+    sink.flush();
+
+    // Teardown: `disconnecting` then `disconnect`, then forget the connection.
+    {
+        let state = state.clone();
+        let ns = ns.clone();
+        let conn_id = conn_id.clone();
+        let session_id = session_id.clone();
+        socket.on_disconnect(move |_s: SocketRef| {
+            let state = state.clone();
+            let ns = ns.clone();
+            let conn_id = conn_id.clone();
+            let session_id = session_id.clone();
+            async move {
+                let _ = dispatch_sio(
+                    &state,
+                    &ns,
+                    &conn_id,
+                    session_id.clone(),
+                    SioDispatch::NsEvent("disconnecting"),
+                )
+                .await;
+                let _ = dispatch_sio(
+                    &state,
+                    &ns,
+                    &conn_id,
+                    session_id,
+                    SioDispatch::NsEvent("disconnect"),
+                )
+                .await;
+                cfml_vm::socketio_compat::compat().drop_conn(&conn_id);
                 state.server_state.websocket.unregister(&conn_id);
             }
         });

@@ -24,6 +24,7 @@ pub mod jit;
 #[cfg(feature = "s3")]
 mod s3_vfs;
 pub mod session_store;
+pub mod socketio_compat;
 pub mod web;
 pub mod websocket;
 pub use application_store::{ApplicationStore, MemoryApplicationStore};
@@ -66,6 +67,28 @@ const ARGUMENTS_SCOPE_KEY: &str = "__arguments__";
 /// #70 intra-request program swap) cannot occur by construction. A non-`Int`
 /// body (e.g. `Null` for native/intercepted functions) simply isn't a UDF
 /// reference and dispatches by name.
+
+/// Normalize a socket.io-lucee `rooms` argument (an array of room names, a
+/// single room string, or empty) into a list of non-empty room names. An empty
+/// result means "no room narrowing" (broadcast to the whole namespace).
+fn sio_room_list(value: &CfmlValue) -> Vec<String> {
+    match value {
+        CfmlValue::Array(items) => items
+            .iter()
+            .map(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        CfmlValue::Null => Vec::new(),
+        other => {
+            let s = other.as_string();
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s]
+            }
+        }
+    }
+}
 
 /// Persistent application state, keyed by app name.
 #[derive(Clone)]
@@ -7855,6 +7878,173 @@ impl CfmlVirtualMachine {
                     (Some(channel), Some(ss)) => Ok(ss.websocket.presence_state(&channel)),
                     _ => Ok(CfmlValue::strukt(ValueMap::default())),
                 };
+            }
+
+            // ── socket.io-lucee compat BIFs ($sio*) ───────────────────────
+            // The flat seam the imperative SocketIoServer/Namespace/Socket CFCs
+            // call instead of socket.io-lucee's embedded Java server. They store
+            // handlers in the process-wide `socketio_compat` store and fan out
+            // through the shared `WebSocketRegistry` — same engine as the fluent
+            // `io()`/`wsPublish` API, different CFML surface.
+            if name_lower.starts_with("$sio") {
+                let compat = crate::socketio_compat::compat();
+                let arg_s = |i: usize| args.get(i).map(|v| v.as_string()).unwrap_or_default();
+                let arg_v = |i: usize| args.get(i).cloned().unwrap_or(CfmlValue::Null);
+                match name_lower.as_str() {
+                    "$sioregisternamespace" => {
+                        compat.register_namespace(&arg_s(0));
+                        return Ok(CfmlValue::Null);
+                    }
+                    "$sioregisterednamespaces" => {
+                        return Ok(CfmlValue::array(
+                            compat
+                                .registered_namespaces()
+                                .into_iter()
+                                .map(CfmlValue::string)
+                                .collect(),
+                        ));
+                    }
+                    // ($sioRegisterNsHandler ns, event, callback)
+                    "$sioregisternshandler" => {
+                        let cb = arg_v(2);
+                        let fns = self.collect_reachable_fn_arcs(&cb);
+                        compat.set_ns_handler(
+                            &arg_s(0),
+                            crate::socketio_compat::Handler { event: arg_s(1), callback: cb, fns },
+                        );
+                        return Ok(CfmlValue::Null);
+                    }
+                    // ($sioRegisterSocketHandler socketId, event, callback)
+                    "$sioregistersockethandler" => {
+                        let cb = arg_v(2);
+                        let fns = self.collect_reachable_fn_arcs(&cb);
+                        compat.set_socket_handler(
+                            &arg_s(0),
+                            crate::socketio_compat::Handler { event: arg_s(1), callback: cb, fns },
+                        );
+                        return Ok(CfmlValue::Null);
+                    }
+                    // ($sioBroadcast event, data, rooms, namespace, socketId)
+                    // namespace set → broadcast to the whole namespace; socketId
+                    // set → broadcast to the sender's namespace excluding it.
+                    // rooms (array|string|empty) narrows to those rooms.
+                    "$siobroadcast" => {
+                        let event = arg_s(0);
+                        let data = arg_v(1);
+                        let rooms = sio_room_list(&arg_v(2));
+                        let namespace = arg_s(3);
+                        let socket_id = arg_s(4);
+                        if let Some(ss) = self.server_state.as_ref() {
+                            let registry = ss.websocket.clone();
+                            let (channel, except) = if !namespace.is_empty() {
+                                (namespace, None)
+                            } else if !socket_id.is_empty() {
+                                let ch = registry.channel_of(&socket_id).unwrap_or_default();
+                                (ch, Some(socket_id))
+                            } else {
+                                (String::new(), None)
+                            };
+                            if !channel.is_empty() {
+                                if rooms.is_empty() {
+                                    let frame = registry.msg(
+                                        &channel,
+                                        Some(event),
+                                        data,
+                                    );
+                                    registry.broadcast(&channel, frame, except.as_deref());
+                                } else {
+                                    for room in &rooms {
+                                        let frame = registry.msg(
+                                            &channel,
+                                            Some(event.clone()),
+                                            data.clone(),
+                                        );
+                                        registry.to_room(
+                                            &channel,
+                                            room,
+                                            frame,
+                                            except.as_deref(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(CfmlValue::Null);
+                    }
+                    // ($sioSend socketId, event, data) — direct to one client.
+                    "$siosend" => {
+                        let socket_id = arg_s(0);
+                        let event = arg_s(1);
+                        let data = arg_v(2);
+                        if let Some(ss) = self.server_state.as_ref() {
+                            let registry = ss.websocket.clone();
+                            let channel = registry.channel_of(&socket_id).unwrap_or_default();
+                            let frame = registry.msg(&channel, Some(event), data);
+                            registry.emit_to(&socket_id, frame);
+                        }
+                        return Ok(CfmlValue::Null);
+                    }
+                    "$siojoinroom" => {
+                        if let Some(ss) = self.server_state.as_ref() {
+                            ss.websocket.join(&arg_s(0), &arg_s(1));
+                        }
+                        return Ok(CfmlValue::Null);
+                    }
+                    "$sioleaveroom" => {
+                        if let Some(ss) = self.server_state.as_ref() {
+                            ss.websocket.leave(&arg_s(0), &arg_s(1));
+                        }
+                        return Ok(CfmlValue::Null);
+                    }
+                    // Leave every room except the connection's own id-room (which
+                    // the registry auto-joins so "send to this socket" works).
+                    "$sioleaveallrooms" => {
+                        let socket_id = arg_s(0);
+                        if let Some(ss) = self.server_state.as_ref() {
+                            let registry = ss.websocket.clone();
+                            for room in registry.rooms_of(&socket_id) {
+                                if room != socket_id {
+                                    registry.leave(&socket_id, &room);
+                                }
+                            }
+                        }
+                        return Ok(CfmlValue::Null);
+                    }
+                    "$siodisconnect" => {
+                        let socket_id = arg_s(0);
+                        if let Some(ss) = self.server_state.as_ref() {
+                            ss.websocket.close_conn(&socket_id, 1000, String::new());
+                        }
+                        compat.drop_conn(&socket_id);
+                        return Ok(CfmlValue::Null);
+                    }
+                    "$siogetdata" => {
+                        return Ok(CfmlValue::strukt(compat.get_data(&arg_s(0))));
+                    }
+                    // ($sioSetData socketId, data-struct)
+                    "$siosetdata" => {
+                        let data = match arg_v(1) {
+                            CfmlValue::Struct(s) => s.snapshot(),
+                            _ => ValueMap::default(),
+                        };
+                        compat.set_data(&arg_s(0), data);
+                        return Ok(CfmlValue::Null);
+                    }
+                    "$siosocketcount" => {
+                        let n = self
+                            .server_state
+                            .as_ref()
+                            .map(|ss| ss.websocket.channel_count(&arg_s(0)))
+                            .unwrap_or(0);
+                        return Ok(CfmlValue::Int(n as i64));
+                    }
+                    _ => {
+                        return Err(self.wrap_error(CfmlError::runtime(format!(
+                            "Unknown socket.io compat function [{}]",
+                            func.name
+                        ))))
+                    }
+                }
             }
 
             // __writeText: same as writeOutput but suppressed when enableCFOutputOnly > 0
@@ -16215,6 +16405,38 @@ impl CfmlVirtualMachine {
         self.app_function_table = table;
     }
 
+    /// Collect the `BytecodeFunction` `Arc`s reachable from an arbitrary value
+    /// (a stored closure and everything in its captured scope), resolved against
+    /// *this* VM's `fn_registry`. The socket.io-lucee compat layer captures
+    /// these when a `$sio*` BIF stores a handler, so a later dispatch VM can
+    /// `register_fn` them and invoke the closure — the same reachability +
+    /// transitive-`DefineFunction` closure as [`rehome_application_functions`],
+    /// but rooted at one value instead of the whole application scope.
+    pub fn collect_reachable_fn_arcs(
+        &self,
+        value: &CfmlValue,
+    ) -> Vec<Arc<cfml_codegen::compiler::BytecodeFunction>> {
+        let mut ids: HashSet<i64> = HashSet::new();
+        let mut visited = HashSet::new();
+        Self::collect_app_fn_ids(value, &mut ids, &mut visited);
+        // Close over nested `DefineFunction` targets (closures a stored function
+        // defines at call time are referenced only by global_id in its bytecode).
+        let mut worklist: Vec<i64> = ids.iter().copied().collect();
+        while let Some(gid) = worklist.pop() {
+            if let Some(arc) = self.resolve_fn(gid) {
+                for op in &arc.instructions {
+                    if let BytecodeOp::DefineFunction(child) = op {
+                        let child = *child as i64;
+                        if ids.insert(child) {
+                            worklist.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        ids.into_iter().filter_map(|gid| self.resolve_fn(gid)).collect()
+    }
+
     /// Get default datasource from application scope or request scope
     fn get_default_datasource(&self, parent_locals: &ValueMap) -> String {
         // Per-application default datasource (this.datasource / cfconfig default)
@@ -19382,6 +19604,81 @@ impl CfmlVirtualMachine {
         let result = self.dispatch_ws_event_inner(cfc_path, method, event, args);
         self.current_ws_channel = prev_channel;
         result
+    }
+
+    // ── socket.io-lucee compat dispatch ───────────────────────────────────
+    // The imperative surface stores handler closures (the namespace `connect`
+    // listener and the per-socket `on="event"` listeners it registers) in the
+    // process-wide `socketio_compat` store, each with the `BytecodeFunction`
+    // `Arc`s reachable from it. These methods re-register those Arcs into this
+    // (fresh) dispatch VM and invoke the closure — the connect/disconnect
+    // listeners with a freshly-built `socket` facade, the per-socket event
+    // listeners with the client payload (their closure already captured the
+    // `socket` from the connect handler's scope).
+
+    /// Build the engine `SocketIoSocket` facade bound to a connection. Methods
+    /// read `variables.id` / `variables.namespace`, so we seed them directly
+    /// rather than running the CFC's `init` — the facade is otherwise stateless
+    /// (every method delegates to a `$sio*` BIF keyed by the connection id).
+    fn sio_socket(&mut self, conn_id: &str, ns: &str) -> Option<CfmlValue> {
+        let locals = ValueMap::default();
+        let template = self.resolve_component_template("SocketIoSocket", &locals)?;
+        let instance = self.resolve_inheritance(template, &locals);
+        if let CfmlValue::Struct(ref s) = instance {
+            let vars = s.get_or_insert_struct("__variables");
+            vars.insert("id".to_string(), CfmlValue::string(conn_id.to_string()));
+            vars.insert("namespace".to_string(), CfmlValue::string(ns.to_string()));
+        }
+        Some(instance)
+    }
+
+    /// Run a namespace-level listener (`connect` / `disconnect` /
+    /// `disconnecting`) with a fresh socket facade as its sole argument.
+    /// `Ok(None)` when no such listener is registered (a no-op).
+    pub fn dispatch_sio_ns(
+        &mut self,
+        conn_id: &str,
+        ns: &str,
+        event: &str,
+    ) -> Result<Option<CfmlValue>, CfmlError> {
+        let handler = match crate::socketio_compat::compat().ns_handler(ns, event) {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+        for f in &handler.fns {
+            self.register_fn(f);
+        }
+        let socket = match self.sio_socket(conn_id, ns) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let prev = self.current_ws_channel.replace(ns.to_string());
+        let r = self.call_function(&handler.callback, vec![socket], &ValueMap::default());
+        self.current_ws_channel = prev;
+        r.map(Some)
+    }
+
+    /// Run a per-socket inbound event listener with the client payload. The
+    /// listener closure captured its `socket` at registration time, so only the
+    /// payload is passed; the return value rides back as the socket.io ack.
+    pub fn dispatch_sio_event(
+        &mut self,
+        conn_id: &str,
+        ns: &str,
+        event: &str,
+        payload: CfmlValue,
+    ) -> Result<Option<CfmlValue>, CfmlError> {
+        let handler = match crate::socketio_compat::compat().socket_handler(conn_id, event) {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+        for f in &handler.fns {
+            self.register_fn(f);
+        }
+        let prev = self.current_ws_channel.replace(ns.to_string());
+        let r = self.call_function(&handler.callback, vec![payload], &ValueMap::default());
+        self.current_ws_channel = prev;
+        r.map(Some)
     }
 
     fn dispatch_ws_event_inner(

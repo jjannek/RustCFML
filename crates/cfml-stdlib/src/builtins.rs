@@ -487,6 +487,22 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("wsPresence".into(), fn_ws_stub); // VM intercepts
     f.insert("assertBroadcast".into(), fn_ws_stub); // VM intercepts (test harness)
 
+    // socket.io-lucee compat seam ($sio*) — the flat BIFs the imperative
+    // SocketIoServer/Namespace/Socket CFCs call; all VM-intercepted in lib.rs.
+    f.insert("$sioRegisterNamespace".into(), fn_ws_stub);
+    f.insert("$sioRegisteredNamespaces".into(), fn_ws_stub);
+    f.insert("$sioRegisterNsHandler".into(), fn_ws_stub);
+    f.insert("$sioRegisterSocketHandler".into(), fn_ws_stub);
+    f.insert("$sioBroadcast".into(), fn_ws_stub);
+    f.insert("$sioSend".into(), fn_ws_stub);
+    f.insert("$sioJoinRoom".into(), fn_ws_stub);
+    f.insert("$sioLeaveRoom".into(), fn_ws_stub);
+    f.insert("$sioLeaveAllRooms".into(), fn_ws_stub);
+    f.insert("$sioDisconnect".into(), fn_ws_stub);
+    f.insert("$sioGetData".into(), fn_ws_stub);
+    f.insert("$sioSetData".into(), fn_ws_stub);
+    f.insert("$sioSocketCount".into(), fn_ws_stub);
+
     // ---- JSON functions ----
     f.insert("serializeJSON".into(), fn_serialize_json);
     f.insert("deserializeJSON".into(), fn_deserialize_json);

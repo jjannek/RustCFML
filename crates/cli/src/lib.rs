@@ -1,6 +1,7 @@
 mod rewrite;
 mod session;
 mod socketio;
+mod socketio_assets;
 mod websocket;
 
 use clap::Parser;
@@ -418,7 +419,9 @@ fn real_main() {
             socket,
             args.debug,
             args.single_threaded,
-            vfs::real_fs(),
+            // Overlay the engine-bundled socket.io-lucee compat CFCs so
+            // `new SocketIoServer()` resolves without the user shipping them.
+            Arc::new(socketio_assets::SocketIoOverlay::new(vfs::real_fs())),
             false,
             production,
             Arc::new(cfconfig),

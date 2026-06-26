@@ -422,9 +422,88 @@ console.log(ack.delivered);
 > socket connects, a client should wait for the `connect` event before its first
 > `emit` (the socket.io client does this by default).
 
-Multi-channel / multi-segment namespaces and the imperative socket.io-lucee CFML
-surface (`new SocketIoServer()` / `io.on("connect", …)`) are **not** part of this
-transport — that compatibility layer is the remaining [roadmap](#roadmap) item.
+For the **imperative** socket.io-lucee CFML surface (`new SocketIoServer()` /
+`io.of(ns).on("connect", …)` / `socket.on/emit/joinRoom`), see
+[socket.io-lucee compatibility layer](#socketio-lucee-compatibility-layer) below
+— it rides this same transport and registry.
+
+## socket.io-lucee compatibility layer
+
+Alongside the convention API (one CFC per channel under `websockets/`), RustCFML
+ships an **imperative** surface that mirrors
+[socket.io-lucee](https://github.com/pixl8/socket.io-lucee) — so a
+`preside-ext-socket-io`-style handler runs largely unchanged. Both surfaces share
+the one `/socket.io/` transport and the one registry; a namespace is owned by
+whichever surface registered it.
+
+The engine bundles the `SocketIoServer` / `SocketIoNamespace` / `SocketIoSocket`
+CFCs (no install needed). Create the server once and store it somewhere
+long-lived (application scope is the norm) so its handler closures survive across
+requests — typically in `onApplicationStart`:
+
+```cfml
+component {
+    function onApplicationStart() {
+        application.io = new SocketIoServer();
+
+        application.io.of( "/chat" ).on( "connect", function( socket ){
+            socket.emit( "welcome", { id = socket.getId() } );
+
+            // Inbound event; the return value is the client's native ack.
+            socket.on( "say", function( msg ){
+                socket.broadcast( "said", msg );   // everyone else in the namespace
+                return { delivered = true };
+            } );
+
+            socket.on( "joinRoom", function( data ){
+                socket.joinRoom( data.room );
+                application.io.of( "/chat" ).emit( "roomNews", { room = data.room }, [ data.room ] );
+            } );
+        } );
+
+        return true;
+    }
+}
+```
+
+The JS side is a stock socket.io client connecting to the namespace
+(`io("/chat")`). Surface supported:
+
+- **`SocketIoServer`** — `of(ns)` / `namespace(ns)` (register + get a namespace),
+  `on(event, cb)` (shortcut for the `/` namespace), `getRegisteredNamespaces()`,
+  and `this.sockets` (the root namespace). `start()`/`stop()`/`close()`/`shutdown()`
+  are no-ops (the transport is the engine's own server, always running);
+  `isRunning()` is `true` and `getState()` is `"RUNNING"`. Constructor args
+  (host/port/cors/ping…) are accepted for compatibility and ignored.
+- **namespace** — `on(event, cb)` for `connect` / `disconnect` / `disconnecting`
+  (the callback receives the `socket`), `broadcast(event, args, rooms)` /
+  `emit(...)` (whole namespace, or narrowed to room(s)), `getSocketCount()`.
+- **socket** — `on(event, cb)` (inbound), `emit(event, args)` / `send(message)`
+  (direct to this client), `broadcast(event, args, rooms)` (everyone else),
+  `joinRoom` / `leaveRoom` / `leaveAllRooms`, `disconnect(close)`,
+  `getId()` / `getNamespace()`, and `getSocketData()` / `setSocketData(struct)`
+  (per-connection state held engine-side across messages).
+
+Notes and current limits:
+
+- **Bootstrap before connections.** The app owns registration — run it (e.g. in
+  `onApplicationStart`) before clients connect, exactly as socket.io-lucee
+  requires. A connection to an unregistered namespace falls through to the
+  convention `websockets/` discovery.
+- **Register `socket.on` handlers inside the connect listener.** socketioxide
+  has no catch-all, so the transport subscribes to exactly the events the connect
+  listener registered. Frames the connect listener emits (e.g. `welcome`) are
+  buffered until those handlers are wired, so a client that emits in reaction to
+  the greeting is routed correctly; a `socket.on` added *after* connect returns
+  is not wired.
+- **One payload per event.** `emit`/`broadcast` deliver a single payload value
+  (socket.io's multi-argument form is not split out), matching the rest of the
+  realtime engine.
+- **Server-initiated ack callbacks** (`socket.emit(event, args, ackCallback)`)
+  are accepted for API compatibility but not delivered back — client→server acks
+  (the handler return value) work, as in the example above.
+- Preside's own `isWebUser()` / `getWebsiteLoggedInUserId()` stay in the
+  extension; they read the session the engine attaches at the handshake.
 
 ## Wire format
 
@@ -498,9 +577,12 @@ assertBroadcast( "/chat", "nope" );                                     // false
 ```
 
 (Live-socket behaviour — echo, broadcast, rooms, reject, binary — is covered by
-the Rust integration suites in `crates/cli/tests/websocket_raw.rs` (raw WS) and
+the Rust integration suites in `crates/cli/tests/websocket_raw.rs` (raw WS),
 `crates/cli/tests/websocket_socketio.rs` (the socket.io transport: connect, emit,
-native ack, server-pushed events, broadcast, reject).)
+native ack, server-pushed events, broadcast, reject), and
+`crates/cli/tests/websocket_sio_compat.rs` (the imperative socket.io-lucee
+surface: connect listener, per-socket `socket.on` with native ack, broadcast,
+room-scoped `namespace.emit`).)
 
 ## Roadmap
 
@@ -510,11 +592,15 @@ Phase 1 (this page) covers the raw-WebSocket core. **Phase 2 is complete:**
 (`history=`, above), and **multi-node fan-out** over the shared-session cluster
 ([Clustering / multi-node](#clustering--multi-node), above) have all landed.
 
-**Phase 3 is in progress.** The **socket.io transport** (Engine.IO v4 handshake,
+**Phase 3 is complete.** The **socket.io transport** (Engine.IO v4 handshake,
 namespaces, acks, polling↔ws fallback) is live — see
-[socket.io transport](#socketio-transport), above. Planned:
+[socket.io transport](#socketio-transport), above — and the **socket.io-lucee
+compatibility layer** (the imperative `new SocketIoServer()` /
+`io.of(ns).on("connect", …)` / `socket.on/emit/joinRoom` surface) ships on top of
+it — see [socket.io-lucee compatibility layer](#socketio-lucee-compatibility-layer),
+above — so existing socket.io CFML apps (e.g. `preside-ext-socket-io`) run with
+minimal change, over the same transport and registry. Planned:
 
-- **Phase 3 (remaining)** — a **socket.io-lucee compatibility layer** (the imperative `new SocketIoServer()` / `io.on("connect", …)` / `socket.on/emit/joinRoom` surface) so existing socket.io CFML apps (e.g. `preside-ext-socket-io`) run with minimal change, over the same transport and registry.
 - **Phase 4** — declarative conveniences: model/domain-event auto-broadcast, whisper/client events, optional `/topic`·`/user` naming conventions.
 
 See [`websocket-implementation-plan.md`](websocket-implementation-plan.md) for
