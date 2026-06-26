@@ -8301,6 +8301,7 @@ impl CfmlVirtualMachine {
                 | "querysetcell"
                 | "createobject"
                 | "getcurrenttemplatepath"
+                | "getmetadata"
                 | "getcomponentmetadata"
                 | "getcomponentstaticscope"
                 | "getapplicationmetadata"
@@ -10181,6 +10182,104 @@ impl CfmlVirtualMachine {
                                 return Ok(stat);
                             }
                         }
+                    }
+                    return Ok(CfmlValue::strukt(ValueMap::default()));
+                }
+                "getmetadata" => {
+                    // getMetadata() on a function/method *reference* must return
+                    // the full function metadata — including doc-comment
+                    // annotations (@expectedException, @skip, @labels, @order,
+                    // @hint, ...) — matching getComponentMetadata().functions[n]
+                    // and Lucee/ACF (GitHub #208). A bare `CfmlValue::Function`
+                    // carries no path back to its owning component's
+                    // `__funcmeta_<name>` struct, so we resolve its
+                    // `BytecodeFunction` via the global_id stamped into its body
+                    // and read the function-level annotations carried there.
+                    // Every other value (component instance, query, struct, ...)
+                    // falls through to the pure builtin implementation.
+                    if let Some(CfmlValue::Function(f)) = args.first() {
+                        let mut meta = ValueMap::default();
+                        meta.insert("name".to_string(), CfmlValue::string(f.name.clone()));
+                        meta.insert(
+                            "access".to_string(),
+                            CfmlValue::string(format!("{:?}", f.access).to_lowercase()),
+                        );
+                        if let Some(ref rt) = f.return_type {
+                            meta.insert(
+                                "returnType".to_string(),
+                                CfmlValue::string(rt.clone()),
+                            );
+                        }
+                        // Lucee/ACF expose `closure` on function metadata; a
+                        // declared component method / UDF reference is not a
+                        // closure.
+                        meta.insert("closure".to_string(), CfmlValue::Bool(false));
+                        let params: Vec<CfmlValue> = f
+                            .params
+                            .iter()
+                            .map(|p| {
+                                let mut pm = ValueMap::default();
+                                pm.insert(
+                                    "name".to_string(),
+                                    CfmlValue::string(p.name.clone()),
+                                );
+                                if let Some(ref t) = p.param_type {
+                                    pm.insert(
+                                        "type".to_string(),
+                                        CfmlValue::string(t.clone()),
+                                    );
+                                }
+                                pm.insert(
+                                    "required".to_string(),
+                                    CfmlValue::Bool(p.required),
+                                );
+                                if let Some(ref d) = p.default {
+                                    pm.insert("default".to_string(), d.clone());
+                                }
+                                for (k, v) in &p.annotations {
+                                    pm.insert(k.clone(), CfmlValue::string(v.clone()));
+                                }
+                                CfmlValue::strukt(pm)
+                            })
+                            .collect();
+                        meta.insert("parameters".to_string(), CfmlValue::array(params));
+                        // Function-level doc-comment / inline annotations,
+                        // carried on the BytecodeFunction (resolved by global_id
+                        // from the function value's body). Surfaced as flat
+                        // top-level keys (Lucee/ACF), without clobbering the
+                        // reserved keys above.
+                        if let cfml_common::dynamic::CfmlClosureBody::Expression(ref body) =
+                            f.body
+                        {
+                            if let CfmlValue::Int(gid) = body.as_ref() {
+                                if let Some(bf) = self.resolve_fn(*gid) {
+                                    for (k, v) in &bf.metadata {
+                                        if !meta.contains_key(k.as_str()) {
+                                            meta.insert(
+                                                k.clone(),
+                                                CfmlValue::string(v.clone()),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(CfmlValue::strukt(meta));
+                    }
+                    // Non-function argument: defer to the pure builtin, which
+                    // handles components, queries, structs, and scalars.
+                    let builtin = self
+                        .builtins
+                        .get("getMetadata")
+                        .or_else(|| {
+                            self.builtins
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("getmetadata"))
+                                .map(|(_, v)| v)
+                        })
+                        .copied();
+                    if let Some(bf) = builtin {
+                        return bf(args);
                     }
                     return Ok(CfmlValue::strukt(ValueMap::default()));
                 }

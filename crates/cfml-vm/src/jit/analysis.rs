@@ -1245,6 +1245,7 @@ mod tests {
             param_annotations: params.iter().map(|_| Vec::new()).collect(),
             is_component_method: false,
             access: cfml_common::dynamic::CfmlAccess::Public,
+            metadata: Vec::new(),
         }
     }
 
