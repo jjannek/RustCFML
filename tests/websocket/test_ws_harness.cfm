@@ -4,6 +4,12 @@ suiteBegin("WebSocket harness (connection-free)");
 // emit-from-anywhere: wsPublish records into the per-VM broadcast log so
 // realtime logic is testable with no live socket (design principle P14).
 // assertBroadcast(channel, event[, predicate]) inspects that log.
+//
+// wsPublish/assertBroadcast are RustCFML-only realtime BIFs (no Lucee
+// equivalent), so the whole suite is gated on isRustCFML() to keep the
+// cross-engine Lucee run clean — same convention as test_jwt etc. The live
+// socket behaviour is covered by the Rust suites in crates/cli/tests/.
+if ( isRustCFML() ) {
 
 // Named-arg form (the canonical call shape).
 wsPublish( channel="/chat", event="message", data={ from="alice", text="hi" } );
@@ -27,6 +33,8 @@ assertTrue( "positional wsPublish recorded", assertBroadcast( "/room", "joined" 
 
 // Channel-only assertion (no event filter).
 assertTrue( "channel-only match", assertBroadcast( "/chat" ) );
+
+} // isRustCFML()
 
 suiteEnd();
 </cfscript>
