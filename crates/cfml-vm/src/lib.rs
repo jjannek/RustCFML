@@ -10313,7 +10313,23 @@ impl CfmlVirtualMachine {
                     if let Some(arg) = args.get(0) {
                         // If the argument is already a struct (component instance), extract metadata directly
                         if let CfmlValue::Struct(ref s) = arg {
-                            return Ok(extract_component_meta(&s.snapshot(), ""));
+                            let snap = s.snapshot();
+                            // Interfaces carry their signatures in __methods, not
+                            // as Function entries — build their metadata separately
+                            // (issue #205).
+                            if matches!(
+                                snap.get("__is_interface"),
+                                Some(CfmlValue::Bool(true))
+                            ) {
+                                let mut visited = std::collections::HashSet::new();
+                                return Ok(self.build_interface_metadata(
+                                    &snap,
+                                    "",
+                                    parent_locals,
+                                    &mut visited,
+                                ));
+                            }
+                            return Ok(extract_component_meta(&snap, ""));
                         }
                         // Otherwise treat as a component name/path to look up
                         let comp_name = arg.as_string();
@@ -10322,7 +10338,20 @@ impl CfmlVirtualMachine {
                         {
                             let resolved = self.resolve_inheritance(template, parent_locals);
                             if let CfmlValue::Struct(ref s) = resolved {
-                                return Ok(extract_component_meta(&s.snapshot(), &comp_name));
+                                let snap = s.snapshot();
+                                if matches!(
+                                    snap.get("__is_interface"),
+                                    Some(CfmlValue::Bool(true))
+                                ) {
+                                    let mut visited = std::collections::HashSet::new();
+                                    return Ok(self.build_interface_metadata(
+                                        &snap,
+                                        &comp_name,
+                                        parent_locals,
+                                        &mut visited,
+                                    ));
+                                }
+                                return Ok(extract_component_meta(&snap, &comp_name));
                             }
                             return Ok(resolved);
                         }
@@ -17524,6 +17553,104 @@ impl CfmlVirtualMachine {
         }
 
         Ok(methods)
+    }
+
+    /// Build `getComponentMetadata()`-shape metadata for an INTERFACE struct
+    /// (issue #205). Interfaces declare method signatures with no executable
+    /// body, so they carry no `CfmlValue::Function` entries — their signatures
+    /// live in `__methods`. Lucee/ACF surface them as `.functions`, and MockBox
+    /// (`createStub(implements=…)`) reads `.functions` (and recurses through
+    /// `.extends[fqn].functions`) to generate stub methods. `extract_component_meta`
+    /// only sees Function entries, so it must NOT be used for interfaces.
+    ///
+    /// Each parent in `__extends` is resolved recursively to its own full
+    /// interface metadata so inherited signatures are reachable; `visited`
+    /// guards against extends cycles (falling back to a flat stub).
+    fn build_interface_metadata(
+        &mut self,
+        iface_struct: &ValueMap,
+        fallback_name: &str,
+        locals: &ValueMap,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> CfmlValue {
+        let mut meta = ValueMap::default();
+        let name = iface_struct
+            .get("__name")
+            .map(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback_name.to_string());
+        meta.insert("name".to_string(), CfmlValue::string(name.clone()));
+        meta.insert("fullname".to_string(), CfmlValue::string(name));
+        meta.insert("type".to_string(), CfmlValue::string("interface".to_string()));
+        if let Some(CfmlValue::String(src)) = iface_struct.get("__source_file") {
+            meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
+        }
+
+        // functions: the interface's declared signatures (already built in the
+        // component-`functions` shape by compile_interface).
+        let mut functions = Vec::new();
+        if let Some(CfmlValue::Struct(methods)) = iface_struct.get("__methods") {
+            for (_k, v) in methods.snapshot() {
+                if let CfmlValue::Struct(fm) = v {
+                    let mut fmeta = fm.snapshot();
+                    // MockBox iterates thisMethod.parameters unconditionally —
+                    // guarantee the key exists even for no-arg methods.
+                    fmeta
+                        .entry("parameters".to_string())
+                        .or_insert_with(|| CfmlValue::array(Vec::new()));
+                    functions.push(CfmlValue::strukt(fmeta));
+                }
+            }
+        }
+        meta.insert("functions".to_string(), CfmlValue::array(functions));
+
+        // extends: a struct keyed by each parent interface's FQN -> the parent's
+        // full interface metadata (recursive), so inherited methods are reachable.
+        if let Some(CfmlValue::Array(parents)) = iface_struct.get("__extends") {
+            let mut ext = ValueMap::default();
+            for p in parents.iter() {
+                let fqn = p.as_string();
+                if fqn.is_empty() {
+                    continue;
+                }
+                let lc = fqn.to_lowercase();
+                if visited.contains(&lc) {
+                    // Cycle / already-walked: flat stub avoids infinite recursion.
+                    ext.insert(fqn.clone(), interface_meta_stub(&fqn));
+                    continue;
+                }
+                visited.insert(lc);
+                let parent_struct = self
+                    .resolve_component_template(&fqn, locals)
+                    .and_then(|t| match t {
+                        CfmlValue::Struct(s) => Some(s.snapshot()),
+                        _ => None,
+                    });
+                match parent_struct {
+                    Some(ps) => {
+                        let pm = self.build_interface_metadata(&ps, &fqn, locals, visited);
+                        ext.insert(fqn.clone(), pm);
+                    }
+                    None => {
+                        ext.insert(fqn.clone(), interface_meta_stub(&fqn));
+                    }
+                }
+            }
+            if !ext.is_empty() {
+                meta.insert("extends".to_string(), CfmlValue::strukt(ext));
+            }
+        }
+
+        // Custom interface attributes (top-level keys, Lucee/ACF parity).
+        if let Some(CfmlValue::Struct(md)) = iface_struct.get("__metadata") {
+            for (mk, mv) in md.snapshot() {
+                if !meta.contains_key(&mk) {
+                    meta.insert(mk, mv);
+                }
+            }
+        }
+
+        CfmlValue::strukt(meta)
     }
 
     /// Collect all transitive interface names from an interface's extends chain.

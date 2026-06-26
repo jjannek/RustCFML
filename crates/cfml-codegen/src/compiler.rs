@@ -2646,7 +2646,14 @@ impl CfmlCompiler {
             prop_count += 1;
         }
 
-        // __methods struct: { method_name_lc: { name, params, returnType, access } }
+        // __methods struct: each entry mirrors the component `functions`
+        // metadata shape ({ name, access, returntype, parameters:[{name, type,
+        // required, ...annotations}] }) so getComponentMetadata(iface).functions
+        // can surface an interface's declared signatures (issue #205 — MockBox
+        // createStub(implements=) reads these to generate stub methods).
+        // `parameters` is ALWAYS emitted (MockBox iterates it unconditionally).
+        // resolve_interface_methods only reads the keys of this struct, so the
+        // richer values are safe.
         if !interface.functions.is_empty() {
             instructions.push(BytecodeOp::String("__methods".to_string()));
             for func in &interface.functions {
@@ -2660,13 +2667,6 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::String(func.name.clone()));
                 method_prop_count += 1;
 
-                // returnType
-                if let Some(ref rt) = func.return_type {
-                    instructions.push(BytecodeOp::String("returnType".to_string()));
-                    instructions.push(BytecodeOp::String(rt.clone()));
-                    method_prop_count += 1;
-                }
-
                 // access
                 let access_str = match func.access {
                     AccessModifier::Public => "public",
@@ -2678,15 +2678,47 @@ impl CfmlCompiler {
                 instructions.push(BytecodeOp::String(access_str.to_string()));
                 method_prop_count += 1;
 
-                // params array
-                if !func.params.is_empty() {
-                    instructions.push(BytecodeOp::String("params".to_string()));
-                    for param in &func.params {
-                        instructions.push(BytecodeOp::String(param.name.clone()));
+                // returntype (default "any", matching Lucee/ACF)
+                instructions.push(BytecodeOp::String("returntype".to_string()));
+                instructions.push(BytecodeOp::String(
+                    func.return_type.clone().unwrap_or_else(|| "any".to_string()),
+                ));
+                method_prop_count += 1;
+
+                // parameters: full param structs, always present
+                instructions.push(BytecodeOp::String("parameters".to_string()));
+                for param in &func.params {
+                    let mut param_prop_count = 0;
+
+                    instructions.push(BytecodeOp::String("name".to_string()));
+                    instructions.push(BytecodeOp::String(param.name.clone()));
+                    param_prop_count += 1;
+
+                    if let Some(ref t) = param.param_type {
+                        instructions.push(BytecodeOp::String("type".to_string()));
+                        instructions.push(BytecodeOp::String(t.clone()));
+                        param_prop_count += 1;
                     }
-                    instructions.push(BytecodeOp::BuildArray(func.params.len()));
-                    method_prop_count += 1;
+
+                    instructions.push(BytecodeOp::String("required".to_string()));
+                    instructions.push(if param.required {
+                        BytecodeOp::True
+                    } else {
+                        BytecodeOp::False
+                    });
+                    param_prop_count += 1;
+
+                    // Javadoc-style param annotations (e.g. WireBox @x.inject)
+                    for (k, v) in &param.annotations {
+                        instructions.push(BytecodeOp::String(k.clone()));
+                        instructions.push(BytecodeOp::String(v.clone()));
+                        param_prop_count += 1;
+                    }
+
+                    instructions.push(BytecodeOp::BuildStruct(param_prop_count));
                 }
+                instructions.push(BytecodeOp::BuildArray(func.params.len()));
+                method_prop_count += 1;
 
                 instructions.push(BytecodeOp::BuildStruct(method_prop_count));
             }
