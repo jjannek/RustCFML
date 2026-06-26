@@ -921,6 +921,17 @@ impl CfmlValue {
         }
     }
 
+    /// Case-insensitive struct-key lookup (CFML keys are case-insensitive).
+    /// Mirrors `get` but resolves struct members regardless of casing — e.g.
+    /// `this.MockBox` reaching a stored `mockbox`. Arrays/query columns are
+    /// numeric-indexed, so casing does not apply; they defer to `get`.
+    pub fn get_ci(&self, key: &str) -> Option<CfmlValue> {
+        match self {
+            CfmlValue::Struct(s) => s.get_ci(key),
+            other => other.get(key),
+        }
+    }
+
     pub fn set(&mut self, key: String, value: CfmlValue) {
         match self {
             CfmlValue::Struct(s) => {

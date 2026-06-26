@@ -6886,16 +6886,65 @@ impl CfmlVirtualMachine {
                             // skips non-component targets (e.g. a deep path that
                             // navigates into the `arguments` SCOPE for
                             // `arguments.cfc.getName()`), so no scope pollution.
-                            let load_path = path.clone();
+                            // A method called on a NESTED CFC PROPERTY
+                            // (`user.author.addError()`, path ["user","author"])
+                            // must write its `variables` mutations back into the
+                            // RECEIVER (`user.author`), not the outer object — so
+                            // use the full path (v0.281, Wheels model errorsSpec).
+                            //
+                            // BUT when the path is reached through a SCOPE PREFIX
+                            // (`this.x.m()`, `arguments.obj.m()`, `variables.x.m()`
+                            // — path[0] a scope keyword), navigating into the scope
+                            // and re-storing a reconstructed copy detaches/clobbers
+                            // the shared component Arc. That regressed MockBox's
+                            // decoration pattern (#204): the generated method's
+                            // `this.mockBox` read null. For a scope-prefixed
+                            // receiver the method's mutations already applied in
+                            // place to the shared Arc, so fall back to the
+                            // pre-v0.281 trim (the __name gate below then makes the
+                            // scope-root merge a harmless no-op — a scope is not a
+                            // CFC). Wheels' `user.author` has a real var at path[0],
+                            // so it keeps the full-path behavior.
+                            let path0_is_scope = matches!(
+                                path[0].to_lowercase().as_str(),
+                                "local" | "variables" | "arguments" | "this"
+                                | "super" | "request" | "application" | "session"
+                                | "server" | "cgi" | "url" | "form" | "cookie"
+                                | "client" | "thread" | "static"
+                            );
+                            let load_path = if path.len() == 1 || path0_is_scope {
+                                if path.len() == 1 {
+                                    path.clone()
+                                } else {
+                                    path[..path.len() - 1].to_vec()
+                                }
+                            } else {
+                                path.clone()
+                            };
+                            // Navigation may fail to reach the receiver — a path
+                            // segment can be absent (or, since struct `get` is
+                            // case-sensitive while CFML keys are not, a casing
+                            // mismatch like `this.MockBox` vs stored `mockbox`).
+                            // If it does, we must NOT store back the resulting
+                            // Null: deep_set-ing Null nulls the navigated key,
+                            // which is exactly how MockBox's `this.mockBox`
+                            // back-reference got wiped (#204). Bail instead — the
+                            // method's mutations already applied in place.
+                            let mut nav_ok = true;
                             if let Some(mut comp_obj) =
                                 self.scope_aware_load(&load_path[0], &locals)
                             {
                                 if load_path.len() > 1 {
-                                    // Navigate to the component object
+                                    // Navigate to the component object (case-
+                                    // insensitive to match CFML key semantics).
                                     for part in &load_path[1..] {
-                                        comp_obj = comp_obj.get(part).unwrap_or(CfmlValue::Null);
+                                        match comp_obj.get_ci(part) {
+                                            Some(v) => comp_obj = v,
+                                            None => { nav_ok = false; break; }
+                                        }
                                     }
                                 }
+                                if nav_ok {
                                 if let Some(s) = comp_obj.as_cfml_struct() {
                                     // Only write a method's `variables` mutations back into
                                     // an actual CFC instance (carries `__name`). A deep
@@ -6919,6 +6968,7 @@ impl CfmlVirtualMachine {
                                         Self::deep_set(&mut root_obj, &load_path[1..], comp_obj);
                                         self.scope_aware_store(var_name, root_obj, &mut locals, effective_local_mode_modern);
                                     }
+                                }
                                 }
                             }
                         }
