@@ -718,6 +718,38 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
         "nanotime" => {
             Ok(CfmlValue::Double(cfml_common::clock::now_unix_nanos() as f64))
         }
+        "identityhashcode" => {
+            // java.lang.System.identityHashCode(obj) — a stable per-object
+            // identity hash: same reference -> same value, distinct
+            // (reference-typed) objects -> distinct values. Used by CacheBox's
+            // CacheFactory (factoryId) and TestBox's assertSame/assertNotSame.
+            // Reference types (Struct — incl. live CFC instances — Array, Query,
+            // NativeObject, Function) carry an Arc backing pointer that is
+            // exactly this identity. Value types have no Java-object identity,
+            // so we fold a content hash; either way we never return null.
+            let obj = args.first().cloned().unwrap_or(CfmlValue::Null);
+            let raw: u64 = match &obj {
+                CfmlValue::Struct(s) => s.backing_ptr() as u64,
+                CfmlValue::Array(a) => a.backing_ptr() as u64,
+                CfmlValue::Query(q) => q.backing_ptr() as u64,
+                CfmlValue::NativeObject(n) => std::sync::Arc::as_ptr(n) as *const () as u64,
+                CfmlValue::Function(f) => {
+                    std::sync::Arc::as_ptr(f) as *const () as u64
+                }
+                // Value types (and the cloned-by-value Component) have no
+                // shared backing store, so hash their content for a stable,
+                // non-null result.
+                other => {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    other.as_string().hash(&mut h);
+                    h.finish()
+                }
+            };
+            // Fold to a positive 31-bit int (Java identity hashes are ints).
+            let folded = (raw ^ (raw >> 32)) & 0x7fff_ffff;
+            Ok(CfmlValue::Int(folded as i64))
+        }
         "getproperty" => {
             // Some callers pass the key as the first "real" arg, but member
             // dispatch prepends the object — skip leading shim structs.

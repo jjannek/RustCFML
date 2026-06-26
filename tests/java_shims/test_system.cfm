@@ -36,5 +36,22 @@ assertTrue("nanoTime is positive", nano gt 0);
 out = javaSystem.out;
 assertTrue("System.out exists", isObject(out));
 
+// identityHashCode (GitHub #209) - must return a non-null int; same reference
+// yields the same hash, distinct objects yield distinct hashes. CacheBox's
+// CacheFactory and TestBox's assertSame/assertNotSame depend on this.
+a = { x : 1 };
+b = { x : 1 };
+ha = javaSystem.identityHashCode( a );
+assertFalse("identityHashCode not null", isNull( ha ));
+assertTrue("identityHashCode returns numeric", isNumeric( ha ));
+assertTrue("identityHashCode stable for same ref", ha eq javaSystem.identityHashCode( a ));
+assertTrue("identityHashCode distinct for distinct objects", ha neq javaSystem.identityHashCode( b ));
+// Aliases share identity (reference semantics).
+c = a;
+assertTrue("alias shares identity hash", javaSystem.identityHashCode( c ) eq ha);
+// Components are objects too.
+greeter = createObject("component", "oop.Greeter");
+assertTrue("component identityHashCode numeric", isNumeric( javaSystem.identityHashCode( greeter ) ));
+
 suiteEnd();
 </cfscript>
