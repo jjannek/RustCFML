@@ -151,6 +151,90 @@ fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool {
         && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
 }
 
+/// Build the *leaf* (own-class) metadata for a component from a raw class
+/// template `s` — name/fullname/path/implements/properties plus the class's OWN
+/// methods (with each function's doc-comment annotations FLATTENED as top-level
+/// keys, the shape TestBox's `getAnnotatedMethods` reads). It deliberately does
+/// NOT set `extends`; the inheritance chain is layered on by
+/// [`CfmlVirtualMachine::build_inheritance_metadata`] (GitHub #210). Mirrors the
+/// `extract_component_meta` helper inside the `getcomponentmetadata` arm, but
+/// returns a `ValueMap` so the caller can attach a recursive `extends`.
+fn component_leaf_metadata(s: &ValueMap, fallback_name: &str) -> ValueMap {
+    let mut meta = ValueMap::default();
+    let name_val = s
+        .get("__name")
+        .cloned()
+        .unwrap_or(CfmlValue::string(fallback_name.to_string()));
+    meta.insert("name".to_string(), name_val.clone());
+    meta.insert("fullname".to_string(), name_val);
+    meta.insert("type".to_string(), CfmlValue::string("component".to_string()));
+    if let Some(CfmlValue::String(src)) = s.get("__source_file") {
+        meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
+    }
+    if let Some(imp) = build_implements_meta(s) {
+        meta.insert("implements".to_string(), imp);
+    }
+    let mut functions = Vec::new();
+    for (k, v) in s {
+        if let CfmlValue::Function(f) = v {
+            if k.starts_with("__") {
+                continue;
+            }
+            let mut func_meta = ValueMap::default();
+            func_meta.insert("name".to_string(), CfmlValue::string(k.clone()));
+            func_meta.insert(
+                "access".to_string(),
+                CfmlValue::string(format!("{:?}", f.access).to_lowercase()),
+            );
+            if let Some(ref rt) = f.return_type {
+                func_meta.insert("returntype".to_string(), CfmlValue::string(rt.clone()));
+            }
+            let params: Vec<CfmlValue> = f
+                .params
+                .iter()
+                .map(|p| {
+                    let mut pm = ValueMap::default();
+                    pm.insert("name".to_string(), CfmlValue::string(p.name.clone()));
+                    if let Some(ref t) = p.param_type {
+                        pm.insert("type".to_string(), CfmlValue::string(t.clone()));
+                    }
+                    pm.insert("required".to_string(), CfmlValue::Bool(p.required));
+                    for (ak, av) in &p.annotations {
+                        pm.insert(ak.clone(), CfmlValue::string(av.clone()));
+                    }
+                    CfmlValue::strukt(pm)
+                })
+                .collect();
+            func_meta.insert("parameters".to_string(), CfmlValue::array(params));
+            // Flatten the function's doc-comment annotations (`__funcmeta_<name>`)
+            // as top-level keys — `@beforeAll`/`@expectedException`/... — so
+            // TestBox's `structKeyExists(thisFunction, annotation)` finds them.
+            let fmeta_key = format!("__funcmeta_{}", k);
+            if let Some(CfmlValue::Struct(fm)) = s.get(&fmeta_key) {
+                for (mk, mv) in fm.iter() {
+                    if !func_meta.contains_key(&mk) {
+                        func_meta.insert(mk, mv);
+                    }
+                }
+            }
+            functions.push(CfmlValue::strukt(func_meta));
+        }
+    }
+    meta.insert("functions".to_string(), CfmlValue::array(functions));
+    if let Some(CfmlValue::Struct(md)) = s.get("__metadata") {
+        for (mk, mv) in md.iter() {
+            if !meta.contains_key(&mk) {
+                meta.insert(mk, mv);
+            }
+        }
+        meta.insert("metadata".to_string(), CfmlValue::Struct(md.clone()));
+    }
+    if let Some(props) = s.get("__properties") {
+        meta.insert("properties".to_string(), props.clone());
+    }
+    meta
+}
+
 /// Data-only session rule (issue #88): the session scope persists data values
 /// only — no components, closures/functions, or native objects. Returns the
 /// offending key-path on the first violation so the error names exactly what
@@ -10266,6 +10350,46 @@ impl CfmlVirtualMachine {
                         }
                         return Ok(CfmlValue::strukt(meta));
                     }
+                    // Component instance with an inheritance chain (GitHub #210):
+                    // build metadata from the RAW class templates so `.functions`
+                    // is own-only and `.extends` carries the parent's full
+                    // metadata recursively. Only inheriting components take this
+                    // path; standalone components and every other value keep the
+                    // flat builtin behaviour below.
+                    if let Some(CfmlValue::Struct(s)) = args.first() {
+                        let is_component = s.contains_key_ci("__name")
+                            && !s.contains_key_ci("__java_class")
+                            && !s.contains_key_ci("__is_interface");
+                        let inherits = s.contains_key_ci("__extends_chain");
+                        if is_component && inherits {
+                            let name = s
+                                .get_ci("__name")
+                                .map(|v| v.as_string())
+                                .unwrap_or_default();
+                            let src = match s.get_ci("__source_file") {
+                                Some(CfmlValue::String(p)) => Some((*p).to_string()),
+                                _ => None,
+                            };
+                            let chain = s.get_ci("__extends_chain");
+                            if !name.is_empty() {
+                                let mut visited = std::collections::HashSet::new();
+                                if let Some(mut meta) = self.build_inheritance_metadata(
+                                    &name,
+                                    src,
+                                    parent_locals,
+                                    &mut visited,
+                                ) {
+                                    // Preserve RustCFML's flat `fullExtends` chain
+                                    // (carried on the instance) for callers that
+                                    // read it.
+                                    if let Some(chain @ CfmlValue::Array(_)) = chain {
+                                        meta.insert("fullExtends".to_string(), chain);
+                                    }
+                                    return Ok(CfmlValue::strukt(meta));
+                                }
+                            }
+                        }
+                    }
                     // Non-function argument: defer to the pure builtin, which
                     // handles components, queries, structs, and scalars.
                     let builtin = self
@@ -17669,6 +17793,88 @@ impl CfmlVirtualMachine {
         }
 
         Ok(methods)
+    }
+
+    /// Build full component metadata for the component identified by `name`,
+    /// resolving its RAW (un-flattened) class template so `.functions` lists
+    /// ONLY the class's own methods, and recursing through `__extends` so
+    /// `.extends` carries the parent's full metadata (its own functions + its
+    /// own `.extends`, ...). This matches Lucee/ACF inheritance-chain
+    /// introspection (GitHub #210) — a flattened instance struct would instead
+    /// merge every ancestor method into `.functions` and expose only the parent
+    /// NAME under `.extends`, double-counting inherited lifecycle hooks when a
+    /// framework (TestBox) scans `.functions` AND recurses into `.extends`.
+    ///
+    /// `source_context` is the directory-bearing source path used to resolve a
+    /// sibling parent (mirrors `resolve_inheritance_chain`). Returns `None` when
+    /// the template can't be resolved (caller falls back to flat metadata).
+    fn build_inheritance_metadata(
+        &mut self,
+        name: &str,
+        source_context: Option<String>,
+        locals: &ValueMap,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Option<ValueMap> {
+        let lc = name.to_lowercase();
+        if visited.contains(&lc) {
+            return None;
+        }
+        visited.insert(lc);
+
+        // Resolve the raw template with the component's own dir as the source
+        // context so a sibling parent (`extends="Parent"`) resolves.
+        let prev_source = self.source_file.clone();
+        if let Some(src) = source_context {
+            self.source_file = Some(src);
+        }
+        let template = self.resolve_component_template(name, locals);
+        self.source_file = prev_source;
+
+        let snap = match template {
+            Some(CfmlValue::Struct(s)) => s.snapshot(),
+            _ => return None,
+        };
+        // An interface template would have no Function entries — let the
+        // interface path handle those; this builder is for components only.
+        if matches!(snap.get("__is_interface"), Some(CfmlValue::Bool(true))) {
+            return None;
+        }
+
+        let mut meta = component_leaf_metadata(&snap, name);
+
+        // Recurse into the parent class for `.extends` (raw template stores the
+        // parent as a plain `__extends` string).
+        if let Some(CfmlValue::String(parent)) = snap.get("__extends") {
+            let parent = parent.to_string();
+            if !parent.is_empty() {
+                if let Some(rust) = parent.strip_prefix("rust:") {
+                    // Rust-class parent: no CFML template, expose just the name
+                    // (matches the flat builtin and the extends-rust test).
+                    let _ = rust;
+                    let mut e = ValueMap::default();
+                    e.insert("name".to_string(), CfmlValue::string(parent.clone()));
+                    meta.insert("extends".to_string(), CfmlValue::strukt(e));
+                } else {
+                    let parent_src = match snap.get("__source_file") {
+                        Some(CfmlValue::String(s)) => Some((**s).clone()),
+                        _ => None,
+                    };
+                    match self.build_inheritance_metadata(&parent, parent_src, locals, visited) {
+                        Some(pm) => {
+                            meta.insert("extends".to_string(), CfmlValue::strukt(pm));
+                        }
+                        None => {
+                            // Parent template unresolved — still surface the link
+                            // by name so introspection sees the chain exists.
+                            let mut e = ValueMap::default();
+                            e.insert("name".to_string(), CfmlValue::string(parent.clone()));
+                            meta.insert("extends".to_string(), CfmlValue::strukt(e));
+                        }
+                    }
+                }
+            }
+        }
+        Some(meta)
     }
 
     /// Build `getComponentMetadata()`-shape metadata for an INTERFACE struct

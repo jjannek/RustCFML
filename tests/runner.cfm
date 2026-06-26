@@ -274,6 +274,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_getmetadata_properties.cfm">
 <cf_runtest file="oop/test_function_return_type_metadata.cfm">
 <cf_runtest file="oop/test_function_annotation_metadata.cfm">
+<cf_runtest file="oop/test_getmetadata_extends_functions.cfm">
 <cf_runtest file="oop/test_metadata_implements_extends.cfm">
 <cf_runtest file="oop/test_component_bool_attr.cfm">
 <cf_runtest file="oop/test_chained_writeback_clobber.cfm">
