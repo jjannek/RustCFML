@@ -132,6 +132,7 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cftransaction isolation="…">` | `isolation` | Parsed only to disambiguate the `datasource` arg; the isolation level is never applied to the connection. |
 | `s3Write` / `s3Upload` / `s3Copy` / `s3Move` | `acl`, `location` | Accepted but not sent to the backend. |
 | `s3Read` / `s3Download` | `charset` | Accepted but ignored. |
+| `writeDump(output=…)` | a filename path | `output="console"` (→ server stdout) and `output="browser"`/default (→ page) are honoured; a filename value (Lucee writes the dump to that file) is not — it falls back to page output. |
 
 ## 8. Environment-specific 🌍
 

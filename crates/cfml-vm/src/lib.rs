@@ -8124,6 +8124,7 @@ impl CfmlVirtualMachine {
                 // (var is the first positional arg).
                 let mut opts = dump::DumpOptions::default();
                 let mut var: Option<CfmlValue> = None;
+                let mut output: Option<String> = None;
                 if let Some(pairs) = &named {
                     for (k, v) in pairs {
                         match k.to_lowercase().as_str() {
@@ -8136,11 +8137,27 @@ impl CfmlVirtualMachine {
                                     opts.top = Some(n as usize);
                                 }
                             }
+                            "output" => output = Some(v.as_string()),
                             _ => {}
                         }
                     }
                 }
                 let value = var.or_else(|| args.into_iter().next()).unwrap_or(CfmlValue::Null);
+                // output="console" sends a plain-text dump to the server console
+                // (stdout), leaving the page / HTTP response untouched (issue #207
+                // — Lucee/ACF parity). TestBox/ColdBox use this for non-fatal
+                // diagnostics; routing it into the response polluted reporter output.
+                if output
+                    .as_deref()
+                    .map(|o| o.eq_ignore_ascii_case("console"))
+                    .unwrap_or(false)
+                {
+                    let rendered = dump::render(&value, &opts, false, false);
+                    print!("{}", rendered);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    return Ok(CfmlValue::Null);
+                }
                 let include_assets = self.web_context && !self.dump_assets_emitted;
                 let rendered = dump::render(&value, &opts, self.web_context, include_assets);
                 if include_assets {

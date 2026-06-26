@@ -35,6 +35,17 @@ assertTrue("java shim labelled Java", findNoCase("Java", shimdump) GT 0);
 assertTrue("java shim shows class", findNoCase("java.util.date", shimdump) GT 0);
 assertFalse("java shim hides __java_shim marker", findNoCase("__java_shim", shimdump) GT 0);
 
+// output="console" sends the dump to the server console (stdout), NOT the page
+// (issue 207). Captured page output must be empty, while a default dump is not.
+savecontent variable="consoleDump" {
+    writeDump(var="rcf207-console-marker", output="console");
+}
+assert("output=console emits nothing to the page", trim(consoleDump), "");
+savecontent variable="browserDump" {
+    writeDump(var="rcf207-browser-marker");
+}
+assertTrue("default output still emits to the page", findNoCase("rcf207-browser-marker", browserDump) GT 0);
+
 // Query dump shows columns, rows, and (for executed queries) timing + SQL.
 qn = queryNew("id,name", "integer,varchar");
 queryAddRow(qn); querySetCell(qn, "id", 1); querySetCell(qn, "name", "Ada");
