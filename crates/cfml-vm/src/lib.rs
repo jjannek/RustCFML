@@ -2146,6 +2146,7 @@ impl CfmlVirtualMachine {
         params_arg: &CfmlValue,
         return_type: &str,
         column_key: Option<String>,
+        max_rows: Option<usize>,
         parent_locals: &ValueMap,
     ) -> CfmlResult {
         let stmt = cfml_qoq::parse(sql)
@@ -2175,6 +2176,19 @@ impl CfmlVirtualMachine {
         self.qoq_registry = registry;
 
         let query_val = result?;
+        // The `maxrows` queryExecute option caps the result set (Lucee/ACF). Cap
+        // the result query's rows before any returntype conversion so an `array`/
+        // `struct` returntype is bounded too. This is the QoQ result (a freshly
+        // built query), never a source table, so truncating in place is safe.
+        if let (CfmlValue::Query(q), Some(n)) = (&query_val, max_rows) {
+            q.with_write(|d| {
+                for col in d.data.iter_mut() {
+                    if col.len() > n {
+                        Arc::make_mut(col).truncate(n);
+                    }
+                }
+            });
+        }
         Ok(convert_query_return(query_val, return_type, column_key.as_deref()))
     }
 
@@ -11310,7 +11324,7 @@ impl CfmlVirtualMachine {
                     let ret = if is_qoq {
                         let sql = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                         let params_arg = args.get(1).cloned().unwrap_or(CfmlValue::Null);
-                        let (return_type, column_key) = match args.get(2) {
+                        let (return_type, column_key, max_rows) = match args.get(2) {
                             Some(CfmlValue::Struct(opts)) => {
                                 let rt = opts
                                     .get_ci("returntype")
@@ -11320,15 +11334,22 @@ impl CfmlVirtualMachine {
                                 let ck = opts.get_ci("columnkey")
                                     .or_else(|| opts.get_ci("keycolumn"))
                                     .map(|v| v.as_string());
-                                (rt, ck)
+                                // `maxrows` caps the result set; a negative value
+                                // (Lucee's "no limit" sentinel) means no cap.
+                                let mr = opts.get_ci("maxrows").and_then(|v| {
+                                    let n = v.as_string().trim().parse::<i64>().ok()?;
+                                    if n >= 0 { Some(n as usize) } else { None }
+                                });
+                                (rt, ck, mr)
                             }
-                            _ => ("query".to_string(), None),
+                            _ => ("query".to_string(), None, None),
                         };
                         self.execute_qoq(
                             &sql,
                             &params_arg,
                             &return_type,
                             column_key,
+                            max_rows,
                             parent_locals,
                         )?
                     } else {
@@ -21856,9 +21877,28 @@ fn build_qoq_params(arg: &CfmlValue) -> cfml_qoq::QoQParams {
 }
 
 /// Unwrap a `cfqueryparam` struct (`{value: x, cfsqltype: …}`) to its value.
+/// A `list=true` param splits its delimited value into an array of values, which
+/// the QoQ `IN` evaluator expands into a value list (`IN (:ids)` -> `IN (1,2,3)`,
+/// Lucee/ACF parity). The delimiter defaults to "," and honours `separator`/
+/// `delimiter`.
 fn unwrap_query_param(v: &CfmlValue) -> CfmlValue {
     if let CfmlValue::Struct(s) = v {
         if let Some(inner) = s.get_ci("value") {
+            let is_list = s.get_ci("list").map(|lv| lv.is_true()).unwrap_or(false);
+            if is_list {
+                let sep = s
+                    .get_ci("separator")
+                    .or_else(|| s.get_ci("delimiter"))
+                    .map(|x| x.as_string())
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or_else(|| ",".to_string());
+                let parts: Vec<CfmlValue> = inner
+                    .as_string()
+                    .split(&sep)
+                    .map(|p| CfmlValue::string(p.to_string()))
+                    .collect();
+                return CfmlValue::array(parts);
+            }
             return inner;
         }
     }

@@ -1745,6 +1745,19 @@ impl<'a, I: Invoker> Engine<'a, I> {
         let mut found_null = false;
         for item in list {
             let v = self.eval(item, tables, ctx)?;
+            // A `list=true` cfqueryparam binds to an array; each element is a
+            // candidate value, so `IN (:ids)` matches any of them (Lucee/ACF
+            // IN-list expansion). A scalar element is tested directly.
+            if let CfmlValue::Array(arr) = &v {
+                for elem in arr.iter() {
+                    match sql_equal(&target, &elem) {
+                        Some(true) => return Ok(CfmlValue::Bool(!negated)),
+                        Some(false) => {}
+                        None => found_null = true,
+                    }
+                }
+                continue;
+            }
             match sql_equal(&target, &v) {
                 Some(true) => return Ok(CfmlValue::Bool(!negated)),
                 Some(false) => {}
