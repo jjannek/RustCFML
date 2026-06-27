@@ -2123,6 +2123,7 @@ fn populate_datasource_registry(cfg: &RustCfmlConfig) {
     for (name, ds) in cfg.datasources.iter() {
         if let Some(url) = ds.connection_url() {
             cfml_stdlib::builtins::register_datasource(name, url.clone());
+            cfml_stdlib::builtins::register_datasource_timeout(&url, ds.connection_timeout);
             if ds.default {
                 cfml_stdlib::builtins::set_default_datasource(url);
             }

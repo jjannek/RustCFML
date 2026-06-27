@@ -19312,6 +19312,7 @@ impl CfmlVirtualMachine {
         // Application.cfc) overrides these.
         for (name, ds) in merged.datasources.iter() {
             if let Some(url) = ds.connection_url() {
+                self.register_ds_timeout_via_builtin(&url, ds.connection_timeout);
                 self.app_datasources.insert(name.to_lowercase(), url.clone());
                 if ds.default {
                     self.app_default_datasource = Some(url);
@@ -19326,9 +19327,37 @@ impl CfmlVirtualMachine {
     /// (`{driver, host, port, database, username, password, connectionString}`)
     /// — the struct form is synthesised through the same `DatasourceCfg` URL
     /// builder the cfconfig datasources use, so both config paths agree.
-    fn datasource_value_to_url(val: &CfmlValue) -> Option<String> {
+    /// Register a per-datasource connection-acquire timeout with the stdlib pool
+    /// layer, addressed by connection URL. Routed through the `__register_ds_timeout`
+    /// builtin (installed by cfml-stdlib when a DB feature is compiled in) rather
+    /// than a direct call, so cfml-vm carries no hard dependency on cfml-stdlib —
+    /// the wasm targets build without it and simply have no such builtin. A `0`
+    /// timeout is a no-op (pool default applies).
+    fn register_ds_timeout_via_builtin(&self, url: &str, secs: u32) {
+        if secs == 0 {
+            return;
+        }
+        if let Some(f) = self
+            .builtins
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("__register_ds_timeout"))
+            .map(|(_, v)| *v)
+        {
+            let _ = f(vec![
+                CfmlValue::string(url.to_string()),
+                CfmlValue::Int(secs as i64),
+            ]);
+        }
+    }
+
+    /// Returns `(connection_url, connection_timeout_secs)`. A `0` timeout means
+    /// "unset" — the pool default applies. The timeout is registered with the
+    /// stdlib pool layer by the caller (via the `__register_ds_timeout` builtin),
+    /// keeping cfml-vm free of a hard dependency on cfml-stdlib (wasm targets
+    /// build without it).
+    fn datasource_value_to_url(val: &CfmlValue) -> Option<(String, u32)> {
         match val {
-            CfmlValue::String(s) if !s.is_empty() => Some(s.to_string()),
+            CfmlValue::String(s) if !s.is_empty() => Some((s.to_string(), 0)),
             CfmlValue::Struct(s) => {
                 let get = |key: &str| -> String {
                     s.iter()
@@ -19358,7 +19387,11 @@ impl CfmlVirtualMachine {
                     let cs = get("connectionString");
                     if cs.is_empty() { get("connectionstring") } else { cs }
                 };
-                ds.connection_url()
+                // Optional per-datasource connection-acquire timeout (seconds);
+                // lets an app make an unreachable datasource fail fast. The
+                // `get` helper is case-insensitive so this matches any casing.
+                let timeout: u32 = get("connectionTimeout").trim().parse().unwrap_or(0);
+                ds.connection_url().map(|url| (url, timeout))
             }
             _ => None,
         }
@@ -19377,7 +19410,8 @@ impl CfmlVirtualMachine {
             .map(|(_, v)| v)
         {
             for (name, def) in map.iter() {
-                if let Some(url) = Self::datasource_value_to_url(&def) {
+                if let Some((url, timeout)) = Self::datasource_value_to_url(&def) {
+                    self.register_ds_timeout_via_builtin(&url, timeout);
                     self.app_datasources.insert(name.to_lowercase(), url);
                 }
             }

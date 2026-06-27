@@ -689,6 +689,8 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("dbinfo".into(), fn_cfdbinfo_stub);
     #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
     f.insert("__dbinfo_impl".into(), crate::dbinfo::fn_dbinfo_impl);
+    #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+    f.insert("__register_ds_timeout".into(), fn_register_ds_timeout);
     f.insert("__cflog".into(), fn_cflog_stub);
     f.insert("__cfparam".into(), fn_cfparam_stub);
     f.insert("__cfsetting".into(), fn_cfsetting_stub);
@@ -7237,6 +7239,62 @@ pub fn set_default_datasource(url: String) {
     m.lock().unwrap().insert(String::new(), url);
 }
 
+/// Per-datasource connection-acquire timeout overrides, keyed by the resolved
+/// connection URL (the same key the pool builders cache on). Populated from the
+/// `connectionTimeout` config key in `.cfconfig.json` / `this.datasources` so an
+/// app can make an unreachable datasource fail fast — or wait longer — than the
+/// default. Absent => the pool builder's built-in default applies.
+static DATASOURCE_TIMEOUTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+/// Default connection-acquire timeout (seconds) for the networked DB pools
+/// (PostgreSQL, MSSQL). Lowered from 30s so an unreachable / misconfigured
+/// datasource fails a request in seconds instead of stalling it for half a
+/// minute — r2d2 retries a doomed connection with backoff until this elapses.
+/// Override per-datasource with the `connectionTimeout` config key.
+#[cfg(any(feature = "postgres_db", feature = "mssql_db"))]
+const DEFAULT_DB_CONNECTION_TIMEOUT_SECS: u64 = 5;
+
+/// Record a per-datasource connection-acquire timeout (seconds) for `url`.
+/// `0` is ignored (treated as "unset" — the pool default applies). Re-recording
+/// an existing url overwrites it.
+pub fn register_datasource_timeout(url: &str, secs: u32) {
+    if secs == 0 {
+        return;
+    }
+    let m = DATASOURCE_TIMEOUTS.get_or_init(|| Mutex::new(HashMap::new()));
+    m.lock().unwrap().insert(url.to_string(), secs as u64);
+}
+
+/// Builtin bridge letting the VM register a per-datasource connection timeout
+/// without a hard cfml-vm -> cfml-stdlib dependency (wasm builds omit stdlib).
+/// Args: `[url: String, secs: Int]`. Registered as `__register_ds_timeout`.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn fn_register_ds_timeout(args: Vec<CfmlValue>) -> CfmlResult {
+    if args.len() >= 2 {
+        let url = args[0].as_string();
+        let secs = match &args[1] {
+            CfmlValue::Int(i) => *i,
+            CfmlValue::Double(d) => *d as i64,
+            other => other.as_string().trim().parse().unwrap_or(0),
+        };
+        if secs > 0 {
+            register_datasource_timeout(&url, secs as u32);
+        }
+    }
+    Ok(CfmlValue::Null)
+}
+
+/// Resolve the connection-acquire timeout for a connection URL: the registered
+/// per-datasource override if present, else the networked-pool default.
+#[cfg(any(feature = "postgres_db", feature = "mssql_db"))]
+fn datasource_timeout(url: &str) -> std::time::Duration {
+    let secs = DATASOURCE_TIMEOUTS
+        .get()
+        .and_then(|m| m.lock().unwrap().get(url).copied())
+        .unwrap_or(DEFAULT_DB_CONNECTION_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Resolve a datasource identifier to a connection URL. If `name` matches a
 /// registered datasource, return its URL; otherwise return `name` unchanged
 /// so callers can still pass raw `mysql://...` strings.
@@ -7723,7 +7781,7 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
     let pool = r2d2::Pool::builder()
         .max_size(PG_POOL_MAX_SIZE)
         .min_idle(Some(1))
-        .connection_timeout(std::time::Duration::from_secs(30))
+        .connection_timeout(datasource_timeout(url))
         // Do NOT ping `SELECT 1` on every checkout (Lucee parity / remote-DB
         // perf): Lucee's pool defaults `validate` off, so a cfquery is ONE
         // round-trip, not two. We rely on PostgresConnectionManager::has_broken
@@ -7916,7 +7974,7 @@ fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlE
     let pool = r2d2::Pool::builder()
         .max_size(MSSQL_POOL_MAX_SIZE)
         .min_idle(Some(1))
-        .connection_timeout(std::time::Duration::from_secs(30))
+        .connection_timeout(datasource_timeout(url))
         // No per-checkout ping (Lucee parity / remote-DB perf): rely on
         // MssqlConnectionManager::has_broken to evict dead connections instead.
         .test_on_check_out(false)

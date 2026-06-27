@@ -38,7 +38,11 @@ component {
         "rc_app_mem"     : { driver: "sqlite", database: ":memory:" },
         "rc_app_mem_str" : "sqlite://:memory:",
         "rc_app_type"    : { type: "sqlite", database: ":memory:" },
-        "rc_app_bad"     : { driver: "postgresql", host: "127.0.0.1", port: "1", database: "definitely_absent", username: "x", password: "y" }
+        // connectionTimeout:1 keeps the unreachable-host discriminator fast:
+        // it must still THROW (proving this.datasources is resolved, not a
+        // silent sqlite fallthrough), but in ~1s instead of the 30s the r2d2
+        // pool would otherwise spend retrying a doomed connection.
+        "rc_app_bad"     : { driver: "postgresql", host: "127.0.0.1", port: "1", database: "definitely_absent", username: "x", password: "y", connectionTimeout: 1 }
     };
 
 }
