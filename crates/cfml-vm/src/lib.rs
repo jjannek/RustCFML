@@ -943,6 +943,16 @@ pub struct CfmlVirtualMachine {
     /// body and pops it after; `LoadSuper` falls back to the top entry. A stack
     /// (not an Option) keeps nested instantiation correct.
     pseudo_ctor_super: Vec<CfmlValue>,
+    /// Stack of dotted class names currently being constructed, pushed before a
+    /// component's pseudo-constructor (`__cfc_body__`) body runs and popped after.
+    /// The `this` struct built inside the body bakes in `__name = "Anonymous"`
+    /// (the parser placeholder); its real name is only stamped onto the finished
+    /// instance AFTER the body returns. So a `getMetadata(this).name` read DURING
+    /// the pseudo-constructor would otherwise see "Anonymous". getMetadata
+    /// consults the top of this stack to substitute the real name (GitHub #212 /
+    /// Wheels Global.cfc promoteIncludedGlobalsMemoSpec). A stack (not an Option)
+    /// keeps nested construction correct.
+    constructing_component_names: Vec<String>,
     /// After a component method executes, holds modified variables scope entries for
     /// write-back to the component's __variables. Enables `variables.x = y` to persist.
     method_variables_writeback: Option<CfmlStruct>,
@@ -1477,6 +1487,7 @@ impl CfmlVirtualMachine {
             current_column: 0,
             method_this_writeback: None,
             pseudo_ctor_super: Vec::new(),
+            constructing_component_names: Vec::new(),
             method_variables_writeback: None,
             closure_parent_writeback: None,
             request_scope: CfmlStruct::empty(),
@@ -10300,6 +10311,34 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::strukt(ValueMap::default()));
                 }
                 "getmetadata" => {
+                    // During a component's pseudo-constructor, the in-construction
+                    // `this` still carries the parser placeholder __name =
+                    // "Anonymous" (it is renamed to the real class name only AFTER
+                    // the body returns). Stamp the class currently being
+                    // constructed onto it so a ctor-time `getMetadata(this).name`
+                    // returns the real name, matching Lucee/ACF (GitHub #212 /
+                    // Wheels Global.cfc promoteIncludedGlobalsMemoSpec). This
+                    // mutates the in-construction instance in place; the
+                    // post-body rename then sees __name is already correct and is
+                    // a no-op. Only fires while a non-anonymous construction is on
+                    // the stack and the arg is itself an anonymous component.
+                    if let Some(ctor_name) = self.constructing_component_names.last().cloned() {
+                        if ctor_name != "Anonymous" {
+                            if let Some(CfmlValue::Struct(s)) = args.first() {
+                                let is_anon_component = matches!(
+                                    s.get_ci("__name"),
+                                    Some(CfmlValue::String(n)) if n.as_str() == "Anonymous"
+                                ) && !s.contains_key_ci("__java_class")
+                                    && !s.contains_key_ci("__is_interface");
+                                if is_anon_component {
+                                    s.insert(
+                                        "__name".to_string(),
+                                        CfmlValue::string(ctor_name),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     // getMetadata() on a function/method *reference* must return
                     // the full function metadata — including doc-comment
                     // annotations (@expectedException, @skip, @labels, @order,
@@ -14610,6 +14649,18 @@ impl CfmlVirtualMachine {
         })
     }
 
+    /// Normalize a caller-supplied component path to the dotted name Lucee/ACF
+    /// expose in `getMetadata(cfc).name` (e.g. "/app/x/Greeter.cfc" ->
+    /// "app.x.Greeter"). Already-dotted names pass through unchanged.
+    fn dotted_component_name(class_name: &str) -> String {
+        let mut n = class_name.to_string();
+        if let Some(stripped) = n.strip_suffix(".cfc").or_else(|| n.strip_suffix(".CFC")) {
+            n = stripped.to_string();
+        }
+        let n = n.trim_start_matches(['/', '\\']);
+        n.replace(['/', '\\'], ".")
+    }
+
     fn call_member_function(
         &mut self,
         object: &CfmlValue,
@@ -17480,7 +17531,14 @@ impl CfmlVirtualMachine {
             if let Some(sup) = super_value {
                 self.pseudo_ctor_super.push(sup);
             }
+            // Expose the real (dotted) class name to a `getMetadata(this).name`
+            // read inside the pseudo-constructor body — the `this` struct built
+            // by the body bakes in __name = "Anonymous" and is only renamed AFTER
+            // the body returns (GitHub #212).
+            self.constructing_component_names
+                .push(Self::dotted_component_name(class_name));
             let _ = self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
+            self.constructing_component_names.pop();
             if pushed_super {
                 self.pseudo_ctor_super.pop();
             }
@@ -17577,17 +17635,7 @@ impl CfmlVirtualMachine {
                     // slash-path name yielded the whole path and broke m2m join
                     // relationship validation. Already-dotted names are unchanged
                     // (no slashes to replace). Verified vs Lucee 7.0.4.
-                    let dotted = {
-                        let mut n = class_name.to_string();
-                        if let Some(stripped) = n
-                            .strip_suffix(".cfc")
-                            .or_else(|| n.strip_suffix(".CFC"))
-                        {
-                            n = stripped.to_string();
-                        }
-                        let n = n.trim_start_matches(['/', '\\']);
-                        n.replace(['/', '\\'], ".")
-                    };
+                    let dotted = Self::dotted_component_name(class_name);
                     s.insert("__name".to_string(), CfmlValue::string(dotted));
                 }
             }
