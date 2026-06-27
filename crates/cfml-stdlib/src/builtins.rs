@@ -4693,13 +4693,40 @@ pub fn fn_serialize_json(args: Vec<CfmlValue>) -> CfmlResult {
 /// stack overflows and aborts the whole process (uncatchable SIGABRT). On
 /// revisiting a container we emit `null` to break the cycle, mirroring
 /// `as_string_guarded`/`deep_copy_guarded`.
+/// Escape a string for inclusion in a JSON string literal, per RFC 8259 §7.
+/// Standard short escapes for `" \ \b \f \n \r \t`, and `\u00XX` for every other
+/// control character (U+0000–U+001F). All other bytes (including non-ASCII
+/// Unicode) pass through unchanged. Required so serializeJSON output containing a
+/// control char (e.g. chr(7) BEL) is valid JSON that deserializeJSON — and any
+/// RFC-conformant parser — accepts; previously the raw control byte was emitted
+/// and the serializer's own parser rejected its output (GitHub #213). Also
+/// escapes backslashes in struct keys / column names, which the old per-site
+/// `"`-only replace missed.
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
     match val {
         CfmlValue::Null => "null".to_string(),
         CfmlValue::Bool(b) => b.to_string(),
         CfmlValue::Int(i) => i.to_string(),
         CfmlValue::Double(d) => d.to_string(),
-        CfmlValue::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")),
+        CfmlValue::String(s) => format!("\"{}\"", json_escape_str(s)),
         CfmlValue::Array(arr) => {
             let ptr = arr.backing_ptr();
             if visited.contains(&ptr) {
@@ -4726,7 +4753,7 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
                 let rows: Vec<String> = (0..row_count).map(|r| {
                     let fields: Vec<String> = d.columns.iter().enumerate().map(|(ci, col)| {
                         let val = &d.data[ci][r];
-                        format!("\"{}\":{}", col.replace('"', "\\\""), serialize_value(val, visited))
+                        format!("\"{}\":{}", json_escape_str(col), serialize_value(val, visited))
                     }).collect();
                     format!("{{{}}}", fields.join(","))
                 }).collect();
@@ -4740,7 +4767,7 @@ fn serialize_value(val: &CfmlValue, visited: &mut Vec<usize>) -> String {
             // expose a Serializable method on their CfmlNative implementation.
             let name = obj.read().map(|g| g.class_name().to_string())
                 .unwrap_or_else(|_| "poisoned".to_string());
-            format!("\"<NativeObject:{}>\"", name.replace('"', "\\\""))
+            format!("\"<NativeObject:{}>\"", json_escape_str(&name))
         }
         CfmlValue::QueryColumn(_) => {
             // A bare query-column access (q.col) is a proxy standing in for its
@@ -4784,7 +4811,7 @@ fn serialize_struct(s: &CfmlStruct, visited: &mut Vec<usize>) -> String {
             }
             !matches!(v, CfmlValue::Function(_) | CfmlValue::Closure(_))
         })
-        .map(|(k, v)| format!("\"{}\":{}", k.replace('"', "\\\""), serialize_value(&v, visited)))
+        .map(|(k, v)| format!("\"{}\":{}", json_escape_str(&k), serialize_value(&v, visited)))
         .collect();
     format!("{{{}}}", items.join(","))
 }
