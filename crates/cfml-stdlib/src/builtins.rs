@@ -8883,6 +8883,33 @@ fn sqlite_to_cfml(val: rusqlite::types::Value) -> CfmlValue {
 // MySQL driver
 // -----------------------------------------------
 
+/// Unwrap a cfqueryparam-style param AND apply its declared `cfsqltype` to the
+/// bind value. Plain `cfqueryparam_unwrap` returns the raw `value` untouched, so
+/// a typed string like `{value:"true", cfsqltype:"cf_sql_bit"}` (how Preside
+/// binds a boolean column) reaches the driver as the literal string 'true' —
+/// which MySQL rejects for an integer/bit column ("Incorrect integer value:
+/// 'true'"). The positional-array path already coerces via normalize_query_params;
+/// the named path must do the same. Coercion mirrors coerce_by_sqltype_value:
+/// cf_sql_bit/boolean "true"/"false"/"1"/"0" -> Bool (bound as 1/0), the integer/
+/// float families parse the string, everything else is left as-is.
+#[cfg(feature = "mysql_db")]
+fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
+    let unwrapped = cfqueryparam_unwrap(v);
+    if matches!(unwrapped, CfmlValue::Null) {
+        return unwrapped; // null=true (or a genuine NULL value) — no type coercion
+    }
+    if let CfmlValue::Struct(s) = v {
+        if let Some(cfsqltype) = s
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cfsqltype"))
+            .map(|(_, val)| val.as_string().to_lowercase())
+        {
+            return coerce_by_sqltype_value(&unwrapped, &cfsqltype);
+        }
+    }
+    unwrapped
+}
+
 /// Rewrite a SQL string's named `:placeholder`s to positional `?`, returning the
 /// rewritten SQL and the bound values in positional order (one value pushed per
 /// textual occurrence, so a repeated `:name` binds correctly). Name characters
@@ -8913,7 +8940,7 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
                     .find(|(k, _)| k.eq_ignore_ascii_case(&param_name))
                     .map(|(_, v)| v)
                     .unwrap_or(CfmlValue::Null);
-                result.push(cfqueryparam_unwrap(&raw));
+                result.push(cfqueryparam_unwrap_typed(&raw));
                 out_sql.push_str(&sql[seg_start..i]);
                 out_sql.push('?');
                 i = end;
@@ -14546,7 +14573,7 @@ mod db_tls_tests {
 ///   cargo test -p cfml-stdlib --features mysql_db
 #[cfg(all(test, feature = "mysql_db"))]
 mod mysql_named_param_tests {
-    use super::mysql_named_to_positional;
+    use super::{cfqueryparam_unwrap_typed, mysql_named_to_positional};
     use cfml_common::dynamic::{CfmlStruct, CfmlValue, ValueMap};
 
     fn struct_of(pairs: &[(&str, CfmlValue)]) -> CfmlStruct {
@@ -14555,6 +14582,56 @@ mod mysql_named_param_tests {
             m.insert((*k).to_string(), v.clone());
         }
         CfmlStruct::new(m)
+    }
+
+    // --- cfqueryparam cfsqltype coercion on the named-param path ---
+
+    #[test]
+    fn bit_typed_string_true_coerces_to_bool() {
+        // Preside binds boolean columns as {value:"true", cfsqltype:"cf_sql_bit"}.
+        // Without coercion this reached MySQL as the literal string 'true', which
+        // it rejects for an integer/bit column.
+        let p = CfmlValue::Struct(struct_of(&[
+            ("value", CfmlValue::string("true")),
+            ("cfsqltype", CfmlValue::string("cf_sql_bit")),
+        ]));
+        assert!(matches!(cfqueryparam_unwrap_typed(&p), CfmlValue::Bool(true)));
+
+        let p = CfmlValue::Struct(struct_of(&[
+            ("value", CfmlValue::string("false")),
+            ("cfsqltype", CfmlValue::string("cf_sql_bit")),
+        ]));
+        assert!(matches!(cfqueryparam_unwrap_typed(&p), CfmlValue::Bool(false)));
+    }
+
+    #[test]
+    fn integer_typed_string_coerces_to_int() {
+        let p = CfmlValue::Struct(struct_of(&[
+            ("value", CfmlValue::string("42")),
+            ("cfsqltype", CfmlValue::string("cf_sql_integer")),
+        ]));
+        assert!(matches!(cfqueryparam_unwrap_typed(&p), CfmlValue::Int(42)));
+    }
+
+    #[test]
+    fn null_flag_wins_over_type() {
+        let p = CfmlValue::Struct(struct_of(&[
+            ("value", CfmlValue::string("true")),
+            ("null", CfmlValue::Bool(true)),
+            ("cfsqltype", CfmlValue::string("cf_sql_bit")),
+        ]));
+        assert!(matches!(cfqueryparam_unwrap_typed(&p), CfmlValue::Null));
+    }
+
+    #[test]
+    fn varchar_and_plain_values_pass_through() {
+        let p = CfmlValue::Struct(struct_of(&[
+            ("value", CfmlValue::string("hello")),
+            ("cfsqltype", CfmlValue::string("cf_sql_varchar")),
+        ]));
+        assert_eq!(cfqueryparam_unwrap_typed(&p).as_string(), "hello");
+        // A non-cfqueryparam plain value is returned unchanged.
+        assert_eq!(cfqueryparam_unwrap_typed(&CfmlValue::Int(7)).as_string(), "7");
     }
 
     #[test]
