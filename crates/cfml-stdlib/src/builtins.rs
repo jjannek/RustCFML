@@ -8883,6 +8883,56 @@ fn sqlite_to_cfml(val: rusqlite::types::Value) -> CfmlValue {
 // MySQL driver
 // -----------------------------------------------
 
+/// Rewrite a SQL string's named `:placeholder`s to positional `?`, returning the
+/// rewritten SQL and the bound values in positional order (one value pushed per
+/// textual occurrence, so a repeated `:name` binds correctly). Name characters
+/// are ASCII alphanumeric + `_` (case-insensitively matched against the params
+/// struct), so camelCase names like `:dateCreated` are captured whole — unlike
+/// the mysql crate's lowercase-only named-param parser. Single-quoted string
+/// literals are skipped so a `:` inside them is not treated as a placeholder.
+/// Mirrors build_sqlite_params' rewrite.
+#[cfg(feature = "mysql_db")]
+fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlValue>) {
+    let mut result = Vec::new();
+    let mut out_sql = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut seg_start = 0; // byte offset of unflushed literal text
+    while i < len {
+        if bytes[i] == b':' && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+            let start = i + 1;
+            let mut end = start;
+            while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > start {
+                let param_name: String = String::from_utf8_lossy(&bytes[start..end]).to_string();
+                let raw = map
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&param_name))
+                    .map(|(_, v)| v)
+                    .unwrap_or(CfmlValue::Null);
+                result.push(cfqueryparam_unwrap(&raw));
+                out_sql.push_str(&sql[seg_start..i]);
+                out_sql.push('?');
+                i = end;
+                seg_start = end;
+                continue;
+            }
+        }
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < len && bytes[i] != b'\'' {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out_sql.push_str(&sql[seg_start..]);
+    (out_sql, result)
+}
+
 #[cfg(feature = "mysql_db")]
 fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str) -> CfmlResult {
     use mysql::*;
@@ -8892,28 +8942,32 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
     let mut conn = pool.get_conn()
         .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL connection error: {}", e)))?;
 
-    let params = match params_arg {
+    // Build the SQL we actually execute plus its bound params. For NAMED (struct)
+    // params we rewrite `:name` placeholders to positional `?` ourselves rather
+    // than handing `:name` SQL to the mysql crate's Params::Named parser: that
+    // parser only consumes lowercase identifier chars after `:`, so a camelCase
+    // placeholder is TRUNCATED at its first uppercase letter (`:dateCreated` ->
+    // `?` + stray `Created`, a MySQL syntax error). Preside's object SQL uses
+    // camelCase property names throughout. Mirrors build_sqlite_params.
+    let (final_sql, params): (std::borrow::Cow<str>, Params) = match params_arg {
         CfmlValue::Array(arr) => {
             let vals: Vec<mysql::Value> = arr.iter().map(|v| cfml_to_mysql_value(&v)).collect();
-            Params::Positional(vals)
+            let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
+            (std::borrow::Cow::Borrowed(sql), p)
         }
-        // An empty params struct means "no parameters" (Preside passes `{}`
-        // to placeholder-free SQL). The mysql crate rejects Params::Named for a
-        // query with no `:name` placeholders ("Can not pass named parameters to
-        // positional query"), so map empty -> Empty. Lucee treats empty params
-        // as no params.
-        CfmlValue::Struct(map) if map.is_empty() => Params::Empty,
+        // An empty params struct means "no parameters" (Preside passes `{}` to
+        // placeholder-free SQL). Lucee treats empty params as no params.
+        CfmlValue::Struct(map) if map.is_empty() => (std::borrow::Cow::Borrowed(sql), Params::Empty),
         CfmlValue::Struct(map) => {
-            let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
-            for (k, v) in map.iter() {
-                // Unwrap cfqueryparam-style param structs before binding.
-                let val = cfqueryparam_unwrap(&v);
-                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&val));
-            }
-            Params::Named(named)
+            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map);
+            let vals: Vec<mysql::Value> =
+                vals_cfml.iter().map(|v| cfml_to_mysql_value(v)).collect();
+            let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
+            (std::borrow::Cow::Owned(rewritten), p)
         }
-        _ => Params::Empty,
+        _ => (std::borrow::Cow::Borrowed(sql), Params::Empty),
     };
+    let sql: &str = &final_sql;
 
     if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
@@ -10456,28 +10510,28 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
     use mysql::*;
     use mysql::prelude::*;
 
-    let params = match params_arg {
+    // Same camelCase-safe `:name` -> positional `?` rewrite as execute_mysql
+    // (see mysql_named_to_positional): the mysql crate's named-param parser
+    // truncates camelCase placeholders at the first uppercase char.
+    let (final_sql, params): (std::borrow::Cow<str>, Params) = match params_arg {
         CfmlValue::Array(arr) => {
             let vals: Vec<mysql::Value> = arr.iter().map(|v| cfml_to_mysql_value(&v)).collect();
-            Params::Positional(vals)
+            let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
+            (std::borrow::Cow::Borrowed(sql), p)
         }
-        // An empty params struct means "no parameters" (Preside passes `{}`
-        // to placeholder-free SQL). The mysql crate rejects Params::Named for a
-        // query with no `:name` placeholders ("Can not pass named parameters to
-        // positional query"), so map empty -> Empty. Lucee treats empty params
-        // as no params.
-        CfmlValue::Struct(map) if map.is_empty() => Params::Empty,
+        // An empty params struct means "no parameters" (Preside passes `{}` to
+        // placeholder-free SQL). Lucee treats empty params as no params.
+        CfmlValue::Struct(map) if map.is_empty() => (std::borrow::Cow::Borrowed(sql), Params::Empty),
         CfmlValue::Struct(map) => {
-            let mut named: HashMap<Vec<u8>, mysql::Value> = HashMap::new();
-            for (k, v) in map.iter() {
-                // Unwrap cfqueryparam-style param structs before binding.
-                let val = cfqueryparam_unwrap(&v);
-                named.insert(k.as_bytes().to_vec(), cfml_to_mysql_value(&val));
-            }
-            Params::Named(named)
+            let (rewritten, vals_cfml) = mysql_named_to_positional(sql, map);
+            let vals: Vec<mysql::Value> =
+                vals_cfml.iter().map(|v| cfml_to_mysql_value(v)).collect();
+            let p = if vals.is_empty() { Params::Empty } else { Params::Positional(vals) };
+            (std::borrow::Cow::Owned(rewritten), p)
         }
-        _ => Params::Empty,
+        _ => (std::borrow::Cow::Borrowed(sql), Params::Empty),
     };
+    let sql: &str = &final_sql;
 
     if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
@@ -14481,5 +14535,82 @@ mod db_tls_tests {
             let ssl = ssl.expect("ssl opts");
             assert!(ssl.accept_invalid_certs()); // required, no verify
         }
+    }
+}
+
+/// Regression tests for the MySQL named-parameter rewrite. The mysql crate's own
+/// `Params::Named` parser only consumes lowercase identifier chars after `:`, so
+/// it truncated camelCase placeholders (`:dateCreated` -> `?` + stray `Created`),
+/// crashing Preside's object SQL with a MySQL syntax error. We rewrite `:name`
+/// to positional `?` ourselves instead. Run with:
+///   cargo test -p cfml-stdlib --features mysql_db
+#[cfg(all(test, feature = "mysql_db"))]
+mod mysql_named_param_tests {
+    use super::mysql_named_to_positional;
+    use cfml_common::dynamic::{CfmlStruct, CfmlValue, ValueMap};
+
+    fn struct_of(pairs: &[(&str, CfmlValue)]) -> CfmlStruct {
+        let mut m = ValueMap::default();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), v.clone());
+        }
+        CfmlStruct::new(m)
+    }
+
+    #[test]
+    fn camelcase_placeholder_is_captured_whole() {
+        // The exact shape that broke Preside: a camelCase named param.
+        let map = struct_of(&[("dateCreated", CfmlValue::string("2026-06-27"))]);
+        let (sql, vals) = mysql_named_to_positional(
+            "insert into t ( datecreated ) values ( :dateCreated )",
+            &map,
+        );
+        // No stray `Created` left in the SQL; placeholder became a single `?`.
+        assert_eq!(sql, "insert into t ( datecreated ) values ( ? )");
+        assert!(!sql.contains("Created"), "camelCase name must not leak into SQL: {sql}");
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0].as_string(), "2026-06-27");
+    }
+
+    #[test]
+    fn repeated_named_param_binds_once_per_occurrence() {
+        let map = struct_of(&[("id", CfmlValue::Int(7))]);
+        let (sql, vals) = mysql_named_to_positional(
+            "update t set parent = :id where id = :id",
+            &map,
+        );
+        assert_eq!(sql, "update t set parent = ? where id = ?");
+        assert_eq!(vals.len(), 2, "one bound value per textual occurrence");
+        assert_eq!(vals[0].as_string(), "7");
+        assert_eq!(vals[1].as_string(), "7");
+    }
+
+    #[test]
+    fn name_is_matched_case_insensitively() {
+        let map = struct_of(&[("DateCreated", CfmlValue::string("x"))]);
+        let (sql, vals) = mysql_named_to_positional("select :datecreated", &map);
+        assert_eq!(sql, "select ?");
+        assert_eq!(vals.len(), 1);
+        assert_eq!(vals[0].as_string(), "x");
+    }
+
+    #[test]
+    fn colon_inside_string_literal_is_not_a_placeholder() {
+        let map = struct_of(&[("x", CfmlValue::Int(1))]);
+        let (sql, vals) = mysql_named_to_positional(
+            "select ':notAParam', :x",
+            &map,
+        );
+        assert_eq!(sql, "select ':notAParam', ?");
+        assert_eq!(vals.len(), 1);
+    }
+
+    #[test]
+    fn missing_named_param_binds_null() {
+        let map = struct_of(&[("present", CfmlValue::Int(1))]);
+        let (sql, vals) = mysql_named_to_positional("select :missing", &map);
+        assert_eq!(sql, "select ?");
+        assert_eq!(vals.len(), 1);
+        assert!(matches!(vals[0], CfmlValue::Null));
     }
 }
