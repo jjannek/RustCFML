@@ -258,6 +258,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_static.cfm">
 <cf_runtest file="oop/test_soft_keyword_function_name.cfm">
 <cf_runtest file="oop/test_preside_serve_fixes.cfm">
+<cf_runtest file="oop/test_preside_testbox_fixes.cfm">
 <cf_runtest file="oop/test_property_attributes.cfm">
 <cf_runtest file="oop/test_struct_method_dispatch.cfm">
 <cf_runtest file="oop/test_external_prop.cfm">

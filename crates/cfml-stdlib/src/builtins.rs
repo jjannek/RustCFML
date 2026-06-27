@@ -15,7 +15,7 @@
 //! - System functions
 
 use cfml_common::dynamic::{build_implements_meta, CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
-use cfml_common::vm::{CfmlError, CfmlResult};
+use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
 use std::collections::HashMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
@@ -7155,10 +7155,18 @@ pub(crate) fn resolve_query_datasource(name: &str) -> Result<String, CfmlError> 
     let resolved = resolve_datasource(name);
     // `resolve_datasource` returns the name unchanged when it is not registered.
     if resolved.eq_ignore_ascii_case(name) && !looks_like_connection_string(&resolved) {
-        return Err(CfmlError::runtime(format!(
-            "datasource [{}] could not be found. Define it in this.datasources or .cfconfig.json, or pass a connection string.",
-            name
-        )));
+        // Lucee/ACF raise a catchable `database`-typed exception for an unknown
+        // datasource (NOT a generic runtime error), so `cftry { ... } cfcatch
+        // type="database"` probes work. Preside's test-suite Application.cfc
+        // (`_dsnExists()` → `dbinfo` wrapped in `catch( database e )`) relies on
+        // exactly this to detect whether its datasource has been registered yet.
+        return Err(CfmlError::new(
+            format!(
+                "datasource [{}] could not be found. Define it in this.datasources or .cfconfig.json, or pass a connection string.",
+                name
+            ),
+            CfmlErrorType::Custom("database".to_string()),
+        ));
     }
     Ok(resolved)
 }

@@ -6293,8 +6293,23 @@ impl CfmlVirtualMachine {
                     // whose name matches a builtin (object dispatch wins over
                     // the BIF for `obj.method()`); the guard would otherwise
                     // poison the whole component (PR #79).
+                    // Case-insensitive against the builtin set: CFML identifiers
+                    // are case-insensitive, so a CFC method declared as
+                    // `getMetaData` (capital D) collides with the `getMetadata`
+                    // BIF just as `getmetadata` would. An exact-case
+                    // `contains_key` missed the variant, so the method leaked
+                    // into the global `user_functions` table and a later BARE
+                    // `getMetadata(obj)` resolved to it instead of the BIF —
+                    // Preside's DocumentMetadataService declares
+                    // `function getMetaData()`, which silently stole every bare
+                    // getMetadata() call program-wide (returning empty metadata
+                    // and breaking TestBox bundle discovery).
                     let shadows_builtin = !func_name.starts_with("__")
-                        && self.builtins.contains_key(func_name.as_str());
+                        && (self.builtins.contains_key(func_name.as_str())
+                            || self
+                                .builtins
+                                .keys()
+                                .any(|k| k.eq_ignore_ascii_case(func_name.as_str())));
                     if shadows_builtin && !bc_func_arc.is_component_method {
                         return Err(self.wrap_error(CfmlError::runtime(format!(
                             "The name [{}] is already used by a built in Function",
@@ -8414,6 +8429,7 @@ impl CfmlVirtualMachine {
                 | "getcomponentmetadata"
                 | "getcomponentstaticscope"
                 | "getapplicationmetadata"
+                | "getapplicationsettings"
                 | "__cfheader"
                 | "__cfapplication"
                 | "__cfcontent"
@@ -10264,7 +10280,13 @@ impl CfmlVirtualMachine {
                     };
                     return Ok(CfmlValue::string(out.format("%Y-%m-%d %H:%M:%S").to_string()));
                 }
-                "getapplicationmetadata" => {
+                "getapplicationmetadata" | "getapplicationsettings" => {
+                    // `getApplicationSettings()` is an alias for
+                    // `getApplicationMetadata()` (Lucee/ACF) — both must surface
+                    // the live `mappings` table. TestBox's LuceeMappingHelper does
+                    // `getApplicationSettings().mappings.append( ... )`, so the
+                    // pure-builtin fallback (which returns only `{name:""}`) is
+                    // not sufficient; route both through this VM handler.
                     // Build application metadata from the loaded Application.cfc
                     // `this` scope (name, sessionManagement, sessionTimeout,
                     // mappings, datasources, and any custom this.* settings),
