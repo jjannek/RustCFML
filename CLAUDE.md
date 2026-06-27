@@ -56,16 +56,22 @@ wasm-pack build crates/wasm --target web
 > `cfml-worker`'s HyperdriveDriver; fixed in v0.34.1.) Requires the target:
 > `rustup target add wasm32-unknown-unknown`.
 
-> ℹ️ **Known-flaky test — `tests/stdlib/test_cfhttp.cfm`.** This suite makes
-> live calls to `https://httpbin.org` (GET/POST/params), so it fails whenever
-> httpbin is down, rate-limiting, or unreachable — typically surfacing as
-> `ERROR | stdlib/test_cfhttp.cfm | Invalid JSON: expected value at line 1
-> column 1` (an empty/non-JSON response). This is environmental, NOT a code
-> regression, and only fires in serve mode (the CLI run skips it). Don't
-> `git bisect` it. If it's red, re-run or confirm httpbin is up before treating
-> it as a blocker. (Engine-side cfhttp coverage that does NOT depend on the
-> public internet lives in `tests/tags/test_cfhttp_attribute_collection.cfm`
-> and `tests/tags/test_tags_cfhttp_interpolation.cfm`, which hit the local
+> ℹ️ **Network test — `tests/stdlib/test_cfhttp.cfm`.** This suite makes live
+> `<cfhttp>` calls to the **RustCFML Cloudflare Worker** echo service at
+> `https://rustcfml-worker.rustcfml.workers.dev/echo/` (request mirror,
+> response-header reflector, status endpoint — sources live in the sibling
+> `RustCFMLWorker` repo under `cfml/echo/`). This replaced the old, flaky
+> `httpbin.org` dependency: the worker is edge-hosted and effectively always-on.
+> The test has a **reachability guard** — if the first probe doesn't return 200
+> (offline dev box, edge outage, OR the worker simply hasn't been redeployed
+> with the `/echo/` endpoints yet) it skips the ~46 network assertions with a
+> single informational pass rather than spraying false reds. So a green run here
+> means *either* "all assertions passed" *or* "endpoint unreachable, skipped" —
+> if you changed cfhttp, confirm the endpoints are deployed and the guard isn't
+> silently masking a regression. Don't `git bisect` a red here; it's
+> environmental. (Engine-side cfhttp coverage that needs **no** network lives in
+> `tests/tags/test_cfhttp_attribute_collection.cfm` and
+> `tests/tags/test_tags_cfhttp_interpolation.cfm`, which hit the local
 > `tests/tags/http_statements_target.cfm` echo endpoint.)
 
 Tests are CFML-based, not Rust-based. The test runner (`tests/runner.cfm`) includes all test files and uses the harness (`tests/harness.cfm`) which provides `assert()`, `assertTrue()`, `assertFalse()`, `assertNull()`, `assertThrows()`, `suiteBegin()`, `suiteEnd()`.
