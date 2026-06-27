@@ -16305,14 +16305,30 @@ impl CfmlVirtualMachine {
                 // name — Lucee resolves both. Named functions/real closures are
                 // reachable via user_functions and are skipped (the env -> Function
                 // -> captured_scope -> env cycle would leak otherwise).
+                // A Function whose `captured_scope` is already None carries no
+                // env -> Function -> captured_scope -> env cycle, so capturing
+                // it is always safe. This covers two shapes:
+                //   1. a var-scoped function EXPRESSION (PR #198), and
+                //   2. a function INHERITED from an enclosing closure's captured
+                //      scope — it was already stored stripped, so it lands here
+                //      with captured_scope None even though it is not var-declared
+                //      in *this* frame. Without this a nested closure defined
+                //      inside an intermediate closure's body and invoked after
+                //      that body returned loses the grandparent helper and throws
+                //      "Variable '<name>' is undefined" (PR #211: describe(() => {
+                //      it(() => { helper(); }); }) — the deferred Wheels shape).
+                if f.captured_scope.is_none() {
+                    return Some(value.clone());
+                }
+                // A Function that still owns a captured_scope is a named nested
+                // function / real closure: reachable via user_functions, and
+                // re-capturing it would reintroduce the leak cycle. Capture only
+                // when var-scoped (PR #198), stripping the scope to break it.
                 let is_var_scoped = declared_locals.contains(name)
                     || declared_locals.contains(&name.to_lowercase())
                     || params.iter().any(|p| p.eq_ignore_ascii_case(name));
                 if !is_var_scoped {
                     return None;
-                }
-                if f.captured_scope.is_none() {
-                    return Some(value.clone());
                 }
                 let mut nf = (**f).clone();
                 nf.captured_scope = None;
