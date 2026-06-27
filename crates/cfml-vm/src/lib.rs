@@ -889,10 +889,29 @@ impl ServerState {
 
 /// A held lock guard for cflock (keeps the lock alive during the block).
 /// The guard fields are never read directly — they are held for their Drop behavior.
+///
+/// Each guard variant owns a clone of the backing `Arc<RwLock<()>>` *in addition*
+/// to the lifetime-extended guard. This is load-bearing on two counts:
+///   1. The guard is `transmute`d to `'static`, erasing its borrow of the RwLock.
+///      Holding the owning Arc next to it keeps that RwLock allocation alive for
+///      exactly as long as the guard — the field-drop order (guard first, Arc
+///      second; struct fields drop in declaration order) guarantees the guard
+///      unlocks *before* its backing is freed.
+///   2. `evict_idle_named_locks` retains only map entries with `strong_count > 1`.
+///      The held Arc keeps the count at ≥2 (map + held) so an actively-held lock
+///      can never be evicted out from under its live guard — the use-after-free
+///      that SIGSEGV'd in `RwLock::unlock_queue` when >1024 distinct named locks
+///      (e.g. Preside's per-object locks) tripped the eviction cap.
 #[allow(dead_code)]
 enum HeldLock {
-    Write(std::sync::RwLockWriteGuard<'static, ()>),
-    Read(std::sync::RwLockReadGuard<'static, ()>),
+    Write(
+        std::sync::RwLockWriteGuard<'static, ()>,
+        Arc<RwLock<()>>,
+    ),
+    Read(
+        std::sync::RwLockReadGuard<'static, ()>,
+        Arc<RwLock<()>>,
+    ),
     /// A reentrant re-acquire of a lock already held by this request/thread.
     /// Holds no real guard — named locks are reentrant per thread, so the inner
     /// acquire must not block on the non-reentrant RwLock. Popped in LIFO order
@@ -11894,11 +11913,16 @@ impl CfmlVirtualMachine {
                         if is_exclusive {
                             loop {
                                 if let Ok(guard) = lock.try_write() {
-                                    // SAFETY: We extend the lifetime because the Arc keeps the RwLock alive.
-                                    // The guard is dropped in __cflock_end before the Arc can be dropped.
+                                    // SAFETY: the lifetime extension is sound because we
+                                    // store the owning `Arc<RwLock<()>>` (`lock`) alongside
+                                    // the guard in the same `HeldLock`. The Arc keeps the
+                                    // RwLock allocation alive for at least as long as the
+                                    // guard, and HeldLock's field order drops the guard
+                                    // (unlock) before the Arc (free). See HeldLock docs.
                                     let guard: std::sync::RwLockWriteGuard<'static, ()> =
                                         unsafe { std::mem::transmute(guard) };
-                                    self.held_locks.push((lock_name, HeldLock::Write(guard)));
+                                    self.held_locks
+                                        .push((lock_name, HeldLock::Write(guard, lock.clone())));
                                     break;
                                 }
                                 if cfml_common::clock::Monotonic::now() >= deadline {
@@ -11911,9 +11935,13 @@ impl CfmlVirtualMachine {
                         } else {
                             loop {
                                 if let Ok(guard) = lock.try_read() {
+                                    // SAFETY: see the exclusive branch above — the owning
+                                    // Arc is stored next to the guard, keeping the RwLock
+                                    // alive (and unevictable) for the guard's whole life.
                                     let guard: std::sync::RwLockReadGuard<'static, ()> =
                                         unsafe { std::mem::transmute(guard) };
-                                    self.held_locks.push((lock_name, HeldLock::Read(guard)));
+                                    self.held_locks
+                                        .push((lock_name, HeldLock::Read(guard, lock.clone())));
                                     break;
                                 }
                                 if cfml_common::clock::Monotonic::now() >= deadline {

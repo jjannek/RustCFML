@@ -301,6 +301,11 @@ include "harness.cfm";
 <!--- A named exclusive lock must be reentrant within the same request/thread. --->
 <!--- RustCFML 0.161.0 self-deadlocked on re-entry (inner timed out + threw). --->
 <cf_runtest file="core/test_named_lock_reentrant.cfm">
+<!--- An actively-held named lock must never be evicted from the >1024-entry registry --->
+<!--- cap while its 'static guard is live. Pre-fix the eviction sweep freed the held --->
+<!--- lock's RwLock and dropping the dangling guard SIGSEGV'd serve mode (found via --->
+<!--- Preside's PresideObjectServiceTest, which acquires thousands of per-object locks). --->
+<cf_runtest file="core/test_named_lock_eviction_uaf.cfm">
 <!--- `new Comp(args)` must propagate an exception thrown by init() (constructor-guard --->
 <!--- validation). RustCFML 0.161.0 swallowed it under the `new` sugar and returned a --->
 <!--- half-built object; createObject(...).init() propagates correctly. --->
