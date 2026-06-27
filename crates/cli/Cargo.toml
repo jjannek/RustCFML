@@ -43,6 +43,11 @@ uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memcache = { version = "0.17", optional = true }
+# memcache enables its `tls` feature by default, which pulls in native openssl.
+# `vendored` compiles OpenSSL from source and statically links it, so the build
+# needs no system OpenSSL — required for the Windows MSVC release runner, and it
+# makes the distributed binaries self-contained on every platform.
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 memberlist = { version = "0.8", optional = true, default-features = false, features = ["tokio", "tcp", "serde"] }
 automerge = { version = "0.9", optional = true }
 bincode = { version = "2", optional = true, features = ["serde"] }
@@ -54,7 +59,7 @@ socketioxide = "0.16.3"
 
 [features]
 default = ["memcached", "cluster", "jit"]
-memcached = ["dep:memcache"]
+memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # Passthrough to the VM's Cranelift JIT (native only). **On by default** via
 # `cfml-vm`'s default feature set; this feature exists so that a downstream
