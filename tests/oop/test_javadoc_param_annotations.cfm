@@ -55,4 +55,32 @@ gcf   = findParam( gInit, "configuredFeatures" );
 assert( "getComponentMetadata param inject", gcf.inject, "coldbox:setting:features" );
 
 suiteEnd();
+
+suiteBegin("Javadoc annotation quoted-value stripping (Lucee parity)");
+
+qmd = getMetadata( createObject( "component", "oop.JavadocQuotedAnnotations" ) );
+
+// `@tablePrefix ""` -> empty string (NOT the literal `""`, NOT "true").
+assertTrue( "tablePrefix annotation present", structKeyExists( qmd, "tablePrefix" ) );
+assert( "tablePrefix quoted-empty -> empty string", qmd.tablePrefix, "" );
+assert( "tablePrefix length is 0", len( qmd.tablePrefix ), 0 );
+
+// Surrounding double / single quotes are stripped (one matching pair).
+assert( "double-quoted value stripped", qmd.doubleQuoted, "hello world" );
+assert( "single-quoted value stripped", qmd.singleQuoted, "sq value" );
+
+// Unquoted values are unchanged.
+assert( "bare unquoted value unchanged", qmd.bareValue, "plain" );
+
+// A value-less annotation is boolean true.
+assertTrue( "value-less annotation is true", qmd.boolFlag );
+
+// Quote stripping also applies to per-parameter (dotted) annotations.
+qInit = findFn( qmd, "init" );
+qx    = findParam( qInit, "x" );
+qy    = findParam( qInit, "y" );
+assert( "param double-quoted inject stripped", qx.inject, "coldbox:setting:thing" );
+assert( "param single-quoted inject stripped", qy.inject, "logbox:logger:{this}" );
+
+suiteEnd();
 </cfscript>

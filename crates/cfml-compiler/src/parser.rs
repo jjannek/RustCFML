@@ -3585,9 +3585,20 @@ impl Parser {
                     None => (rest.to_string(), String::new()),
                 };
                 let value = if val.is_empty() {
+                    // A bare annotation with no value (`@foo`) is boolean true.
                     "true".to_string()
                 } else {
-                    val
+                    // Strip a single matching pair of surrounding quotes, matching
+                    // Lucee: `@k "v"` -> v, `@k ""` -> "" (empty, NOT "true"),
+                    // `@k 'v'` -> v, `@k v` -> v. (The quote chars are ASCII, so
+                    // the byte-index slice lands on char boundaries.)
+                    let b = val.as_bytes();
+                    if val.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[val.len() - 1] == b[0]
+                    {
+                        val[1..val.len() - 1].to_string()
+                    } else {
+                        val
+                    }
                 };
                 if let Some(dot) = key.find('.') {
                     let pname = key[..dot].to_lowercase();
