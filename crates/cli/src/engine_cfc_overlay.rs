@@ -1,11 +1,12 @@
-//! Engine-bundled socket.io-lucee compat CFCs, overlaid onto the serve-mode
-//! VFS so `new SocketIoServer()` resolves out of the box.
+//! Engine-bundled compat CFCs, overlaid onto the serve-mode VFS so reserved
+//! component names resolve out of the box:
+//!   - the socket.io-lucee compat trio (`new SocketIoServer()` etc.)
+//!   - Lucee's built-in `new Query()` builder + its `Result` return object
 //!
-//! [`SocketIoOverlay`] wraps the real filesystem and serves the three compat
-//! CFCs (`SocketIoServer` / `SocketIoNamespace` / `SocketIoSocket`) for any
-//! path whose basename matches — *only when the base VFS does not already have
-//! that file*. So a user's own same-named file always wins; the engine copy is
-//! a fallback for the reserved names. All other paths pass straight through.
+//! [`EngineCfcOverlay`] wraps the real filesystem and serves an engine copy
+//! for any path whose basename matches a reserved name — *only when the base
+//! VFS does not already have that file*. So a user's own same-named file always
+//! wins; the engine copy is a fallback. All other paths pass straight through.
 
 use std::io;
 use std::sync::Arc;
@@ -16,6 +17,8 @@ use cfml_common::vfs::{Vfs, VfsDirEntry};
 const SERVER_CFC: &str = include_str!("../assets/socketio/SocketIoServer.cfc");
 const NAMESPACE_CFC: &str = include_str!("../assets/socketio/SocketIoNamespace.cfc");
 const SOCKET_CFC: &str = include_str!("../assets/socketio/SocketIoSocket.cfc");
+const QUERY_CFC: &str = include_str!("../assets/lucee/Query.cfc");
+const RESULT_CFC: &str = include_str!("../assets/lucee/Result.cfc");
 
 /// The embedded source for a reserved compat-CFC path, keyed by basename
 /// (case-insensitive). `None` for any other path.
@@ -26,21 +29,23 @@ fn engine_cfc(path: &str) -> Option<&'static str> {
         "socketioserver.cfc" => Some(SERVER_CFC),
         "socketionamespace.cfc" => Some(NAMESPACE_CFC),
         "socketiosocket.cfc" => Some(SOCKET_CFC),
+        "query.cfc" => Some(QUERY_CFC),
+        "result.cfc" => Some(RESULT_CFC),
         _ => None,
     }
 }
 
-pub struct SocketIoOverlay {
+pub struct EngineCfcOverlay {
     base: Arc<dyn Vfs>,
 }
 
-impl std::fmt::Debug for SocketIoOverlay {
+impl std::fmt::Debug for EngineCfcOverlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SocketIoOverlay").finish()
+        f.debug_struct("EngineCfcOverlay").finish()
     }
 }
 
-impl SocketIoOverlay {
+impl EngineCfcOverlay {
     pub fn new(base: Arc<dyn Vfs>) -> Self {
         Self { base }
     }
@@ -55,7 +60,7 @@ impl SocketIoOverlay {
     }
 }
 
-impl Vfs for SocketIoOverlay {
+impl Vfs for EngineCfcOverlay {
     fn read_to_string(&self, path: &str) -> io::Result<String> {
         match self.overlaid(path) {
             Some(src) => Ok(src.to_string()),

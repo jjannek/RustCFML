@@ -1,7 +1,7 @@
+mod engine_cfc_overlay;
 mod rewrite;
 mod session;
 mod socketio;
-mod socketio_assets;
 mod websocket;
 
 use clap::Parser;
@@ -419,9 +419,10 @@ fn real_main() {
             socket,
             args.debug,
             args.single_threaded,
-            // Overlay the engine-bundled socket.io-lucee compat CFCs so
-            // `new SocketIoServer()` resolves without the user shipping them.
-            Arc::new(socketio_assets::SocketIoOverlay::new(vfs::real_fs())),
+            // Overlay the engine-bundled compat CFCs (socket.io trio +
+            // Lucee's `new Query()` builder) so they resolve without the
+            // user shipping them.
+            Arc::new(engine_cfc_overlay::EngineCfcOverlay::new(vfs::real_fs())),
             false,
             production,
             Arc::new(cfconfig),
@@ -500,7 +501,9 @@ fn execute_code_with_file(source: &str, debug: bool, source_file: Option<String>
         secure_json_prefix: cfconfig.security.secure_json_prefix.clone(),
     });
     let server_state = ServerState::with_config(false, cfconfig);
-    match compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, vfs::real_fs(), false, None, false, false) {
+    let cli_vfs: Arc<dyn vfs::Vfs> =
+        Arc::new(engine_cfc_overlay::EngineCfcOverlay::new(vfs::real_fs()));
+    match compile_and_run(source, debug, source_file, ValueMap::default(), Some(&server_state), None, None, cli_vfs, false, None, false, false) {
         Ok(response) => {
             if !response.output.is_empty() {
                 print!("{}", response.output);
