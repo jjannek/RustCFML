@@ -8279,9 +8279,18 @@ fn coerce_by_sqltype_value(val: &CfmlValue, sqltype: &str) -> CfmlValue {
     }
 }
 
-/// Strip leading whitespace and SQL comments (`-- line` and `/* block */`)
-/// so the first *significant* keyword can be classified. Returns the
-/// remainder starting at the first non-comment, non-whitespace byte.
+/// Strip leading whitespace, SQL comments (`-- line` and `/* block */`), and
+/// leading open-parens so the first *significant* keyword can be classified.
+/// Returns the remainder starting at the first non-comment, non-whitespace,
+/// non-`(` byte.
+///
+/// Leading `(` is peeled because a parenthesised top-level statement is always
+/// row-returning — `( SELECT ... ) UNION ALL ( SELECT ... )` (Preside's
+/// `selectUnion` wraps every branch in parens) or `( SELECT ... )` / `( VALUES
+/// ... )`. You cannot wrap an INSERT/UPDATE/DELETE in parens at the top level,
+/// so peeling can't misclassify a mutation as a query. Without this, a leading
+/// `(` left an empty first keyword, the statement was treated as a mutation, and
+/// the UNION ran down the execute path returning 0 rows.
 #[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
 fn strip_leading_sql_noise(sql: &str) -> &str {
     let mut s = sql.trim_start();
@@ -8298,6 +8307,9 @@ fn strip_leading_sql_noise(sql: &str) -> &str {
                 Some(i) => rest[i + 2..].trim_start(),
                 None => return "",
             };
+        } else if let Some(rest) = s.strip_prefix('(') {
+            // leading open-paren of a parenthesised row-returning statement
+            s = rest.trim_start();
         } else {
             return s;
         }
@@ -8925,7 +8937,7 @@ fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
 /// the positional-array path does in `normalize_query_params`, so the named
 /// (`:name`) path produces the same `IN (?,?,…)` binding instead of stuffing a
 /// chr(31)-joined list into a single placeholder.
-#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+#[cfg(feature = "mysql_db")]
 fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
     if let CfmlValue::Struct(s) = v {
         let has_value_key = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
@@ -14809,5 +14821,36 @@ mod mysql_named_param_tests {
         assert_eq!(vals.len(), 3);
         assert_eq!(vals[0].as_string(), "a");
         assert_eq!(vals[2].as_string(), "c");
+    }
+}
+
+/// A row-returning statement wrapped in parentheses — `( SELECT ... ) UNION ALL
+/// ( SELECT ... )`, the shape Preside's selectUnion() emits — must still be
+/// classified as a query (run via the row-returning path), not a mutation.
+#[cfg(all(test, any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db")))]
+mod sql_classifier_tests {
+    use super::{is_select_query, strip_leading_sql_noise};
+
+    #[test]
+    fn parenthesised_union_is_a_select() {
+        assert!(is_select_query("( select id from a ) union all ( select id from b )"));
+        assert!(is_select_query("(( select 1 ))"));
+        assert!(is_select_query("  (  select 1 )"));
+        assert!(is_select_query("(\n  select 1\n)"));
+    }
+
+    #[test]
+    fn leading_paren_is_peeled_for_classification() {
+        assert_eq!(strip_leading_sql_noise("( select 1 )").trim_start(), "select 1 )");
+        assert_eq!(strip_leading_sql_noise("/* c */ ( select 1 )").trim_start(), "select 1 )");
+    }
+
+    #[test]
+    fn plain_statements_unaffected() {
+        assert!(is_select_query("select * from t"));
+        assert!(is_select_query("WITH x as (select 1) select * from x"));
+        assert!(!is_select_query("insert into t (a) values (1)"));
+        assert!(!is_select_query("update t set a = 1"));
+        assert!(!is_select_query("delete from t"));
     }
 }
