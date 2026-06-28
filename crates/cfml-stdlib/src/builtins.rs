@@ -1339,16 +1339,24 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
         Err(_) => return Ok(CfmlValue::Int(0)),
     };
 
-    let search_str = if start < string.len() { &string[start..] } else { "" };
+    // Start the search at byte offset `start` WITHOUT re-anchoring `^`/`\b` to
+    // that offset: `find_at`/`captures_at` advance the search position but keep
+    // the anchors relative to the TRUE start of the string (Lucee/Java/PCRE
+    // semantics). Slicing `&string[start..]` and matching that — the old
+    // approach — made `^` match at the slice start, so e.g.
+    // `reFind("^a","xax",2)` wrongly returned 2 instead of 0. Returned match
+    // offsets from these APIs are already absolute, so they are NOT re-adjusted.
+    // Clamp to len so an out-of-range start can't panic.
+    let start = start.min(string.len());
 
     if return_sub {
-        if let Some(caps) = re.captures(search_str) {
+        if let Some(caps) = re.captures_at(&string, start) {
             let mut pos_arr = Vec::new();
             let mut match_arr = Vec::new();
             let mut len_arr = Vec::new();
             for i in 0..caps.len() {
                 if let Some(m) = caps.get(i) {
-                    pos_arr.push(CfmlValue::Int((m.start() + start + 1) as i64));
+                    pos_arr.push(CfmlValue::Int((m.start() + 1) as i64));
                     match_arr.push(CfmlValue::string(m.as_str().to_string()));
                     len_arr.push(CfmlValue::Int(m.len() as i64));
                 } else {
@@ -1370,8 +1378,8 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
             Ok(CfmlValue::strukt(result))
         }
     } else {
-        match re.find(search_str) {
-            Some(m) => Ok(CfmlValue::Int((m.start() + start + 1) as i64)),
+        match re.find_at(&string, start) {
+            Some(m) => Ok(CfmlValue::Int((m.start() + 1) as i64)),
             None => Ok(CfmlValue::Int(0)),
         }
     }

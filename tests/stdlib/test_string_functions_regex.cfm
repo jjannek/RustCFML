@@ -68,5 +68,21 @@ assert("reReplace \w keeps backslash", reReplace("abc", "b", "\w"), "a\wc");
 assert("reReplace \U..\E uppercases backref", reReplace("a-hello-z", "(hello)", "\U\1\E"), "a-HELLO-z");
 assert("reReplace \l lowercases next", reReplace("aBc", "(B)", "\l\1"), "abc");
 
+// --- start-position must NOT re-anchor ^ / \b (Lucee/Java/PCRE semantics) ---
+// reFind/reFindNoCase with a start index begins the SEARCH at that position but
+// keeps `^` anchored to the TRUE start of the string. Previously RustCFML sliced
+// the string at `start` and matched the slice, so `^` matched at the slice start
+// — `reFind("^a","xax",2)` wrongly returned 2. This produced a suffix explosion
+// in Preside's regex field-scanner (every restart matched `(^|\s|,)` at the
+// offset), inventing bogus join targets -> "no path exists" relationship errors.
+assert("reFind ^ no re-anchor at start>1 (a)", reFind("^a", "xax", 2), 0);
+assert("reFind ^ at true start still matches", reFind("^x", "xax", 1), 1);
+assert("reFind ^ no match when start past true start", reFind("^x", "xax", 2), 0);
+// non-anchored pattern still finds the later occurrence from the start position
+assert("reFind non-anchored from start pos", reFind("a", "xax", 2), 2);
+// the (^|\s|,) leading-delimiter idiom: at offset 1 (mid-token) it must NOT match
+reAnchorMatch = reFindNoCase("(^|\s|,)([a-z_]+)", "object.email", 2, true);
+assert("reFindNoCase leading-delim idiom no spurious mid-token match", reAnchorMatch.match[1], "");
+
 suiteEnd();
 </cfscript>
