@@ -52,3 +52,6 @@ whitebackground.png
 
 # Generated sqlite test datasource artifact (served-mode cfconfig tests)
 testds
+# Stray SQLite DB materialised from a "sqlite::memory:" DSN used as a path.
+# The ':' is illegal on Windows and breaks `git checkout` in CI — never track it.
+sqlite::memory:
