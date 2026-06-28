@@ -7503,7 +7503,7 @@ fn get_sqlite_pool(path: &str) -> Result<r2d2::Pool<SqliteConnectionManager>, Cf
         .min_idle(Some(1))
         .connection_timeout(std::time::Duration::from_secs(30))
         .build(mgr)
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to create SQLite pool: {}", e)))?;
+        .map_err(|e| CfmlError::database(format!("queryExecute: failed to create SQLite pool: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
     Ok(pool)
 }
@@ -7619,10 +7619,10 @@ fn get_mysql_pool(url: &str) -> Result<mysql::Pool, CfmlError> {
     }
     let (sanitized, ssl) = mysql_extract_ssl(url);
     let opts = mysql::Opts::from_url(&sanitized)
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: invalid MySQL connection string: {}", e)))?;
+        .map_err(|e| CfmlError::database(format!("queryExecute: invalid MySQL connection string: {}", e)))?;
     let builder = mysql::OptsBuilder::from_opts(opts).ssl_opts(ssl);
     let pool = mysql::Pool::new(builder)
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL pool creation error: {}", e)))?;
+        .map_err(|e| CfmlError::database(format!("queryExecute: MySQL pool creation error: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
     Ok(pool)
 }
@@ -7923,7 +7923,7 @@ fn get_postgres_pool(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>,
         // (is_closed) to evict dead connections on return instead. See PR #125.
         .test_on_check_out(false)
         .build(mgr)
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to create PostgreSQL pool: {}", e)))?;
+        .map_err(|e| CfmlError::database(format!("queryExecute: failed to create PostgreSQL pool: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
     Ok(pool)
 }
@@ -8054,9 +8054,9 @@ fn mssql_config_from_url(url: &str) -> Result<(tiberius::Config, String), CfmlEr
     };
     // Format: user:pass@host:port/database
     let (auth_part, host_db) = clean_url.split_once('@')
-        .ok_or_else(|| CfmlError::runtime("queryExecute: MSSQL URL must be mssql://user:pass@host:port/database".to_string()))?;
+        .ok_or_else(|| CfmlError::database("queryExecute: MSSQL URL must be mssql://user:pass@host:port/database".to_string()))?;
     let (user, pass) = auth_part.split_once(':')
-        .ok_or_else(|| CfmlError::runtime("queryExecute: MSSQL URL must include user:password".to_string()))?;
+        .ok_or_else(|| CfmlError::database("queryExecute: MSSQL URL must include user:password".to_string()))?;
     let (host_port, database) = host_db.split_once('/')
         .unwrap_or((host_db, "master"));
     let (host, port_str) = host_port.split_once(':')
@@ -8114,7 +8114,7 @@ fn get_mssql_pool(url: &str) -> Result<r2d2::Pool<MssqlConnectionManager>, CfmlE
         // MssqlConnectionManager::has_broken to evict dead connections instead.
         .test_on_check_out(false)
         .build(mgr)
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to create MSSQL pool: {}", e)))?;
+        .map_err(|e| CfmlError::database(format!("queryExecute: failed to create MSSQL pool: {}", e)))?;
     manager.insert(key, Box::new(pool.clone()));
     Ok(pool)
 }
@@ -8703,7 +8703,7 @@ fn normalize_positional_params(sql: String, raw_params: &CfmlValue) -> (String, 
 pub fn fn_query_execute(args: Vec<CfmlValue>) -> CfmlResult {
     let sql = get_str(&args, 0);
     if sql.is_empty() {
-        return Err(CfmlError::runtime("queryExecute: SQL string is required".to_string()));
+        return Err(CfmlError::database("queryExecute: SQL string is required".to_string()));
     }
 
     let raw_params = args.get(1).cloned().unwrap_or(CfmlValue::Null);
@@ -8792,7 +8792,7 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
 
     let pool = get_sqlite_pool(path)?;
     let conn = pool.get()
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: failed to get SQLite connection from pool: {}", e)))?;
+        .map_err(|e| CfmlError::database(format!("queryExecute: failed to get SQLite connection from pool: {}", e)))?;
 
     // See `execute_sqlite_with_conn`: emulate MySQL `@@` system variables that
     // SQLite cannot parse, so capability-detection selects don't crash.
@@ -8802,7 +8802,7 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
 
     if is_select_query(sql) {
         let mut stmt = conn.prepare(&exec_sql)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
 
         let column_count = stmt.column_count();
         let columns: Vec<String> = (0..column_count)
@@ -8818,15 +8818,15 @@ fn execute_sqlite(path: &str, sql: &str, params_arg: &CfmlValue, return_type: &s
                 }
                 Ok(row_map)
             })
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: query error: {}", e)))?
+            .map_err(|e| CfmlError::database(format!("queryExecute: query error: {}", e)))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: row error: {}", e)));
+            .map_err(|e| CfmlError::database(format!("queryExecute: row error: {}", e)));
 
         let rows = rows_result?;
         build_query_result(columns, rows, sql, return_type)
     } else {
         let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
 
         let last_id = conn.last_insert_rowid();
         build_mutation_result(affected as i64, last_id, sql)
@@ -9149,7 +9149,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
 
     let pool = get_mysql_pool(url)?;
     let mut conn = pool.get_conn()
-        .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL connection error: {}", e)))?;
+        .map_err(|e| CfmlError::database(format!("queryExecute: MySQL connection error: {}", e)))?;
 
     // Build the SQL we actually execute plus its bound params. For NAMED (struct)
     // params we rewrite `:name` placeholders to positional `?` ourselves rather
@@ -9180,7 +9180,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
 
     if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL query error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL query error: {}", e)))?;
 
         // Extract column names from result set
         let columns: Vec<String> = if let Some(first_row) = result.first() {
@@ -9205,7 +9205,7 @@ fn execute_mysql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
         build_query_result(columns, rows, sql, return_type)
     } else {
         conn.exec_drop(sql, &params)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL error: {}", e)))?;
 
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
@@ -9281,7 +9281,7 @@ fn execute_postgres(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &
     let mut last_err: Option<CfmlError> = None;
     for _ in 0..=PG_POOL_MAX_SIZE {
         let mut conn = pool.get()
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: PostgreSQL connection error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: PostgreSQL connection error: {}", e)))?;
         match run_postgres_on_conn(&mut conn, sql, params_arg, return_type) {
             Ok(value) => return Ok(value),
             Err(err) if err.retry_safe => {
@@ -9292,7 +9292,7 @@ fn execute_postgres(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        CfmlError::runtime("queryExecute: PostgreSQL connection error: exhausted pool retries".to_string())
+        CfmlError::database("queryExecute: PostgreSQL connection error: exhausted pool retries".to_string())
     }))
 }
 
@@ -10004,7 +10004,7 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
     let mut last_err: Option<CfmlError> = None;
     for _ in 0..=MSSQL_POOL_MAX_SIZE {
         let mut conn = pool.get()
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: MSSQL connection error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: MSSQL connection error: {}", e)))?;
         match run_mssql_on_conn(&mut conn, sql, &effective_params, return_type) {
             Ok(value) => return Ok(value),
             // Connection-level failure on a replayable statement: drop the broken
@@ -10017,7 +10017,7 @@ fn execute_mssql(url: &str, sql: &str, params_arg: &CfmlValue, return_type: &str
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        CfmlError::runtime("queryExecute: MSSQL connection error: exhausted pool retries".to_string())
+        CfmlError::database("queryExecute: MSSQL connection error: exhausted pool retries".to_string())
     }))
 }
 
@@ -10141,7 +10141,7 @@ impl MssqlRunError {
     fn from_tiberius(ctx: &str, e: tiberius::error::Error, retry_safe: bool) -> Self {
         let connection_broken = is_mssql_connection_error(&e);
         Self {
-            error: CfmlError::runtime(format!("queryExecute: MSSQL {}: {}", ctx, e)),
+            error: CfmlError::database(format!("queryExecute: MSSQL {}: {}", ctx, e)),
             connection_broken,
             // Only retry connection-level failures, and only when the caller says
             // the statement is replayable. SELECTs are side-effect free, so they
@@ -10687,7 +10687,7 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
 
     if is_select_query(sql) {
         let mut stmt = conn.prepare(&exec_sql)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
         let column_count = stmt.column_count();
         let columns: Vec<String> = (0..column_count)
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
@@ -10701,14 +10701,14 @@ fn execute_sqlite_with_conn(conn: &rusqlite::Connection, sql: &str, params_arg: 
                 }
                 Ok(row_map)
             })
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: query error: {}", e)))?
+            .map_err(|e| CfmlError::database(format!("queryExecute: query error: {}", e)))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: row error: {}", e)));
+            .map_err(|e| CfmlError::database(format!("queryExecute: row error: {}", e)));
         let rows = rows_result?;
         build_query_result(columns, rows, sql, return_type)
     } else {
         let affected = conn.execute(&exec_sql, rusqlite::params_from_iter(bound_params.iter()))
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: SQL error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: SQL error: {}", e)))?;
         let last_id = conn.last_insert_rowid();
         build_mutation_result(affected as i64, last_id, sql)
     }
@@ -10744,7 +10744,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
 
     if mysql_returns_rows(sql) {
         let result: Vec<Row> = conn.exec(sql, &params)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL query error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL query error: {}", e)))?;
         let columns: Vec<String> = if let Some(first_row) = result.first() {
             first_row.columns_ref().iter()
                 .map(|c| c.name_str().to_string())
@@ -10764,7 +10764,7 @@ fn execute_mysql_with_conn(conn: &mut mysql::PooledConn, sql: &str, params_arg: 
         build_query_result(columns, rows, sql, return_type)
     } else {
         conn.exec_drop(sql, &params)
-            .map_err(|e| CfmlError::runtime(format!("queryExecute: MySQL error: {}", e)))?;
+            .map_err(|e| CfmlError::database(format!("queryExecute: MySQL error: {}", e)))?;
         let affected = conn.affected_rows() as i64;
         let last_id = conn.last_insert_id() as i64;
         build_mutation_result(affected, last_id, sql)

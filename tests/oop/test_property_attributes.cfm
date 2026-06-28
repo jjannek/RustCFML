@@ -56,6 +56,14 @@ tp3 = tmd.properties[3];
 assert("tag: prop3 name", tp3.name, "title");
 assert("tag: prop3 type", tp3.type, "string");
 
+// --- <cfproperty> attribute order must follow SOURCE declaration order ---
+// Tag attributes are parsed into a HashMap, whose iteration order is otherwise
+// non-deterministic across processes. cfproperty order is preserved into
+// component metadata and feeds identity hashes (Preside derives FK constraint
+// names from Hash(SerializeJson(property))), so a stable, source-ordered key
+// list is required — name first, then attributes as written.
+assert("tag: prop2 attr order is source order", structKeyList(tp2), "name,inject,hint");
+
 // --- required="false" must be PRESERVED in property metadata (Lucee parity) ---
 // Previously `required` was collapsed to a bool field that codegen only emitted
 // when true, so `required="false"` was silently dropped. Preside's

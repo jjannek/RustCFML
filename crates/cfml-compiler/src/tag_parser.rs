@@ -502,7 +502,8 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
     }
 
     // Parse attributes for all other tags
-    let (attrs, quoted, tag_end) = parse_tag_attributes(chars, name_end, len);
+    let (attrs, quoted, attr_order, tag_end) =
+        parse_tag_attributes_ordered(chars, name_end, len);
 
     match tag_lower.as_str() {
         "cfoutput" => {
@@ -862,13 +863,19 @@ fn parse_cf_tag(chars: &[char], start: usize, len: usize, imports: &mut std::col
             // Convert <cfproperty name="x" type="y" inject="z" default="v">
             // to CFScript: property name="x" type="y" inject="z" default="v";
             let mut prop_str = String::from("property ");
-            // Output name first, then all other attributes
+            // Output name first, then all other attributes in SOURCE ORDER.
+            // Order matters: cfproperty attributes are preserved into component
+            // metadata and feed identity hashes (Preside FK constraint names are
+            // Hash(SerializeJson(property))), so HashMap iteration order would
+            // make those hashes non-deterministic and diverge from Lucee.
             if let Some(name) = attrs.get("name") {
                 prop_str.push_str(&format!("name=\"{}\" ", name));
             }
-            for (k, v) in &attrs {
+            for k in &attr_order {
                 if k != "name" {
-                    prop_str.push_str(&format!("{}=\"{}\" ", k, v));
+                    if let Some(v) = attrs.get(k) {
+                        prop_str.push_str(&format!("{}=\"{}\" ", k, v));
+                    }
                 }
             }
             prop_str.push_str(";\n");
@@ -1972,8 +1979,26 @@ fn parse_tag_attributes(
     start: usize,
     len: usize,
 ) -> (std::collections::HashMap<String, String>, std::collections::HashSet<String>, usize) {
+    let (attrs, quoted, _order, end) = parse_tag_attributes_ordered(chars, start, len);
+    (attrs, quoted, end)
+}
+
+/// Like `parse_tag_attributes` but also returns the attribute keys in the order
+/// they appear in the source. Tag attributes are otherwise stored in a HashMap,
+/// whose iteration order is non-deterministic across processes — fine for tags
+/// that emit key:value struct literals (order-irrelevant), but NOT for
+/// `<cfproperty>`, whose attribute order is preserved into component metadata
+/// and feeds identity hashes (e.g. Preside's FK constraint names are
+/// `Hash(SerializeJson(property))`). Emitting attributes in source order keeps
+/// that hash stable run-to-run and matches Lucee.
+fn parse_tag_attributes_ordered(
+    chars: &[char],
+    start: usize,
+    len: usize,
+) -> (std::collections::HashMap<String, String>, std::collections::HashSet<String>, Vec<String>, usize) {
     let mut attrs = std::collections::HashMap::new();
     let mut quoted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut order: Vec<String> = Vec::new();
     let mut i = start;
 
     // Skip whitespace
@@ -2064,6 +2089,9 @@ fn parse_tag_attributes(
                 }
                 let key = attr_name.to_lowercase();
                 quoted.insert(key.clone());
+                if !attrs.contains_key(&key) {
+                    order.push(key.clone());
+                }
                 attrs.insert(key, val);
             } else {
                 // Unquoted value
@@ -2072,10 +2100,18 @@ fn parse_tag_attributes(
                     i += 1;
                 }
                 let val: String = chars[val_start..i].iter().collect();
-                attrs.insert(attr_name.to_lowercase(), val);
+                let key = attr_name.to_lowercase();
+                if !attrs.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                attrs.insert(key, val);
             }
         } else if !attr_name.is_empty() {
-            attrs.insert(attr_name.to_lowercase(), String::new());
+            let key = attr_name.to_lowercase();
+            if !attrs.contains_key(&key) {
+                order.push(key.clone());
+            }
+            attrs.insert(key, String::new());
         }
 
         // Skip whitespace
@@ -2086,7 +2122,7 @@ fn parse_tag_attributes(
 
     // Find the actual end of the tag
     let tag_end = find_tag_end(chars, i, len);
-    (attrs, quoted, tag_end)
+    (attrs, quoted, order, tag_end)
 }
 
 /// Format an attribute value for emission inside a script struct literal.

@@ -40,6 +40,15 @@ impl CfmlError {
     pub fn runtime(message: String) -> Self {
         Self::new(message, CfmlErrorType::Runtime)
     }
+
+    /// A catchable `database`-typed exception, matching how Lucee/ACF surface
+    /// SQL execution and connection failures. CFML code routinely does
+    /// `catch( database e )` (e.g. Preside's cascade-delete guard depends on a
+    /// FK-constraint violation arriving as a `database` exception), so DB errors
+    /// must NOT be generic `runtime` errors.
+    pub fn database(message: String) -> Self {
+        Self::new(message, CfmlErrorType::Custom("database".to_string()))
+    }
 }
 
 impl std::fmt::Display for CfmlErrorType {

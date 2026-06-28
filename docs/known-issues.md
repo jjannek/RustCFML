@@ -408,6 +408,29 @@ Edges:
 | Non-literal `type` | A `type` given as an expression (not a string literal) is not validated. |
 | "required" semantics | A typed param with no default whose value is absent is defaulted to `""` then type-checked, so the error names the type rather than "parameter required". |
 
+## 15. `serializeJSON` struct key order — insertion order, not Lucee's HashMap order 🌟 *(divergence)*
+
+RustCFML structs are insertion-ordered (`IndexMap`), so `serializeJSON()` emits keys
+in the order they were added. Lucee/ACF back component metadata (and many internal
+structs) with a Java `HashMap`, whose iteration order is hash-bucket order — neither
+insertion nor alphabetical, but deterministic for a given JVM.
+
+This is normally invisible and arguably an improvement (stable, predictable output).
+It only bites code that **hashes a serialized struct as an identity key** and expects
+byte-for-byte parity with Lucee. The known case is **Preside's foreign-key constraint
+names**: `RelationshipGuidance.cfc` computes `fk_#Hash( SerializeJson( property ) )#`
+over the normalised property struct. RustCFML produces *deterministic, self-consistent*
+FK names (so its own dbSync/diffing works), but they will **not equal the values Lucee
+generated**. Preside's `PresideObjectServiceTest` `test011`/`test012` assert the exact
+Lucee-generated `fk_<md5>` strings and therefore fail on RustCFML even though the
+relationships, columns and referential rules are correct.
+
+Reproducing Lucee's exact hash would require emulating `java.util.HashMap` iteration
+order (bucket index + resize thresholds) plus its attribute-name case preservation and
+`required="true"`→`"yes"` metadata coercion — brittle and not worth it. Treated as a
+**won't-fix divergence**. (FK *rule* reporting via `dbinfo type="foreignkeys"` — the
+JDBC numeric `UPDATE_RULE`/`DELETE_RULE` codes — *is* matched; see §10.)
+
 *This list is not exhaustive — it captures gaps identified to date. A periodic audit
 sweep (e.g. parallel search for "not supported" / accepted-but-unused config keys /
 ignored tag attributes) should refresh it.*

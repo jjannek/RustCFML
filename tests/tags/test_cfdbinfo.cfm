@@ -96,6 +96,26 @@ if (NOT dbiSkip) {
     assert("foreignkeys: FKCOLUMN_NAME", valueList(fks.FKCOLUMN_NAME), "role_id");
     assert("foreignkeys: FKTABLE_NAME", valueList(fks.FKTABLE_NAME), "users");
     assert("foreignkeys: PKTABLE_NAME", fks.PKTABLE_NAME[1], "roles");
+    // UPDATE_RULE / DELETE_RULE are the JDBC numeric referential-action codes
+    // Lucee surfaces (importedKeyCascade=0, importedKeyRestrict=1,
+    // importedKeySetNull=2, importedKeyNoAction=3), NOT textual "CASCADE"/etc.
+    // users.role_id declares no rule → NO ACTION (3). Consumers like Preside's
+    // dbSync key a struct on these integers, so the numeric form is load-bearing.
+    assert("foreignkeys: UPDATE_RULE is numeric NO ACTION", fks.UPDATE_RULE[1], 3);
+    assert("foreignkeys: DELETE_RULE is numeric NO ACTION", fks.DELETE_RULE[1], 3);
+
+    // A table with explicit referential actions → cascade (0) / set null (2).
+    queryExecute("CREATE TABLE perms (id INTEGER PRIMARY KEY, role_id INTEGER REFERENCES roles(role_id) ON DELETE CASCADE ON UPDATE SET NULL)", [], {datasource: dbiDs});
+    cfdbinfo(type="foreignkeys", name="fkp", table="roles", datasource=dbiDs);
+    permRow = 0;
+    for (i = 1; i <= fkp.recordCount; i++) {
+        if (fkp.FKTABLE_NAME[i] == "perms") { permRow = i; }
+    }
+    assertTrue("foreignkeys: perms FK row found", permRow GT 0);
+    assert("foreignkeys: DELETE_RULE cascade=0", fkp.DELETE_RULE[permRow], 0);
+    assert("foreignkeys: UPDATE_RULE set null=2", fkp.UPDATE_RULE[permRow], 2);
+    // Drop the helper table so later table-listing assertions stay clean.
+    queryExecute("DROP TABLE perms", [], {datasource: dbiDs});
 
     // --- dbnames ---
     cfdbinfo(type="dbnames", name="dbn", datasource=dbiDs);

@@ -75,5 +75,22 @@ ages = queryColumnData(q2, "age");
 assert("queryColumnData returns array", arrayLen(ages), 3);
 assert("queryColumnData first value", ages[1], 30);
 
+// --- SQL execution errors are catchable `database`-typed exceptions ---
+// Lucee/ACF surface SQL failures as type="database", and CFML code routinely
+// does `catch( database e )` (e.g. Preside's cascade-delete guard relies on a
+// FK/constraint violation arriving as a database exception). A bad query must
+// NOT be a generic runtime error.
+dbErrDs = "sqlite://" & getTempDirectory() & "/rustcfml_dberr_" & createUUID() & ".sqlite";
+try { queryExecute("CREATE TABLE t_dberr (id INTEGER PRIMARY KEY)", [], {datasource: dbErrDs}); } catch (any e) {}
+caughtAsDatabase = false;
+try {
+    queryExecute("SELECT * FROM no_such_table_here", [], {datasource: dbErrDs});
+} catch (database e) {
+    caughtAsDatabase = true;
+} catch (any e) {
+    caughtAsDatabase = false;
+}
+assertTrue("SQL error is catchable as type='database'", caughtAsDatabase);
+
 suiteEnd();
 </cfscript>

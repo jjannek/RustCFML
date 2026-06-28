@@ -1088,6 +1088,24 @@ fn type_index(ds: &str, driver: &DbDriver, table: &str, schema: Option<&str>) ->
 // type="foreignkeys"  (exported keys: FKs in other tables referencing TABLE)
 // -----------------------------------------------
 
+// Map a textual referential action (as reported by information_schema /
+// SQLite pragma) to the JDBC `DatabaseMetaData` numeric rule code that Lucee's
+// `dbinfo type="foreignkeys"` surfaces in UPDATE_RULE / DELETE_RULE. Callers
+// (e.g. Preside's dbSync) key a struct on these integers ("0"=cascade,
+// "2"=set null), so returning the textual form silently mis-classified every
+// rule. importedKeyCascade=0, importedKeyRestrict=1, importedKeySetNull=2,
+// importedKeyNoAction=3, importedKeySetDefault=4.
+fn fk_rule_code(rule: &str) -> i64 {
+    match rule.trim().to_ascii_uppercase().as_str() {
+        "CASCADE" => 0,
+        "RESTRICT" => 1,
+        "SET NULL" | "SETNULL" => 2,
+        "SET DEFAULT" | "SETDEFAULT" => 4,
+        // "NO ACTION" and anything unrecognised behave as no-action.
+        _ => 3,
+    }
+}
+
 fn type_foreignkeys(ds: &str, driver: &DbDriver, table: &str, schema: Option<&str>) -> CfmlResult {
     let table = fold_case(driver, table);
     let columns = vec![
@@ -1209,8 +1227,8 @@ fn type_foreignkeys(ds: &str, driver: &DbDriver, table: &str, schema: Option<&st
         row.insert("FKTABLE_NAME".to_string(), s(&fktable));
         row.insert("FKCOLUMN_NAME".to_string(), s(&fkcol));
         row.insert("KEY_SEQ".to_string(), CfmlValue::Int(key_seq));
-        row.insert("UPDATE_RULE".to_string(), s(&upd));
-        row.insert("DELETE_RULE".to_string(), s(&del));
+        row.insert("UPDATE_RULE".to_string(), CfmlValue::Int(fk_rule_code(&upd)));
+        row.insert("DELETE_RULE".to_string(), CfmlValue::Int(fk_rule_code(&del)));
         row.insert("FK_NAME".to_string(), s(&fk_name));
         row.insert("PK_NAME".to_string(), s(""));
         row.insert("DEFERRABILITY".to_string(), CfmlValue::Int(7));
