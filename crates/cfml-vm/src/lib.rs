@@ -7268,7 +7268,21 @@ impl CfmlVirtualMachine {
                                 // A Java-collection shim (LinkedHashMap etc.) is a
                                 // transparent map — hide its `__java_*` markers.
                                 let is_java_shim = s.contains_key("__java_shim");
-                                let keys: Vec<CfmlValue> = s
+                                // A java.util.TreeMap iterates its keys in SORTED
+                                // (natural) order, unlike an insertion-ordered
+                                // HashMap/struct. The shim stores entries in
+                                // insertion order, so for-in must sort. MockBox's
+                                // normalizeArguments() relies on this to build an
+                                // argument-order-independent hash (`for(k in
+                                // treeMap)`); without it the hash depends on
+                                // call-site arg order, mocks fail to match, and
+                                // `var x = mock()` assigns null -> downstream
+                                // "Variable undefined".
+                                let is_treemap = s
+                                    .get("__java_class")
+                                    .map(|v| v.as_string().eq_ignore_ascii_case("java.util.treemap"))
+                                    .unwrap_or(false);
+                                let mut keys: Vec<CfmlValue> = s
                                     .keys()
                                     .into_iter()
                                     .filter(|k| {
@@ -7303,6 +7317,9 @@ impl CfmlVirtualMachine {
                                     })
                                     .map(CfmlValue::string)
                                     .collect();
+                                if is_treemap {
+                                    keys.sort_by(|a, b| a.as_string().cmp(&b.as_string()));
+                                }
                                 stack.push(CfmlValue::array(keys));
                             }
                             CfmlValue::String(s) => {

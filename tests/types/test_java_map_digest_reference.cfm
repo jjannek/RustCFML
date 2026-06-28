@@ -29,5 +29,24 @@ assertTrue("isEqual: identical bytes", md.isEqual("abc".getBytes("UTF-8"), "abc"
 assertFalse("isEqual: differing bytes", md.isEqual("abc".getBytes("UTF-8"), "abd".getBytes("UTF-8")));
 assertFalse("isEqual: differing length", md.isEqual("abc".getBytes("UTF-8"), "abcd".getBytes("UTF-8")));
 
+// java.util.TreeMap iterates its keys in SORTED (natural) order, regardless of
+// insertion order — unlike a plain struct/HashMap. MockBox's normalizeArguments
+// relies on this (`for(k in treeMap)`) to make its argument hash independent of
+// call-site argument order; without sorted for-in, mocks with named args fail to
+// match and `var x = mock()` assigns null -> "Variable undefined" (the Preside
+// PresideObjectCloningService newId/relatedTo failures).
+tm = CreateObject("java", "java.util.TreeMap").init({ objectName="o", propertyName="p", attributeName="a", zeta="z" });
+forInOrder = "";
+for ( k in tm ) { forInOrder = listAppend( forInOrder, k ); }
+assert("TreeMap for-in iterates keys sorted", forInOrder, "attributeName,objectName,propertyName,zeta");
+// keySet() is likewise sorted, and __java_* markers never leak into iteration.
+assert("TreeMap keySet sorted", arrayToList( tm.keySet() ), "attributeName,objectName,propertyName,zeta");
+// Order-independent serialization (the MockBox idiom): two maps with the same
+// entries in different insertion order iterate identically.
+tm2 = CreateObject("java", "java.util.TreeMap").init({ zeta="z", attributeName="a", propertyName="p", objectName="o" });
+ser1 = ""; for ( k in tm  ) { ser1 &= k & "=" & tm[k]  & ";"; }
+ser2 = ""; for ( k in tm2 ) { ser2 &= k & "=" & tm2[k] & ";"; }
+assert("TreeMap iteration order-independent of insertion order", ser1, ser2);
+
 suiteEnd();
 </cfscript>
