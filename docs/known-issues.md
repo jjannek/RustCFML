@@ -107,6 +107,8 @@ These do **not** silently no-op — they throw a clear message (listed for compl
 | `<cfimport>` without `taglib` | Throws — Java/JSP class imports unsupported (custom-tag taglibs work). |
 | `<cffile action="...">` outside the supported actions | Throws "not implemented". |
 | `<cfthread action="...">` outside run/join/terminate | Throws "not supported". |
+| `createObject("java", "…")` for a class outside the shimmed set | Throws "Java class […] is not supported" (RustCFML has no JVM; only a curated set of `java.*` standard-library classes are shimmed). Was previously a **silent null**, which surfaced downstream as a confusing "Variable X is undefined". |
+| Dynamically-loaded Java classes (`cbjavaloader` / `java.net.URLClassLoader`) | The classloader *plumbing* (`URLClassLoader`, `coldfusion.runtime.java.JavaProxy`, `Class.forName`, `java.lang.reflect.Array`, `array.iterator()`) is shimmed so ColdBox's `cbjavaloader` module boots, but **invoking a class it loads throws** — there is no JVM to load JAR bytecode. Runtime features that genuinely need a loaded class (e.g. GoogleAuthenticator 2FA) fail loudly when used, not at boot. |
 
 > **`evaluate()` is supported** (read-only). It compiles and runs each string
 > argument as a CFML expression against the caller's scope and returns the value

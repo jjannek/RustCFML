@@ -820,6 +820,17 @@ pub struct ServerState {
     /// node-qualified-id seam so a distributed `Broker` can slot in later
     /// without touching the wire. See `crates/cfml-vm/src/websocket.rs`.
     pub websocket: Arc<websocket::WebSocketRegistry>,
+    /// The live `server` scope — a shared `CfmlStruct` (`Arc<RwLock<…>>`) that
+    /// persists server-wide across requests, giving the `server` scope real
+    /// write-through semantics (Lucee/ACF parity). It is lazily seeded with the
+    /// synthetic baseline (os, java, coldfusion, lucee, separator, …) on first
+    /// access and the per-request `cfconfig` key is refreshed each read.
+    /// ColdBox's cbjavaloader caches its URLClassLoader here under a uuid key
+    /// (`server[ "cbox-javaloader-#hash#" ]`) and reads it back a few lines
+    /// later — without a live backing those writes vanished and the loader read
+    /// back null. Reading `server` returns this handle (a live clone), so the
+    /// scope-pointer pattern writes through, exactly like `application`.
+    pub server_scope: CfmlStruct,
 }
 
 impl ServerState {
@@ -849,6 +860,7 @@ impl ServerState {
             websocket: Arc::new(websocket::WebSocketRegistry::new(
                 uuid::Uuid::new_v4().to_string(),
             )),
+            server_scope: CfmlStruct::empty(),
         }
     }
 
@@ -1014,6 +1026,11 @@ pub struct CfmlVirtualMachine {
     application_stopped: bool,
     /// Server-level state — persists across requests in --serve mode
     pub server_state: Option<ServerState>,
+    /// Live `server` scope. In `--serve` mode the active handle is the shared
+    /// one from `ServerState.server_scope` (cross-request); this VM-local field
+    /// is the CLI fallback when there is no `server_state`. See
+    /// `server_scope_handle` / `live_server_scope`.
+    pub server_scope: CfmlStruct,
     /// HTTP response headers set by cfheader
     pub response_headers: Vec<(String, String)>,
     /// HTTP response status code set by cfheader
@@ -1512,6 +1529,7 @@ impl CfmlVirtualMachine {
             request_scope: CfmlStruct::empty(),
             page_thread_scope: CfmlStruct::empty(),
             application_scope: None,
+            server_scope: CfmlStruct::empty(),
             session_scope: None,
             current_application_name: None,
             application_stopped: false,
@@ -3245,22 +3263,7 @@ impl CfmlVirtualMachine {
                             .cloned()
                             .unwrap_or(CfmlValue::strukt(ValueMap::default()))
                     } else if name_lower == "server" {
-                        let mut scope = build_server_scope(self.report_as_lucee());
-                        // Prefer the per-request application-level cfconfig overlay
-                        // (a `.cfconfig.json` beside the Application.cfc) over the
-                        // server baseline when present.
-                        if let Some(ref app_cfg) = self.app_cfconfig {
-                            scope.insert(
-                                "cfconfig".to_string(),
-                                cfconfig_to_cfml(app_cfg),
-                            );
-                        } else if let Some(ref ss) = self.server_state {
-                            scope.insert(
-                                "cfconfig".to_string(),
-                                cfconfig_to_cfml(&ss.cfconfig),
-                            );
-                        }
-                        CfmlValue::strukt(scope)
+                        CfmlValue::Struct(self.live_server_scope())
                     } else if let Some(val) =
                         self.lookup_name_in_scopes(name.as_str(), name_lower, &locals)
                     {
@@ -3417,7 +3420,7 @@ impl CfmlVirtualMachine {
                             CfmlValue::Null
                         }
                     } else if name_lower == "server" {
-                        CfmlValue::Null // server scope handled by LoadLocal
+                        CfmlValue::Struct(self.live_server_scope())
                     } else {
                         self.lookup_name_in_scopes(name.as_str(), &name_lower, &locals)
                             .unwrap_or(CfmlValue::Null)
@@ -10882,7 +10885,31 @@ impl CfmlVirtualMachine {
                                 "java.text.dateformat" | "java.text.simpledateformat" => {
                                     java_shims::handle_java_dateformat("init", empty_args, &CfmlValue::Null)
                                 }
-                                _ => Ok(CfmlValue::Null),
+                                "java.lang.class" => {
+                                    java_shims::handle_java_class("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.lang.runtime" => {
+                                    java_shims::handle_java_runtime("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.lang.reflect.array" => {
+                                    java_shims::handle_java_reflect_array("init", empty_args, &CfmlValue::Null)
+                                }
+                                // cbjavaloader's classloader tower. These are
+                                // "deferred Java objects": their plumbing methods
+                                // no-op so Preside boots, but invoking a class
+                                // they pretend to load throws (no JVM). See
+                                // java_shims::handle_java_classloader.
+                                "java.net.urlclassloader"
+                                | "java.lang.classloader"
+                                | "coldfusion.runtime.java.javaproxy" => {
+                                    Ok(java_shims::make_deferred_java(&args[1].as_string()))
+                                }
+                                _ => Err(CfmlError::runtime(format!(
+                                    "createObject: Java class [{}] is not supported. \
+                                     RustCFML has no JVM, so only a curated set of \
+                                     java.* standard-library classes are shimmed.",
+                                    args[1].as_string()
+                                ))),
                             };
                         }
                     }
@@ -13677,6 +13704,12 @@ impl CfmlVirtualMachine {
         if name_lower == "request" {
             return Some(CfmlValue::strukt(self.request_scope.snapshot()));
         }
+        if name_lower == "server" {
+            // `server.x = v` / `server[k] = v` load base: the live handle, so
+            // SetProperty/SetIndex mutate the persistent backing in place (the
+            // scope_aware_store("server") writeback is then a self-alias no-op).
+            return Some(CfmlValue::Struct(self.live_server_scope()));
+        }
         if name_lower == "thread" {
             // `thread.x = y` routes here (autoviv scope root). A real local var or
             // the cfthread scope wins; otherwise the page-level soft-scope field.
@@ -13780,6 +13813,48 @@ impl CfmlVirtualMachine {
     /// `modern` is the frame's effective Lucee localMode (`true` = a bare write
     /// is a LOCAL-scope write). It governs only the brand-new bare-name case
     /// below — see the `__variables` routing branch in the tail.
+    /// The active live `server` scope handle: the cross-request shared one from
+    /// `ServerState` in `--serve` mode, or the VM-local one in CLI mode. A
+    /// returned `CfmlStruct` is a live Arc clone (writes propagate).
+    fn server_scope_handle(&self) -> CfmlStruct {
+        match &self.server_state {
+            Some(ss) => ss.server_scope.clone(),
+            None => self.server_scope.clone(),
+        }
+    }
+
+    /// The live `server` scope, ready to read or write: lazily seeded with the
+    /// synthetic baseline (os/java/lucee/coldfusion/separator/…) on first use,
+    /// with the per-request `cfconfig` key refreshed each call. Returned as a
+    /// live handle so `server.x = v` / `server[k] = v` (SetProperty/SetIndex)
+    /// mutate the persistent backing in place — the same write-through model as
+    /// `application`. User-written keys (e.g. cbjavaloader's classloader cache)
+    /// survive across requests.
+    fn live_server_scope(&self) -> CfmlStruct {
+        let handle = self.server_scope_handle();
+        // Seed the baseline once (only the keys not already present, so user
+        // writes are never clobbered by a later read).
+        if !handle.contains_key("separator") {
+            let baseline = build_server_scope(self.report_as_lucee());
+            handle.with_write(|m| {
+                for (k, v) in baseline {
+                    m.entry(k).or_insert(v);
+                }
+            });
+        }
+        // Refresh the per-request cfconfig overlay (application-level
+        // `.cfconfig.json` beside the Application.cfc wins over the server one).
+        let cfg = if let Some(ref app_cfg) = self.app_cfconfig {
+            Some(cfconfig_to_cfml(app_cfg))
+        } else {
+            self.server_state.as_ref().map(|ss| cfconfig_to_cfml(&ss.cfconfig))
+        };
+        if let Some(cfg) = cfg {
+            handle.insert("cfconfig".to_string(), cfg);
+        }
+        handle
+    }
+
     fn scope_aware_store(
         &mut self,
         name: &str,
@@ -13823,6 +13898,23 @@ impl CfmlVirtualMachine {
         } else if name_lower == "request" {
             if let CfmlValue::Struct(s) = &val {
                 self.request_scope.with_write(|m| *m = s.snapshot());
+            }
+        } else if name_lower == "server" {
+            // `server` is a live handle (see live_server_scope): SetProperty/
+            // SetIndex already mutated the persistent backing in place, so a
+            // matching-backing writeback is a self-alias no-op (copying it onto
+            // itself would also reentrant-deadlock the RwLock). A *different*
+            // struct (a wholesale `server = {...}` replacement) is merged in.
+            if let CfmlValue::Struct(s) = &val {
+                let live = self.server_scope_handle();
+                if s.backing_ptr() != live.backing_ptr() {
+                    let snap = s.snapshot();
+                    live.with_write(|m| {
+                        for (k, v) in snap {
+                            m.insert(k, v);
+                        }
+                    });
+                }
             }
         } else if name_lower == "thread" {
             // `thread.x = y` writeback. A real local var or the cfthread scope
@@ -14961,6 +15053,33 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Bool(matched));
                 }
 
+                // Special: Iterator.next() returns the current element AND
+                // advances the cursor; the advanced iterator must be written
+                // back so the next call (and the surrounding `while
+                // hasNext()`) sees the new position — same writeback pattern as
+                // Matcher.find above. (hasNext() is pure → handled by the
+                // generic handler below.)
+                if java_class == "java.util.iterator" && method_lower == "next" {
+                    let pos = s.get("__iter_pos").map(|v| match v {
+                        CfmlValue::Int(n) => n,
+                        other => other.as_string().trim().parse::<i64>().unwrap_or(0),
+                    }).unwrap_or(0);
+                    let items = match s.get("__iter_items") {
+                        Some(CfmlValue::Array(a)) => a.snapshot(),
+                        _ => Vec::new(),
+                    };
+                    if (pos as usize) >= items.len() {
+                        return Err(self.wrap_error(CfmlError::runtime(
+                            "java.util.NoSuchElementException: iterator has no more elements".to_string(),
+                        )));
+                    }
+                    let element = items[pos as usize].clone();
+                    let mut ns = s.snapshot();
+                    ns.insert("__iter_pos".to_string(), CfmlValue::Int(pos + 1));
+                    self.method_this_writeback = Some(CfmlValue::strukt(ns));
+                    return Ok(element);
+                }
+
                 let all_args: Vec<CfmlValue> = std::mem::take(extra_args);
                 let m = method_lower.clone();
                 let result = match java_class.as_str() {
@@ -15004,6 +15123,21 @@ impl CfmlVirtualMachine {
                         handle_java_pattern(&m, all_args, object)
                     }
                     "java.lang.class" => handle_java_class(&m, all_args, object),
+                    "java.lang.runtime" => {
+                        java_shims::handle_java_runtime(&m, all_args, object)
+                    }
+                    "java.lang.reflect.array" => {
+                        java_shims::handle_java_reflect_array(&m, all_args, object)
+                    }
+                    "java.net.urlclassloader"
+                    | "java.lang.classloader"
+                    | "coldfusion.runtime.java.javaproxy"
+                    | "java.lang.__deferred" => {
+                        java_shims::handle_java_classloader(&m, all_args, object)
+                    }
+                    "java.util.iterator" => {
+                        java_shims::handle_java_iterator(&m, all_args, object)
+                    }
                     "java.util.map.entry" => handle_java_map_entry(&m, all_args, object),
                     "java.util.locale" => java_shims::handle_java_locale(&m, all_args, object),
                     "java.util.timezone" => java_shims::handle_java_timezone(&m, all_args, object),
@@ -15247,6 +15381,25 @@ impl CfmlVirtualMachine {
                     // Lucee users chain to after keySet(). Keeping the same
                     // code path working on both engines.
                     return Ok(object.clone());
+                }
+                // .iterator() — java.util.List passthrough. Returns a
+                // java.util.Iterator shim over a snapshot of the array;
+                // hasNext()/next() drive it (see handle_java_iterator + the
+                // Iterator.next() writeback block). cbjavaloader's JavaLoader
+                // iterates its jar list this way during Preside module boot.
+                "iterator" => {
+                    let mut shim = ValueMap::default();
+                    shim.insert(
+                        "__java_class".to_string(),
+                        CfmlValue::string("java.util.iterator".to_string()),
+                    );
+                    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                    shim.insert(
+                        "__iter_items".to_string(),
+                        CfmlValue::array(arr.snapshot()),
+                    );
+                    shim.insert("__iter_pos".to_string(), CfmlValue::Int(0));
+                    return Ok(CfmlValue::strukt(shim));
                 }
                 "append" | "push" => Some("arrayAppend"),
                 "prepend" => Some("arrayPrepend"),
@@ -16298,7 +16451,7 @@ impl CfmlVirtualMachine {
                 .cloned()
                 .or(Some(CfmlValue::strukt(ValueMap::default())))
         } else if root == "server" {
-            Some(CfmlValue::strukt(build_server_scope(self.report_as_lucee())))
+            Some(CfmlValue::Struct(self.live_server_scope()))
         } else {
             // Check locals (exact then CI)
             locals

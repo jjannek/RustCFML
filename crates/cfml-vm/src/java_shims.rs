@@ -465,6 +465,17 @@ pub fn handle_java_file(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) 
             }
             Ok(CfmlValue::Int(0))
         }
+        "tourl" | "touri" => {
+            // File.toURL()/toURI() returns a java.net.URL/URI. cbjavaloader only
+            // stuffs the result into a URL[] it hands to a (deferred) class
+            // loader and never dereferences it, so a `file:` string suffices.
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::String(path)) = shim.get("__path") {
+                    return Ok(CfmlValue::string(format!("file:{}", path)));
+                }
+            }
+            Ok(CfmlValue::string(String::new()))
+        }
         "topath" => {
             // File.toPath() returns a java.nio.file.Path. This is the portable
             // alternative to Paths.get(…), which Lucee can't dispatch to
@@ -1270,13 +1281,35 @@ pub fn handle_java_concurrenthashmap(
 // class name picked at getClass() time; getName()/getSimpleName() let TestBox's
 // instanceOf matcher and Wheels' toXML read a type string off a non-component
 // value (boolean/string/array/struct/...).
-pub fn handle_java_class(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+/// Build a `java.lang.Class` shim carrying the given class name. Its
+/// getName()/getSimpleName()/forName() members come from `handle_java_class`.
+pub fn make_class_shim(class_name: &str) -> CfmlValue {
+    let mut shim = ValueMap::default();
+    shim.insert(
+        "__java_class".to_string(),
+        CfmlValue::string("java.lang.class".to_string()),
+    );
+    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    shim.insert("__class_name".to_string(), CfmlValue::string(class_name.to_string()));
+    CfmlValue::strukt(shim)
+}
+
+pub fn handle_java_class(method: &str, args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
     let class_name = if let CfmlValue::Struct(ref shim) = object {
         shim.get("__class_name").map(|v| v.as_string()).unwrap_or_default()
     } else {
         String::new()
     };
     match method {
+        // createObject("java","java.lang.Class") — the receiver represents the
+        // Class class itself; the actual class is supplied later via forName().
+        "init" => Ok(make_class_shim("java.lang.Class")),
+        // Class.forName("a.b.C") — static factory returning a Class shim for the
+        // named class. Used by cbjavaloader's JavaLoader to build URL[] arrays.
+        "forname" => {
+            let name = args.first().map(|a| a.as_string()).unwrap_or_default();
+            Ok(make_class_shim(&name))
+        }
         "getname" | "getcanonicalname" | "gettypename" => Ok(CfmlValue::string(class_name)),
         "getsimplename" => {
             let simple = class_name.rsplit('.').next().unwrap_or(&class_name).to_string();
@@ -1285,6 +1318,212 @@ pub fn handle_java_class(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue
         "tostring" => Ok(CfmlValue::string(format!("class {}", class_name))),
         _ => Ok(CfmlValue::Null),
     }
+}
+
+/// Build a "deferred Java object" shim: a stand-in for a class/instance that
+/// RustCFML cannot truly provide because there is no JVM (java.net.URLClassLoader,
+/// coldfusion.runtime.java.JavaProxy, java.lang.ClassLoader, and the classes
+/// they "load"). It no-ops the classloader-plumbing calls cbjavaloader makes
+/// during boot and throws loudly the moment a genuinely-loaded class is invoked.
+/// See `handle_java_classloader`.
+pub fn make_deferred_java(class_name: &str) -> CfmlValue {
+    let mut shim = ValueMap::default();
+    shim.insert(
+        "__java_class".to_string(),
+        CfmlValue::string("java.lang.__deferred".to_string()),
+    );
+    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    shim.insert("__class_name".to_string(), CfmlValue::string(class_name.to_string()));
+    CfmlValue::strukt(shim)
+}
+
+/// Coerce a CfmlValue argument to an i64 the way the other Java shims do.
+fn java_int_arg(v: &CfmlValue) -> i64 {
+    match v {
+        CfmlValue::Int(n) => *n,
+        CfmlValue::Double(d) => *d as i64,
+        other => other.as_string().trim().parse::<i64>().unwrap_or(0),
+    }
+}
+
+/// java.lang.reflect.Array — the static helper cbjavaloader uses to build the
+/// `URL[]` it hands to URLClassLoader. We model a Java array as a plain CFML
+/// (1-based) array; newInstance(class, n) makes one of `n` nulls and set/get
+/// index it 0-based, exactly as the Java API does.
+pub fn handle_java_reflect_array(
+    method: &str,
+    args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.lang.reflect.array".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // Array.newInstance(componentType, length) -> a new array of `length`
+        // nulls. The component type is irrelevant for our untyped CFML array.
+        "newinstance" => {
+            let len = args.get(1).map(java_int_arg).unwrap_or(0).max(0) as usize;
+            Ok(CfmlValue::array(vec![CfmlValue::Null; len]))
+        }
+        // Array.set(array, index, value) — 0-based; mutate a copy and write it
+        // back is not possible here (static call, no receiver writeback), so the
+        // caller must hold the array reference. CfmlArray is Arc-shared, so
+        // mutating in place propagates to the holding variable.
+        "set" => {
+            if let (Some(CfmlValue::Array(arr)), Some(idx), Some(val)) =
+                (args.first(), args.get(1), args.get(2))
+            {
+                let i = java_int_arg(idx);
+                if i >= 0 {
+                    arr.with_write(|v| {
+                        let i = i as usize;
+                        if i < v.len() {
+                            v[i] = val.clone();
+                        } else {
+                            while v.len() < i {
+                                v.push(CfmlValue::Null);
+                            }
+                            v.push(val.clone());
+                        }
+                    });
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "get" => {
+            if let (Some(CfmlValue::Array(arr)), Some(idx)) = (args.first(), args.get(1)) {
+                let i = java_int_arg(idx);
+                if i >= 0 {
+                    return Ok(arr.get(i as usize).unwrap_or(CfmlValue::Null));
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "getlength" => {
+            if let Some(CfmlValue::Array(arr)) = args.first() {
+                return Ok(CfmlValue::Int(arr.len() as i64));
+            }
+            Ok(CfmlValue::Int(0))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// The "deferred Java object" dispatcher (see `make_deferred_java`). Covers
+/// java.net.URLClassLoader, coldfusion.runtime.java.JavaProxy,
+/// java.lang.ClassLoader and the classes they pretend to load. cbjavaloader's
+/// `JavaLoader.cfc` builds a URLClassLoader / NetworkClassLoader tower at module
+/// boot; none of the classes it loads are actually used during Preside boot
+/// (only at runtime, e.g. GoogleAuthenticator 2FA), so we let the *plumbing*
+/// calls succeed and throw clearly only when a genuinely-loaded class is used.
+pub fn handle_java_classloader(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    let class_name = if let CfmlValue::Struct(ref s) = object {
+        s.get("__class_name").map(|v| v.as_string()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    match method {
+        // JavaProxy.init(class) adopts the wrapped class so a later loadClass /
+        // create reports the right name. URLClassLoader.init(urls) and the
+        // proxy's no-arg .init() just return the (deferred) receiver.
+        "init" => match args.first() {
+            Some(CfmlValue::Struct(s))
+                if s.get("__java_class").map(|v| v.as_string()).as_deref()
+                    == Some("java.lang.class") =>
+            {
+                let adopted = s.get("__class_name").map(|v| v.as_string()).unwrap_or_default();
+                Ok(make_deferred_java(&adopted))
+            }
+            Some(CfmlValue::String(name)) => Ok(make_deferred_java(name)),
+            _ => Ok(object.clone()),
+        },
+        // loadClass / forName hand back a Class shim (deferred) — instantiation
+        // is what ultimately throws, not the class lookup.
+        "loadclass" | "forname" => {
+            let name = args.first().map(|a| a.as_string()).unwrap_or_default();
+            Ok(make_class_shim(&name))
+        }
+        "getsystemclassloader" | "getcontextclassloader" | "getparent" | "getclassloader" => {
+            Ok(object.clone())
+        }
+        // void plumbing methods — return a non-null so the dispatcher doesn't
+        // treat the result as "method unhandled" and fall through.
+        "setcontextclassloader" | "addurl" => Ok(CfmlValue::Bool(true)),
+        "geturls" => Ok(CfmlValue::array(vec![])),
+        "getname" | "getcanonicalname" | "gettypename" => Ok(CfmlValue::string(class_name)),
+        "tostring" => Ok(CfmlValue::string(class_name)),
+        _ => Err(CfmlError::runtime(format!(
+            "Java class [{}] cannot be used: RustCFML has no JVM, so classes loaded \
+             dynamically via cbjavaloader / java.net.URLClassLoader are unavailable \
+             (attempted method [{}]).",
+            if class_name.is_empty() { "java.net.URLClassLoader" } else { &class_name },
+            method
+        ))),
+    }
+}
+
+/// java.lang.Runtime — JVM runtime singleton. ColdBox's CacheBoxProvider builds
+/// it eagerly at init for an optional free-memory threshold check (which Preside
+/// leaves disabled), so it must construct without error. We back the handful of
+/// methods with real host values where we can; gc() is a no-op.
+pub fn handle_java_runtime(method: &str, _args: Vec<CfmlValue>, object: &CfmlValue) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.lang.runtime".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // Runtime.getRuntime() — static accessor returning the singleton; the
+        // receiver already IS that singleton shim.
+        "getruntime" => Ok(object.clone()),
+        "availableprocessors" => Ok(CfmlValue::Int(
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as i64,
+        )),
+        // We have no JVM heap; report plausible non-zero byte counts so callers
+        // computing free/max ratios don't divide by zero. (256 MiB free of 4 GiB.)
+        "freememory" => Ok(CfmlValue::Double(268_435_456.0)),
+        "totalmemory" => Ok(CfmlValue::Double(536_870_912.0)),
+        "maxmemory" => Ok(CfmlValue::Double(4_294_967_296.0)),
+        "gc" | "runfinalization" => Ok(CfmlValue::Null),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+/// java.util.Iterator — produced by `array.iterator()`. Holds a snapshot of the
+/// array plus a cursor. `hasNext()` is pure (handled here); `next()` advances
+/// the cursor and so is handled at the call site with a receiver write-back
+/// (mirroring the Matcher.find pattern in lib.rs).
+pub fn handle_java_iterator(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    if method == "hasnext" {
+        if let CfmlValue::Struct(ref s) = object {
+            let pos = s.get("__iter_pos").map(|v| java_int_arg(&v)).unwrap_or(0);
+            let len = match s.get("__iter_items") {
+                Some(CfmlValue::Array(a)) => a.len() as i64,
+                _ => 0,
+            };
+            return Ok(CfmlValue::Bool(pos < len));
+        }
+        return Ok(CfmlValue::Bool(false));
+    }
+    Ok(CfmlValue::Null)
 }
 
 // ---- java.util.Map.Entry (yielded by ConcurrentHashMap.entrySet()) ----

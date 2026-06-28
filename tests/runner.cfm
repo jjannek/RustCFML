@@ -33,6 +33,7 @@ include "harness.cfm";
 <cf_runtest file="core/test_closure_captures_local_function.cfm">
 <cf_runtest file="core/test_struct_stored_closure_dotcall.cfm">
 <cf_runtest file="core/test_closure_unscoped_reset.cfm">
+<cf_runtest file="core/test_server_scope_write.cfm">
 <cf_runtest file="core/test_compound_assignment.cfm">
 <cf_runtest file="core/test_undeclared_named_args.cfm">
 <!--- - invoke_undeclared_keys: the argument struct of the positional BIF --->
@@ -441,6 +442,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_stringbuilder.cfm">
 <cf_runtest file="java_shims/test_system.cfm">
 <cf_runtest file="java_shims/test_concurrent_map.cfm">
+<cf_runtest file="java_shims/test_classloader_shims.cfm">
 
 <!--- --- Engine Compatibility --- --->
 <cf_runtest file="compat_engine/test_math_functions.cfm">
