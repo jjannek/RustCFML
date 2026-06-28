@@ -55,5 +55,20 @@ tp3 = tmd.properties[3];
 assert("tag: prop3 name", tp3.name, "title");
 assert("tag: prop3 type", tp3.type, "string");
 
+// --- required="false" must be PRESERVED in property metadata (Lucee parity) ---
+// Previously `required` was collapsed to a bool field that codegen only emitted
+// when true, so `required="false"` was silently dropped. Preside's
+// PresideObjectReaderTest compares the full property attribute struct, so the
+// missing `required` key failed the match.
+rmd = getComponentMetadata("oop.PropRequiredFixture");
+rprops = {};
+for ( p in rmd.properties ) { rprops[ p.name ] = p; }
+assertTrue("numprop has required key", structKeyExists(rprops.numprop, "required"));
+assert("numprop required preserved as false", rprops.numprop.required, "false");
+assert("numprop keeps minValue", rprops.numprop.minValue, "1");
+assert("numprop keeps maxValue", rprops.numprop.maxValue, "10");
+assertTrue("reqprop required=true present", rprops.reqprop.required);
+assertFalse("plainprop has no required key", structKeyExists(rprops.plainprop, "required"));
+
 suiteEnd();
 </cfscript>

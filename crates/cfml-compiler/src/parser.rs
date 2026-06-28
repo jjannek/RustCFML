@@ -4196,7 +4196,15 @@ impl Parser {
                     match key.to_lowercase().as_str() {
                         "name" => name = val,
                         "type" => prop_type = Some(val),
-                        "required" => required = val.eq_ignore_ascii_case("true"),
+                        // `required` with an explicit value (`required="false"`)
+                        // is metadata that must be PRESERVED verbatim in
+                        // getMetadata().properties — Lucee keeps `required:
+                        // "false"`. Storing it as a normal attribute (rather than
+                        // collapsing to the bool field, which codegen only emits
+                        // when true) keeps the literal and its declared position.
+                        // The bool field stays false here, so codegen won't also
+                        // emit a duplicate `required` key.
+                        "required" => attributes.push(("required".to_string(), val)),
                         _ => attributes.push((key.to_lowercase(), val)),
                     }
                 }
