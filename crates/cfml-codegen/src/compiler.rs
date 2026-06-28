@@ -3054,6 +3054,19 @@ impl CfmlCompiler {
                     instructions.push(BytecodeOp::True);
                     attr_count += 1;
                 }
+                // `default="…"` must surface in getMetadata().properties (Lucee
+                // keeps it) — frameworks read it to auto-populate unprovided fields
+                // (e.g. Preside insertData defaults). The default is parsed as an
+                // expression; for the literal forms used in practice
+                // (`default="property_a default"`, `"cfml:Now()"`,
+                // `"method:CalculatePropC"`) compiling it yields exactly the source
+                // string Lucee stores. This mirrors the accessor-default emission
+                // above, so it is no riskier to evaluate here.
+                if let Some(ref default_expr) = prop.default {
+                    instructions.push(BytecodeOp::String("default".to_string()));
+                    self.compile_expression(default_expr, instructions);
+                    attr_count += 1;
+                }
                 // Custom attributes (inject, hint, etc.)
                 for (key, val) in &prop.attributes {
                     instructions.push(BytecodeOp::String(key.clone()));

@@ -29,6 +29,7 @@ assert("prop3 hint", prop3.hint, "Configuration manager");
 prop4 = md.properties[4];
 assert("prop4 name", prop4.name, "greeting");
 assert("prop4 type", prop4.type, "string");
+assert("prop4 default surfaced in metadata", prop4.default, "Hello");
 assertFalse("prop4 has no inject", structKeyExists(prop4, "inject"));
 
 // Test that component instantiation still works
@@ -69,6 +70,16 @@ assert("numprop keeps minValue", rprops.numprop.minValue, "1");
 assert("numprop keeps maxValue", rprops.numprop.maxValue, "10");
 assertTrue("reqprop required=true present", rprops.reqprop.required);
 assertFalse("plainprop has no required key", structKeyExists(rprops.plainprop, "required"));
+
+// --- default="…" must be PRESERVED in property metadata (Lucee parity) ---
+// Previously the parsed `default` expression was never emitted into the
+// __properties metadata, so getMetadata().properties[x].default was missing —
+// breaking Preside insertData's auto-population of unprovided defaulted fields.
+assertTrue("litdefault has default key", structKeyExists(rprops.litdefault, "default"));
+assert("litdefault literal preserved", rprops.litdefault.default, "hello default");
+assert("cfmldefault cfml: prefix preserved verbatim", rprops.cfmldefault.default, "cfml:Now()");
+assert("methoddefault method: prefix preserved verbatim", rprops.methoddefault.default, "method:CalcIt");
+assertFalse("plainprop has no default key", structKeyExists(rprops.plainprop, "default"));
 
 suiteEnd();
 </cfscript>
