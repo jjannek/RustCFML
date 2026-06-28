@@ -14732,6 +14732,47 @@ impl CfmlVirtualMachine {
         n.replace(['/', '\\'], ".")
     }
 
+    /// When a bound method value (one whose `captured_scope` pins it to the
+    /// component it was *read from* via `this.method` — carrying that component's
+    /// `this`/`variables`/`super`) is dispatched AS A METHOD on a different
+    /// receiver — a mixin/injection like Preside's `decorated.onMissingMethod =
+    /// this.onMissingMethod` — the receiver's instance scope must win, not the
+    /// captured one. Strip the four instance-binding keys from the function's
+    /// captured scope so the dispatch's own `method_locals` (this/variables/
+    /// super) take effect; any genuinely closed-over LOCAL variables are kept.
+    /// Returns `func` unchanged when there is nothing to strip (the common
+    /// unbound-method case pays only a couple of reads, no clone).
+    fn strip_instance_binding(func: &CfmlValue) -> CfmlValue {
+        if let CfmlValue::Function(f) = func {
+            if let Some(ref cap) = f.captured_scope {
+                let (cleaned, orig_len): (ValueMap, usize) = {
+                    let g = cap.read().unwrap();
+                    let cleaned = g
+                        .iter()
+                        .filter(|(k, _)| {
+                            !matches!(
+                                k.to_lowercase().as_str(),
+                                "this" | "variables" | "__variables" | "super"
+                            )
+                        })
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    (cleaned, g.len())
+                };
+                if cleaned.len() != orig_len {
+                    let mut nf = (**f).clone();
+                    nf.captured_scope = if cleaned.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(std::sync::RwLock::new(cleaned)))
+                    };
+                    return CfmlValue::Function(Arc::new(nf));
+                }
+            }
+        }
+        func.clone()
+    }
+
     fn call_member_function(
         &mut self,
         object: &CfmlValue,
@@ -15830,29 +15871,7 @@ impl CfmlVirtualMachine {
             // is the mirror of the bound-method case (`arguments.fn()`), where
             // the receiver is NOT a component and the captured binding stands.
             if receiver_is_cfc {
-                if let CfmlValue::Function(f) = &func_ref {
-                    if let Some(ref cap) = f.captured_scope {
-                        let cleaned: ValueMap = {
-                            let g = cap.read().unwrap();
-                            g.iter()
-                                .filter(|(k, _)| !matches!(
-                                    k.to_lowercase().as_str(),
-                                    "this" | "variables" | "__variables" | "super"
-                                ))
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect()
-                        };
-                        if cleaned.len() != cap.read().unwrap().len() {
-                            let mut nf = (**f).clone();
-                            nf.captured_scope = if cleaned.is_empty() {
-                                None
-                            } else {
-                                Some(Arc::new(std::sync::RwLock::new(cleaned)))
-                            };
-                            func_ref = CfmlValue::Function(Arc::new(nf));
-                        }
-                    }
-                }
+                func_ref = Self::strip_instance_binding(&func_ref);
             }
             let mut method_locals = ValueMap::default();
             // While a CFC method runs, relative component resolution (bare
@@ -16016,7 +16035,17 @@ impl CfmlVirtualMachine {
                 .iter()
                 .find(|(k, _)| k.to_lowercase() == "onmissingmethod")
                 .map(|(_, v)| v.clone());
-            if let Some(handler @ CfmlValue::Function(_)) = missing_handler {
+            if let Some(handler) = missing_handler {
+                if !matches!(handler, CfmlValue::Function(_)) {
+                    // not a function — fall through to the no-method error below
+                } else {
+                // The handler may be an INJECTED method (Preside decorates an
+                // object with `obj.onMissingMethod = decorator.onMissingMethod`).
+                // Read via `this.onMissingMethod`, it carries a captured scope
+                // pinning `this` to the decorator; here it is being dispatched as
+                // a method on `object` (the decorated receiver), so the receiver's
+                // `this` must win — strip the captured instance binding.
+                let handler = Self::strip_instance_binding(&handler);
                 let args_array: Vec<CfmlValue> = extra_args.drain(..).collect();
                 // Key missingMethodArguments by the call-site argument NAME when
                 // the call used named args (obj.probe(label="x") -> key "label"),
@@ -16073,6 +16102,7 @@ impl CfmlVirtualMachine {
                     ],
                     &method_locals,
                 );
+                }
             }
         }
 
