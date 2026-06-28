@@ -23,6 +23,15 @@ component {
     // mapping, never by webroot-relative path resolution. Points at tests/tags/.
     this.mappings["/wheelsmapprobe"] = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/";
 
+    // Mapping whose TARGET contains a "../" segment. Used by
+    // tests/tags/test_mapping_dotdot_normalization.cfm to prove that file BIFs
+    // (directoryList/expandPath/fileExists) collapse ".." consistently. Preside's
+    // "/preside" mapping points at "../system"; an un-normalized resolution left
+    // directoryList entries with a literal "tests/../system" prefix that
+    // expandPath had already canonicalized away, breaking Preside's
+    // _getAllObjectPaths prefix-strip. Points at tests/oop/ via tests/tags/../oop/.
+    this.mappings["/dotdotprobe"] = getDirectoryFromPath(getCurrentTemplatePath()) & "tags/../oop/";
+
     // Per-application datasources (Lucee/BoxLang parity). Scoped to THIS
     // application and resolved by cfquery/queryExecute ahead of the global
     // cfconfig registry. Exercised by tests/config/test_app_datasources.cfm.

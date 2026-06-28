@@ -18786,8 +18786,23 @@ impl CfmlVirtualMachine {
                 continue;
             }
             let remainder = rel[prefix.len()..].trim_start_matches(['/', '\\']);
-            let candidate = std::path::PathBuf::from(&mapping.path).join(remainder);
-            return Some(candidate.to_string_lossy().into_owned());
+            let candidate = std::path::PathBuf::from(&mapping.path)
+                .join(remainder)
+                .to_string_lossy()
+                .into_owned();
+            // Normalize the resolved path the same way expandPath does, so file
+            // BIFs (directoryList, fileExists, …) and expandPath agree on the
+            // canonical form. A mapping target containing ".." (e.g. Preside's
+            // "/preside" -> "../system") otherwise yields an un-collapsed
+            // "<webroot>/tests/../system/..." here while expandPath canonicalizes
+            // to "<webroot>/system/...". Preside's _getAllObjectPaths strips
+            // ExpandPath(dir) off each DirectoryList entry via Replace(); the
+            // mismatch left the prefix un-stripped and produced a malformed
+            // doubled component path. canonicalize only resolves existing paths;
+            // fall back to the raw join (matching expandPath's own fallback) so
+            // not-yet-created write targets are unaffected.
+            let normalized = self.vfs.canonicalize(&candidate).unwrap_or(candidate);
+            return Some(normalized);
         }
         None
     }
