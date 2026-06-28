@@ -67,6 +67,23 @@ fn capitalize_first(s: &str) -> String {
         + &s[1..]
 }
 
+/// A struct-literal key in the nested-build tree: either a static literal
+/// segment (from an identifier/quoted/dotted key) or a key that must be
+/// evaluated at runtime (a computed `{ "#k#" = v }` key). Computed keys only
+/// ever appear at the top level (they can't be a dotted nesting prefix).
+enum StructKey {
+    Static(String),
+    Computed(Expression),
+}
+
+/// Node in the ordered tree used to compile a struct literal that contains
+/// dotted-path keys (`{ a.b = 1, a.c = 2 }` → `{ a: { b: 1, c: 2 } }`). A leaf
+/// carries the value expression; a branch carries ordered child segments.
+enum StructKeyNode {
+    Leaf(Expression),
+    Branch(Vec<(StructKey, StructKeyNode)>),
+}
+
 pub struct CfmlCompiler {
     pub program: BytecodeProgram,
     /// Stack of (break_placeholder_indices, continue_placeholder_indices, is_loop)
@@ -726,6 +743,93 @@ impl CfmlCompiler {
             "application" | "session" | "server" | "cgi" | "url" | "form" |
             "cookie" | "client" | "thread" | "static"
         )
+    }
+
+    /// Flatten a struct-literal KEY expression into its dotted path segments.
+    /// A bare identifier (`id`) or a quoted string literal (`"a.b"`) is a single
+    /// literal segment; a plain (non null-safe) member-access chain of
+    /// identifiers (`obj_a.meta`) becomes the multi-segment path
+    /// `["obj_a", "meta"]`. Returns `None` for anything that must be evaluated at
+    /// runtime (bracketed/parenthesized/computed keys, calls, indices) — those
+    /// keep the existing flat `BuildStruct` path.
+    fn flatten_struct_key_path(expr: &Expression) -> Option<Vec<String>> {
+        match expr {
+            Expression::Identifier(id) => Some(vec![id.name.clone()]),
+            Expression::MemberAccess(access) if !access.null_safe => {
+                let mut base = Self::flatten_struct_key_path(&access.object)?;
+                base.push(access.member.clone());
+                Some(base)
+            }
+            Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => {
+                // Quoted keys are LITERAL single keys — `{ "a.b" = 1 }` makes a
+                // key named "a.b", it does NOT nest. So never split on dots here.
+                Some(vec![s.clone()])
+            }
+            _ => None,
+        }
+    }
+
+    /// Insert a dotted-path value into the ordered struct-literal tree, creating
+    /// branch nodes for intermediate segments and merging into existing branches
+    /// that share a prefix (so `{ a.b = 1, a.c = 2 }` collapses to a single
+    /// `a` branch holding both). Key matching is case-insensitive (CFML struct
+    /// keys), first-occurrence original case wins. A later leaf at an existing
+    /// path overwrites; a deeper path under an existing leaf promotes it to a
+    /// branch (last write wins, matching Lucee's left-to-right vivification).
+    fn insert_struct_path(
+        children: &mut Vec<(StructKey, StructKeyNode)>,
+        segs: &[String],
+        value: Expression,
+    ) {
+        let (head, rest) = segs.split_first().expect("non-empty path");
+        let existing = children.iter().position(|(k, _)| {
+            matches!(k, StructKey::Static(s) if s.eq_ignore_ascii_case(head))
+        });
+        if rest.is_empty() {
+            match existing {
+                Some(pos) => children[pos].1 = StructKeyNode::Leaf(value),
+                None => children.push((StructKey::Static(head.clone()), StructKeyNode::Leaf(value))),
+            }
+            return;
+        }
+        match existing {
+            Some(pos) => {
+                if let StructKeyNode::Branch(c) = &mut children[pos].1 {
+                    Self::insert_struct_path(c, rest, value);
+                } else {
+                    let mut c = Vec::new();
+                    Self::insert_struct_path(&mut c, rest, value);
+                    children[pos].1 = StructKeyNode::Branch(c);
+                }
+            }
+            None => {
+                let mut c = Vec::new();
+                Self::insert_struct_path(&mut c, rest, value);
+                children.push((StructKey::Static(head.clone()), StructKeyNode::Branch(c)));
+            }
+        }
+    }
+
+    /// Emit bytecode that builds a (possibly nested) struct from a struct-literal
+    /// tree: for each child push its key string then its value (a leaf compiles
+    /// the value expression; a branch recurses to build the nested struct), then
+    /// a single `BuildStruct` over all the children.
+    fn emit_struct_tree(
+        &mut self,
+        children: &[(StructKey, StructKeyNode)],
+        instructions: &mut Vec<BytecodeOp>,
+    ) {
+        for (key, node) in children {
+            match key {
+                StructKey::Static(s) => instructions.push(BytecodeOp::String(s.clone())),
+                StructKey::Computed(expr) => self.compile_expression(expr, instructions),
+            }
+            match node {
+                StructKeyNode::Leaf(value) => self.compile_expression(value, instructions),
+                StructKeyNode::Branch(c) => self.emit_struct_tree(c, instructions),
+            }
+        }
+        instructions.push(BytecodeOp::BuildStruct(children.len()));
     }
 
     /// Scope roots whose nested member writes are routed through the runtime
@@ -3819,18 +3923,56 @@ impl CfmlCompiler {
                         }
                     }
                 } else {
-                    for (key, value) in &st.pairs {
-                        match key {
-                            Expression::Identifier(ident) => {
-                                instructions.push(BytecodeOp::String(ident.name.clone()));
-                            }
-                            _ => {
-                                self.compile_expression(key, instructions);
+                    // Lucee/ACF: a struct literal with dotted-path keys builds a
+                    // nested struct — `{ obj_a.meta = X }` is `{ obj_a: { meta: X } }`.
+                    // Detect when every key flattens to a literal path AND at least
+                    // one is multi-segment; if so, build the nested tree (correct
+                    // deep-merge + ordering) and emit nested BuildStruct ops. Any
+                    // computed/bracketed key falls back to the flat path below,
+                    // where its key expression is evaluated at runtime.
+                    let key_paths: Vec<Option<Vec<String>>> = st
+                        .pairs
+                        .iter()
+                        .map(|(k, _)| Self::flatten_struct_key_path(k))
+                        .collect();
+                    let use_nested = key_paths
+                        .iter()
+                        .any(|p| matches!(p, Some(segs) if segs.len() > 1));
+
+                    if use_nested {
+                        let mut root: Vec<(StructKey, StructKeyNode)> = Vec::new();
+                        for ((key, value), segs) in st.pairs.iter().zip(key_paths.iter()) {
+                            match segs {
+                                // Literal (identifier/quoted/dotted) key — merge
+                                // into the nested tree.
+                                Some(segs) => {
+                                    Self::insert_struct_path(&mut root, segs, value.clone());
+                                }
+                                // Computed key (`{ "#k#" = v }`) — a single
+                                // runtime-evaluated top-level entry; never nests.
+                                None => {
+                                    root.push((
+                                        StructKey::Computed(key.clone()),
+                                        StructKeyNode::Leaf(value.clone()),
+                                    ));
+                                }
                             }
                         }
-                        self.compile_expression(value, instructions);
+                        self.emit_struct_tree(&root, instructions);
+                    } else {
+                        for (key, value) in &st.pairs {
+                            match key {
+                                Expression::Identifier(ident) => {
+                                    instructions.push(BytecodeOp::String(ident.name.clone()));
+                                }
+                                _ => {
+                                    self.compile_expression(key, instructions);
+                                }
+                            }
+                            self.compile_expression(value, instructions);
+                        }
+                        instructions.push(BytecodeOp::BuildStruct(st.pairs.len()));
                     }
-                    instructions.push(BytecodeOp::BuildStruct(st.pairs.len()));
                 }
             }
             Expression::Ternary(tern) => {

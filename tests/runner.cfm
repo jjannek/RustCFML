@@ -138,6 +138,7 @@ include "harness.cfm";
 <cf_runtest file="types/test_struct.cfm">
 <cf_runtest file="types/test_struct_reference_semantics.cfm">
 <cf_runtest file="types/test_ordered_struct_literals.cfm">
+<cf_runtest file="types/test_dotted_key_struct_literals.cfm">
 <cf_runtest file="types/test_nested_writeback.cfm">
 <cf_runtest file="types/test_query.cfm">
 <cf_runtest file="types/test_query_column.cfm">
