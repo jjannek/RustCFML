@@ -8910,6 +8910,62 @@ fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
     unwrapped
 }
 
+/// Expand a single cfqueryparam-style value into the bound values it produces,
+/// honouring `list=true` (split on `separator`, default `,`) and applying
+/// `cfsqltype` coercion to each element. A non-list param yields exactly one
+/// value; a `null=true` param yields a single NULL. Mirrors the list-expansion
+/// the positional-array path does in `normalize_query_params`, so the named
+/// (`:name`) path produces the same `IN (?,?,…)` binding instead of stuffing a
+/// chr(31)-joined list into a single placeholder.
+#[cfg(any(feature = "sqlite", feature = "mysql_db", feature = "postgres_db", feature = "mssql_db"))]
+fn expand_cfqueryparam_values(v: &CfmlValue) -> Vec<CfmlValue> {
+    if let CfmlValue::Struct(s) = v {
+        let has_value_key = s.iter().any(|(k, _)| k.eq_ignore_ascii_case("value"));
+        if has_value_key {
+            let is_null = s.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("null"))
+                .map(|(_, val)| match val {
+                    CfmlValue::Bool(b) => b,
+                    CfmlValue::String(st) => st.eq_ignore_ascii_case("true") || st.eq_ignore_ascii_case("yes"),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if is_null {
+                return vec![CfmlValue::Null];
+            }
+            let value = s.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("value"))
+                .map(|(_, val)| val.clone())
+                .unwrap_or(CfmlValue::Null);
+            let cfsqltype = s.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("cfsqltype"))
+                .map(|(_, val)| val.as_string().to_lowercase())
+                .unwrap_or_else(|| "cf_sql_varchar".to_string());
+            let is_list = s.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("list"))
+                .map(|(_, val)| match val {
+                    CfmlValue::Bool(b) => b,
+                    CfmlValue::String(st) => st.eq_ignore_ascii_case("true") || st.eq_ignore_ascii_case("yes"),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if is_list {
+                let separator = s.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("separator"))
+                    .map(|(_, val)| val.as_string())
+                    .unwrap_or_else(|| ",".to_string());
+                return value
+                    .as_string()
+                    .split(&*separator)
+                    .map(|part| coerce_by_sqltype(part.trim(), &cfsqltype))
+                    .collect();
+            }
+            return vec![coerce_by_sqltype_value(&value, &cfsqltype)];
+        }
+    }
+    vec![cfqueryparam_unwrap_typed(v)]
+}
+
 /// Rewrite a SQL string's named `:placeholder`s to positional `?`, returning the
 /// rewritten SQL and the bound values in positional order (one value pushed per
 /// textual occurrence, so a repeated `:name` binds correctly). Name characters
@@ -8917,7 +8973,8 @@ fn cfqueryparam_unwrap_typed(v: &CfmlValue) -> CfmlValue {
 /// struct), so camelCase names like `:dateCreated` are captured whole — unlike
 /// the mysql crate's lowercase-only named-param parser. Single-quoted string
 /// literals are skipped so a `:` inside them is not treated as a placeholder.
-/// Mirrors build_sqlite_params' rewrite.
+/// `list=true` params expand to `?,?,…` (one per element). Mirrors
+/// build_sqlite_params' rewrite.
 #[cfg(feature = "mysql_db")]
 fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlValue>) {
     let mut result = Vec::new();
@@ -8940,9 +8997,22 @@ fn mysql_named_to_positional(sql: &str, map: &CfmlStruct) -> (String, Vec<CfmlVa
                     .find(|(k, _)| k.eq_ignore_ascii_case(&param_name))
                     .map(|(_, v)| v)
                     .unwrap_or(CfmlValue::Null);
-                result.push(cfqueryparam_unwrap_typed(&raw));
+                let expanded = expand_cfqueryparam_values(&raw);
                 out_sql.push_str(&sql[seg_start..i]);
-                out_sql.push('?');
+                if expanded.is_empty() {
+                    // An empty list still needs a placeholder so `IN (?)` stays
+                    // valid SQL; bind NULL (matches nothing, as `IN (NULL)`).
+                    out_sql.push('?');
+                    result.push(CfmlValue::Null);
+                } else {
+                    for (j, val) in expanded.into_iter().enumerate() {
+                        if j > 0 {
+                            out_sql.push(',');
+                        }
+                        out_sql.push('?');
+                        result.push(val);
+                    }
+                }
                 i = end;
                 seg_start = end;
                 continue;
@@ -14689,5 +14759,47 @@ mod mysql_named_param_tests {
         assert_eq!(sql, "select ?");
         assert_eq!(vals.len(), 1);
         assert!(matches!(vals[0], CfmlValue::Null));
+    }
+
+    #[test]
+    fn list_param_expands_to_multiple_placeholders() {
+        // The exact Preside shape: an array-valued filter joins ids with chr(31)
+        // and binds with list=true. Must expand to `IN (?,?,?)`, not one `?`
+        // bound to the whole "1\x1F3\x1F4" string (which MySQL rejects as a
+        // truncated integer).
+        let sep = "\u{1f}".to_string();
+        let listval = format!("1{sep}3{sep}4");
+        let map = struct_of(&[(
+            "ids",
+            CfmlValue::Struct(struct_of(&[
+                ("value", CfmlValue::string(listval)),
+                ("cfsqltype", CfmlValue::string("cf_sql_integer")),
+                ("list", CfmlValue::Bool(true)),
+                ("separator", CfmlValue::string("\u{1f}")),
+            ])),
+        )]);
+        let (sql, vals) = mysql_named_to_positional("select * from t where id in (:ids)", &map);
+        assert_eq!(sql, "select * from t where id in (?,?,?)");
+        assert_eq!(vals.len(), 3);
+        assert!(matches!(vals[0], CfmlValue::Int(1)));
+        assert!(matches!(vals[1], CfmlValue::Int(3)));
+        assert!(matches!(vals[2], CfmlValue::Int(4)));
+    }
+
+    #[test]
+    fn list_param_default_comma_separator() {
+        let map = struct_of(&[(
+            "vals",
+            CfmlValue::Struct(struct_of(&[
+                ("value", CfmlValue::string("a,b,c")),
+                ("cfsqltype", CfmlValue::string("cf_sql_varchar")),
+                ("list", CfmlValue::Bool(true)),
+            ])),
+        )]);
+        let (sql, vals) = mysql_named_to_positional("where x in (:vals)", &map);
+        assert_eq!(sql, "where x in (?,?,?)");
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals[0].as_string(), "a");
+        assert_eq!(vals[2].as_string(), "c");
     }
 }
