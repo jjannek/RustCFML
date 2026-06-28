@@ -53,9 +53,99 @@ static SSN_REGEX: Lazy<Regex> = Lazy::new(|| {
 // reFind with fixed patterns. A compiled `Regex` is cheap to clone (internally
 // `Arc`-shared), so caching it turns the second-and-later call into a hashmap
 // hit + refcount bump instead of a full recompile.
-static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, Regex>>> =
+static REGEX_CACHE: Lazy<std::sync::RwLock<HashMap<String, CfRegex>>> =
     Lazy::new(|| std::sync::RwLock::new(HashMap::new()));
 const REGEX_CACHE_CAP: usize = 4096;
+
+/// A compiled CFML regex, backed by the fast `regex` crate where possible and
+/// falling back to `fancy-regex` for patterns the `regex` crate rejects —
+/// chiefly lookaround (`(?=…)`, `(?!…)`, `(?<=…)`, `(?<!…)`) and backreferences
+/// (`\1`), both of which appear in real framework code (e.g. Preside's
+/// `_escapeAlias` uses `\bas\b\s+(\w+)(?!\s*[`"\[])$`). Java/Lucee/ACF regex
+/// supports these; the `regex` crate does not. The fast variant stays the hot
+/// path (the cache holds whichever variant compiled); only patterns that fail
+/// to compile on `regex` pay the backtracking cost.
+#[derive(Clone)]
+enum CfRegex {
+    Std(Regex),
+    Fancy(fancy_regex::Regex),
+}
+
+/// One captured group resolved to (byte-start, matched text). `None` = the group
+/// did not participate in the match. Index 0 is the whole match.
+type CapList = Vec<Option<(usize, String)>>;
+
+impl CfRegex {
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            CfRegex::Std(r) => r.is_match(text),
+            CfRegex::Fancy(r) => r.is_match(text).unwrap_or(false),
+        }
+    }
+
+    /// Overall-match byte start, searching from byte offset `start`. `^`/`\A`
+    /// remain anchored to the true start of the text (Lucee/Java/PCRE semantics).
+    fn find_at_start(&self, text: &str, start: usize) -> Option<usize> {
+        match self {
+            CfRegex::Std(r) => r.find_at(text, start).map(|m| m.start()),
+            CfRegex::Fancy(r) => r.find_from_pos(text, start).ok().flatten().map(|m| m.start()),
+        }
+    }
+
+    /// All capture groups for the first match at/after byte offset `start`.
+    fn captures_at_start(&self, text: &str, start: usize) -> Option<CapList> {
+        match self {
+            CfRegex::Std(r) => r.captures_at(text, start).map(|caps| {
+                (0..caps.len())
+                    .map(|i| caps.get(i).map(|m| (m.start(), m.as_str().to_string())))
+                    .collect()
+            }),
+            CfRegex::Fancy(r) => r.captures_from_pos(text, start).ok().flatten().map(|caps| {
+                (0..caps.len())
+                    .map(|i| caps.get(i).map(|m| (m.start(), m.as_str().to_string())))
+                    .collect()
+            }),
+        }
+    }
+
+    /// All non-overlapping whole matches as owned strings (for `reMatch`).
+    fn find_all(&self, text: &str) -> Vec<String> {
+        match self {
+            CfRegex::Std(r) => r.find_iter(text).map(|m| m.as_str().to_string()).collect(),
+            CfRegex::Fancy(r) => r
+                .find_iter(text)
+                .filter_map(|m| m.ok().map(|m| m.as_str().to_string()))
+                .collect(),
+        }
+    }
+
+    /// Replace using a CFML replacement template (honors `\N` backrefs and case
+    /// modifiers). `all=false` replaces only the first match.
+    fn replace_cfml(&self, text: &str, replacement: &str, all: bool) -> String {
+        match self {
+            CfRegex::Std(r) => {
+                let rep = |caps: &regex::Captures| {
+                    expand_cfml_replacement(replacement, |g| caps.get(g).map(|m| m.as_str().to_string()))
+                };
+                if all {
+                    r.replace_all(text, rep).to_string()
+                } else {
+                    r.replace(text, rep).to_string()
+                }
+            }
+            CfRegex::Fancy(r) => {
+                let rep = |caps: &fancy_regex::Captures| {
+                    expand_cfml_replacement(replacement, |g| caps.get(g).map(|m| m.as_str().to_string()))
+                };
+                if all {
+                    r.replace_all(text, rep).to_string()
+                } else {
+                    r.replace(text, rep).to_string()
+                }
+            }
+        }
+    }
+}
 
 /// Compile `pat`, returning a clone of the cached `Regex` on hit. On a compile
 /// error returns `Err` (callers fall back to their no-match behavior). The
@@ -126,11 +216,21 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-fn cached_regex(pat: &str) -> Result<Regex, regex::Error> {
+fn cached_regex(pat: &str) -> Result<CfRegex, ()> {
     if let Some(re) = REGEX_CACHE.read().unwrap().get(pat) {
         return Ok(re.clone());
     }
-    let re = Regex::new(&translate_cfml_regex(pat))?;
+    let translated = translate_cfml_regex(pat);
+    // Fast path: the `regex` crate. On a compile error, retry with `fancy-regex`,
+    // which supports lookaround and backreferences (a genuinely-malformed pattern
+    // fails both and the caller falls back to its no-match behavior).
+    let re = match Regex::new(&translated) {
+        Ok(r) => CfRegex::Std(r),
+        Err(_) => match fancy_regex::Regex::new(&translated) {
+            Ok(r) => CfRegex::Fancy(r),
+            Err(_) => return Err(()),
+        },
+    };
     let mut cache = REGEX_CACHE.write().unwrap();
     if cache.len() >= REGEX_CACHE_CAP {
         cache.clear();
@@ -1350,15 +1450,15 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
     let start = start.min(string.len());
 
     if return_sub {
-        if let Some(caps) = re.captures_at(&string, start) {
+        if let Some(caps) = re.captures_at_start(&string, start) {
             let mut pos_arr = Vec::new();
             let mut match_arr = Vec::new();
             let mut len_arr = Vec::new();
-            for i in 0..caps.len() {
-                if let Some(m) = caps.get(i) {
-                    pos_arr.push(CfmlValue::Int((m.start() + 1) as i64));
-                    match_arr.push(CfmlValue::string(m.as_str().to_string()));
-                    len_arr.push(CfmlValue::Int(m.len() as i64));
+            for cap in &caps {
+                if let Some((m_start, m_str)) = cap {
+                    pos_arr.push(CfmlValue::Int((*m_start + 1) as i64));
+                    len_arr.push(CfmlValue::Int(m_str.len() as i64));
+                    match_arr.push(CfmlValue::string(m_str.clone()));
                 } else {
                     pos_arr.push(CfmlValue::Int(0));
                     match_arr.push(CfmlValue::string(String::new()));
@@ -1378,8 +1478,8 @@ fn re_find_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
             Ok(CfmlValue::strukt(result))
         }
     } else {
-        match re.find_at(&string, start) {
-            Some(m) => Ok(CfmlValue::Int((m.start() + 1) as i64)),
+        match re.find_at_start(&string, start) {
+            Some(m_start) => Ok(CfmlValue::Int((m_start + 1) as i64)),
             None => Ok(CfmlValue::Int(0)),
         }
     }
@@ -1400,7 +1500,7 @@ fn fn_re_replace_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 /// case modifiers `\u`/`\l` upper/lower the next character while `\U`/`\L` apply
 /// to the rest until `\E`. Any other `\X` emits `X` literally, and a bare `$`
 /// is literal (the regex crate would otherwise treat `$name` as a group ref).
-fn expand_cfml_replacement(template: &str, caps: &regex::Captures) -> String {
+fn expand_cfml_replacement<F: Fn(usize) -> Option<String>>(template: &str, group: F) -> String {
     let chars: Vec<char> = template.chars().collect();
     let n = chars.len();
     let mut out = String::new();
@@ -1430,8 +1530,8 @@ fn expand_cfml_replacement(template: &str, caps: &regex::Captures) -> String {
             match next {
                 '0'..='9' => {
                     let g = next as usize - '0' as usize;
-                    let text = caps.get(g).map(|m| m.as_str()).unwrap_or("");
-                    emit(&mut out, text, ranged_upper, &mut oneshot_upper);
+                    let text = group(g).unwrap_or_default();
+                    emit(&mut out, &text, ranged_upper, &mut oneshot_upper);
                 }
                 'u' => oneshot_upper = Some(true),
                 'l' => oneshot_upper = Some(false),
@@ -1475,17 +1575,7 @@ fn re_replace_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
 
     // Use a custom replacer so CFML's `\N` backreferences and `\u`/`\l`/`\U`/`\L`
     // case modifiers are honored (and `$` stays literal).
-    if scope == "all" {
-        Ok(CfmlValue::string(
-            re.replace_all(&string, |caps: &regex::Captures| expand_cfml_replacement(&replacement, caps))
-                .to_string(),
-        ))
-    } else {
-        Ok(CfmlValue::string(
-            re.replace(&string, |caps: &regex::Captures| expand_cfml_replacement(&replacement, caps))
-                .to_string(),
-        ))
-    }
+    Ok(CfmlValue::string(re.replace_cfml(&string, &replacement, scope == "all")))
 }
 
 fn fn_re_match(args: Vec<CfmlValue>) -> CfmlResult {
@@ -1510,8 +1600,10 @@ fn re_match_impl(args: Vec<CfmlValue>, case_insensitive: bool) -> CfmlResult {
         Err(_) => return Ok(CfmlValue::array(Vec::new())),
     };
 
-    let matches: Vec<CfmlValue> = re.find_iter(&string)
-        .map(|m| CfmlValue::string(m.as_str().to_string()))
+    let matches: Vec<CfmlValue> = re
+        .find_all(&string)
+        .into_iter()
+        .map(CfmlValue::string)
         .collect();
     Ok(CfmlValue::array(matches))
 }

@@ -1031,6 +1031,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1274,7 +1289,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cfml-codegen"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
@@ -1284,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-common"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "indexmap",
  "js-sys",
@@ -1299,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-compiler"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "cfml-common",
  "log",
@@ -1308,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-config"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "indexmap",
  "log",
@@ -1319,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-qoq"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "cfml-common",
  "indexmap",
@@ -1330,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-stdlib"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "aes",
  "argon2",
@@ -1345,6 +1360,7 @@ dependencies = [
  "chrono-tz",
  "des",
  "ego-tree",
+ "fancy-regex",
  "hmac 0.12.1",
  "iana-time-zone",
  "indexmap",
@@ -1381,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-vm"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "anyhow",
  "cfml-codegen",
@@ -1411,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-worker"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "cfml-codegen",
  "cfml-common",
@@ -2415,6 +2431,17 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fancy-regex"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
 
 [[package]]
 name = "fastrand"
@@ -5266,7 +5293,7 @@ dependencies = [
 
 [[package]]
 name = "rustcfml-cli"
-version = "0.340.0"
+version = "0.341.0"
 dependencies = [
  "anyhow",
  "automerge",

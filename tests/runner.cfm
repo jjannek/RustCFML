@@ -160,6 +160,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_string_functions_regex.cfm">
 <cf_runtest file="stdlib/test_string_split_member.cfm">
 <cf_runtest file="stdlib/test_regex_backspace_in_class.cfm">
+<cf_runtest file="stdlib/test_regex_lookaround.cfm">
 <cf_runtest file="stdlib/test_inetaddress_loopback.cfm">
 <cf_runtest file="stdlib/test_java_files_shims.cfm">
 <cf_runtest file="stdlib/test_path_sanitization.cfm">
