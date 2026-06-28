@@ -47,5 +47,26 @@ assert("array.find(2)", [1, 2, 3].find(2), 2);
 assertTrue("array.contains(2)", [1, 2, 3].contains(2));
 assertFalse("array.contains(9)", [1, 2, 3].contains(9));
 
+// --- addAll (java.util.List passthrough; mutates in place, returns boolean) ---
+// Lucee-verified: arr.addAll(collection) merges every element of `collection`
+// into `arr` in place and returns boolean `true`. Preside's ColdBox
+// ModuleService.rebuildModuleRegistry uses this to merge ModulesExternalLocation
+// into its module-scan list; without it /preside/system/modules (cbi18n, etc.)
+// went undiscovered and serve-mode boot 500'd on a missing `unknownTranslation`.
+addAllArr = [ "x" ];
+addAllRet = addAllArr.addAll( [ "y", "z" ] );
+assert("array.addAll() mutates in place", addAllArr.toList(), "x,y,z");
+assert("array.addAll() new length", addAllArr.len(), 3);
+assertTrue("array.addAll() returns boolean true", addAllRet);
+// empty collection is a no-op
+addAllEmpty = [ 1, 2 ];
+addAllEmpty.addAll( [] );
+assert("array.addAll([]) no-op", addAllEmpty.toList(), "1,2");
+// chained / repeated
+addAllChain = [ 1 ];
+addAllChain.addAll( [ "a", "b" ] );
+addAllChain.addAll( [ 3 ] );
+assert("array.addAll() repeated", addAllChain.toList(), "1,a,b,3");
+
 suiteEnd();
 </cfscript>

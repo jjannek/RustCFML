@@ -15250,6 +15250,31 @@ impl CfmlVirtualMachine {
                 }
                 "append" | "push" => Some("arrayAppend"),
                 "prepend" => Some("arrayPrepend"),
+                // `arr.addAll(collection)` — java.util.List passthrough that
+                // Lucee exposes on CFML arrays: appends every element of the
+                // passed collection in place and returns boolean `true`. (NOT a
+                // member of is_mutating_method — the boolean must NOT be written
+                // back over the receiver; CfmlArray is Arc-shared so the
+                // with_write mutation already propagates to the variable.)
+                // Preside's ColdBox ModuleService.rebuildModuleRegistry relies
+                // on this to merge ModulesExternalLocation into the scan list;
+                // without it cbi18n (and every /preside/system/modules module)
+                // was never discovered → the `unknownTranslation` setting was
+                // never registered → serve-mode boot 500'd.
+                "addall" => {
+                    if let Some(first) = extra_args.first() {
+                        match first {
+                            CfmlValue::Array(other) => {
+                                let elems = other.snapshot();
+                                if !elems.is_empty() {
+                                    arr.with_write(|v| v.extend(elems));
+                                }
+                            }
+                            _ => arr.push(first.clone()),
+                        }
+                    }
+                    return Ok(CfmlValue::Bool(true));
+                }
                 "deleteat" => Some("arrayDeleteAt"),
                 // `arr.delete(value)` deletes the element equal to `value`
                 // (Lucee member function). Missing here, it fell through to
