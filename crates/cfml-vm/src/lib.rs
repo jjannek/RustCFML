@@ -14963,8 +14963,26 @@ impl CfmlVirtualMachine {
                     }
                     _ => Ok(CfmlValue::Null),
                 };
+                // Map-like shims (ConcurrentHashMap / LinkedHashMap / TreeMap)
+                // have getters (`get` / `getOrDefault`) that legitimately return
+                // null when the key is absent. The generic `Ok(Null) => fall
+                // through` rule below conflates that real null with "method not
+                // recognized", which then re-resolves `pool.get(key)` against the
+                // CALLER component's method table — e.g. Preside CacheBox's
+                // `ConcurrentStore.getQuiet` (`return pool.get(arguments.objectKey)`)
+                // mis-dispatched to the sibling `ConcurrentStore.get` with zero
+                // args (the args were already consumed by `mem::take`), throwing
+                // "The parameter [objectKey] to function [get] is required". Treat
+                // the map shim's getter result as authoritative so a miss returns
+                // null instead of falling through.
+                let map_getter_owns_null = matches!(
+                    java_class.as_str(),
+                    "java.util.concurrent.concurrenthashmap"
+                        | "java.util.linkedhashmap"
+                        | "java.util.treemap"
+                ) && matches!(method_lower.as_str(), "get" | "getordefault");
                 match result {
-                    Ok(CfmlValue::Null) => {
+                    Ok(CfmlValue::Null) if !map_getter_owns_null => {
                         // Shim didn't handle the method — fall through to the
                         // regular dispatch below so property access (e.g.
                         // system.out) still works.
@@ -15749,12 +15767,22 @@ impl CfmlVirtualMachine {
         let prop = match prop {
             CfmlValue::Function(_) => prop,
             _ => match object {
-                CfmlValue::Struct(ref s) if !s.contains_key("__variables") => caller_variables
-                    .as_ref()
-                    .and_then(|v| v.as_cfml_struct())
-                    .and_then(|vars| vars.get_ci(method))
-                    .filter(|v| matches!(v, CfmlValue::Function(_)))
-                    .unwrap_or(prop),
+                // A java shim (ConcurrentHashMap etc.) is never an in-construction
+                // CFC, so an unrecognized method on it must NOT resolve against the
+                // caller's component method table — that's how `pool.get(key)` once
+                // mis-dispatched to the caller's own `get`. Only genuine
+                // mid-construction `this` (a struct with no `__variables` yet and no
+                // shim marker) uses the caller's hoisted method table.
+                CfmlValue::Struct(ref s)
+                    if !s.contains_key("__variables") && !s.contains_key("__java_shim") =>
+                {
+                    caller_variables
+                        .as_ref()
+                        .and_then(|v| v.as_cfml_struct())
+                        .and_then(|vars| vars.get_ci(method))
+                        .filter(|v| matches!(v, CfmlValue::Function(_)))
+                        .unwrap_or(prop)
+                }
                 // A function injected into the component's PRIVATE `variables`
                 // scope (`__variables`) — not the public scope — is still
                 // callable as a method. Wheels' plugin loader mixes plugin

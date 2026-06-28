@@ -50,4 +50,23 @@ assertTrue( "ConcurrentHashMap clear", pool.size() == 0 );
 assertTrue( "ConcurrentHashMap isEmpty true", pool.isEmpty() );
 
 suiteEnd();
+
+// Regression: a component-internal `pool.get( key )` on a MISSING key must
+// return null, not mis-dispatch to the component's own `get( required objectKey )`
+// method (the Preside CacheBox ConcurrentStore SIGSEGV-adjacent dispatch bug).
+suiteBegin( "Java Shims: map getter null vs caller-method mis-dispatch" );
+
+store = new CacheStoreFixture();
+
+// MISS via the sibling method that does `pool.get( arguments.objectKey )`.
+// Pre-fix this threw "The parameter [objectKey] to function [get] is required".
+assertTrue( "getQuiet on missing key returns null", isNull( store.getQuiet( "absent" ) ) );
+assertTrue( "get on missing key returns null", isNull( store.get( "absent" ) ) );
+
+// HIT path still works through the same dispatch.
+store.set( "k1", "v1" );
+assertTrue( "getQuiet on present key returns value", store.getQuiet( "k1" ) == "v1" );
+assertTrue( "get on present key returns value", store.get( "k1" ) == "v1" );
+
+suiteEnd();
 </cfscript>
