@@ -246,7 +246,23 @@ impl Lexer {
                 }
             }
             '<' => {
-                if self.match_char('=') {
+                // CFML tag-style comment `<!--- ... --->`. In tag mode the tag
+                // preprocessor strips these, but a script-based `.cfc` body is
+                // lexed directly as CFScript, so the comment reaches the lexer.
+                // Lucee tolerates these inside script components (Preside's
+                // preside-objects use `<!--- properties --->` markers); without
+                // this the whole component fails to parse.
+                if self.peek(0) == '!'
+                    && self.peek(1) == '-'
+                    && self.peek(2) == '-'
+                    && self.peek(3) == '-'
+                {
+                    self.advance(); // '!'
+                    self.advance(); // '-'
+                    self.advance(); // '-'
+                    self.advance(); // '-'
+                    self.tag_comment();
+                } else if self.match_char('=') {
                     self.add_token(Token::LessEqual);
                 } else if self.match_char('>') {
                     self.add_token(Token::BangEqual); // <> is != in CFML
@@ -274,6 +290,87 @@ impl Lexer {
         } else {
             self.advance();
             true
+        }
+    }
+
+    /// Consume a quoted string literal verbatim into `out`, starting at the
+    /// opening quote (`current()` is the quote). Handles doubled-quote escapes
+    /// (`''`/`""`), `##` hash escapes, and `#...#` interpolation segments whose
+    /// expressions may contain further nested strings with their own
+    /// interpolation. Leaves the lexer positioned just after the closing quote
+    /// (or at EOF if the string is unterminated). Used while scanning the
+    /// expression of an outer `#...#` interpolation so a nested string is
+    /// captured as one opaque unit.
+    fn consume_string_literal_into(&mut self, out: &mut String) {
+        let quote = self.current();
+        out.push(quote);
+        self.advance(); // opening quote
+        while !self.is_at_end() {
+            let c = self.current();
+            if c == quote {
+                if self.peek(1) == quote {
+                    // Doubled quote — escaped quote, not the end of the string.
+                    out.push(quote);
+                    out.push(quote);
+                    self.advance();
+                    self.advance();
+                    continue;
+                }
+                out.push(quote);
+                self.advance(); // closing quote
+                return;
+            }
+            if c == '#' {
+                if self.peek(1) == '#' {
+                    // ## — escaped literal hash.
+                    out.push('#');
+                    out.push('#');
+                    self.advance();
+                    self.advance();
+                    continue;
+                }
+                out.push('#');
+                self.advance(); // opening #
+                self.consume_interpolation_into(out);
+                continue;
+            }
+            out.push(c);
+            self.advance();
+        }
+    }
+
+    /// Consume an interpolation expression into `out`, starting just after the
+    /// opening `#`, up to and including the matching depth-0 closing `#`. Nested
+    /// `()`/`[]` add depth; nested string literals are consumed whole (which may
+    /// recurse back into interpolation) so a `#` inside a nested string is never
+    /// mistaken for the closing `#`. Best-effort on EOF (degrades rather than
+    /// erroring — the top-level scanner owns unterminated-interpolation errors).
+    fn consume_interpolation_into(&mut self, out: &mut String) {
+        let mut depth = 0i32;
+        let mut expr_buf = String::new(); // tracked for the string-start guard
+        while !self.is_at_end() {
+            let c = self.current();
+            if c == '#' && depth == 0 {
+                out.push('#');
+                self.advance(); // closing #
+                return;
+            }
+            if (c == '"' || c == '\'') && self.can_start_interpolation_string_literal(&expr_buf) {
+                self.consume_string_literal_into(out);
+                // A nested string just closed; reflect that for the next guard
+                // check (a quote can't immediately follow a string).
+                expr_buf.push(c);
+                continue;
+            }
+            if c == '(' || c == '[' {
+                depth += 1;
+            }
+            if c == ')' || c == ']' {
+                depth -= 1;
+            }
+            out.push(c);
+            expr_buf.push(c);
+            self.advance();
         }
     }
 
@@ -344,26 +441,13 @@ impl Lexer {
                         if (self.current() == '"' || self.current() == '\'')
                             && self.can_start_interpolation_string_literal(&expr_str)
                         {
-                            let nested_quote = self.current();
-                            expr_str.push(nested_quote);
-                            self.advance();
-
-                            while !self.is_at_end() {
-                                let c = self.current();
-                                expr_str.push(c);
-                                self.advance();
-
-                                if c == nested_quote {
-                                    // A doubled quote is an escaped quote, not the
-                                    // end of the nested string.
-                                    if !self.is_at_end() && self.current() == nested_quote {
-                                        expr_str.push(self.current());
-                                        self.advance();
-                                        continue;
-                                    }
-                                    break;
-                                }
-                            }
+                            // Consume the whole nested string literal. It may itself
+                            // contain `#...#` interpolation whose expressions hold
+                            // further nested strings (e.g. Preside's
+                            // `'Right( #fn( 'col' )# - ? )'` inside an outer string),
+                            // so this must recurse rather than scan flatly for the
+                            // next matching quote.
+                            self.consume_string_literal_into(&mut expr_str);
                             continue;
                         }
                         if self.current() == '(' || self.current() == '[' { depth += 1; }
@@ -611,6 +695,42 @@ impl Lexer {
         // with CR-only endings and 18 line comments.
         while !self.is_at_end() && self.current() != '\n' && self.current() != '\r' {
             self.advance();
+        }
+    }
+
+    fn tag_comment(&mut self) {
+        // Consume through the matching `--->`. CFML tag comments nest, so track
+        // depth. The opening `<!---` has already been consumed by the caller.
+        let mut depth = 1usize;
+        while !self.is_at_end() {
+            if self.peek(0) == '<'
+                && self.peek(1) == '!'
+                && self.peek(2) == '-'
+                && self.peek(3) == '-'
+                && self.peek(4) == '-'
+            {
+                self.advance();
+                self.advance();
+                self.advance();
+                self.advance();
+                self.advance();
+                depth += 1;
+            } else if self.peek(0) == '-'
+                && self.peek(1) == '-'
+                && self.peek(2) == '-'
+                && self.peek(3) == '>'
+            {
+                self.advance();
+                self.advance();
+                self.advance();
+                self.advance();
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            } else {
+                self.advance();
+            }
         }
     }
 

@@ -262,6 +262,25 @@ assert("no named-extra leak into next positional call", _argPositionalKeys("v"),
 superScope = new PresideFixSuperScopeChild();
 assert("super-dispatched sibling sees parent-init's auto-vivd instance", superScope.getSeed(), "SEEDED");
 
+// F) A `<!--- ... --->` tag-style comment inside a script-based component body
+//    must NOT force the whole .cfc through the tag preprocessor (which echoes
+//    `component {...}` as literal text and loses every property). Preside's
+//    preside-objects use `<!--- properties --->` markers; page.cfc was building
+//    with only its inherited columns because the body parsed as a template.
+tcMeta = getMetaData( new PresideFixTagCommentProps() );
+assert("script .cfc with tag comments parses all properties", arrayLen( tcMeta.properties ?: [] ), 5);
+tcNames = [];
+for ( tcP in ( tcMeta.properties ?: [] ) ) { arrayAppend( tcNames, tcP.name ?: "?" ); }
+assert("tag-comment .cfc property names preserved in order", arrayToList( tcNames ), "title,slug,page_type,parent_page,child_pages");
+assert("component labelfield attribute survives tag-comment body", tcMeta.labelfield ?: "", "title");
+
+// G) Nested string interpolation: an outer `#...#` expression containing a
+//    nested string that itself contains `#...#` (with further nested quotes).
+//    Preside page.cfc's updateChildHierarchyHelpers builds SQL this way; the
+//    interpolation scanner used to stop at the first inner quote and misparse
+//    the whole component.
+assert("deeply nested string interpolation", new PresideFixTagCommentProps().buildSql( "foo" ), ", ?Right( foo, LEN(foo) - ? )");
+
 suiteEnd();
 
 // Paramless proxy forwarding a positional arg via argumentCollection to a

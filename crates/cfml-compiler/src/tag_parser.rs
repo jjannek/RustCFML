@@ -152,10 +152,30 @@ pub fn has_cfml_tags(source: &str) -> bool {
             }
             continue;
         }
-        if c == b'<' {
-            if source[i..].starts_with("<!---") || is_cf_at(i) {
-                return true;
+        // A `<!--- --->` CFML comment must NOT force tag mode. It is a valid
+        // comment inside a script-based `.cfc` body (Preside preside-objects
+        // use `<!--- properties --->` markers), and the CFScript lexer strips
+        // it. Skip the whole comment so neither it, nor a `<cf...>` tag that is
+        // commented out *inside* it, triggers tag preprocessing.
+        if c == b'<'
+            && i + 4 < n
+            && b[i + 1] == b'!'
+            && b[i + 2] == b'-'
+            && b[i + 3] == b'-'
+            && b[i + 4] == b'-'
+        {
+            i += 5;
+            while i + 3 < n {
+                if b[i] == b'-' && b[i + 1] == b'-' && b[i + 2] == b'-' && b[i + 3] == b'>' {
+                    i += 4;
+                    break;
+                }
+                i += 1;
             }
+            continue;
+        }
+        if c == b'<' && is_cf_at(i) {
+            return true;
         }
         i += 1;
     }
