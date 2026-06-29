@@ -11529,6 +11529,13 @@ impl CfmlVirtualMachine {
                                 "org.mindrot.jbcrypt.bcrypt" => {
                                     java_shims::handle_java_bcrypt("init", empty_args, &CfmlValue::Null)
                                 }
+                                // Legacy Preside YAML (cfflow YamlParser). The
+                                // shim's load() routes to the native
+                                // yamlDeserialize builtin (see
+                                // handle_snakeyaml_method).
+                                "org.yaml.snakeyaml.yaml" => {
+                                    java_shims::handle_java_yaml("init", empty_args, &CfmlValue::Null)
+                                }
                                 _ => Err(CfmlError::runtime(format!(
                                     "createObject: Java class [{}] is not supported. \
                                      RustCFML has no JVM, so only a curated set of \
@@ -13511,6 +13518,9 @@ impl CfmlVirtualMachine {
                     // throw is caught at an outer frame and crosses a call
                     // boundary) sees a non-empty trace and does NOT re-record the
                     // exception — it was already recorded above.
+                    // `err` is only mutated under the observability feature; the
+                    // `mut` is otherwise unused (e.g. the wasm/worker builds).
+                    #[cfg_attr(not(feature = "observability"), allow(unused_mut))]
                     let mut err = CfmlError::runtime(message);
                     #[cfg(feature = "observability")]
                     if self.interest.contains(observe::Interest::ERROR) {
@@ -15232,20 +15242,46 @@ impl CfmlVirtualMachine {
     /// `BCryptHash`/`BCryptVerify`. Lets legacy Preside's BCryptService work with
     /// no JVM. The crypto crate lives in cfml-stdlib, so we reach it via the
     /// builtin table rather than depending on it here.
+    /// Call a registered builtin by name (case-insensitive). Used by the Java
+    /// shims that delegate to native BIFs (the crypto/yaml crates live in
+    /// cfml-stdlib, reachable only through the builtin table).
+    fn call_named_builtin(&self, name: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        if let Some(b) = self.builtins.get(name) {
+            return b(args);
+        }
+        let nl = name.to_lowercase();
+        if let Some((_, b)) = self.builtins.iter().find(|(k, _)| k.eq_ignore_ascii_case(&nl)) {
+            return b(args);
+        }
+        Err(CfmlError::runtime(format!(
+            "shim: builtin [{}] is unavailable (engine built without the relevant feature)",
+            name
+        )))
+    }
+
+    /// Legacy Preside YAML: `org.yaml.snakeyaml.Yaml` instance methods routed to
+    /// the native YAML builtins. cfflow's YamlParser only ever calls `.load()`.
+    fn handle_snakeyaml_method(&self, method: &str, mut args: Vec<CfmlValue>) -> CfmlResult {
+        match method {
+            "load" | "loadas" => {
+                let content = if args.is_empty() {
+                    CfmlValue::string(String::new())
+                } else {
+                    args.remove(0)
+                };
+                self.call_named_builtin("yamlDeserialize", vec![content])
+            }
+            "dump" | "dumpasmap" => self.call_named_builtin("yamlSerialize", args),
+            other => Err(CfmlError::runtime(format!(
+                "org.yaml.snakeyaml.Yaml shim has no method [{}]",
+                other
+            ))),
+        }
+    }
+
     fn handle_jbcrypt_method(&self, method: &str, args: Vec<CfmlValue>) -> CfmlResult {
-        let call = |vm: &Self, name: &str, a: Vec<CfmlValue>| -> CfmlResult {
-            if let Some(b) = vm.builtins.get(name) {
-                return b(a);
-            }
-            let nl = name.to_lowercase();
-            if let Some((_, b)) = vm.builtins.iter().find(|(k, _)| k.eq_ignore_ascii_case(&nl)) {
-                return b(a);
-            }
-            Err(CfmlError::runtime(format!(
-                "BCrypt shim: builtin [{}] unavailable (built without the `security` feature?)",
-                name
-            )))
-        };
+        let call =
+            |vm: &Self, name: &str, a: Vec<CfmlValue>| -> CfmlResult { vm.call_named_builtin(name, a) };
         match method {
             "gensalt" => {
                 let wf = args
@@ -16105,6 +16141,7 @@ impl CfmlVirtualMachine {
                 let m = method_lower.clone();
                 let result = match java_class.as_str() {
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
+                    "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),
                     "java.security.messagedigest" => {
                         handle_java_messagedigest(&m, all_args, object)
                     }

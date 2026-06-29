@@ -23,6 +23,25 @@ pub fn handle_java_bcrypt(
     Ok(CfmlValue::strukt(shim))
 }
 
+/// `org.yaml.snakeyaml.Yaml` construction. Returns a marker shim; the `load`
+/// method is routed (VM-side) to the native `yamlDeserialize` builtin. The jar
+/// path arg is ignored. Lets legacy Preside's cfflow YamlParser work without a
+/// JVM while the canonical yamlDeserialize()/yamlSerialize() BIFs give YAML to
+/// all RustCFML code.
+pub fn handle_java_yaml(
+    _method: &str,
+    _args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    let mut shim = ValueMap::default();
+    shim.insert(
+        "__java_class".to_string(),
+        CfmlValue::string("org.yaml.snakeyaml.yaml".to_string()),
+    );
+    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    Ok(CfmlValue::strukt(shim))
+}
+
 pub fn handle_java_messagedigest(
     method: &str,
     args: Vec<CfmlValue>,

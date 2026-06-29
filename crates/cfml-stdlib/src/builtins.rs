@@ -939,6 +939,14 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
         f.insert("csrfVerifyToken".into(), fn_csrf_verify_token);
     }
 
+    // ---- YAML functions (BoxLang-compatible names) ----
+    #[cfg(feature = "yaml")]
+    {
+        f.insert("yamlDeserialize".into(), fn_yaml_deserialize);
+        f.insert("yamlSerialize".into(), fn_yaml_serialize);
+        f.insert("yamlDeserializeFile".into(), fn_yaml_deserialize_file);
+    }
+
     // ---- XML functions ----
     #[cfg(feature = "xml")]
     {
@@ -14506,6 +14514,122 @@ fn fn_bcrypt_verify(args: Vec<CfmlValue>) -> CfmlResult {
             }
         }
     }
+}
+
+// ===============================================
+// YAML (BoxLang-compatible: yamlDeserialize / yamlSerialize / yamlDeserializeFile)
+// ===============================================
+
+#[cfg(feature = "yaml")]
+fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
+    use serde_yaml::Value as Y;
+    match v {
+        Y::Null => String::new(),
+        Y::Bool(b) => b.to_string(),
+        Y::Number(n) => n.to_string(),
+        Y::String(s) => s.clone(),
+        other => serde_yaml::to_string(other).unwrap_or_default().trim().to_string(),
+    }
+}
+
+/// Convert a parsed `serde_yaml::Value` into native CFML values (recursively):
+/// mappings → Struct, sequences → Array, scalars → Bool/Int/Double/String.
+#[cfg(feature = "yaml")]
+fn yaml_to_cfml(v: serde_yaml::Value) -> CfmlValue {
+    use serde_yaml::Value as Y;
+    match v {
+        Y::Null => CfmlValue::Null,
+        Y::Bool(b) => CfmlValue::Bool(b),
+        Y::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                CfmlValue::Int(i)
+            } else {
+                CfmlValue::Double(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        Y::String(s) => CfmlValue::string(s),
+        Y::Sequence(seq) => CfmlValue::array(seq.into_iter().map(yaml_to_cfml).collect()),
+        Y::Mapping(map) => {
+            let mut m = ValueMap::default();
+            for (k, val) in map {
+                let key = match &k {
+                    Y::String(s) => s.clone(),
+                    other => yaml_scalar_to_string(other),
+                };
+                m.insert(key, yaml_to_cfml(val));
+            }
+            CfmlValue::strukt(m)
+        }
+        Y::Tagged(t) => yaml_to_cfml(t.value),
+    }
+}
+
+/// Convert a CFML value into a `serde_yaml::Value` for serialization. Internal
+/// component keys (`__*`) are skipped, mirroring serializeJSON.
+#[cfg(feature = "yaml")]
+fn cfml_to_yaml(v: &CfmlValue) -> serde_yaml::Value {
+    use serde_yaml::Value as Y;
+    match v {
+        CfmlValue::Null => Y::Null,
+        CfmlValue::Bool(b) => Y::Bool(*b),
+        CfmlValue::Int(i) => Y::Number((*i).into()),
+        CfmlValue::Double(d) => Y::Number((*d).into()),
+        CfmlValue::String(s) => Y::String((**s).clone()),
+        CfmlValue::Array(a) => {
+            Y::Sequence(a.snapshot().iter().map(cfml_to_yaml).collect())
+        }
+        CfmlValue::Struct(s) => {
+            let mut m = serde_yaml::Mapping::new();
+            for (k, val) in s.iter() {
+                if k.starts_with("__") {
+                    continue;
+                }
+                m.insert(Y::String(k), cfml_to_yaml(&val));
+            }
+            Y::Mapping(m)
+        }
+        // Non-data values (queries, functions, binary, …) stringify.
+        _ => Y::String(v.as_string()),
+    }
+}
+
+/// yamlDeserialize( content ) — parse a YAML string into native CFML values.
+#[cfg(feature = "yaml")]
+fn fn_yaml_deserialize(args: Vec<CfmlValue>) -> CfmlResult {
+    let content = get_str(&args, 0);
+    let v: serde_yaml::Value = serde_yaml::from_str(&content)
+        .map_err(|e| CfmlError::runtime(format!("yamlDeserialize: invalid YAML: {}", e)))?;
+    Ok(yaml_to_cfml(v))
+}
+
+/// yamlSerialize( content, [filepath], [charset="utf8"] ) — serialize a CFML
+/// value to a YAML string; optionally also write it to `filepath` (BoxLang
+/// parity). Returns the YAML string. `charset` is accepted but ignored (UTF-8).
+#[cfg(feature = "yaml")]
+fn fn_yaml_serialize(args: Vec<CfmlValue>) -> CfmlResult {
+    let data = args.first().cloned().unwrap_or(CfmlValue::Null);
+    let yaml = serde_yaml::to_string(&cfml_to_yaml(&data))
+        .map_err(|e| CfmlError::runtime(format!("yamlSerialize: {}", e)))?;
+    if let Some(fp) = args.get(1) {
+        let path = fp.as_string();
+        if !path.is_empty() {
+            std::fs::write(&path, &yaml).map_err(|e| {
+                CfmlError::runtime(format!("yamlSerialize: cannot write [{}]: {}", path, e))
+            })?;
+        }
+    }
+    Ok(CfmlValue::string(yaml))
+}
+
+/// yamlDeserializeFile( filepath, [charset="utf8"] ) — read a YAML file and
+/// parse it into native CFML values.
+#[cfg(feature = "yaml")]
+fn fn_yaml_deserialize_file(args: Vec<CfmlValue>) -> CfmlResult {
+    let path = get_str(&args, 0);
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        CfmlError::runtime(format!("yamlDeserializeFile: cannot read [{}]: {}", path, e))
+    })?;
+    fn_yaml_deserialize(vec![CfmlValue::string(content)])
 }
 
 /// generateSCryptHash(password)

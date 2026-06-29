@@ -181,6 +181,7 @@ include "harness.cfm";
 <cf_runtest file="stdlib/test_dateadd_invalid_datepart.cfm">
 <cf_runtest file="stdlib/test_file_bif_errors.cfm">
 <cf_runtest file="stdlib/test_bcrypt.cfm">
+<cf_runtest file="stdlib/test_yaml.cfm">
 <cf_runtest file="stdlib/test_array_higher_order.cfm">
 <cf_runtest file="stdlib/test_struct_functions.cfm">
 <cf_runtest file="stdlib/test_struct_higher_order.cfm">
