@@ -757,4 +757,8 @@ include "harness.cfm";
 <!--- behaviour is covered by crates/cli/tests/websocket_raw.rs). --->
 <cf_runtest file="websocket/test_ws_harness.cfm">
 
+<!--- Observability: classic CF debug-footer BIFs. Footer activation/render --->
+<!--- (serve-only) is covered by Rust gate tests in cfml-vm/src/lib.rs. --->
+<cf_runtest file="observe/test_debug_footer.cfm">
+
 <cfscript> printSummary(); </cfscript>

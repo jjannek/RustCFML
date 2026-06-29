@@ -542,10 +542,48 @@ pub struct LoggerCfg {
 // Debugging
 // ─────────────────────────────────────────────
 
+/// Classic CF debug output (the footer/panel). Modelled on Lucee 6/7's
+/// `debugging` block so a `.cfconfig.json` authored for Lucee is drop-in
+/// compatible, with two RustCFML enhancements: a fully configurable URL trigger
+/// (param name *and* value) and reverse-proxy-aware client-IP resolution.
+///
+/// `enabled` is the master switch (off by default). The footer renders only
+/// when all four activation gates pass: enabled, viewer-allowed (IP whitelist
+/// OR URL trigger), not suppressed by `<cfsetting showDebugOutput="false">`,
+/// and the response is renderable HTML. See `docs/observability-*.md`.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct DebuggingCfg {
+    /// Master switch (Lucee `debuggingEnabled`). Set `true` and restrict
+    /// `showFromIPs` to run live in production with no leakage to other visitors.
     pub enabled: bool,
+    /// The security gate: only these client IPs (and the URL trigger) see the
+    /// footer. Honoured in production too. Exact-match for stage 1; CIDR ranges
+    /// are a documented follow-up.
+    #[serde(rename = "showFromIPs", alias = "showfromips")]
+    pub show_from_ips: Vec<String>,
+    /// Reverse-proxy client-IP resolution. `false` (default) uses the socket
+    /// peer; `true` trusts `X-Forwarded-For` / `X-Real-IP` (the documented
+    /// foot-gun — only safe when your edge overwrites the header on ingress).
+    #[serde(rename = "trustForwardedFor")]
+    pub trust_forwarded_for: bool,
+    /// RustCFML enhancement — a configurable URL trigger (Lucee core matches by
+    /// IP only). Both the param NAME and required value are configurable, so a
+    /// secret `?myhiddenvar=s3cr3t` can gate the footer (security-by-obscurity).
+    #[serde(rename = "urlTrigger")]
+    pub url_trigger: UrlTriggerCfg,
+    /// `modern` (default) | `classic` | `simple` | `comment` | `none`.
+    pub template: String,
+    /// Slow-row red-highlight threshold in ms (Adobe/Lucee universal default 250).
+    #[serde(rename = "highlightMs")]
+    pub highlight_ms: u64,
+    /// Rolling per-section row cap (≈ Lucee `debugMaxRecordsLogged`).
+    #[serde(rename = "maxRecords")]
+    pub max_records: usize,
+    /// The seven Lucee section toggles + the scope-dump selection.
+    pub fields: DebugFieldsCfg,
+
+    // ── Error-page settings (pre-existing; unrelated to the footer) ──
     #[serde(rename = "errorTemplate")]
     pub error_template: String,
     #[serde(rename = "errorStatusCode")]
@@ -558,9 +596,70 @@ impl Default for DebuggingCfg {
     fn default() -> Self {
         Self {
             enabled: false,
+            show_from_ips: vec!["127.0.0.1".into(), "::1".into()],
+            trust_forwarded_for: false,
+            url_trigger: UrlTriggerCfg::default(),
+            template: "modern".into(),
+            highlight_ms: 250,
+            max_records: 10,
+            fields: DebugFieldsCfg::default(),
             error_template: String::new(),
             error_status_code: true,
             show_execution_time: false,
+        }
+    }
+}
+
+/// Configurable URL trigger for the debug footer (RustCFML enhancement).
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct UrlTriggerCfg {
+    pub enabled: bool,
+    /// The URL/form variable NAME (default `debug`). Rename for obscurity.
+    pub param: String,
+    /// Required value (default `true`). Set an unguessable secret to gate by it;
+    /// empty = presence-only (refused when `production_mode` is on).
+    pub value: String,
+}
+
+impl Default for UrlTriggerCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            param: "debug".into(),
+            value: "true".into(),
+        }
+    }
+}
+
+/// Lucee's seven section toggles plus the scope-dump selection.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct DebugFieldsCfg {
+    pub database: bool,
+    pub exception: bool,
+    pub tracing: bool,
+    pub timer: bool,
+    #[serde(rename = "implicitAccess")]
+    pub implicit_access: bool,
+    #[serde(rename = "queryUsage")]
+    pub query_usage: bool,
+    pub dump: bool,
+    /// Which scopes the scope-dump renders. Never `variables`/`local`.
+    pub scopes: Vec<String>,
+}
+
+impl Default for DebugFieldsCfg {
+    fn default() -> Self {
+        Self {
+            database: true,
+            exception: true,
+            tracing: true,
+            timer: true,
+            implicit_access: false,
+            query_usage: false,
+            dump: true,
+            scopes: vec!["cgi".into(), "url".into(), "form".into()],
         }
     }
 }
@@ -698,6 +797,12 @@ impl RustCfmlConfig {
         }
         // debugging
         expand(&mut self.debugging.error_template);
+        expand(&mut self.debugging.template);
+        expand(&mut self.debugging.url_trigger.param);
+        expand(&mut self.debugging.url_trigger.value);
+        for s in &mut self.debugging.show_from_ips {
+            expand(s);
+        }
         // security
         for s in &mut self.security.disallowed_functions {
             expand(s);

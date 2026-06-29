@@ -716,6 +716,13 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     // shadowed that mapping and hit the stub — a 500 "requires VM intercept".
     f.insert("trace".into(), fn_trace);
     f.insert("exceptionKeyExists".into(), fn_exception_key_exists);
+    // Classic CF debug-footer BIFs. These are VM-intercepted in lib.rs when the
+    // `observability` feature is on (they need the per-request collector + live
+    // scopes); the stubs below are the fallback for feature-off builds (e.g. the
+    // wasm worker) so a page calling them never errors.
+    f.insert("getDebugData".into(), fn_get_debug_data_stub);
+    f.insert("isDebugMode".into(), fn_is_debug_mode_stub);
+    f.insert("debugAdd".into(), fn_debug_add_stub);
 
     // ---- File I/O functions ----
     f.insert("fileRead".into(), fn_file_read);
@@ -13294,6 +13301,21 @@ fn fn_get_application_metadata(_args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_trace(args: Vec<CfmlValue>) -> CfmlResult {
     let text = get_str(&args, 0);
     eprintln!("[TRACE] {}", text);
+    Ok(CfmlValue::Null)
+}
+
+/// Fallback `getDebugData()` for feature-off builds — empty struct.
+fn fn_get_debug_data_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Ok(CfmlValue::strukt(ValueMap::default()))
+}
+
+/// Fallback `isDebugMode()` for feature-off builds — always false.
+fn fn_is_debug_mode_stub(_args: Vec<CfmlValue>) -> CfmlResult {
+    Ok(CfmlValue::Bool(false))
+}
+
+/// Fallback `debugAdd()` for feature-off builds — no-op.
+fn fn_debug_add_stub(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::Null)
 }
 

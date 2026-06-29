@@ -51,8 +51,16 @@ cranelift-native = { workspace = true, optional = true }
 cfml-stdlib = { workspace = true, default-features = false }
 
 [features]
-default = ["std", "real-threads", "jit"]
+default = ["std", "real-threads", "jit", "observability"]
 std = []
+# Observability & debugging hook bus + the classic CF debug footer (Phase 0/1
+# of docs/observability-implementation-plan.md). Pure-Rust, host-only: it pulls
+# in NO heavy deps, but is gated off the wasm crates (which build cfml-vm with
+# `default-features = false`) so the worker pays nothing and the OS-timer /
+# Instant code paths never reach wasm32. When the feature is off, every hook
+# call site in the VM vanishes (`#[cfg(feature = "observability")]`), so the
+# hot path is byte-identical to a no-observability build.
+observability = []
 # Real OS-thread cfthread support. On by default for native targets; the wasm
 # targets (cfml-worker, rustcfml-wasm) build with default-features disabled and
 # fall back to the synchronous-inline cfthread path (no std::thread on wasm32).

@@ -798,6 +798,11 @@ fn compile_and_run(
     // execute_with_lifecycle dispatches to the handler instead of a target page.
     vm.missing_template = missing_template;
 
+    // Classic CF debug footer (Phase 1): evaluate the activation gates now that
+    // web scopes + cfconfig are in place, and install the per-request collector
+    // when they pass. A request that won't show debug output collects nothing.
+    vm.maybe_install_debug_collector();
+
     // Run the lifecycle. In serve mode (`persist_jit`), adopt this worker
     // thread's persistent JIT engine for the duration via `JitLease` so
     // compiled native code + hotness counters accumulate across requests
@@ -829,6 +834,11 @@ fn compile_and_run(
     // Flush any buffered <cfhtmlhead>/<cfhtmlbody> content into the output
     // before it is consumed.
     vm.finalize_html_injections();
+
+    // Render the debug footer (if a collector was installed and the page is a
+    // renderable HTML response not suppressed by <cfsetting showDebugOutput>).
+    // Appends to the output buffer, so it flows into the response body below.
+    vm.maybe_render_debug_footer();
 
     // Catch redirect errors as success
     let result = match result {

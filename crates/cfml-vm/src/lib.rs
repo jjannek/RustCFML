@@ -15,6 +15,12 @@ use std::time::SystemTime;
 pub mod application_store;
 pub mod async_kernel;
 pub mod dump;
+/// Observability/debugging hook bus (Phase 0) + the classic CF debug footer
+/// (Phase 1). Behind the `observability` feature; absent on the wasm crates.
+#[cfg(feature = "observability")]
+pub mod observe;
+#[cfg(feature = "observability")]
+pub mod debug_footer;
 mod java_shims;
 pub mod tz;
 /// Optional Cranelift JIT (native targets, `--features jit`). The interpreter
@@ -1246,6 +1252,11 @@ pub struct CfmlVirtualMachine {
     /// cfsetting requesttimeout (seconds), stored as milliseconds. 0 = unset.
     /// getPageContext().getRequestTimeout() reads it back (in ms, Lucee-style).
     pub request_timeout_ms: i64,
+    /// `<cfsetting showDebugOutput="false">` — page-level suppression of the
+    /// classic debug footer (gate 3). Can only turn the footer OFF, never bypass
+    /// the IP/trigger gates. Defaults true.
+    #[cfg(feature = "observability")]
+    pub show_debug_output: bool,
     /// Sandbox mode: blocks host filesystem access, routes reads through VFS
     pub sandbox: bool,
     /// After a function call, holds modified complex-type argument values for
@@ -1361,6 +1372,25 @@ pub struct CfmlVirtualMachine {
     /// the feature is off.
     #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
     jit: Option<jit::JitEngine>,
+
+    /// The composed hook-bus observer (Phase 0). `None` ⇒ no subscriber, so
+    /// every hook site is a `bitand`+branch and nothing else. Today the only
+    /// subscriber is the debug-footer collector, installed per request when the
+    /// four activation gates pass.
+    #[cfg(feature = "observability")]
+    observer: Option<std::sync::Arc<dyn observe::VmObserver>>,
+    /// Cached OR of every observer's `interest()`, read by the hot path so it
+    /// never dereferences the `Arc` just to decide whether to fire.
+    #[cfg(feature = "observability")]
+    interest: observe::Interest,
+    /// Typed handle to the footer collector (also stored as `observer`), kept so
+    /// the render/`getDebugData()` paths can read it back without downcasting.
+    #[cfg(feature = "observability")]
+    debug_collector: Option<std::sync::Arc<debug_footer::DebugCollector>>,
+    /// Resolved `debugging` config block (copied by `apply_cfconfig`). Drives
+    /// the footer activation gates.
+    #[cfg(feature = "observability")]
+    pub debug_config: cfml_config::DebuggingCfg,
 }
 
 /// Constructor signature for a Rust-backed class registered via
@@ -1591,6 +1621,8 @@ impl CfmlVirtualMachine {
             cache: HashMap::new(),
             enable_cfoutput_only: 0,
             request_timeout_ms: 0,
+            #[cfg(feature = "observability")]
+            show_debug_output: true,
             sandbox: false,
             arg_ref_writeback: None,
             pending_result_writeback: None,
@@ -1620,6 +1652,14 @@ impl CfmlVirtualMachine {
             last_component_compile_error: None,
             #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
             jit: jit::JitEngine::maybe_new(),
+            #[cfg(feature = "observability")]
+            observer: None,
+            #[cfg(feature = "observability")]
+            interest: observe::Interest::NONE,
+            #[cfg(feature = "observability")]
+            debug_collector: None,
+            #[cfg(feature = "observability")]
+            debug_config: cfml_config::DebuggingCfg::default(),
         };
         // Register the root program's functions so stored references and
         // DefineFunction ops resolve by global_id from the first instruction.
@@ -1916,6 +1956,288 @@ impl CfmlVirtualMachine {
                 }
             })
             .collect();
+        // debugging.* — the classic CF debug footer (Phase 1). Stored verbatim;
+        // the activation gates read it when the request is about to run.
+        #[cfg(feature = "observability")]
+        {
+            self.debug_config = cfg.debugging.clone();
+        }
+    }
+
+    // ── Observability hook bus (Phase 0) + debug footer (Phase 1) ───────────
+
+    /// Install the composed hook-bus observer and cache its interest mask so the
+    /// hot path never dereferences the `Arc` just to decide whether to fire.
+    #[cfg(feature = "observability")]
+    fn set_observer(&mut self, obs: std::sync::Arc<dyn observe::VmObserver>) {
+        self.interest = obs.interest();
+        self.observer = Some(obs);
+    }
+
+    /// Find a web scope (`cgi`/`url`/`form`/…) by case-insensitive name.
+    #[cfg(feature = "observability")]
+    fn scope_struct(&self, scope: &str) -> Option<&CfmlStruct> {
+        self.globals
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(scope))
+            .and_then(|(_, v)| match v {
+                CfmlValue::Struct(s) => Some(s),
+                _ => None,
+            })
+    }
+
+    /// Resolve the client IP for the footer's IP whitelist gate. Honours
+    /// `trustForwardedFor` (the documented foot-gun) when set; otherwise uses the
+    /// socket peer exposed as `cgi.remote_addr`. CLI runs (no web context) are
+    /// treated as localhost so the footer is usable from `rustcfml file.cfm`.
+    #[cfg(feature = "observability")]
+    fn resolve_client_ip(&self) -> String {
+        if !self.web_context {
+            return "127.0.0.1".to_string();
+        }
+        if self.debug_config.trust_forwarded_for {
+            if let Some(cgi) = self.scope_struct("cgi") {
+                for key in ["http_x_forwarded_for", "x_forwarded_for", "http_x_real_ip"] {
+                    if let Some(v) = cgi.get_ci(key) {
+                        let raw = v.as_string();
+                        let first = raw.split(',').next().unwrap_or("").trim();
+                        if !first.is_empty() {
+                            return first.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        self.scope_struct("cgi")
+            .and_then(|c| c.get_ci("remote_addr"))
+            .map(|v| v.as_string())
+            .unwrap_or_default()
+    }
+
+    /// Gate 2's URL-trigger half — matches the configured param (in `url` or
+    /// `form`) against the configured value. Production refuses a presence-only
+    /// (empty-value) trigger so a bare `?debug` can never unlock a live site.
+    #[cfg(feature = "observability")]
+    fn url_trigger_matches(&self) -> bool {
+        let t = &self.debug_config.url_trigger;
+        if !t.enabled || t.param.is_empty() {
+            return false;
+        }
+        let production = self
+            .server_state
+            .as_ref()
+            .map(|s| s.production_mode)
+            .unwrap_or(false);
+        for scope in ["url", "form"] {
+            if let Some(s) = self.scope_struct(scope) {
+                if let Some(v) = s.get_ci(&t.param) {
+                    let val = v.as_string();
+                    if t.value.is_empty() {
+                        // presence-only — refused in production
+                        if !production {
+                            return true;
+                        }
+                    } else if val.eq_ignore_ascii_case(&t.value) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Footer activation gates 1 (enabled) + 2 (viewer allowed: IP whitelist OR
+    /// URL trigger). Fail-closed.
+    #[cfg(feature = "observability")]
+    fn footer_activation_allowed(&self) -> bool {
+        if !self.debug_config.enabled {
+            return false;
+        }
+        let ip = self.resolve_client_ip();
+        let ip_ok = self
+            .debug_config
+            .show_from_ips
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(ip.trim()));
+        ip_ok || self.url_trigger_matches()
+    }
+
+    /// Evaluate gates 1 & 2 and, when they pass, install a fresh per-request
+    /// debug-footer collector as the hook-bus observer. A request that won't
+    /// show debug output collects nothing and allocates nothing. Called once,
+    /// just before the request body runs (after web scopes + cfconfig are set).
+    #[cfg(feature = "observability")]
+    pub fn maybe_install_debug_collector(&mut self) {
+        if self.debug_collector.is_some() || !self.footer_activation_allowed() {
+            return;
+        }
+        let cfg = &self.debug_config;
+        let fcfg = debug_footer::FooterCfg {
+            template: cfg.template.clone(),
+            highlight_ms: cfg.highlight_ms as i64,
+            max_records: if cfg.max_records == 0 {
+                usize::MAX
+            } else {
+                cfg.max_records
+            },
+            database: cfg.fields.database,
+            exception: cfg.fields.exception,
+            tracing: cfg.fields.tracing,
+        };
+        let collector = std::sync::Arc::new(debug_footer::DebugCollector::new(fcfg));
+        self.debug_collector = Some(collector.clone());
+        self.set_observer(collector);
+    }
+
+    /// True when the footer is active for this request (gates 1 & 2 passed and a
+    /// collector is installed). Backs the `isDebugMode()` BIF.
+    #[cfg(feature = "observability")]
+    pub fn is_debug_mode(&self) -> bool {
+        self.debug_collector.is_some()
+    }
+
+    /// Gather the configured scope snapshots for the footer's scope dump. Never
+    /// includes `variables`/`local` (the universal debug-footer contract).
+    #[cfg(feature = "observability")]
+    fn gather_debug_scopes(&self) -> Vec<(String, ValueMap)> {
+        let mut out = Vec::new();
+        for name in &self.debug_config.fields.scopes {
+            let lname = name.to_ascii_lowercase();
+            if lname == "variables" || lname == "local" {
+                continue;
+            }
+            if let Some(s) = self.scope_struct(&lname) {
+                out.push((lname, s.snapshot()));
+            }
+        }
+        out
+    }
+
+    /// The `getDebugData()` projection. Empty struct when no collector is active.
+    #[cfg(feature = "observability")]
+    pub fn debug_data_cfml(&self) -> CfmlValue {
+        match &self.debug_collector {
+            Some(c) => {
+                let scopes = self.gather_debug_scopes();
+                let main = self.base_template_path.as_deref();
+                c.to_cfml(&scopes, main)
+            }
+            None => CfmlValue::strukt(ValueMap::default()),
+        }
+    }
+
+    /// The `debugAdd()` channel — append a `genericData` row. No-op when the
+    /// footer isn't active.
+    #[cfg(feature = "observability")]
+    pub fn debug_add(&self, category: &str, name: &str, value: &str) {
+        if let Some(c) = &self.debug_collector {
+            c.add_generic(category, name, value);
+        }
+    }
+
+    /// Render the footer and append it to the output buffer, if a collector is
+    /// installed and gates 3 (page suppression) & 4 (renderable HTML) pass.
+    /// Called once at request end, after HTML injections are finalised.
+    #[cfg(feature = "observability")]
+    pub fn maybe_render_debug_footer(&mut self) {
+        let collector = match &self.debug_collector {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        // The footer is a web-page artifact: auto-render only on web requests.
+        // CLI runs still collect (so `getDebugData()`/`isDebugMode()` work) but
+        // don't get an HTML panel appended to stdout.
+        if !self.web_context {
+            return;
+        }
+        // gate 3 — page-level suppression via <cfsetting showDebugOutput="false">.
+        if !self.show_debug_output {
+            return;
+        }
+        // gate 4 — renderable: not a redirect, and HTML/text content.
+        if self.redirect_url.is_some() {
+            return;
+        }
+        if let Some(ct) = &self.response_content_type {
+            let ctl = ct.to_ascii_lowercase();
+            if !(ctl.contains("html") || ctl.contains("text")) {
+                return;
+            }
+        }
+        if self.debug_config.template.eq_ignore_ascii_case("none") {
+            return;
+        }
+        let scopes = self.gather_debug_scopes();
+        let main = self.base_template_path.clone();
+        let footer = collector.render(&scopes, main.as_deref());
+        if !footer.is_empty() {
+            self.output_buffer.push_str(&footer);
+        }
+    }
+
+    // ── Hook-fire helpers (called from the boundary sites) ──────────────────
+
+    /// Fire the `query` hook (guarded by `QUERY` interest at the call site).
+    #[cfg(feature = "observability")]
+    fn fire_query(&self, ev: &observe::QueryEvent) {
+        if let Some(o) = &self.observer {
+            o.on_query(ev);
+        }
+    }
+
+    /// Fire the `template` hook (guarded by `TEMPLATE` interest at the call
+    /// site). `elapsed_us` is microseconds.
+    #[cfg(feature = "observability")]
+    fn fire_template(&self, path: &str, elapsed_us: i64) {
+        if let Some(o) = &self.observer {
+            o.on_template(&observe::TemplateEvent { path, elapsed_us });
+        }
+    }
+
+    /// Flatten a queryExecute params argument into the debug footer's param
+    /// list (name, value, cfsqltype). Handles named (struct) and positional
+    /// (array) params, and unwraps cfqueryparam-style `{ value, cfsqltype }`
+    /// structs to their value + type (matching Lucee's PARAMVALUE/PARAMTYPE).
+    #[cfg(feature = "observability")]
+    fn extract_query_params(arg: Option<&CfmlValue>) -> Vec<observe::QueryParam> {
+        fn value_and_type(v: &CfmlValue) -> (String, String) {
+            // cfqueryparam form: a struct carrying `value` (+ optional cfsqltype).
+            if let CfmlValue::Struct(s) = v {
+                if let Some(inner) = s.get_ci("value") {
+                    let ty = s
+                        .get_ci("cfsqltype")
+                        .or_else(|| s.get_ci("sqltype"))
+                        .map(|t| t.as_string())
+                        .unwrap_or_default();
+                    return (inner.as_string(), ty);
+                }
+            }
+            (v.as_string(), String::new())
+        }
+        match arg {
+            Some(CfmlValue::Struct(s)) => s
+                .snapshot()
+                .into_iter()
+                .map(|(k, v)| {
+                    let (value, sqltype) = value_and_type(&v);
+                    observe::QueryParam { name: k, value, sqltype }
+                })
+                .collect(),
+            Some(CfmlValue::Array(a)) => a
+                .snapshot()
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let (value, sqltype) = value_and_type(v);
+                    observe::QueryParam {
+                        name: (i + 1).to_string(),
+                        value,
+                        sqltype,
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// Snapshot everything a child VM needs to run `closure` as a `cfthread`
@@ -2456,6 +2778,33 @@ impl CfmlVirtualMachine {
     fn wrap_error(&self, mut err: CfmlError) -> CfmlError {
         if err.stack_trace.is_empty() {
             err.stack_trace = self.build_stack_trace();
+        }
+        // Observability: fire the `error` hook (debug footer exceptions section,
+        // OTel exception events). Guarded by interest so a request with no
+        // subscriber pays nothing. `uncaught` is left false here — this is the
+        // raise site, before the try-stack decides; the footer records all
+        // raised exceptions (Lucee-style), the OTel layer (Phase 3) will refine
+        // caught-vs-uncaught at its own hook.
+        #[cfg(feature = "observability")]
+        if self.interest.contains(observe::Interest::ERROR) {
+            if let Some(o) = &self.observer {
+                let etype = format!("{}", err.error_type);
+                let src = self.source_file.clone().unwrap_or_default();
+                let stack: Vec<(String, usize)> = err
+                    .stack_trace
+                    .iter()
+                    .map(|f| (f.template.clone(), f.line))
+                    .collect();
+                o.on_error(&observe::ErrorEvent {
+                    etype: &etype,
+                    message: &err.message,
+                    detail: "",
+                    src: &src,
+                    line: self.current_line,
+                    uncaught: false,
+                    stack,
+                });
+            }
         }
         err
     }
@@ -7426,12 +7775,25 @@ impl CfmlVirtualMachine {
                             // Isolate try-stack so throws inside the include
                             // don't consume outer handlers
                             let saved_try_stack = std::mem::take(&mut self.try_stack);
+                            // Observability: time the include for the footer's
+                            // `pages` section. The clock read is skipped entirely
+                            // unless a TEMPLATE-interested observer is attached.
+                            #[cfg(feature = "observability")]
+                            let __tmpl_start = self
+                                .interest
+                                .contains(observe::Interest::TEMPLATE)
+                                .then(std::time::Instant::now);
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
                                 Some(&locals),
                             );
                             self.try_stack = saved_try_stack;
+                            #[cfg(feature = "observability")]
+                            if let Some(start) = __tmpl_start {
+                                let us = start.elapsed().as_micros() as i64;
+                                self.fire_template(&resolved, us);
+                            }
                             // Merge newly created variables from the include back
                             // into the caller's locals. This makes variables set via
                             // `variables.foo = "bar"` in the include accessible from
@@ -7541,12 +7903,22 @@ impl CfmlVirtualMachine {
                             let pre_include_keys: std::collections::HashSet<String> =
                                 locals.keys().cloned().collect();
                             let saved_try_stack = std::mem::take(&mut self.try_stack);
+                            #[cfg(feature = "observability")]
+                            let __tmpl_start = self
+                                .interest
+                                .contains(observe::Interest::TEMPLATE)
+                                .then(std::time::Instant::now);
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
                                 Some(&locals),
                             );
                             self.try_stack = saved_try_stack;
+                            #[cfg(feature = "observability")]
+                            if let Some(start) = __tmpl_start {
+                                let us = start.elapsed().as_micros() as i64;
+                                self.fire_template(&resolved, us);
+                            }
                             // Merge new non-function variables from the include
                             if let Some(inc_locals) = self.captured_locals.take() {
                                 for (k, v) in inc_locals {
@@ -8548,6 +8920,14 @@ impl CfmlVirtualMachine {
                 | "getpagecontext"
                 | "evaluate"
                 | "precisionevaluate" => {
+                    // Will be handled at the end of this function (needs VM access)
+                }
+                // Debug-footer BIFs (Phase 1). Need VM access (the per-request
+                // collector + live scopes), so they are VM-intercepted. When the
+                // `observability` feature is off they fall through to the no-op
+                // stub builtins registered in cfml-stdlib.
+                #[cfg(feature = "observability")]
+                "getdebugdata" | "isdebugmode" | "debugadd" => {
                     // Will be handled at the end of this function (needs VM access)
                 }
                 _ => {
@@ -11401,6 +11781,30 @@ impl CfmlVirtualMachine {
                             .unwrap_or(false),
                         _ => false,
                     };
+                    // Observability: capture the datasource, query name, and the
+                    // bound parameters now, before the QoQ/driver branches below
+                    // consume `args`. Only when a QUERY-interested observer is
+                    // attached, so a normal request pays nothing.
+                    #[cfg(feature = "observability")]
+                    let __obs_query_meta: Option<(
+                        String,
+                        String,
+                        bool,
+                        Vec<observe::QueryParam>,
+                    )> = if self.interest.contains(observe::Interest::QUERY) {
+                            let params = Self::extract_query_params(args.get(1));
+                            match args.get(2) {
+                                Some(CfmlValue::Struct(opts)) => Some((
+                                    opts.get_ci("datasource").map(|v| v.as_string()).unwrap_or_default(),
+                                    opts.get_ci("name").map(|v| v.as_string()).unwrap_or_default(),
+                                    is_qoq,
+                                    params,
+                                )),
+                                _ => Some((String::new(), String::new(), is_qoq, params)),
+                            }
+                        } else {
+                            None
+                        };
                     // Measure wall-clock execution time of the driver
                     // round-trip (Lucee's `executionTime`, in ms). Monotonic
                     // clock isn't available on wasm32, so it reports 0 there.
@@ -11498,6 +11902,12 @@ impl CfmlVirtualMachine {
                     let exec_ms = __query_start.elapsed().as_millis() as i64;
                     #[cfg(target_arch = "wasm32")]
                     let exec_ms = 0i64;
+                    // Microsecond precision for the debug footer (Lucee stores
+                    // query times in µs); measured at the same point as exec_ms.
+                    #[cfg(all(feature = "observability", not(target_arch = "wasm32")))]
+                    let exec_us = __query_start.elapsed().as_micros() as i64;
+                    #[cfg(all(feature = "observability", target_arch = "wasm32"))]
+                    let exec_us = 0i64;
 
                     // Record execution time (and the originating SQL, if the
                     // driver/QoQ path didn't already) on the Query itself so
@@ -11592,6 +12002,34 @@ impl CfmlVirtualMachine {
                     }
                     if !deliveries.is_empty() {
                         self.pending_result_writeback = Some(deliveries);
+                    }
+                    // Observability: fire the `query` hook (debug footer, OTel).
+                    // Reuses `exec_ms` and the meta captured before `args` was
+                    // consumed. QoQ reports a synthetic "query" datasource.
+                    #[cfg(feature = "observability")]
+                    if let Some((ds_name, q_name, was_qoq, params)) = __obs_query_meta {
+                        let datasource = if was_qoq && ds_name.is_empty() {
+                            "query".to_string()
+                        } else {
+                            ds_name
+                        };
+                        let rowcount = match &ret {
+                            CfmlValue::Query(q) => q.row_count() as i64,
+                            CfmlValue::Array(a) => a.len() as i64,
+                            _ => 0,
+                        };
+                        let src = self.source_file.clone().unwrap_or_default();
+                        self.fire_query(&observe::QueryEvent {
+                            name: &q_name,
+                            sql: &sql_text,
+                            datasource: &datasource,
+                            rowcount,
+                            elapsed_us: exec_us,
+                            cached: false,
+                            src: &src,
+                            line: self.current_line,
+                            params: &params,
+                        });
                     }
                     return Ok(ret);
                 }
@@ -11798,6 +12236,48 @@ impl CfmlVirtualMachine {
                             .map(|(_, v)| v.as_string())
                             .unwrap_or_else(|| "application".to_string());
                         eprintln!("[CFLOG {}:{}] {}", file, log_type, text);
+                        // Observability: feed the footer's trace/log section.
+                        #[cfg(feature = "observability")]
+                        if self.interest.contains(observe::Interest::LOG) {
+                            if let Some(o) = &self.observer {
+                                o.on_log(&observe::LogEvent {
+                                    text: &text,
+                                    log_type: &log_type,
+                                    file: &file,
+                                });
+                            }
+                        }
+                    }
+                    return Ok(CfmlValue::Null);
+                }
+                #[cfg(feature = "observability")]
+                "getdebugdata" => {
+                    // The structured DebugData (Lucee's getPageContext().
+                    // getDebugger().getDebuggingData() equivalent). Empty struct
+                    // when the footer isn't active this request.
+                    return Ok(self.debug_data_cfml());
+                }
+                #[cfg(feature = "observability")]
+                "isdebugmode" => {
+                    return Ok(CfmlValue::Bool(self.is_debug_mode()));
+                }
+                #[cfg(feature = "observability")]
+                "debugadd" => {
+                    // debugAdd(category, name, value) OR debugAdd(category, struct)
+                    // — append rows to the genericData section (custom panels).
+                    let category = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    match args.get(1) {
+                        Some(CfmlValue::Struct(s)) => {
+                            for (k, v) in s.snapshot() {
+                                self.debug_add(&category, &k, &v.as_string());
+                            }
+                        }
+                        Some(v) => {
+                            let name = v.as_string();
+                            let value = args.get(2).map(|x| x.as_string()).unwrap_or_default();
+                            self.debug_add(&category, &name, &value);
+                        }
+                        None => {}
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -11872,6 +12352,19 @@ impl CfmlVirtualMachine {
                             if secs > 0.0 {
                                 self.request_timeout_ms = (secs * 1000.0) as i64;
                             }
+                        }
+                        // showDebugOutput — page-level suppress-only gate for the
+                        // classic debug footer (Adobe/Lucee). Only ever turns it
+                        // off; can never bypass the IP/trigger gates.
+                        #[cfg(feature = "observability")]
+                        if let Some((_, v)) = opts
+                            .iter()
+                            .find(|(k, _)| k.to_lowercase() == "showdebugoutput")
+                        {
+                            self.show_debug_output = matches!(
+                                v.as_string().to_lowercase().as_str(),
+                                "true" | "yes" | "1"
+                            );
                         }
                     }
                     return Ok(CfmlValue::Null);
@@ -14882,7 +15375,40 @@ impl CfmlVirtualMachine {
         func.clone()
     }
 
+    /// Public entry for a CFC method call. When the debug footer is active this
+    /// times the call and records it against the receiver component's source
+    /// file (Lucee's Templates/pages section aggregates per file, so every CFC
+    /// method call — including `Application.cfc` lifecycle methods reached this
+    /// way — contributes to that file's row). Otherwise it's a direct passthrough.
     fn call_member_function(
+        &mut self,
+        object: &CfmlValue,
+        method: &str,
+        extra_args: &mut Vec<CfmlValue>,
+        arg_names: Option<&[String]>,
+    ) -> CfmlResult {
+        #[cfg(feature = "observability")]
+        {
+            if self.interest.contains(observe::Interest::TEMPLATE) {
+                let src = match object {
+                    CfmlValue::Struct(s) => s
+                        .get_ci("__source_file")
+                        .map(|v| v.as_string())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
+                if let Some(src) = src {
+                    let start = std::time::Instant::now();
+                    let r = self.call_member_function_impl(object, method, extra_args, arg_names);
+                    self.fire_template(&src, start.elapsed().as_micros() as i64);
+                    return r;
+                }
+            }
+        }
+        self.call_member_function_impl(object, method, extra_args, arg_names)
+    }
+
+    fn call_member_function_impl(
         &mut self,
         object: &CfmlValue,
         method: &str,
@@ -20128,6 +20654,14 @@ impl CfmlVirtualMachine {
 
         // Resolve inheritance (e.g. extends="taffy.core.api")
         let resolved = self.resolve_inheritance(template, &ValueMap::default());
+        // Stamp the source path so the observability layer (debug footer) can
+        // attribute Application.cfc lifecycle executions to it, and so any
+        // `__source_file` reader sees the app component's own path.
+        if let Some(s) = resolved.as_cfml_struct() {
+            if s.get_ci("__source_file").is_none() {
+                s.insert("__source_file".to_string(), CfmlValue::string(path.to_string()));
+            }
+        }
         Ok(Some(resolved))
     }
 
@@ -20381,8 +20915,37 @@ impl CfmlVirtualMachine {
         )
     }
 
-    /// Call a lifecycle method on the Application.cfc template
+    /// Call a lifecycle method on the Application.cfc template. When the debug
+    /// footer is active, time it and record it against Application.cfc's source
+    /// file so the Templates section shows Application.cfc (Lucee parity).
     fn call_lifecycle_method(
+        &mut self,
+        template: &mut CfmlValue,
+        method: &str,
+        args: Vec<CfmlValue>,
+    ) -> Result<bool, CfmlError> {
+        #[cfg(feature = "observability")]
+        {
+            if self.interest.contains(observe::Interest::TEMPLATE) {
+                let src = match template {
+                    CfmlValue::Struct(ref s) => s
+                        .get_ci("__source_file")
+                        .map(|v| v.as_string())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
+                if let Some(src) = src {
+                    let start = std::time::Instant::now();
+                    let r = self.call_lifecycle_method_impl(template, method, args);
+                    self.fire_template(&src, start.elapsed().as_micros() as i64);
+                    return r;
+                }
+            }
+        }
+        self.call_lifecycle_method_impl(template, method, args)
+    }
+
+    fn call_lifecycle_method_impl(
         &mut self,
         template: &mut CfmlValue,
         method: &str,
@@ -22261,5 +22824,111 @@ fn convert_query_return(value: CfmlValue, return_type: &str, column_key: Option<
             value
         }
         _ => value,
+    }
+}
+
+/// Activation-gate tests for the classic debug footer (Phase 1). Drives the
+/// gate logic directly so they don't depend on a real client socket.
+#[cfg(all(test, feature = "observability"))]
+mod debug_footer_gate_tests {
+    use super::*;
+
+    fn vm() -> CfmlVirtualMachine {
+        CfmlVirtualMachine::new(BytecodeProgram { functions: vec![] })
+    }
+
+    fn scope(pairs: &[(&str, &str)]) -> CfmlValue {
+        let mut m = ValueMap::default();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), CfmlValue::string(*v));
+        }
+        CfmlValue::strukt(m)
+    }
+
+    #[test]
+    fn disabled_blocks_everything() {
+        let mut vm = vm();
+        vm.web_context = true;
+        vm.globals
+            .insert("cgi".into(), scope(&[("remote_addr", "127.0.0.1")]));
+        // enabled defaults false → fail-closed
+        assert!(!vm.footer_activation_allowed());
+        vm.maybe_install_debug_collector();
+        assert!(!vm.is_debug_mode());
+    }
+
+    #[test]
+    fn ip_whitelist_gate() {
+        let mut vm = vm();
+        vm.web_context = true;
+        vm.debug_config.enabled = true;
+        vm.globals.insert("url".into(), scope(&[]));
+        // default show_from_ips includes 127.0.0.1
+        vm.globals
+            .insert("cgi".into(), scope(&[("remote_addr", "127.0.0.1")]));
+        assert!(vm.footer_activation_allowed());
+        // a non-whitelisted IP with no trigger gets nothing
+        vm.globals
+            .insert("cgi".into(), scope(&[("remote_addr", "203.0.113.5")]));
+        assert!(!vm.footer_activation_allowed());
+    }
+
+    #[test]
+    fn url_trigger_custom_param_and_value() {
+        let mut vm = vm();
+        vm.web_context = true;
+        vm.debug_config.enabled = true;
+        vm.debug_config.show_from_ips = vec![]; // IP gate closed
+        vm.debug_config.url_trigger.param = "myhiddenvar".into();
+        vm.debug_config.url_trigger.value = "s3cr3t".into();
+        vm.globals
+            .insert("cgi".into(), scope(&[("remote_addr", "203.0.113.5")]));
+        // correct secret → allowed
+        vm.globals
+            .insert("url".into(), scope(&[("myhiddenvar", "s3cr3t")]));
+        assert!(vm.footer_activation_allowed());
+        // wrong value → refused
+        vm.globals
+            .insert("url".into(), scope(&[("myhiddenvar", "wrong")]));
+        assert!(!vm.footer_activation_allowed());
+        // the default ?debug=true must NOT match a renamed param
+        vm.globals.insert("url".into(), scope(&[("debug", "true")]));
+        assert!(!vm.footer_activation_allowed());
+    }
+
+    #[test]
+    fn install_then_gate3_suppression_and_render() {
+        let mut vm = vm();
+        vm.web_context = true;
+        vm.debug_config.enabled = true;
+        vm.globals
+            .insert("cgi".into(), scope(&[("remote_addr", "127.0.0.1")]));
+        vm.globals.insert("url".into(), scope(&[]));
+        vm.maybe_install_debug_collector();
+        assert!(vm.is_debug_mode());
+
+        // gate 3: <cfsetting showDebugOutput="false"> suppresses
+        vm.show_debug_output = false;
+        vm.maybe_render_debug_footer();
+        assert!(vm.output_buffer.is_empty());
+
+        // re-enabled → the footer renders into the output buffer
+        vm.show_debug_output = true;
+        vm.maybe_render_debug_footer();
+        assert!(vm.output_buffer.contains("RustCFML Debug"));
+    }
+
+    #[test]
+    fn gate4_non_html_content_type_suppresses() {
+        let mut vm = vm();
+        vm.web_context = true;
+        vm.debug_config.enabled = true;
+        vm.globals
+            .insert("cgi".into(), scope(&[("remote_addr", "127.0.0.1")]));
+        vm.globals.insert("url".into(), scope(&[]));
+        vm.maybe_install_debug_collector();
+        vm.response_content_type = Some("application/json".into());
+        vm.maybe_render_debug_footer();
+        assert!(vm.output_buffer.is_empty());
     }
 }

@@ -1,0 +1,47 @@
+<cfscript>
+// Classic CF debug-footer BIFs (Phase 1 of the observability plan).
+//
+// These BIFs (isDebugMode / getDebugData / debugAdd) are RustCFML/Lucee-style
+// debug surface, so the assertions are guarded to RustCFML — Lucee does not
+// expose this exact trio. tests/.cfconfig.json sets `debugging.enabled = true`
+// and the CLI runner is loopback, so the footer's activation gates pass and the
+// per-request collector IS active here (the HTML panel itself is web-only and
+// not appended to CLI stdout — see maybe_render_debug_footer). Footer rendering
+// + the IP/URL-trigger gates are covered by the Rust gate tests in
+// crates/cfml-vm/src/lib.rs (`debug_footer_gate_tests`).
+suiteBegin("Debug footer BIFs");
+
+if (isRustCFML()) {
+    // isDebugMode(): boolean. True here because debugging is enabled in
+    // tests/.cfconfig.json and the runner runs from a whitelisted (loopback) IP.
+    var dm = isDebugMode();
+    assert("isDebugMode returns boolean", isBoolean(dm), true);
+    assert("isDebugMode true when footer active", dm, true);
+
+    // getDebugData(): a struct with the Lucee-shaped sections.
+    var dd = getDebugData();
+    assert("getDebugData returns a struct", isStruct(dd), true);
+    assert("getDebugData has queries array", isArray(dd.queries), true);
+    assert("getDebugData has genericData array", isArray(dd.genericData), true);
+    assert("getDebugData has total", structKeyExists(dd, "total"), true);
+
+    // debugAdd(): the genericData channel. A row added must surface in the next
+    // getDebugData() read.
+    var before = arrayLen(getDebugData().genericData);
+    debugAdd("DebugFooterTest", "marker", "hello");
+    var after = getDebugData().genericData;
+    assert("debugAdd appended a genericData row", arrayLen(after) == before + 1, true);
+    var last = after[arrayLen(after)];
+    assert("debugAdd row category", last.category, "DebugFooterTest");
+    assert("debugAdd row name", last.name, "marker");
+    assert("debugAdd row value", last.value, "hello");
+
+    // debugAdd(category, struct) form: one row per struct key.
+    var b2 = arrayLen(getDebugData().genericData);
+    debugAdd("DebugFooterTest", { "k1": "v1", "k2": "v2" });
+    assert("debugAdd struct form added two rows",
+        arrayLen(getDebugData().genericData) == b2 + 2, true);
+}
+
+suiteEnd();
+</cfscript>
