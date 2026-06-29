@@ -11523,6 +11523,12 @@ impl CfmlVirtualMachine {
                                 | "coldfusion.runtime.java.javaproxy" => {
                                     Ok(java_shims::make_deferred_java(&args[1].as_string()))
                                 }
+                                // Legacy Preside password hashing. The shim's
+                                // gensalt/hashpw/checkpw route to the native
+                                // bcrypt builtins (see handle_jbcrypt_method).
+                                "org.mindrot.jbcrypt.bcrypt" => {
+                                    java_shims::handle_java_bcrypt("init", empty_args, &CfmlValue::Null)
+                                }
                                 _ => Err(CfmlError::runtime(format!(
                                     "createObject: Java class [{}] is not supported. \
                                      RustCFML has no JVM, so only a curated set of \
@@ -15220,6 +15226,59 @@ impl CfmlVirtualMachine {
         matches!(builtin_lc, "directorylist")
     }
 
+    /// Route legacy `org.mindrot.jbcrypt.BCrypt` instance methods onto the native
+    /// bcrypt builtins. `gensalt` returns a pure cost-carrying token (the random
+    /// salt is generated inside `hashpw`); `hashpw`/`checkpw` delegate to
+    /// `BCryptHash`/`BCryptVerify`. Lets legacy Preside's BCryptService work with
+    /// no JVM. The crypto crate lives in cfml-stdlib, so we reach it via the
+    /// builtin table rather than depending on it here.
+    fn handle_jbcrypt_method(&self, method: &str, args: Vec<CfmlValue>) -> CfmlResult {
+        let call = |vm: &Self, name: &str, a: Vec<CfmlValue>| -> CfmlResult {
+            if let Some(b) = vm.builtins.get(name) {
+                return b(a);
+            }
+            let nl = name.to_lowercase();
+            if let Some((_, b)) = vm.builtins.iter().find(|(k, _)| k.eq_ignore_ascii_case(&nl)) {
+                return b(a);
+            }
+            Err(CfmlError::runtime(format!(
+                "BCrypt shim: builtin [{}] unavailable (built without the `security` feature?)",
+                name
+            )))
+        };
+        match method {
+            "gensalt" => {
+                let wf = args
+                    .first()
+                    .and_then(|v| v.as_string().trim().parse::<i64>().ok())
+                    .unwrap_or(10)
+                    .clamp(4, 31);
+                Ok(CfmlValue::string(format!("$2a${:02}$", wf)))
+            }
+            "hashpw" => {
+                let pw = args.first().cloned().unwrap_or_else(|| CfmlValue::string(String::new()));
+                // jBCrypt salt encodes the cost as the 3rd '$'-delimited field
+                // ("$2a$10$..."); fall back to 10.
+                let cost = args
+                    .get(1)
+                    .map(|v| v.as_string())
+                    .and_then(|s| s.split('$').nth(2).and_then(|c| c.parse::<i64>().ok()))
+                    .unwrap_or(10)
+                    .clamp(4, 31);
+                call(self, "bcryptHash", vec![pw, CfmlValue::Int(cost)])
+            }
+            "checkpw" => {
+                let plain = args.first().cloned().unwrap_or_else(|| CfmlValue::string(String::new()));
+                let hashed = args.get(1).cloned().unwrap_or_else(|| CfmlValue::string(String::new()));
+                call(self, "bcryptVerify", vec![plain, hashed])
+            }
+            other => Err(CfmlError::runtime(format!(
+                "org.mindrot.jbcrypt.BCrypt shim has no method [{}]",
+                other
+            ))),
+        }
+    }
+
     /// Lucee/ACF implicit accessor constructor. A component declared with
     /// `accessors=true` and NO explicit `init()` gets a generated constructor
     /// that maps NAMED constructor arguments (and an `argumentCollection`
@@ -16045,6 +16104,7 @@ impl CfmlVirtualMachine {
                 let all_args: Vec<CfmlValue> = std::mem::take(extra_args);
                 let m = method_lower.clone();
                 let result = match java_class.as_str() {
+                    "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
                     "java.security.messagedigest" => {
                         handle_java_messagedigest(&m, all_args, object)
                     }

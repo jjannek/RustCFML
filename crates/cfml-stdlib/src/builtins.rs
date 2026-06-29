@@ -15,7 +15,7 @@
 //! - System functions
 
 use cfml_common::dynamic::{build_implements_meta, CfmlAccess, CfmlClosureBody, CfmlFunction, CfmlQuery, CfmlQueryData, CfmlStruct, CfmlValue, ValueMap};
-use cfml_common::vm::{CfmlError, CfmlErrorType, CfmlResult};
+use cfml_common::vm::{CfmlError, CfmlResult};
 use std::collections::HashMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
@@ -927,6 +927,10 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
         f.insert("generatePBKDFKey".into(), fn_generate_pbkdf_key);
         f.insert("generateBCryptHash".into(), fn_generate_bcrypt_hash);
         f.insert("verifyBCryptHash".into(), fn_verify_bcrypt_hash);
+        // Lucee crypto-extension modern names (GenerateBCryptHash/VerifyBCryptHash
+        // are the deprecated predecessors).
+        f.insert("bcryptHash".into(), fn_bcrypt_hash);
+        f.insert("bcryptVerify".into(), fn_bcrypt_verify);
         f.insert("generateSCryptHash".into(), fn_generate_scrypt_hash);
         f.insert("verifySCryptHash".into(), fn_verify_scrypt_hash);
         f.insert("generateArgon2Hash".into(), fn_generate_argon2_hash);
@@ -7435,13 +7439,10 @@ pub(crate) fn resolve_query_datasource(name: &str) -> Result<String, CfmlError> 
         // type="database"` probes work. Preside's test-suite Application.cfc
         // (`_dsnExists()` → `dbinfo` wrapped in `catch( database e )`) relies on
         // exactly this to detect whether its datasource has been registered yet.
-        return Err(CfmlError::new(
-            format!(
-                "datasource [{}] could not be found. Define it in this.datasources or .cfconfig.json, or pass a connection string.",
-                name
-            ),
-            CfmlErrorType::Custom("database".to_string()),
-        ));
+        return Err(CfmlError::database(format!(
+            "datasource [{}] could not be found. Define it in this.datasources or .cfconfig.json, or pass a connection string.",
+            name
+        )));
     }
     Ok(resolved)
 }
@@ -14455,6 +14456,56 @@ fn fn_verify_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
         .unwrap_or(false);
 
     Ok(CfmlValue::Bool(result))
+}
+
+/// BCryptHash( input, cost=10 ) — Lucee crypto-extension BIF. Generates a salted
+/// bcrypt hash (each call differs); `cost` is the work factor 4-31. Modern name
+/// for the deprecated GenerateBCryptHash().
+#[cfg(feature = "security")]
+fn fn_bcrypt_hash(args: Vec<CfmlValue>) -> CfmlResult {
+    if args.is_empty() {
+        return Err(CfmlError::runtime(
+            "BCryptHash requires at least 1 argument: input".to_string(),
+        ));
+    }
+    let input = get_str(&args, 0);
+    let cost = if args.len() >= 2 { get_int(&args, 1) as u32 } else { 10 };
+    if !(4..=31).contains(&cost) {
+        return Err(CfmlError::runtime(format!(
+            "BCryptHash: cost must be between 4 and 31, got {}",
+            cost
+        )));
+    }
+    // Emit the `$2a$` variant (jBCrypt-compatible) so hashes are interchangeable
+    // with the org.mindrot.jbcrypt.BCrypt shim and reference engines.
+    let parts = bcrypt::hash_with_result(input.as_bytes(), cost)
+        .map_err(|e| CfmlError::runtime(format!("BCryptHash error: {}", e)))?;
+    Ok(CfmlValue::string(parts.format_for_version(bcrypt::Version::TwoA)))
+}
+
+/// BCryptVerify( input, hash, throwOnError=false ) — Lucee crypto-extension BIF.
+/// The cost factor is encoded in the hash. Returns false on a malformed hash
+/// unless `throwOnError` is true. Modern name for the deprecated VerifyBCryptHash().
+#[cfg(feature = "security")]
+fn fn_bcrypt_verify(args: Vec<CfmlValue>) -> CfmlResult {
+    if args.len() < 2 {
+        return Err(CfmlError::runtime(
+            "BCryptVerify requires 2 arguments: input, hash".to_string(),
+        ));
+    }
+    let input = get_str(&args, 0);
+    let hash = get_str(&args, 1);
+    let throw_on_error = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+    match bcrypt::verify(input.as_bytes(), &hash) {
+        Ok(ok) => Ok(CfmlValue::Bool(ok)),
+        Err(e) => {
+            if throw_on_error {
+                Err(CfmlError::runtime(format!("BCryptVerify error: {}", e)))
+            } else {
+                Ok(CfmlValue::Bool(false))
+            }
+        }
+    }
 }
 
 /// generateSCryptHash(password)

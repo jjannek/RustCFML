@@ -4,6 +4,25 @@ use cfml_common::dynamic::{CfmlValue, ValueMap};
 use cfml_common::vm::{CfmlError, CfmlResult};
 use chrono::{Datelike, NaiveDateTime, Timelike};
 
+/// `org.mindrot.jbcrypt.BCrypt` construction. Returns a marker shim; the actual
+/// gensalt/hashpw/checkpw method calls are routed (VM-side) to the pure-Rust
+/// bcrypt builtins (the crypto crate lives in cfml-stdlib, not cfml-vm). This
+/// lets legacy Preside's BCryptService work without a JVM while the canonical
+/// BCryptHash()/BCryptVerify() BIFs give native bcrypt to all RustCFML code.
+pub fn handle_java_bcrypt(
+    _method: &str,
+    _args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    let mut shim = ValueMap::default();
+    shim.insert(
+        "__java_class".to_string(),
+        CfmlValue::string("org.mindrot.jbcrypt.bcrypt".to_string()),
+    );
+    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    Ok(CfmlValue::strukt(shim))
+}
+
 pub fn handle_java_messagedigest(
     method: &str,
     args: Vec<CfmlValue>,
