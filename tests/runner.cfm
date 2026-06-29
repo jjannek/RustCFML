@@ -176,6 +176,8 @@ include "harness.cfm";
 <cf_runtest file="functions/test_encodeforhtmlattribute_space_equals.cfm">
 <cf_runtest file="stdlib/test_array_functions.cfm">
 <cf_runtest file="stdlib/test_array_find_complex.cfm">
+<cf_runtest file="stdlib/test_arraysort_callback.cfm">
+<cf_runtest file="stdlib/test_dateadd_invalid_datepart.cfm">
 <cf_runtest file="stdlib/test_array_higher_order.cfm">
 <cf_runtest file="stdlib/test_struct_functions.cfm">
 <cf_runtest file="stdlib/test_struct_higher_order.cfm">

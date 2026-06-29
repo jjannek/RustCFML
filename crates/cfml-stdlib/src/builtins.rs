@@ -4175,7 +4175,16 @@ fn fn_date_add(args: Vec<CfmlValue>) -> CfmlResult {
         "n" => chrono::Duration::try_minutes(number).and_then(|x| dt.checked_add_signed(x)),
         "s" => chrono::Duration::try_seconds(number).and_then(|x| dt.checked_add_signed(x)),
         "l" => chrono::Duration::try_milliseconds(number).and_then(|x| dt.checked_add_signed(x)),
-        _ => Some(dt),
+        // Unknown datepart: Lucee/ACF throw an `expression` error rather than
+        // silently no-op'ing. Frameworks rely on the throw — e.g. Preside's
+        // RulesEngineTimePeriodService wraps dateAdd in try/catch and returns an
+        // empty struct when the user-supplied unit is invalid.
+        _ => {
+            return Err(CfmlError::expression(format!(
+                "invalid datepart identifier [{}] for function dateAdd",
+                get_str(&args, 0)
+            )));
+        }
     };
 
     match result {
@@ -4209,7 +4218,14 @@ fn fn_date_diff(args: Vec<CfmlValue>) -> CfmlResult {
         "n" => (date2 - date1).num_minutes(),
         "s" => (date2 - date1).num_seconds(),
         "l" => (date2 - date1).num_milliseconds(),
-        _ => 0,
+        // Unknown datepart: Lucee/ACF throw an `expression` error (mirrors the
+        // dateAdd fix) rather than silently returning 0.
+        _ => {
+            return Err(CfmlError::expression(format!(
+                "invalid datepart identifier [{}] for function dateDiff",
+                get_str(&args, 0)
+            )));
+        }
     };
     Ok(CfmlValue::Int(diff))
 }

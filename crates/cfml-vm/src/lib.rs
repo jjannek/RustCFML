@@ -8930,6 +8930,56 @@ impl CfmlVirtualMachine {
             // Higher-order functions must be handled BEFORE regular builtins
             // because they need VM access to invoke closures
             match name_lower.as_str() {
+                // `arraySort( arr, comparatorFn )` — the callback-comparator form
+                // needs to run the CFML closure per comparison, so it must be
+                // VM-intercepted (the member `arr.sort(fn)` form already is). The
+                // raw builtin can't invoke a closure and stringified it into a
+                // text sort, leaving the array effectively unsorted (Preside
+                // RulesEngineExpressionService.listExpressions orders via
+                // `ArraySort(list, fn)`). The string sort-type form
+                // (`arraySort(arr,"numeric")`) fails this guard and falls through
+                // to the regular builtin.
+                "arraysort" if matches!(args.get(1), Some(CfmlValue::Function(_))) => {
+                    if let Some(CfmlValue::Array(arr)) = args.first() {
+                        let callback = args[1].clone();
+                        let mut items = arr.snapshot();
+                        // Stable insertion sort (swap only on strictly > 0, so
+                        // equal elements keep their relative order). Mirrors the
+                        // `arr.sort(fn)` member handler.
+                        let n = items.len();
+                        let mut i = 1;
+                        while i < n {
+                            let mut j = i;
+                            while j > 0 {
+                                let cb_args = vec![items[j - 1].clone(), items[j].clone()];
+                                self.closure_parent_writeback = None;
+                                let r = self.call_function(&callback, cb_args, parent_locals)?;
+                                if let Some(ref wb) = self.closure_parent_writeback {
+                                    Self::write_back_to_captured_scope(&callback, wb);
+                                }
+                                let cmp = match r {
+                                    CfmlValue::Int(v) => v,
+                                    CfmlValue::Double(d) => d as i64,
+                                    CfmlValue::Bool(b) => if b { 1 } else { 0 },
+                                    CfmlValue::String(ref s) => {
+                                        s.trim().parse::<f64>().unwrap_or(0.0) as i64
+                                    }
+                                    _ => 0,
+                                };
+                                if cmp > 0 {
+                                    items.swap(j - 1, j);
+                                    j -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        arr.with_write(|v| *v = items);
+                        return Ok(args[0].clone());
+                    }
+                    return Ok(CfmlValue::Bool(true));
+                }
                 "arraymap"
                 | "arrayfilter"
                 | "arrayreduce"

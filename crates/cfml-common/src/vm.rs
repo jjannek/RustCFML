@@ -49,6 +49,14 @@ impl CfmlError {
     pub fn database(message: String) -> Self {
         Self::new(message, CfmlErrorType::Custom("database".to_string()))
     }
+
+    /// A catchable `expression`-typed exception, matching how Lucee/ACF surface
+    /// expression-evaluation errors (e.g. an invalid datepart passed to
+    /// `dateAdd`/`dateDiff`). CFML code does `catch( expression e )` and many
+    /// guards `try{}catch(any e){}` around these, so they must arrive typed.
+    pub fn expression(message: String) -> Self {
+        Self::new(message, CfmlErrorType::Expression)
+    }
 }
 
 impl std::fmt::Display for CfmlErrorType {
