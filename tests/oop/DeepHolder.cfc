@@ -19,4 +19,16 @@ component accessors="true" {
 		return variables.inner.whoAmI();
 	}
 
+	function probeMixedCase(){
+		// GH #219: same deep-path chain, but the source-text scope path uses a
+		// DIFFERENT casing (`variables.Inner`) than the canonical stored key
+		// (`inner`). The chained-CFC identity guard walked the write-back path
+		// case-sensitively, so it failed to reach the leaf, stayed disarmed, and
+		// let the foreign DeepStore (`getStore()`'s return) clobber
+		// variables.inner. (This is the TestBox BDDRunner async path:
+		// `variables.testBox.getUtility().slugify(...)`, canonical key `testbox`.)
+		variables.Inner.getStore().whoAmI();
+		return variables.inner.whoAmI();
+	}
+
 }

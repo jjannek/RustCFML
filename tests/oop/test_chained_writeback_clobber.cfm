@@ -33,6 +33,16 @@ dh.setInner( new DeepInner() );
 dh.getInner().setStore( new DeepStore() );
 assert("deep chained mutating call does not clobber the 2-segment base", dh.probe(), "Inner");
 
+// GH #219: deep chained call where the source-text scope path casing differs
+// from the canonical stored key (`variables.Inner` vs `inner`). The identity
+// guard walked the write-back path case-sensitively, missed the leaf, and let
+// the chained call's foreign return value clobber the base. (TestBox BDDRunner
+// async path: `variables.testBox.getUtility().slugify(...)`, stored `testbox`.)
+dh2 = new DeepHolder();
+dh2.setInner( new DeepInner() );
+dh2.getInner().setStore( new DeepStore() );
+assert("mixed-case deep chained call does not clobber the base", dh2.probeMixedCase(), "Inner");
+
 // In-place array member fn chained on a method that RETURNS AN ARRAY:
 // `o.getItems().sort()` sorts the returned array, but codegen propagates the
 // writeback path (["o"]) to the outer .sort(), so the sorted array was written

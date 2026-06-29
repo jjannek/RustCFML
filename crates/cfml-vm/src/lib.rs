@@ -7253,8 +7253,15 @@ impl CfmlVirtualMachine {
                                 {
                                     let mut node = root_obj.clone();
                                     let mut reached = true;
+                                    // CFML keys are case-insensitive: the write-back
+                                    // path is captured from source text, whose casing
+                                    // may differ from the canonical stored key (e.g.
+                                    // `variables.testBox` vs the stored `testbox`). A
+                                    // case-sensitive walk would fail to reach the leaf,
+                                    // leave the guard disarmed, and clobber the variable
+                                    // with the chained call's foreign return value.
                                     for part in props {
-                                        match node.get(part) {
+                                        match node.get_ci(part) {
                                             Some(v) => node = v,
                                             None => { reached = false; break; }
                                         }
@@ -7390,8 +7397,14 @@ impl CfmlVirtualMachine {
                                         self.scope_aware_load(var_name, &locals)
                                     {
                                         let mut reached = true;
+                                        // Case-insensitive walk: source-text path casing
+                                        // (`variables.testBox`) may differ from the stored
+                                        // key (`testbox`). A case-sensitive walk misses the
+                                        // leaf, disarms this chained-CFC guard, and lets a
+                                        // chained call's foreign `this` clobber the variable
+                                        // (TestBox BDDRunner async path, GH #219).
                                         for part in &path[1..] {
-                                            match node.get(part) {
+                                            match node.get_ci(part) {
                                                 Some(v) => node = v,
                                                 None => { reached = false; break; }
                                             }
