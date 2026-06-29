@@ -2242,11 +2242,58 @@ fn fn_array_insert_at(args: Vec<CfmlValue>) -> CfmlResult {
     }
 }
 
+/// Deep, order-insensitive value equality for the array find/contains family.
+/// Lucee's `arrayFind`/`arrayContains` match COMPLEX needles (structs/arrays)
+/// by deep equality — struct keys compare case-insensitively and regardless of
+/// insertion order, arrays compare element-wise. Scalars fall back to the same
+/// string comparison the callers used before (so numeric `20` still matches the
+/// string `"20"`); `nocase` lowercases scalar comparisons.
+fn cfml_deep_equal(a: &CfmlValue, b: &CfmlValue, nocase: bool) -> bool {
+    match (a, b) {
+        (CfmlValue::Struct(sa), CfmlValue::Struct(sb)) => {
+            if sa.len() != sb.len() {
+                return false;
+            }
+            for (k, va) in sa.iter() {
+                match sb.get_ci(&k) {
+                    Some(vb) => {
+                        if !cfml_deep_equal(&va, &vb, nocase) {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            true
+        }
+        (CfmlValue::Array(aa), CfmlValue::Array(ab)) => {
+            let sa = aa.snapshot();
+            let sb = ab.snapshot();
+            sa.len() == sb.len()
+                && sa
+                    .iter()
+                    .zip(sb.iter())
+                    .all(|(x, y)| cfml_deep_equal(x, y, nocase))
+        }
+        // A complex value never equals a scalar (or a struct-vs-array mismatch).
+        (CfmlValue::Struct(_), _) | (_, CfmlValue::Struct(_)) => false,
+        (CfmlValue::Array(_), _) | (_, CfmlValue::Array(_)) => false,
+        _ => {
+            if nocase {
+                a.as_string().eq_ignore_ascii_case(&b.as_string())
+            } else {
+                a.as_string() == b.as_string()
+            }
+        }
+    }
+}
+
 fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let Some(arr) = args[0].as_array() {
-            let needle = args[1].as_string();
-            return Ok(CfmlValue::Bool(arr.iter().any(|v| v.as_string() == needle)));
+            return Ok(CfmlValue::Bool(
+                arr.iter().any(|v| cfml_deep_equal(&v, &args[1], false)),
+            ));
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -2255,9 +2302,8 @@ fn fn_array_contains(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_contains_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let Some(arr) = args[0].as_array() {
-            let needle = args[1].as_string().to_lowercase();
             return Ok(CfmlValue::Bool(
-                arr.iter().any(|v| v.as_string().to_lowercase() == needle),
+                arr.iter().any(|v| cfml_deep_equal(&v, &args[1], true)),
             ));
         }
     }
@@ -2267,9 +2313,8 @@ fn fn_array_contains_no_case(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let needle = args[1].as_string();
             for (i, v) in arr.iter().enumerate() {
-                if v.as_string() == needle {
+                if cfml_deep_equal(&v, &args[1], false) {
                     return Ok(CfmlValue::Int((i + 1) as i64));
                 }
             }
@@ -2281,9 +2326,8 @@ fn fn_array_find(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_find_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let needle = args[1].as_string().to_lowercase();
             for (i, v) in arr.iter().enumerate() {
-                if v.as_string().to_lowercase() == needle {
+                if cfml_deep_equal(&v, &args[1], true) {
                     return Ok(CfmlValue::Int((i + 1) as i64));
                 }
             }
@@ -2565,9 +2609,8 @@ fn fn_array_delete(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_find_all(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let value = args[1].as_string();
             let indices: Vec<CfmlValue> = arr.iter().enumerate()
-                .filter(|(_, v)| v.as_string() == value)
+                .filter(|(_, v)| cfml_deep_equal(v, &args[1], false))
                 .map(|(i, _)| CfmlValue::Int((i + 1) as i64))
                 .collect();
             return Ok(CfmlValue::array(indices));
@@ -2579,9 +2622,8 @@ fn fn_array_find_all(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_array_find_all_no_case(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
         if let CfmlValue::Array(arr) = &args[0] {
-            let value = args[1].as_string().to_lowercase();
             let indices: Vec<CfmlValue> = arr.iter().enumerate()
-                .filter(|(_, v)| v.as_string().to_lowercase() == value)
+                .filter(|(_, v)| cfml_deep_equal(v, &args[1], true))
                 .map(|(i, _)| CfmlValue::Int((i + 1) as i64))
                 .collect();
             return Ok(CfmlValue::array(indices));
