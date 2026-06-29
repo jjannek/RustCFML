@@ -88,24 +88,51 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 
 ## Documentation
 
+### Build & run
+
 | Topic | Description |
 |---|---|
 | **[Getting Started](docs/getting-started.md)** | Prebuilt binaries, running files, REPL, shebang scripts, building from source |
 | **[Web Server](docs/web-server.md)** | Serve mode, Application.cfc lifecycle, URL rewriting, distributed sessions |
 | **[Sessions](docs/sessions.md)** | The `session` scope, lazy default, the `CFID` cookie & `this.sessioncookie`, storage backends, expiry |
 | **[Configuration](docs/configuration.md)** | `.cfconfig.json` — datasources, mappings, mail, security, caches, env vars |
-| **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
+
+### Data
+
+| Topic | Description |
+|---|---|
 | **[Database](docs/database.md)** | `queryExecute`, datasources, `cfqueryparam`, engine specifics |
-| **[Debugging](docs/debugging.md)** | The classic debug-output footer — queries (with params), template times, exceptions, scopes; activation gates, `getDebugData()`/`isDebugMode()`/`debugAdd()` |
 | **[Object Storage](docs/s3.md)** | S3 / R2 / MinIO — `S3*` functions and transparent `s3://` paths |
-| **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
-| **[Java Shims](docs/java-shims.md)** | Emulated Java classes for `createObject("java", …)` — what's supported and known gaps |
+
+### Debug & operate
+
+| Topic | Description |
+|---|---|
+| **[Debugging](docs/debugging.md)** | The classic debug-output footer — queries (with params), template times, exceptions, scopes; activation gates, `getDebugData()`/`isDebugMode()`/`debugAdd()` |
+| **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
+| **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
+
+### Concurrency & realtime
+
+| Topic | Description |
+|---|---|
 | **[Threading](docs/threads.md)** | `cfthread` on real OS threads — shared vs copied scopes, join/terminate, caveats |
 | **[WebSockets](docs/websockets.md)** | Realtime channel components, rooms, presence, auth, resumability, multi-node fan-out, ack-by-return — over raw WebSocket **and** socket.io |
+
+### Extend & embed
+
+| Topic | Description |
+|---|---|
+| **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
+| **[Java Shims](docs/java-shims.md)** | Emulated Java classes for `createObject("java", …)` — what's supported and known gaps |
 | **[Embedding](docs/embedding.md)** | Use the RustCFML engine from your own Rust code |
 | **[WebAssembly](docs/wasm.md)** | Compile to WASM; Cloudflare Workers notes |
+
+### Reference
+
+| Topic | Description |
+|---|---|
 | **[Architecture](docs/architecture.md)** | Compilation pipeline and crate layout |
-| **[Performance](docs/performance.md)** | Benchmarks and production-mode caching |
 | **[Testing](docs/testing.md)** | Running the test suites and writing tests |
 | **[Status](docs/status.md)** | Implementation status and remaining work |
 | **[Known Issues](docs/known-issues.md)** | Documented gaps, silent no-ops, and Lucee/BoxLang divergences |
