@@ -257,6 +257,58 @@ fn next_shape_id() -> u64 {
     STRUCT_SHAPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Format an f64 the way Lucee/ACF stringify numbers, rather than Rust's
+/// shortest-round-trip `f64::to_string` (which leaks IEEE noise like
+/// `1756.8000000000002`). The CFML rule, verified against Lucee 7:
+///   * integer-valued doubles print as a whole number (no `.0`, no scientific);
+///   * otherwise, start from the shortest round-trip decimal and, only if it
+///     carries more than 12 fractional digits, round to 12 decimal places;
+///     then strip trailing zeros (and a bare trailing `.`).
+/// Working from the shortest round-trip (not the raw f64 expansion) is what
+/// keeps genuine precision on large magnitudes — `99999999999.9999` and
+/// `1234567890123.456` already have ≤12 fractional digits so survive intact —
+/// while still collapsing noise: `1/3` → `0.333333333333`,
+/// `3.14159265358979` → `3.14159265359`, `0.1+0.2` → `0.3`, `1e-13` → `0`.
+pub fn format_double(d: f64) -> String {
+    if d.is_nan() {
+        return "NaN".to_string();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // Integer-valued: print as a whole number with no decimals or exponent.
+    if d.fract() == 0.0 {
+        // Below 2^53 every integer is exactly representable; use i64 for speed.
+        if d.abs() < 1e15 {
+            return (d as i64).to_string();
+        }
+        return format!("{:.0}", d);
+    }
+    // Rust's Display gives the shortest round-trip in plain (non-scientific)
+    // form for normal magnitudes. If that already fits in ≤12 fractional
+    // digits, it is exactly what Lucee prints.
+    let short = d.to_string();
+    if !short.contains(['e', 'E']) {
+        if let Some(dot) = short.find('.') {
+            if short.len() - dot - 1 <= 12 {
+                return short;
+            }
+        }
+    }
+    let mut s = format!("{:.12}", d);
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    // `-0.0000000000004` rounds to "-0"; normalise to "0" like Lucee.
+    if s == "-0" {
+        s = "0".to_string();
+    }
+    s
+}
+
 #[derive(Clone)]
 pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 
@@ -833,7 +885,7 @@ impl CfmlValue {
             CfmlValue::Null => String::new(),
             CfmlValue::Bool(b) => b.to_string(),
             CfmlValue::Int(i) => i.to_string(),
-            CfmlValue::Double(d) => d.to_string(),
+            CfmlValue::Double(d) => format_double(*d),
             CfmlValue::String(s) => (**s).clone(),
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();

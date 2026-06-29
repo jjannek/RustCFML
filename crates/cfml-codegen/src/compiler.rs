@@ -999,13 +999,28 @@ impl CfmlCompiler {
     /// Member/index bases (`a.b[k]`, `a[i][k]`) already read missing links as
     /// Null via GetProperty/GetIndex, so they use the normal compile path.
     fn compile_index_assign_base(&mut self, base: &Expression, instructions: &mut Vec<BytecodeOp>) {
-        if let Expression::Identifier(ident) = base {
-            if !Self::is_reserved_scope_name(&ident.name) {
+        match base {
+            Expression::Identifier(ident) if !Self::is_reserved_scope_name(&ident.name) => {
                 instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
-                return;
             }
+            // A nested base (`q["lineData"][0] = v`, `q.lineData[0] = v`): recurse
+            // so the *root* identifier is the Null-tolerant TryLoadLocal above,
+            // then walk back down with GetIndex/GetProperty — both of which yield
+            // Null for a Null receiver or a missing key, so the whole base reads
+            // as Null when nothing exists yet. The leaf SetIndex then
+            // auto-vivifies the entire chain (Lucee/ACF/BoxLang), instead of the
+            // generic compile path throwing "Variable '<root>' is undefined".
+            Expression::ArrayAccess(access) => {
+                self.compile_index_assign_base(&access.array, instructions);
+                self.compile_expression(&access.index, instructions);
+                instructions.push(BytecodeOp::GetIndex);
+            }
+            Expression::MemberAccess(access) => {
+                self.compile_index_assign_base(&access.object, instructions);
+                instructions.push(BytecodeOp::GetProperty(access.member.clone()));
+            }
+            _ => self.compile_expression(base, instructions),
         }
-        self.compile_expression(base, instructions);
     }
 
     /// Push the current value of a compound-assignment target onto the stack.
@@ -1091,7 +1106,15 @@ impl CfmlCompiler {
     fn emit_load_for_writeback(&mut self, expr: &Expression, instructions: &mut Vec<BytecodeOp>) {
         match expr {
             Expression::Identifier(ident) => {
-                instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
+                // A non-scope root may not exist yet when a nested index/member
+                // write auto-vivifies it (`q["a"]["b"] = v` with q undefined);
+                // TryLoadLocal yields Null instead of throwing, and the parent
+                // SetIndex/SetProperty + StoreLocal then build & store the chain.
+                if Self::is_reserved_scope_name(&ident.name) {
+                    instructions.push(BytecodeOp::LoadLocal(ident.name.clone()));
+                } else {
+                    instructions.push(BytecodeOp::TryLoadLocal(ident.name.clone()));
+                }
             }
             Expression::This(_) => {
                 instructions.push(BytecodeOp::LoadLocal("this".to_string()));
@@ -1407,7 +1430,11 @@ impl CfmlCompiler {
                                 self.emit_nested_writeback(obj, instructions);
                             }
                         } else {
-                            self.compile_expression(obj, instructions);
+                            // obj is itself an index/member chain (`q["a"].foo = v`).
+                            // Use the auto-vivifying base compile so an undefined
+                            // root reads as Null (and SetProperty/the write-back
+                            // build the chain) rather than throwing.
+                            self.compile_index_assign_base(obj, instructions);
                             instructions.push(BytecodeOp::Swap);
                             instructions.push(BytecodeOp::SetProperty(member.clone()));
                             self.emit_nested_writeback(obj, instructions);

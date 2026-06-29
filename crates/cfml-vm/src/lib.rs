@@ -157,6 +157,35 @@ fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool {
         && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
 }
 
+/// Bind a bare (unbound) component method, extracted as a VALUE, to its owning
+/// component's scope so a later *detached* call still resolves `variables` /
+/// `this` / `super`. `this.method` (GetProperty) already does this inline;
+/// `this[dynamicKey]` (GetIndex) must do the same, otherwise TestBox's
+/// `this[ item.name ]()` lifecycle dispatch runs against an empty scope and
+/// silently no-ops. Returns the value unchanged unless it is an unbound method
+/// on a component struct. Mirrors the GetProperty op's binding (Bug #9 family).
+fn bind_extracted_method(val: CfmlValue, s: &cfml_common::dynamic::CfmlStruct) -> CfmlValue {
+    if let CfmlValue::Function(ref f) = val {
+        if f.captured_scope.is_none()
+            && (s.contains_key("__variables") || s.contains_key("__name"))
+        {
+            let mut bound: ValueMap = ValueMap::default();
+            bound.insert("this".to_string(), CfmlValue::Struct(s.clone()));
+            if let Some(vars) = s.get("__variables") {
+                bound.insert("__variables".to_string(), vars.clone());
+                bound.insert("variables".to_string(), vars.clone());
+            }
+            if let Some(sup) = s.get("__super") {
+                bound.insert("super".to_string(), sup.clone());
+            }
+            let mut bound_fn = (**f).clone();
+            bound_fn.captured_scope = Some(Arc::new(std::sync::RwLock::new(bound)));
+            return CfmlValue::Function(Arc::new(bound_fn));
+        }
+    }
+    val
+}
+
 /// Build the *leaf* (own-class) metadata for a component from a raw class
 /// template `s` — name/fullname/path/implements/properties plus the class's OWN
 /// methods (with each function's doc-comment annotations FLATTENED as top-level
@@ -1084,6 +1113,10 @@ pub struct CfmlVirtualMachine {
     pub http_request_data: Option<CfmlValue>,
     /// Stack of saved output buffers for cfsavecontent
     pub saved_output_buffers: Vec<String>,
+    /// Nesting depth of cfthread bodies currently executing on this VM. Drives
+    /// the `isInThread()` BIF (TestBox's StreamingService auto-queues events
+    /// when called from a thread context). Incremented around `run_thread_body`.
+    pub in_thread_body: u32,
     /// Base template path (original .cfm being served)
     pub base_template_path: Option<String>,
     /// Component mappings: virtual prefix → physical directory (sorted longest-first)
@@ -1584,6 +1617,7 @@ impl CfmlVirtualMachine {
             redirect_url: None,
             http_request_data: None,
             saved_output_buffers: Vec::new(),
+            in_thread_body: 0,
             base_template_path: None,
             mappings: Vec::new(),
             captured_locals: None,
@@ -2371,7 +2405,10 @@ impl CfmlVirtualMachine {
         self.saved_output_buffers
             .push(std::mem::take(&mut self.output_buffer));
         let start_time = cfml_common::clock::Monotonic::now();
+        // Mark thread context so isInThread() reports true inside the body.
+        self.in_thread_body = self.in_thread_body.saturating_add(1);
         let result = self.call_function(closure, vec![], parent_locals);
+        self.in_thread_body = self.in_thread_body.saturating_sub(1);
         let elapsed = start_time.elapsed().as_millis() as i64;
         let output = std::mem::take(&mut self.output_buffer);
         self.output_buffer = self.saved_output_buffers.pop().unwrap_or_default();
@@ -5920,7 +5957,10 @@ impl CfmlVirtualMachine {
                             } else {
                                 direct.unwrap_or(CfmlValue::Null)
                             };
-                            stack.push(val);
+                            // `this[ name ]` extracting a component method must
+                            // bind it to the component scope (same as `this.name`
+                            // via GetProperty), so a deferred detached call works.
+                            stack.push(bind_extracted_method(val, s));
                         }
                         _ => stack.push(CfmlValue::Null),
                     }
@@ -5985,11 +6025,9 @@ impl CfmlVirtualMachine {
                                 CfmlValue::Double(d) => Some(*d as i64),
                                 _ => None,
                             };
-                            if let Some(i) = numeric_idx {
+                            if let Some(i) = numeric_idx.filter(|i| *i >= 1) {
                                 let arr = cfml_common::dynamic::CfmlArray::empty();
-                                if i >= 1 {
-                                    arr.set_or_grow((i - 1) as usize, value);
-                                }
+                                arr.set_or_grow((i - 1) as usize, value);
                                 collection = CfmlValue::Array(arr);
                             } else {
                                 let mut s = ValueMap::default();
@@ -6415,6 +6453,15 @@ impl CfmlVirtualMachine {
                 BytecodeOp::SetProperty(name) => {
                     if let Some(value) = stack.pop() {
                         if let Some(mut obj) = stack.pop() {
+                            // Auto-vivification: setting a property on a base that
+                            // does not yet exist (`q.lineData = v` reached via a
+                            // nested-write-back where `q` is undefined) creates a
+                            // struct, matching SetIndex's Null arm and Lucee/ACF/
+                            // BoxLang — otherwise the write silently vanished into
+                            // a Null receiver, leaving the root Null.
+                            if matches!(obj, CfmlValue::Null) {
+                                obj = CfmlValue::strukt(ValueMap::default());
+                            }
                             // CFC with a Rust-backed parent: route writes the
                             // native side recognises before touching the CFC
                             // struct, so Rust state stays first-class. The
@@ -8934,6 +8981,7 @@ impl CfmlVirtualMachine {
                 | "_schedule"
                 | "callstackget"
                 | "callstackdump"
+                | "isinthread"
                 | "getpagecontext"
                 | "evaluate"
                 | "precisionevaluate" => {
@@ -13861,6 +13909,13 @@ impl CfmlVirtualMachine {
                         result = self.eval_expression_string(&expr, parent_locals)?;
                     }
                     return Ok(result);
+                }
+
+                "isinthread" => {
+                    // True while executing inside a cfthread body (Lucee BIF).
+                    // TestBox's Util.inThread()/StreamingService rely on it to
+                    // auto-queue events from thread contexts.
+                    return Ok(CfmlValue::Bool(self.in_thread_body > 0));
                 }
 
                 "getpagecontext" => {

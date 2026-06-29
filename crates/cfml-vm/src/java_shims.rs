@@ -838,12 +838,18 @@ pub fn handle_java_stringbuilder(
                     .map(|b| b.as_string())
                     .unwrap_or_default();
                 let app = args.first().map(|a| a.as_string()).unwrap_or_default();
-                let mut ns = shim.snapshot();
-                ns.insert(
+                // Mutate the buffer IN PLACE through the shared handle and return
+                // the same builder (Java's `append` returns `this`). A snapshot +
+                // new-struct return only survived reassignment writeback
+                // (`sb = sb.append(x)`); when the builder was passed into a
+                // function (`fn(sb){ sb.append(x); }`, e.g. MockBox's
+                // generateMethodsFromMD) the caller's instance never saw the
+                // append, so generated stubs came out empty.
+                shim.insert(
                     "__buffer".to_string(),
                     CfmlValue::string(format!("{}{}", cur, app)),
                 );
-                Ok(CfmlValue::strukt(ns))
+                Ok(object.clone())
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -870,9 +876,9 @@ pub fn handle_java_stringbuilder(
         }
         "clear" => {
             if let CfmlValue::Struct(ref shim) = object {
-                let mut ns = shim.snapshot();
-                ns.insert("__buffer".to_string(), CfmlValue::string(String::new()));
-                Ok(CfmlValue::strukt(ns))
+                // Mutate in place + return the builder (see `append`).
+                shim.insert("__buffer".to_string(), CfmlValue::string(String::new()));
+                Ok(object.clone())
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -1066,36 +1072,62 @@ pub fn handle_java_concurrentlinkedqueue(
             shim.insert("__queue".to_string(), CfmlValue::array(Vec::new()));
             Ok(CfmlValue::strukt(shim))
         }
-        "offer" => {
+        "add" | "offer" => {
+            // Append IN PLACE through the shared shim (real Java queues are
+            // reference types: `variables.q.add(x)` and a `q` passed into a
+            // function must both see it). Snapshot+return-new only survived
+            // reassignment writeback. Java's add/offer return boolean true.
             if let CfmlValue::Struct(ref shim) = object {
                 if let Some(item) = args.first() {
-                    let mut ns = shim.snapshot();
-                    if let Some(CfmlValue::Array(q)) = ns.get("__queue").cloned() {
-                        let mut nq = q.snapshot();
-                        nq.push(item.clone());
-                        ns.insert("__queue".to_string(), CfmlValue::array(nq));
-                    }
-                    Ok(CfmlValue::strukt(ns))
-                } else {
-                    Ok(object.clone())
+                    let mut q = match shim.get("__queue") {
+                        Some(CfmlValue::Array(a)) => a.snapshot(),
+                        _ => Vec::new(),
+                    };
+                    q.push(item.clone());
+                    shim.insert("__queue".to_string(), CfmlValue::array(q));
                 }
+                Ok(CfmlValue::Bool(true))
             } else {
                 Ok(CfmlValue::Null)
             }
         }
-        "poll" => {
+        "poll" | "remove" => {
+            // Remove and RETURN the head element, mutating the queue in place.
+            // (The old impl returned the queue struct and discarded the head.)
             if let CfmlValue::Struct(ref shim) = object {
-                if let Some(CfmlValue::Array(q)) = shim.get("__queue") {
-                    let qv = q.snapshot();
-                    if !qv.is_empty() {
-                        let mut ns = shim.snapshot();
-                        let _itm = qv[0].clone();
-                        let nq = qv[1..].to_vec();
-                        ns.insert("__queue".to_string(), CfmlValue::array(nq));
-                        return Ok(CfmlValue::strukt(ns));
-                    }
+                let mut q = match shim.get("__queue") {
+                    Some(CfmlValue::Array(a)) => a.snapshot(),
+                    _ => Vec::new(),
+                };
+                if q.is_empty() {
+                    return Ok(CfmlValue::Null);
                 }
+                let head = q.remove(0);
+                shim.insert("__queue".to_string(), CfmlValue::array(q));
+                Ok(head)
+            } else {
                 Ok(CfmlValue::Null)
+            }
+        }
+        "iterator" => {
+            // A weakly-consistent snapshot iterator (good enough for the queue's
+            // documented use). Returns a java.util.iterator shim with hasNext/next.
+            if let CfmlValue::Struct(ref shim) = object {
+                let items = match shim.get("__queue") {
+                    Some(CfmlValue::Array(a)) => a.snapshot(),
+                    _ => Vec::new(),
+                };
+                let mut it = ValueMap::default();
+                it.insert(
+                    "__java_class".to_string(),
+                    CfmlValue::string("java.util.iterator".to_string()),
+                );
+                it.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                // Use the engine's existing iterator convention (__iter_items /
+                // __iter_pos) so hasNext()/next() — handled in cfml-vm — work.
+                it.insert("__iter_items".to_string(), CfmlValue::array(items));
+                it.insert("__iter_pos".to_string(), CfmlValue::Int(0));
+                Ok(CfmlValue::strukt(it))
             } else {
                 Ok(CfmlValue::Null)
             }
@@ -1132,6 +1164,12 @@ pub fn handle_java_concurrentlinkedqueue(
             } else {
                 Ok(CfmlValue::Bool(true))
             }
+        }
+        "clear" => {
+            if let CfmlValue::Struct(ref shim) = object {
+                shim.insert("__queue".to_string(), CfmlValue::array(Vec::new()));
+            }
+            Ok(CfmlValue::Null)
         }
         _ => Ok(CfmlValue::Null),
     }

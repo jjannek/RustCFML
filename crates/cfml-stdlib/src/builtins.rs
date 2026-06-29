@@ -523,6 +523,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getContextRoot".into(), fn_get_context_root);
     f.insert("GetContextRoot".into(), fn_get_context_root);
     f.insert("getPageContext".into(), fn_get_page_context);
+    f.insert("isInThread".into(), fn_is_in_thread);
 
     // ---- List functions ----
     f.insert("listNew".into(), fn_list_new);
@@ -681,6 +682,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
     f.insert("getContextRoot".into(), fn_get_context_root);
     f.insert("GetContextRoot".into(), fn_get_context_root);
     f.insert("getPageContext".into(), fn_get_page_context);
+    f.insert("isInThread".into(), fn_is_in_thread);
     f.insert("getFileFromPath".into(), fn_get_file_from_path);
     f.insert("getCanonicalPath".into(), fn_get_canonical_path);
     f.insert("systemOutput".into(), fn_system_output);
@@ -3241,7 +3243,10 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
         let type_name = get_str(&args, 0).to_lowercase();
         let value = &args[1];
         match type_name.as_str() {
-            "string" => Ok(CfmlValue::Bool(true)),
+            // Lucee/ACF: isValid("string", x) is true only for SIMPLE values —
+            // a struct/array/query/component is not a valid string (TestBox
+            // notTypeOf("string", this)). Was unconditionally true.
+            "string" => fn_is_simple_value(vec![value.clone()]),
             "numeric" | "float" | "double" => fn_is_numeric(vec![value.clone()]),
             "integer" => {
                 let s = value.as_string();
@@ -3250,12 +3255,16 @@ fn fn_is_valid(args: Vec<CfmlValue>) -> CfmlResult {
             "boolean" => fn_is_boolean(vec![value.clone()]),
             "date" | "datetime" => fn_is_date(vec![value.clone()]),
             "time" => {
-                // Lucee: a bare time-of-day (6:15 PM, 18:15, 06:15:30) OR any
-                // parseable date/datetime ("2020-01-01" -> true) is a valid time;
-                // "25:99"/"hello" are not. (Wheels validatesFormat type="time".)
+                // Lucee: a bare time-of-day (6:15 PM, 18:15, 06:15:30) OR a
+                // parseable date/datetime *string* ("2020-01-01" -> true) is a
+                // valid time; "25:99"/"hello" are not. (Wheels validatesFormat
+                // type="time".) A bare number ("1", "123", 0) is a valid *date*
+                // serial but NOT a valid time in Lucee, so exclude numerics from
+                // the date path — isValid("time","1") must be false.
                 let s = value.as_string();
                 let s = s.trim();
-                let ok = parse_cfml_date(s).is_some()
+                let is_numeric = !s.is_empty() && s.parse::<f64>().is_ok();
+                let ok = (!is_numeric && parse_cfml_date(s).is_some())
                     || ["%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"]
                         .iter()
                         .any(|fmt| NaiveTime::parse_from_str(s, fmt).is_ok());
@@ -4449,6 +4458,13 @@ fn fn_get_context_root(_args: Vec<CfmlValue>) -> CfmlResult {
     Ok(CfmlValue::string(String::new()))
 }
 
+fn fn_is_in_thread(_args: Vec<CfmlValue>) -> CfmlResult {
+    // Fallback only. The real isInThread() is VM-intercepted in `cfml-vm`
+    // (reads the cfthread-body depth). This stub keeps the name registered for
+    // resolution; off-VM it conservatively reports false.
+    Ok(CfmlValue::Bool(false))
+}
+
 fn fn_get_page_context(_args: Vec<CfmlValue>) -> CfmlResult {
     // Fallback only. The real getPageContext() is VM-intercepted in
     // `cfml-vm` (`call_function` → `build_page_context_shim`) so it can read
@@ -5581,9 +5597,22 @@ fn fn_get_metadata(args: Vec<CfmlValue>) -> CfmlResult {
                             CfmlValue::strukt(pm)
                         }).collect();
                         func_meta.insert("parameters".to_string(), CfmlValue::array(params));
-                        // Check for function metadata (__funcmeta_<name>)
+                        // Function metadata (__funcmeta_<name>): doc-comment /
+                        // inline annotations (@beforeEach, @aroundEach,
+                        // @expectedException, ...). Lucee/ACF surface these as
+                        // FLAT top-level keys on the function struct — which is
+                        // exactly what TestBox's getAnnotatedMethods reads via
+                        // `structKeyExists(thisFunction, annotation)` — so flatten
+                        // them there (without clobbering the reserved keys above),
+                        // while keeping the `metadata` sub-struct for callers that
+                        // read it directly.
                         let meta_key = format!("__funcmeta_{}", k);
                         if let Some(CfmlValue::Struct(fm)) = s.get(&meta_key) {
+                            for (mk, mv) in fm.iter() {
+                                if !func_meta.contains_key(&mk) {
+                                    func_meta.insert(mk, mv);
+                                }
+                            }
                             func_meta.insert("metadata".to_string(), CfmlValue::Struct(fm.clone()));
                         }
                         functions.push(CfmlValue::strukt(func_meta));
