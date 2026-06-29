@@ -40,5 +40,24 @@ function getStringName( obj ){
 assertTrue("getStringName(struct) does not lose its local", len(getStringName(s)) gt 4);
 assertTrue("getStringName(array) does not lose its local", len(getStringName(a)) gt 4);
 
+// Content-deterministic struct.toString() (v0.362.0): Lucee backs a `{}` struct
+// with a Java HashMap, so its toString() is content-deterministic — two structs
+// with identical keys/values stringify identically regardless of build order.
+// RustCFML's IndexMap is insertion-ordered, which broke any code hashing a
+// stringified struct as an identity key (TestBox/MockBox normalizeArguments →
+// $args matching → Preside AdHocTaskManagerService taskId cluster). We now emit
+// struct keys in sorted order from .toString() so the hash matches both ways.
+// Assert only the cross-engine-stable PROPERTY (order-independence), not the
+// exact format: Lucee's toString() is `{ALPHA=1, ...}` HashMap-style, ours is
+// `{alpha: 1, ...}` sorted — both are content-deterministic, which is all that
+// matters for the hash identity. This file runs on Lucee too.
+o1 = {}; o1.gamma = 3; o1.alpha = 1; o1.beta = 2;
+o2 = {}; o2.beta = 2; o2.alpha = 1; o2.gamma = 3;
+assert("struct.toString() is insertion-order-independent", o1.toString(), o2.toString());
+// nested structs are deterministic recursively too
+n1 = { outer = { z=1, a=2 } };
+n2 = { outer = { a=2, z=1 } };
+assert("nested struct.toString() is insertion-order-independent", n1.toString(), n2.toString());
+
 suiteEnd();
 </cfscript>

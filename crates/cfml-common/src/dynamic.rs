@@ -875,6 +875,73 @@ impl CfmlValue {
         self.as_string_guarded(&mut visited)
     }
 
+    /// Content-deterministic stringification: identical to `as_string` except a
+    /// `Struct`'s keys are emitted in case-insensitive sorted order rather than
+    /// insertion order, recursively.
+    ///
+    /// Lucee/ACF back a plain `{}` struct with a Java `HashMap`, so its
+    /// `toString()` is hash-bucket order — neither insertion nor alphabetical,
+    /// but DETERMINISTIC FOR A GIVEN CONTENT (the same keys always stringify the
+    /// same way regardless of how the struct was built). RustCFML's `IndexMap`
+    /// is insertion-ordered, so two structs with identical content but different
+    /// build order stringify differently. That bites any code that hashes a
+    /// stringified struct as an identity key — notably TestBox/MockBox's
+    /// `normalizeArguments()`, which `$args( {...} )` then matches against the
+    /// struct the system-under-test builds (e.g. Preside's
+    /// `AdHocTaskManagerService.createTask` lists `next_attempt_date` /
+    /// `retry_interval` in a different order than the spec's `$args` literal).
+    /// On RustCFML the hashes diverged, the mock fell through to a null result,
+    /// and `var x = mock(...)` deleted `x` → "Variable X undefined". Sorting the
+    /// keys makes our `toString()` content-deterministic like Lucee's, so the
+    /// setup and call hashes match. See docs/known-issues.md §15.
+    pub fn to_string_sorted(&self) -> String {
+        let mut visited: Vec<usize> = Vec::new();
+        self.to_string_sorted_guarded(&mut visited)
+    }
+
+    fn to_string_sorted_guarded(&self, visited: &mut Vec<usize>) -> String {
+        match self {
+            CfmlValue::Array(a) => {
+                let ptr = a.backing_ptr();
+                if visited.contains(&ptr) {
+                    return "[...]".to_string();
+                }
+                visited.push(ptr);
+                let items: Vec<String> = a
+                    .snapshot()
+                    .iter()
+                    .map(|v| v.to_string_sorted_guarded(visited))
+                    .collect();
+                visited.pop();
+                format!("[{}]", items.join(", "))
+            }
+            CfmlValue::Struct(s) => {
+                if let Some(id) = s.get("__locale_id") {
+                    if s.get("__java_shim").map(|v| v.is_true()).unwrap_or(false) {
+                        return id.as_string();
+                    }
+                }
+                let ptr = s.backing_ptr();
+                if visited.contains(&ptr) {
+                    return "{...}".to_string();
+                }
+                visited.push(ptr);
+                let mut entries: Vec<(String, CfmlValue)> = s.iter().collect();
+                entries.sort_by(|a, b| {
+                    a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0))
+                });
+                let items: Vec<String> = entries
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v.to_string_sorted_guarded(visited)))
+                    .collect();
+                visited.pop();
+                format!("{{{}}}", items.join(", "))
+            }
+            // Everything else stringifies identically to as_string.
+            _ => self.as_string_guarded(visited),
+        }
+    }
+
     /// Cycle-guarded stringification. Structs are reference types, so an object
     /// graph can contain cycles (e.g. WireBox's injector ↔ binder ↔ builder).
     /// Stringifying one would otherwise recurse until the native stack overflows

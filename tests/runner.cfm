@@ -277,6 +277,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_returned_service_chain.cfm">
 <cf_runtest file="oop/test_mixin_writeback.cfm">
 <cf_runtest file="oop/test_nested_cfc_method_writeback.cfm">
+<cf_runtest file="oop/test_closure_writeback_cfc_boundary.cfm">
 <cf_runtest file="oop/test_property_method_name_collision.cfm">
 <cf_runtest file="oop/test_new_named_args.cfm">
 <cf_runtest file="oop/test_dynamic_lhs_assign.cfm">

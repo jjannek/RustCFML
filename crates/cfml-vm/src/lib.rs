@@ -5084,6 +5084,10 @@ impl CfmlVirtualMachine {
                                 }
                                 // queryExecute result=/cfquery name= delivery
                                 self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
+                                // Reconcile any nested-closure writeback that reached
+                                // the shared env behind an intermediate frame (see the
+                                // CallMethod arm / reconcile_closure_env_into_locals).
+                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -5674,6 +5678,7 @@ impl CfmlVirtualMachine {
                                 }
                                 // queryExecute result=/cfquery name= delivery
                                 self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, effective_local_mode_modern);
+                                Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
                                 stack.push(result);
                             }
                             Err(e) => {
@@ -7595,6 +7600,12 @@ impl CfmlVirtualMachine {
                             self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
                         }
                     }
+                    // A closure invoked behind this method (e.g. the method called
+                    // `arguments.someClosure()`) writes back into the shared
+                    // closure env, not this frame's `closure_parent_writeback`
+                    // (which the method frame already consumed). Reconcile the env
+                    // so the enclosing var sees the mutation across the CFC boundary.
+                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
 
                     stack.push(result);
                 }
@@ -7707,6 +7718,7 @@ impl CfmlVirtualMachine {
                             self.scope_aware_store(&k, v, &mut locals, effective_local_mode_modern);
                         }
                     }
+                    Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
                     stack.push(result);
                 }
 
@@ -17218,7 +17230,15 @@ impl CfmlVirtualMachine {
         // Components are handled above (they throw "has no function"); strings and
         // numbers handle `tostring` in their own member-dispatch arms.
         if method_lower == "tostring" {
-            return Ok(CfmlValue::string(object.as_string()));
+            // For structs/arrays, emit keys in a content-deterministic (sorted)
+            // order so `someStruct.toString()` matches Lucee's hash-bucket
+            // determinism — the same content always stringifies the same way,
+            // regardless of insertion order. TestBox/MockBox's
+            // `normalizeArguments()` hashes this string to match `$args( {...} )`
+            // against the struct the SUT builds; insertion-order output made the
+            // two diverge and the mock returned null (→ null-delete →
+            // "Variable X undefined"). See CfmlValue::to_string_sorted / §15.
+            return Ok(CfmlValue::string(object.to_string_sorted()));
         }
 
         // Lucee parity: `dateValue.getTime()` (java.util.Date.getTime) returns
@@ -17583,6 +17603,45 @@ impl CfmlVirtualMachine {
                         continue;
                     }
                     env.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    /// After a call returns in a frame that owns a shared closure environment,
+    /// pull any value a nested closure wrote back into that shared env (via
+    /// `write_back_to_captured_scope`) into this frame's live `locals`.
+    ///
+    /// The env is kept FORWARD-synced on every local write (StoreLocal,
+    /// ForLoopStep, the numeric-delta ops, UnsetPath), so for a captured key it
+    /// is never staler than `locals` — the only way the two diverge is a closure
+    /// mutating an enclosing variable. The per-call `closure_parent_writeback`
+    /// merge handles the direct `fn()` case, but it is consumed by the FIRST
+    /// caller frame; when a closure is invoked behind an intermediate CFC-method
+    /// frame (e.g. `svc.dynamicFindAndReplace( processor )` calling
+    /// `arguments.processor()`), that intermediate frame swallows the writeback
+    /// into its own locals and it never bubbles up to the defining frame.
+    /// Reconciling from the shared env here makes the closure's write visible to
+    /// the defining frame's own subsequent reads (Preside DynamicFindAndReplace's
+    /// capture-groups processor; same family as v0.279 / #188 / #198 / v0.361).
+    fn reconcile_closure_env_into_locals(
+        closure_env: &Option<Arc<std::sync::RwLock<ValueMap>>>,
+        locals: &mut ValueMap,
+    ) {
+        if let Some(env) = closure_env {
+            let env = env.read().unwrap();
+            for (k, v) in env.iter() {
+                // Never pull a (stripped, captured_scope=None) Function copy back
+                // over the live closure value in locals — that would drop its
+                // captured scope and re-break recursion/sibling resolution.
+                if matches!(v, CfmlValue::Function(_)) {
+                    continue;
+                }
+                match locals.get(k) {
+                    Some(lv) if Self::values_equal_shallow(lv, v) => {}
+                    _ => {
+                        locals.insert(k.clone(), v.clone());
+                    }
                 }
             }
         }
