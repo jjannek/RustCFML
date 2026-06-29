@@ -4045,8 +4045,39 @@ impl CfmlVirtualMachine {
                             // Sync to shared closure env so closures see updated value
                             // Only update vars already in the env (don't pollute with new vars)
                             if let Some(ref env) = closure_env {
+                                // A function EXPRESSION (`var f = function(){…}`) whose
+                                // captured scope IS this frame's closure_env must become
+                                // visible under its own var name inside its own body, so a
+                                // recursive call (`var fact = function(n){ … fact(n-1) … }`)
+                                // — and any later sibling closure — can resolve it. At
+                                // DefineFunction time the name isn't bound yet, so the env
+                                // was seeded without it; bind it now. Strip captured_scope
+                                // to None to avoid the env→fn→env Arc cycle (the leak guard);
+                                // the stripped copy still propagates frame-to-frame via the
+                                // parent→locals carry, exactly like closure_env_capture_value
+                                // (PR #198), so each recursion level can see `fact` again.
+                                // Gate on `var`-declaration (like closure_env_capture_value):
+                                // only an anonymous function EXPRESSION bound to a `var`
+                                // name self-binds. A NAMED page/component function
+                                // (`function foo(){}`) is hoisted into user_functions and is
+                                // NOT in declared_locals — force-stripping its captured_scope
+                                // into the env would break its `variables`-scope capture when
+                                // read back (regressed test_include_scope_capture).
+                                let is_own_closure = (declared_locals.contains(name.as_str())
+                                    || declared_locals.contains(&name_lower))
+                                    && matches!(
+                                        &val,
+                                        CfmlValue::Function(f)
+                                            if f.captured_scope.as_ref().is_some_and(|s| Arc::ptr_eq(s, env))
+                                    );
                                 let mut m = env.write().unwrap();
-                                if m.contains_key(name.as_str()) {
+                                if is_own_closure {
+                                    if let CfmlValue::Function(f) = &val {
+                                        let mut stripped = (**f).clone();
+                                        stripped.captured_scope = None;
+                                        m.insert(name.clone(), CfmlValue::Function(Arc::new(stripped)));
+                                    }
+                                } else if m.contains_key(name.as_str()) {
                                     m.insert(name.clone(), val);
                                 }
                             }
@@ -4999,6 +5030,16 @@ impl CfmlVirtualMachine {
                                     // __variables and this ALWAYS come from caller (current state).
                                     let mut m = shared_env.read().unwrap().clone();
                                     for (k, v) in &locals {
+                                        // Preserve a closure self-reference / captured
+                                        // helper: a var-fn the defining frame stored into
+                                        // this env with captured_scope stripped to None.
+                                        // The caller's same-named Some-env copy must NOT
+                                        // clobber it, or a recursive var-scoped function
+                                        // expression inside a CFC method loses its own name.
+                                        if matches!(m.get(k), Some(CfmlValue::Function(f)) if f.captured_scope.is_none())
+                                        {
+                                            continue;
+                                        }
                                         if matches!(v, CfmlValue::Function(_))
                                             || !m.contains_key(k)
                                             || k == "__variables"
@@ -5565,6 +5606,13 @@ impl CfmlVirtualMachine {
                                 merged_scope = if is_cfc_context {
                                     let mut m = shared_env.read().unwrap().clone();
                                     for (k, v) in &locals {
+                                        // Preserve a closure self-reference / captured helper
+                                        // (stored with captured_scope=None) — see the matching
+                                        // guard on the positional-call merge path above.
+                                        if matches!(m.get(k), Some(CfmlValue::Function(f)) if f.captured_scope.is_none())
+                                        {
+                                            continue;
+                                        }
                                         if matches!(v, CfmlValue::Function(_)) || !m.contains_key(k)
                                         {
                                             m.insert(k.clone(), v.clone());
@@ -16177,7 +16225,61 @@ impl CfmlVirtualMachine {
                 "findnocase" => Some("arrayFindNoCase"),
                 "findall" => Some("arrayFindAll"),
                 "findallnocase" => Some("arrayFindAllNoCase"),
-                "sort" => Some("arraySort"),
+                "sort" => {
+                    // `arr.sort(comparator)` with a callback must run the CFML
+                    // closure per-comparison — that path is VM-intercepted only
+                    // for the standalone `arraySort()`. Routing through the
+                    // generic builtin dispatch below would call the raw
+                    // fn_array_sort, which can't invoke a closure, so the array
+                    // was left unsorted (Preside's auto-form field ordering
+                    // relied on `fields.sort( fn )`). Handle it in place here;
+                    // fall through to arraySort for the string sort-type form.
+                    if matches!(extra_args.first(), Some(CfmlValue::Function(_))) {
+                        let callback = extra_args.first().cloned().unwrap();
+                        let mut items = arr.snapshot();
+                        let n = items.len();
+                        // Stable insertion sort (only swaps on strictly > 0, so
+                        // equal elements keep their relative order).
+                        let mut i = 1;
+                        while i < n {
+                            let mut j = i;
+                            while j > 0 {
+                                let cb_args = vec![items[j - 1].clone(), items[j].clone()];
+                                self.closure_parent_writeback = None;
+                                let r =
+                                    self.call_function(&callback, cb_args, &ValueMap::default())?;
+                                if let Some(ref wb) = self.closure_parent_writeback {
+                                    Self::write_back_to_captured_scope(&callback, wb);
+                                }
+                                let cmp = match r {
+                                    CfmlValue::Int(v) => v,
+                                    CfmlValue::Double(d) => d as i64,
+                                    CfmlValue::Bool(b) => {
+                                        if b {
+                                            1
+                                        } else {
+                                            0
+                                        }
+                                    }
+                                    CfmlValue::String(ref s) => {
+                                        s.trim().parse::<f64>().unwrap_or(0.0) as i64
+                                    }
+                                    _ => 0,
+                                };
+                                if cmp > 0 {
+                                    items.swap(j - 1, j);
+                                    j -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            i += 1;
+                        }
+                        arr.with_write(|v| *v = items);
+                        return Ok(object.clone());
+                    }
+                    Some("arraySort")
+                }
                 "reverse" => Some("arrayReverse"),
                 "slice" => Some("arraySlice"),
                 "tolist" => Some("arrayToList"),

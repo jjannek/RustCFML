@@ -11979,6 +11979,43 @@ fn fn_get_time_zone(_args: Vec<CfmlValue>) -> CfmlResult {
 
 // ==== XML FUNCTIONS ====
 
+/// CFML XML objects expose each distinct child-element tag name as a struct key
+/// whose value is an array of the matching child elements (e.g. `node.fieldset`
+/// returns an array of `<fieldset>` children, and `StructKeyExists(node,"fieldset")`
+/// is true). Inject those keys from the element's `xmlChildren` collection.
+#[cfg(feature = "xml")]
+fn xml_inject_named_children(element: &mut ValueMap) {
+    let mut groups: Vec<(String, Vec<CfmlValue>)> = Vec::new();
+    if let Some(children) = element.get("xmlChildren").and_then(|v| v.as_cfml_array()) {
+        for child in children.iter() {
+            let name = match &child {
+                CfmlValue::Struct(s) => s.get_ci("xmlName").map(|v| v.as_string()),
+                _ => None,
+            };
+            if let Some(name) = name {
+                if let Some(g) = groups.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    g.1.push(child.clone());
+                } else {
+                    groups.push((name, vec![child.clone()]));
+                }
+            }
+        }
+    }
+    for (name, vals) in groups {
+        // Never shadow the reserved XML-node keys.
+        let lname = name.to_ascii_lowercase();
+        if matches!(
+            lname.as_str(),
+            "xmlname" | "xmltype" | "xmltext" | "xmlchildren" | "xmlattributes"
+                | "xmlcomment" | "xmlnsprefix" | "xmlnsuri" | "xmlparent" | "xmlroot"
+                | "xmlcdata" | "xmlvalue"
+        ) {
+            continue;
+        }
+        element.insert(name, CfmlValue::array(vals));
+    }
+}
+
 #[cfg(feature = "xml")]
 fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
     use quick_xml::Reader;
@@ -12011,7 +12048,8 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
                 stack.push(element);
             }
             Ok(Event::End(_)) => {
-                if let Some(completed) = stack.pop() {
+                if let Some(mut completed) = stack.pop() {
+                    xml_inject_named_children(&mut completed);
                     if let Some(parent) = stack.last_mut() {
                         if let Some(children) = parent.get_mut("xmlChildren").and_then(|v| v.as_cfml_array()) {
                             children.push(CfmlValue::strukt(completed));
@@ -12067,8 +12105,17 @@ fn fn_xml_parse(args: Vec<CfmlValue>) -> CfmlResult {
     match root {
         Some(root_element) => {
             let mut doc = ValueMap::default();
-            doc.insert("xmlRoot".to_string(), CfmlValue::strukt(root_element));
+            // On the document node, the root element is reachable by its tag name
+            // as a single element (e.g. `xmlDoc.form`), not wrapped in an array.
+            let root_name = root_element.get("xmlName").map(|v| v.as_string());
+            let root_val = CfmlValue::strukt(root_element);
+            doc.insert("xmlRoot".to_string(), root_val.clone());
             doc.insert("xmlType".to_string(), CfmlValue::string("DOCUMENT".to_string()));
+            if let Some(name) = root_name {
+                if !name.is_empty() {
+                    doc.insert(name, root_val);
+                }
+            }
             Ok(CfmlValue::strukt(doc))
         }
         None => Err(CfmlError::runtime("Empty or invalid XML document".to_string()))

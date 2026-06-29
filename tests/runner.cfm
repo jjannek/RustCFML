@@ -31,6 +31,7 @@ include "harness.cfm";
 <!--- undefined". Surfaced in the Wheels suite (helper at top of run() called --->
 <!--- from nested it()/describe() closures). --->
 <cf_runtest file="core/test_closure_captures_local_function.cfm">
+<cf_runtest file="core/test_recursive_closure_var.cfm">
 <cf_runtest file="core/test_struct_stored_closure_dotcall.cfm">
 <cf_runtest file="core/test_closure_unscoped_reset.cfm">
 <cf_runtest file="core/test_server_scope_write.cfm">
