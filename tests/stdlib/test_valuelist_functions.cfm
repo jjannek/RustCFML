@@ -33,4 +33,25 @@ emptyQ = queryNew("name", "varchar");
 assert("valueList empty query", valueList(emptyQ.name), "");
 
 suiteEnd();
+
+// ---------------------------------------------------------------------------
+suiteBegin("valueArray");
+
+// valueArray(query, columnName) — array of that column's values (Lucee form;
+// used by Preside MultiSelectPanel/queryUtils/ScheduledExportService).
+va = valueArray(q, "name");
+assertTrue("valueArray(q,col) is an array", isArray(va));
+assert("valueArray(q,col) length", arrayLen(va), 3);
+assert("valueArray(q,col) joined", arrayToList(va), "Alice,Bob,Charlie");
+
+// valueArray(query.column) — the dot-access already yields a column.
+assert("valueArray(q.column) joined", arrayToList(valueArray(q.age)), "30,25,35");
+
+// valueArray of a plain array returns its values.
+assert("valueArray(array)", arrayToList(valueArray([1,2,3])), "1,2,3");
+
+// Empty query column.
+assert("valueArray empty query", arrayLen(valueArray(emptyQ, "name")), 0);
+
+suiteEnd();
 </cfscript>

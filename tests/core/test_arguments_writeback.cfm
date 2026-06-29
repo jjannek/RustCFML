@@ -56,4 +56,49 @@ assertTrue("nested struct added", structKeyExists(s6, "child"));
 assertTrue("nested value preserved", s6.child.nested);
 
 suiteEnd();
+
+// ---------------------------------------------------------------------------
+suiteBegin("Closure unscoped-write propagates when invoked via a non-CFC receiver");
+
+// A closure that writes to an unscoped enclosing variable must propagate that
+// write back to the defining frame when invoked indirectly — `arguments.fn()`,
+// `someStruct.fn()`, `variables.fn()` — exactly as a bare `fn()` call does.
+// This was lost because the member-call dispatch cleared closure_parent_writeback
+// unconditionally. (Engine cause behind Preside DynamicFindAndReplaceService's
+// capture-groups-to-processor spec.)
+
+// Via arguments.fn()
+function runViaArgs( required any processor ) {
+    return arguments.processor( [ "a", "b", "c" ] );
+}
+function viaArgsTest() {
+    var captured = "";
+    runViaArgs( processor = function( v ){ captured = v; return "ok"; } );
+    return captured;
+}
+caViaArgs = viaArgsTest();
+assertTrue("arguments.fn() write is array", isArray(caViaArgs));
+assert("arguments.fn() write value", arrayToList(caViaArgs), "a,b,c");
+
+// Via a plain struct member
+function viaStructTest() {
+    var captured = "";
+    var holder = { p: function( v ){ captured = v; return "ok"; } };
+    holder.p( [ "x", "y" ] );
+    return captured;
+}
+caViaStruct = viaStructTest();
+assert("struct.fn() write value", isArray(caViaStruct) ? arrayToList(caViaStruct) : caViaStruct, "x,y");
+
+// Direct call still works (control)
+function directTest() {
+    var captured = "";
+    var p = function( v ){ captured = v; return "ok"; };
+    p( [ "1", "2" ] );
+    return captured;
+}
+caDirect = directTest();
+assert("direct fn() write value (control)", isArray(caDirect) ? arrayToList(caDirect) : caDirect, "1,2");
+
+suiteEnd();
 </cfscript>

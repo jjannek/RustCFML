@@ -16994,8 +16994,18 @@ impl CfmlVirtualMachine {
             if let Some(ref wb) = self.closure_parent_writeback {
                 Self::write_back_to_captured_scope(&func_ref, wb);
             }
-            // Clear writeback — component method calls don't leak to calling scope
-            self.closure_parent_writeback = None;
+            // Component method calls must not leak their internal scope to the
+            // caller, so clear the writeback for CFC receivers. But a plain
+            // (non-CFC) receiver holding a CLOSURE — `arguments.fn()`,
+            // `someStruct.fn()`, `variables.fn()` — must propagate an unscoped
+            // write to an enclosing variable back to the calling frame, exactly
+            // as a bare `fn()` call does (the Call op merges it at lib.rs:~5066).
+            // Leave the writeback set so the CallMethod handler's merge
+            // (lib.rs:~7593) applies it. (Fixes closure-via-arguments writeback,
+            // e.g. Preside DynamicFindAndReplace's capture-groups processor.)
+            if receiver_is_cfc {
+                self.closure_parent_writeback = None;
+            }
             if !receiver_is_cfc {
                 // Discard any method-writeback that the inner call set up; for
                 // plain struct receivers, there is no `this` to write back to.

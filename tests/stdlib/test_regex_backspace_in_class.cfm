@@ -20,4 +20,27 @@ assertTrue("URL run found via [^\s\b]+", reFind("(https?://[^\s\b]+)", "go http:
 assert("word boundary \b still works", reFind("\bfoo\b", "a foo b"), 3);
 
 suiteEnd();
+
+// ---------------------------------------------------------------------------
+suiteBegin("Regex literal hyphen adjacent to a class shorthand");
+
+// A literal `-` placed next to a class shorthand (\w \d \s …) inside a char
+// class is treated as a literal hyphen by Java/Lucee/PCRE, but the Rust regex
+// crate parses `\w-\.` as a range with non-literal endpoints and rejects it,
+// which used to make the whole pattern a no-op. Preside's resource-URI
+// validator `[\w][\w-\.]*\:...` relied on this, so every getResource() lookup
+// short-circuited to its default. RustCFML now escapes the hyphen to `\-`.
+
+uri = "core.master:test.resource.key";
+assertTrue("Preside resource-URI validator matches", reFind("[\w][\w-\.]*\:[\w][\w-\.]*[^\.]", uri) GT 0);
+assertTrue("[\w-\.] hyphen-after-shorthand matches", reFind("[\w-\.]", uri) GT 0);
+assertTrue("[\d-x] hyphen-after-shorthand matches", reFind("[\d-x]", "7") GT 0);
+
+// Genuine ranges must keep working (the hyphen is NOT escaped there).
+assert("range [a-z] preserved", reFind("[a-z]", "ABCxyz"), 4);
+assert("range [0-9] preserved", reFind("[0-9]", "ab12"), 3);
+// Leading/escaped hyphens unchanged.
+assertTrue("leading hyphen literal [-a]", reFind("[-a]", "x-y") GT 0);
+
+suiteEnd();
 </cfscript>

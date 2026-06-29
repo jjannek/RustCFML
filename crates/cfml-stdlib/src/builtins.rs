@@ -161,14 +161,26 @@ impl CfRegex {
 /// silently swallow the compile error as "no match", so the whole pattern
 /// becomes a no-op. Rewrite the in-class `\b` to `\x08`; word-boundary `\b`
 /// (outside a class) is left untouched.
+///
+/// Also handles a second real-framework construct (Preside's resource-URI
+/// validator `[\w-\.]`): a literal `-` placed immediately next to a class
+/// shorthand (`\w \W \d \D \s \S`) inside a character class. Java/Lucee/PCRE
+/// treat that `-` as a literal hyphen, but the `regex` crate (and `fancy-regex`)
+/// parse `\w-\.` as a character range with non-literal endpoints and reject it
+/// with "invalid range boundary". Escape the hyphen to `\-`, which keeps Lucee
+/// semantics and compiles. A `-` forming a genuine range (`a-z`, `0-9`) or one
+/// that is leading/trailing in the class is left untouched.
 fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
-    if !pat.contains("\\b") {
+    // Only escapes can trigger either rewrite, so a pattern with no `\` is safe.
+    if !pat.contains('\\') {
         return std::borrow::Cow::Borrowed(pat);
     }
+    let is_shorthand = |c: char| matches!(c, 'w' | 'W' | 'd' | 'D' | 's' | 'S');
     let chars: Vec<char> = pat.chars().collect();
-    let mut out = String::with_capacity(pat.len());
+    let mut out = String::with_capacity(pat.len() + 4);
     let mut in_class = false;
     let mut class_pos = 0usize; // members seen in the current class (for leading-] / ^)
+    let mut prev_was_shorthand = false; // last in-class member emitted was \w \d \s …
     let mut i = 0usize;
     while i < chars.len() {
         let c = chars[i];
@@ -176,9 +188,11 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
             let n = chars[i + 1];
             if in_class && n == 'b' {
                 out.push_str("\\x08");
+                prev_was_shorthand = false;
             } else {
                 out.push(c);
                 out.push(n);
+                prev_was_shorthand = in_class && is_shorthand(n);
             }
             if in_class {
                 class_pos += 1;
@@ -190,6 +204,7 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
             '[' if !in_class => {
                 in_class = true;
                 class_pos = 0;
+                prev_was_shorthand = false;
                 out.push('[');
             }
             ']' if in_class => {
@@ -202,12 +217,27 @@ fn translate_cfml_regex(pat: &str) -> std::borrow::Cow<'_, str> {
                     in_class = false;
                     out.push(']');
                 }
+                prev_was_shorthand = false;
             }
             '^' if in_class && class_pos == 0 => out.push('^'),
+            '-' if in_class && class_pos > 0 => {
+                // Escape only when adjacent to a class shorthand on either side
+                // (an invalid range endpoint); a normal range like a-z is left
+                // alone so genuine ranges keep working.
+                let next_is_shorthand = chars.get(i + 1) == Some(&'\\')
+                    && chars.get(i + 2).map(|&x| is_shorthand(x)).unwrap_or(false);
+                if prev_was_shorthand || next_is_shorthand {
+                    out.push('\\');
+                }
+                out.push('-');
+                class_pos += 1;
+                prev_was_shorthand = false;
+            }
             _ => {
                 if in_class {
                     class_pos += 1;
                 }
+                prev_was_shorthand = false;
                 out.push(c);
             }
         }
@@ -652,6 +682,7 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
 
     // ---- Query value list functions ----
     f.insert("valueList".into(), fn_value_list as BuiltinFunction);
+    f.insert("valueArray".into(), fn_value_array as BuiltinFunction);
     f.insert("quotedValueList".into(), fn_quoted_value_list as BuiltinFunction);
 
     // ---- Utility functions ----
@@ -13191,6 +13222,29 @@ fn fn_value_list(args: Vec<CfmlValue>) -> CfmlResult {
     } else {
         Ok(CfmlValue::string(arr.as_string()))
     }
+}
+
+fn fn_value_array(args: Vec<CfmlValue>) -> CfmlResult {
+    // Lucee valueArray has two forms:
+    //   valueArray(query, columnName) — array of that column's values
+    //   valueArray(query.column)      — the dot-access already yields a column
+    //                                   (Array/QueryColumn); return its values.
+    let arg = args.get(0).ok_or_else(|| {
+        CfmlError::runtime("valueArray() requires a query column or a query + column name".to_string())
+    })?;
+    if let CfmlValue::Query(q) = arg {
+        let col = get_str(&args, 1);
+        let values = q.with_read(|d| {
+            d.column_data_ci(&col)
+                .cloned()
+                .unwrap_or_else(|| vec![CfmlValue::string(String::new()); d.row_count()])
+        });
+        return Ok(CfmlValue::array(values));
+    }
+    if let Some(items) = arg.as_array_or_query_column() {
+        return Ok(CfmlValue::array(items));
+    }
+    Ok(CfmlValue::array(vec![arg.clone()]))
 }
 
 fn fn_quoted_value_list(args: Vec<CfmlValue>) -> CfmlResult {

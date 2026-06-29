@@ -185,6 +185,39 @@ while ( multiMatcher.find() ) {
 assert( "Pattern find loop walks all matches", arrayToList( foundNumbers ), "1,22,333" );
 assertFalse( "Pattern find returns false once exhausted", multiMatcher.find() );
 
+// Matcher.start()/end() — 0-based char offsets of the most recent match,
+// needed for in-place find-and-replace (Preside DynamicFindAndReplaceService).
+// Without these the service prepended all replacements and left tokens intact.
+offsetMatcher = createObject( "java", "java.util.regex.Pattern" )
+    .compile( javaCast( "string", "\{\{.*?\}\}" ) )
+    .matcher( javaCast( "string", "Lorem {{a}} ipsum {{bb}} sit." ) );
+assertTrue( "start/end matcher finds first", offsetMatcher.find() );
+assert( "Matcher.start() of first match", offsetMatcher.start(), 6 );
+assert( "Matcher.end() of first match", offsetMatcher.end(), 11 );
+assertTrue( "start/end matcher finds second", offsetMatcher.find() );
+assert( "Matcher.start() of second match", offsetMatcher.start(), 18 );
+assert( "Matcher.end() of second match", offsetMatcher.end(), 24 );
+
+// Full in-place find-and-replace using start()/end() to slice literal gaps.
+far_source  = "Lorem {{a}} ipsum {{bb}} sit.";
+far_matcher = createObject( "java", "java.util.regex.Pattern" )
+    .compile( javaCast( "string", "\{\{.*?\}\}" ) )
+    .matcher( javaCast( "string", far_source ) );
+far_builder = [];
+far_pos = 1;
+while ( far_matcher.find() ) {
+    far_start = far_matcher.start() + 1;
+    if ( far_pos < far_start ) {
+        arrayAppend( far_builder, mid( far_source, far_pos, far_start - far_pos ) );
+    }
+    arrayAppend( far_builder, "[" & far_matcher.group() & "]" );
+    far_pos = far_matcher.end() + 1;
+}
+if ( len( far_source ) >= far_pos ) {
+    arrayAppend( far_builder, right( far_source, len( far_source ) - ( far_pos - 1 ) ) );
+}
+assert( "in-place find-and-replace preserves order", arrayToList( far_builder, "" ), "Lorem [{{a}}] ipsum [{{bb}}] sit." );
+
 writeOutput( "\n=== All Java shim tests passed! ===\n" );
 
 suiteEnd( "Java Shims" );

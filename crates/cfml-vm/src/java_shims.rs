@@ -1935,6 +1935,29 @@ pub fn handle_java_pattern(method: &str, args: Vec<CfmlValue>, object: &CfmlValu
             }
             Ok(CfmlValue::Int(0))
         }
+        // Matcher.start([n]) / end([n]) — 0-based char offset of the most recent
+        // match (or group n). Populated by `java_matcher_step` after find()/etc.
+        "start" | "end" => {
+            if let CfmlValue::Struct(s) = object {
+                let group_arg = args.first().and_then(|a| a.as_string().trim().parse::<usize>().ok());
+                let (single_key, group_key) = if method == "start" {
+                    ("__start", "__startgroups")
+                } else {
+                    ("__end", "__endgroups")
+                };
+                return Ok(match group_arg {
+                    None | Some(0) => s.get(single_key).unwrap_or(CfmlValue::Int(-1)),
+                    Some(n) => {
+                        if let Some(CfmlValue::Array(g)) = s.get(group_key) {
+                            g.snapshot().get(n).cloned().unwrap_or(CfmlValue::Int(-1))
+                        } else {
+                            CfmlValue::Int(-1)
+                        }
+                    }
+                });
+            }
+            Ok(CfmlValue::Int(-1))
+        }
         _ => Ok(CfmlValue::Null),
     }
 }
@@ -1987,6 +2010,8 @@ pub fn java_matcher_step(
 
     let mut ns = s.snapshot();
     let matched = caps.is_some();
+    // Convert a byte offset into the (0-based) char offset Java's Matcher uses.
+    let char_off = |byte: usize| -> i64 { input[..byte].chars().count() as i64 };
     let groups: Vec<CfmlValue> = match &caps {
         Some(caps) => (0..re.captures_len())
             .map(|i| {
@@ -1997,8 +2022,26 @@ pub fn java_matcher_step(
             .collect(),
         None => Vec::new(),
     };
+    // Stash per-group start/end char offsets so Matcher.start([n])/end([n]) can
+    // read them. Group 0 is the whole match; -1 marks an unmatched group (Java
+    // semantics). On no-match the arrays are empty and start()/end() return -1.
+    let (start_groups, end_groups): (Vec<CfmlValue>, Vec<CfmlValue>) = match &caps {
+        Some(caps) => (0..re.captures_len())
+            .map(|i| match caps.get(i) {
+                Some(m) => (CfmlValue::Int(char_off(m.start())), CfmlValue::Int(char_off(m.end()))),
+                None => (CfmlValue::Int(-1), CfmlValue::Int(-1)),
+            })
+            .unzip(),
+        None => (Vec::new(), Vec::new()),
+    };
+    let group0_start = start_groups.first().cloned().unwrap_or(CfmlValue::Int(-1));
+    let group0_end = end_groups.first().cloned().unwrap_or(CfmlValue::Int(-1));
     ns.insert("__matched".to_string(), CfmlValue::Bool(matched));
     ns.insert("__groups".to_string(), CfmlValue::array(groups));
+    ns.insert("__start".to_string(), group0_start);
+    ns.insert("__end".to_string(), group0_end);
+    ns.insert("__startgroups".to_string(), CfmlValue::array(start_groups));
+    ns.insert("__endgroups".to_string(), CfmlValue::array(end_groups));
     if matches!(mode, MatchMode::Find) && matched {
         ns.insert("__findindex".to_string(), CfmlValue::Int((find_index + 1) as i64));
     }
