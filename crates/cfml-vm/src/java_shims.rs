@@ -793,8 +793,11 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
             Ok(CfmlValue::string(val))
         }
         "getenv" => {
-            // No-arg form returns a struct of all env vars (real Java returns a Map).
-            // Single-arg form returns the value for that key.
+            // Single-arg form returns the value for that key. No-arg form returns
+            // a Map (real Java: `Map<String,String>`), so it MUST be a java.util
+            // map shim — not a plain struct — or member calls on the result like
+            // `System.getenv().get("X")` (Preside's `_getEnvironmentVariable`) and
+            // `.containsKey`/`.keySet` would not dispatch and silently return null.
             let key = args.iter().find_map(|a| match a {
                 CfmlValue::String(s) => Some(s.clone()),
                 _ => None,
@@ -803,6 +806,11 @@ pub fn handle_java_system(method: &str, args: Vec<CfmlValue>, _object: &CfmlValu
                 Some(k) => Ok(CfmlValue::string(std::env::var(k.as_str()).unwrap_or_default())),
                 None => {
                     let mut env = ValueMap::default();
+                    env.insert(
+                        "__java_class".to_string(),
+                        CfmlValue::string("java.util.linkedhashmap".to_string()),
+                    );
+                    env.insert("__java_shim".to_string(), CfmlValue::Bool(true));
                     for (k, v) in std::env::vars() {
                         env.insert(k, CfmlValue::string(v));
                     }

@@ -268,12 +268,15 @@ fn type_version(ds: &str, driver: &DbDriver) -> CfmlResult {
                 .first()
                 .map(|r| cell_str(r, "v"))
                 .unwrap_or_default();
-            let product = if v.to_lowercase().contains("mariadb") {
-                "MariaDB"
-            } else {
-                "MySQL"
-            };
-            (product.to_string(), v, "RustCFML MySQL driver")
+            // Report "MySQL" for the MySQL-protocol driver regardless of the
+            // backend being MariaDB. This matches a Lucee/ACF deployment using
+            // the MySQL JDBC connector (which reports "MySQL" even against a
+            // MariaDB server), so apps that whitelist or branch on
+            // `database_productname == "MySQL"` (e.g. Preside's datasource
+            // validation + DB-adapter selection) work against MariaDB, which is
+            // wire-compatible and uses the same driver. The MariaDB build detail
+            // is still available verbatim in `database_version`.
+            ("MySQL".to_string(), v, "RustCFML MySQL driver")
         }
         DbDriver::Postgres(_) => {
             // version() → "PostgreSQL 16.2 on x86_64..." / "CockroachDB CCL v23…".

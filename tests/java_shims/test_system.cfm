@@ -27,6 +27,15 @@ assertTrue("user.dir returns string", isSimpleValue(userDir));
 env = javaSystem.getEnv();
 assertTrue("getEnv returns something", isStruct(env) or isObject(env));
 
+// No-arg getEnv() returns a java.util Map shim, so Map member methods must
+// dispatch — `getEnv().get(name)` is how Preside's _getEnvironmentVariable
+// reads config. Before the fix it returned a plain struct whose .get() did
+// not dispatch and silently returned null. PATH is set in every environment.
+assert("getEnv().get(PATH) matches single-arg getEnv(PATH)", javaSystem.getEnv().get("PATH"), javaSystem.getEnv("PATH"));
+assertTrue("getEnv().containsKey(PATH)", javaSystem.getEnv().containsKey("PATH"));
+assertNull("getEnv().get(missing) is null", javaSystem.getEnv().get("RUSTCFML_DEFINITELY_UNSET_VAR_XYZ"));
+assertTrue("getEnv().keySet() includes PATH", arrayContains(javaSystem.getEnv().keySet(), "PATH") gt 0);
+
 // Test nanoTime (static method)
 nano = javaSystem.nanoTime();
 assertTrue("nanoTime returns numeric", isNumeric(nano));
