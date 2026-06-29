@@ -157,35 +157,6 @@ fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool {
         && (s.contains_key_ci("this") || s.contains_key_ci("__name"))
 }
 
-/// Bind a bare (unbound) component method, extracted as a VALUE, to its owning
-/// component's scope so a later *detached* call still resolves `variables` /
-/// `this` / `super`. `this.method` (GetProperty) already does this inline;
-/// `this[dynamicKey]` (GetIndex) must do the same, otherwise TestBox's
-/// `this[ item.name ]()` lifecycle dispatch runs against an empty scope and
-/// silently no-ops. Returns the value unchanged unless it is an unbound method
-/// on a component struct. Mirrors the GetProperty op's binding (Bug #9 family).
-fn bind_extracted_method(val: CfmlValue, s: &cfml_common::dynamic::CfmlStruct) -> CfmlValue {
-    if let CfmlValue::Function(ref f) = val {
-        if f.captured_scope.is_none()
-            && (s.contains_key("__variables") || s.contains_key("__name"))
-        {
-            let mut bound: ValueMap = ValueMap::default();
-            bound.insert("this".to_string(), CfmlValue::Struct(s.clone()));
-            if let Some(vars) = s.get("__variables") {
-                bound.insert("__variables".to_string(), vars.clone());
-                bound.insert("variables".to_string(), vars.clone());
-            }
-            if let Some(sup) = s.get("__super") {
-                bound.insert("super".to_string(), sup.clone());
-            }
-            let mut bound_fn = (**f).clone();
-            bound_fn.captured_scope = Some(Arc::new(std::sync::RwLock::new(bound)));
-            return CfmlValue::Function(Arc::new(bound_fn));
-        }
-    }
-    val
-}
-
 /// Build the *leaf* (own-class) metadata for a component from a raw class
 /// template `s` — name/fullname/path/implements/properties plus the class's OWN
 /// methods (with each function's doc-comment annotations FLATTENED as top-level
@@ -1134,6 +1105,14 @@ pub struct CfmlVirtualMachine {
     /// bug). Composes through nested calls because each frame inherits the
     /// caller's `__variables` (the hoisted method table).
     dispatch_caller_variables: Option<CfmlValue>,
+    /// The calling frame's `this` (set alongside `dispatch_caller_variables` by
+    /// the CallMethod op). Lets a plain-struct member call of an UNBOUND
+    /// component method (`item.beforeEach()` where `beforeEach` was extracted via
+    /// `this[item.name]` into a plain struct) run with the caller's component
+    /// `this`/`variables` — matching CFML mixin semantics and the bare `f()`
+    /// call path (which inherits the caller's full locals). Without it the
+    /// extracted method runs detached (`this` undefined). See #220.
+    dispatch_caller_this: Option<CfmlValue>,
     /// Active transaction connection (held during cftransaction block, type-erased)
     pub transaction_conn: Option<Box<dyn std::any::Any>>,
     /// Datasource URL of the active transaction
@@ -1622,6 +1601,7 @@ impl CfmlVirtualMachine {
             mappings: Vec::new(),
             captured_locals: None,
             dispatch_caller_variables: None,
+            dispatch_caller_this: None,
             transaction_conn: None,
             transaction_datasource: None,
             transaction_pending: false,
@@ -6005,10 +5985,18 @@ impl CfmlVirtualMachine {
                             } else {
                                 direct.unwrap_or(CfmlValue::Null)
                             };
-                            // `this[ name ]` extracting a component method must
-                            // bind it to the component scope (same as `this.name`
-                            // via GetProperty), so a deferred detached call works.
-                            stack.push(bind_extracted_method(val, s));
+                            // `this[ name ]` extracts a component method as a bare
+                            // VALUE — it is NOT bound to `s` here. Binding is a
+                            // call-site decision: an immediate `obj[name]()` goes
+                            // through CallComputedMethod (binds the receiver), and
+                            // an extracted-then-invoked method binds to whatever
+                            // component it is called through (member dispatch) or
+                            // the caller's component (a bare/plain-struct call) —
+                            // matching Lucee mixin semantics. Eager-binding here
+                            // froze the SOURCE scope and survived re-homing the
+                            // method onto another component, breaking every Wheels
+                            // boot (#220).
+                            stack.push(val);
                         }
                         _ => stack.push(CfmlValue::Null),
                     }
@@ -7048,6 +7036,7 @@ impl CfmlVirtualMachine {
                     // a still-being-constructed receiver (no `__variables` of its
                     // own yet) can fall back to the caller's hoisted method table.
                     self.dispatch_caller_variables = locals.get("__variables").cloned();
+                    self.dispatch_caller_this = locals.get("this").cloned();
 
                     // Does this receiver have `this`/variables write-back semantics?
                     // Only CFCs (carry __variables/__name) and Java shims (e.g.
@@ -15662,6 +15651,10 @@ impl CfmlVirtualMachine {
         // in-construction `this` during a pseudo-constructor. Taken up-front so
         // nested dispatches inside this call can't clobber it.
         let caller_variables = self.dispatch_caller_variables.take();
+        // The calling frame's `this` — used to give an UNBOUND extracted method,
+        // invoked through a PLAIN struct (`item.beforeEach()`), the caller's
+        // component context. Mirrors `caller_variables`. See #220.
+        let caller_this = self.dispatch_caller_this.take();
 
         // A method call on a null receiver is an error in CFML (Lucee throws);
         // silently returning Null lets `<null>.save(...)` no-op and report fake
@@ -16963,6 +16956,24 @@ impl CfmlVirtualMachine {
                     }
                 }
                 method_locals.insert("this".to_string(), object.clone());
+            } else if matches!(&func_ref, CfmlValue::Function(ref f) if f.captured_scope.is_none()) {
+                // Plain-struct receiver holding an UNBOUND component method
+                // (extracted via `this[item.name]` into a plain struct, then
+                // invoked as `item.beforeEach()`). CFML runs it with the CALLING
+                // frame's component `this`/`variables` — the same context a bare
+                // `f()` call inherits (the bare Call op forwards the caller's
+                // locals). Inject them so the method body's `this`/`variables`
+                // resolve to the caller's component instead of running detached.
+                // Only for unbound functions: a struct-stored closure with its
+                // own captured scope (`enc = { string: fn }`) keeps that scope.
+                // This is the mixin-semantics fix for #220 — replacing the
+                // eager GetIndex binding that wrongly froze the source scope.
+                if let Some(ref ct) = caller_this {
+                    method_locals.insert("this".to_string(), ct.clone());
+                }
+                if let Some(ref cv) = caller_variables {
+                    method_locals.insert("__variables".to_string(), cv.clone());
+                }
             }
             self.closure_parent_writeback = None;
             // Save & clear method-writeback state so a stale `this` from the
