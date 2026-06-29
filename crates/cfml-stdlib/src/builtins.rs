@@ -6183,6 +6183,11 @@ fn fn_file_read(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
     match std::fs::read_to_string(&path) {
         Ok(contents) => Ok(CfmlValue::string(contents)),
+        // Lucee surfaces a missing file from fileRead() as an `expression` error
+        // (only fileReadBinary uses FileNotFoundException) — match that asymmetry.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(CfmlError::expression(format!("The file [{}] does not exist", path)))
+        }
         Err(e) => Err(CfmlError::runtime(format!("fileRead: {}", e))),
     }
 }
@@ -6225,6 +6230,12 @@ fn fn_file_delete(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
     match std::fs::remove_file(&path) {
         Ok(_) => Ok(CfmlValue::Bool(true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Lucee/ACF message contains "does not exist"; callers branch on it
+            // to silently no-op a delete of a missing file (e.g. Preside's
+            // FileSystemStorageProvider.deleteObject).
+            Err(CfmlError::file_not_found(format!("The file [{}] does not exist", path)))
+        }
         Err(e) => Err(CfmlError::runtime(format!("fileDelete: {}", e))),
     }
 }
@@ -6422,8 +6433,15 @@ fn fn_get_temp_file(args: Vec<CfmlValue>) -> CfmlResult {
 fn fn_get_file_info(args: Vec<CfmlValue>) -> CfmlResult {
     let path_str = get_str(&args, 0);
     let path = std::path::Path::new(&path_str);
-    let meta = std::fs::metadata(path)
-        .map_err(|e| CfmlError::runtime(format!("getFileInfo: {}", e)))?;
+    let meta = std::fs::metadata(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            // Lucee/ACF message contains "does not exist"; Preside's
+            // FileSystemStorageProvider.getObjectInfo branches on it.
+            CfmlError::file_not_found(format!("file or directory [{}] does not exist", path_str))
+        } else {
+            CfmlError::runtime(format!("getFileInfo: {}", e))
+        }
+    })?;
 
     let mut info = ValueMap::default();
     info.insert("name".to_string(), CfmlValue::string(
@@ -6437,7 +6455,16 @@ fn fn_get_file_info(args: Vec<CfmlValue>) -> CfmlResult {
     info.insert("canWrite".to_string(), CfmlValue::Bool(!meta.permissions().readonly()));
     if let Ok(modified) = meta.modified() {
         let secs = modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        info.insert("lastModified".to_string(), CfmlValue::Int(secs as i64));
+        // Emit a CFML date string (local time) so IsDate()/date functions accept
+        // it — Lucee's getFileInfo().lastmodified is a date, and callers (e.g.
+        // Preside's getObjectInfo) assert IsDate() on it. A raw epoch int failed.
+        use chrono::TimeZone;
+        let lm = chrono::Local
+            .timestamp_opt(secs as i64, 0)
+            .single()
+            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        info.insert("lastModified".to_string(), CfmlValue::string(lm));
     }
     Ok(CfmlValue::strukt(info))
 }
@@ -13536,6 +13563,9 @@ fn fn_file_read_binary(args: Vec<CfmlValue>) -> CfmlResult {
     let path = get_str(&args, 0);
     match std::fs::read(&path) {
         Ok(bytes) => Ok(CfmlValue::Binary(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(CfmlError::file_not_found(format!("The file [{}] does not exist", path)))
+        }
         Err(e) => Err(CfmlError::runtime(format!("fileReadBinary(): {}", e))),
     }
 }

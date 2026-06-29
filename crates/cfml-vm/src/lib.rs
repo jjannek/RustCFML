@@ -8980,6 +8980,45 @@ impl CfmlVirtualMachine {
                     }
                     return Ok(CfmlValue::Bool(true));
                 }
+                // `arrayFind( arr, fn )` / `arrayFindAll( arr, fn )` closure-
+                // PREDICATE form (Lucee/ACF) — the BIF twin of the `arr.find(fn)`
+                // member handler. Returns the 1-based index of the first truthy
+                // match (find), or an array of all such indices (findAll). The
+                // value-needle form fails the guard and falls through to the
+                // builtin (deep-equality match).
+                "arrayfind" | "arrayfindnocase" | "arrayfindall" | "arrayfindallnocase"
+                    if matches!(args.get(1), Some(CfmlValue::Function(_))) =>
+                {
+                    let all = name_lower.starts_with("arrayfindall");
+                    if let Some(CfmlValue::Array(arr)) = args.first() {
+                        let callback = args[1].clone();
+                        let snap = arr.snapshot();
+                        let mut indices = Vec::new();
+                        for (i, item) in snap.iter().enumerate() {
+                            let cb_args =
+                                vec![item.clone(), CfmlValue::Int((i + 1) as i64), args[0].clone()];
+                            self.closure_parent_writeback = None;
+                            let r = self.call_function(&callback, cb_args, parent_locals)?;
+                            if let Some(ref wb) = self.closure_parent_writeback {
+                                Self::write_back_to_captured_scope(&callback, wb);
+                            }
+                            if r.is_true() {
+                                indices.push(CfmlValue::Int((i + 1) as i64));
+                                if !all {
+                                    break;
+                                }
+                            }
+                        }
+                        if all {
+                            return Ok(CfmlValue::array(indices));
+                        }
+                        return Ok(CfmlValue::Int(indices.first().map(|v| match v {
+                            CfmlValue::Int(n) => *n,
+                            _ => 0,
+                        }).unwrap_or(0)));
+                    }
+                    return Ok(CfmlValue::Int(0));
+                }
                 "arraymap"
                 | "arrayfilter"
                 | "arrayreduce"
@@ -16377,6 +16416,53 @@ impl CfmlVirtualMachine {
                 "insertat" => Some("arrayInsertAt"),
                 "contains" => Some("arrayContains"),
                 "containsnocase" => Some("arrayContainsNoCase"),
+                // `arr.find( fn )` / `arr.findAll( fn )` closure-PREDICATE form
+                // (Lucee/ACF): return the 1-based index of the first element for
+                // which the closure returns truthy (find), or an array of all
+                // such indices (findAll). The value-needle form falls through to
+                // the arrayFind* builtins below. The closure is VM-intercepted
+                // here because the raw builtin can't invoke it.
+                "find" | "indexof" | "findnocase"
+                    if matches!(extra_args.first(), Some(CfmlValue::Function(_))) =>
+                {
+                    let callback = extra_args.first().cloned().unwrap();
+                    let snap = arr.snapshot();
+                    let mut found = 0i64;
+                    for (i, item) in snap.iter().enumerate() {
+                        let cb_args =
+                            vec![item.clone(), CfmlValue::Int((i + 1) as i64), object.clone()];
+                        self.closure_parent_writeback = None;
+                        let r = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                        if let Some(ref wb) = self.closure_parent_writeback {
+                            Self::write_back_to_captured_scope(&callback, wb);
+                        }
+                        if r.is_true() {
+                            found = (i + 1) as i64;
+                            break;
+                        }
+                    }
+                    return Ok(CfmlValue::Int(found));
+                }
+                "findall" | "findallnocase"
+                    if matches!(extra_args.first(), Some(CfmlValue::Function(_))) =>
+                {
+                    let callback = extra_args.first().cloned().unwrap();
+                    let snap = arr.snapshot();
+                    let mut indices = Vec::new();
+                    for (i, item) in snap.iter().enumerate() {
+                        let cb_args =
+                            vec![item.clone(), CfmlValue::Int((i + 1) as i64), object.clone()];
+                        self.closure_parent_writeback = None;
+                        let r = self.call_function(&callback, cb_args, &ValueMap::default())?;
+                        if let Some(ref wb) = self.closure_parent_writeback {
+                            Self::write_back_to_captured_scope(&callback, wb);
+                        }
+                        if r.is_true() {
+                            indices.push(CfmlValue::Int((i + 1) as i64));
+                        }
+                    }
+                    return Ok(CfmlValue::array(indices));
+                }
                 "find" | "indexof" => Some("arrayFind"),
                 "findnocase" => Some("arrayFindNoCase"),
                 "findall" => Some("arrayFindAll"),

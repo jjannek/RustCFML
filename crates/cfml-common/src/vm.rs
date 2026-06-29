@@ -57,6 +57,18 @@ impl CfmlError {
     pub fn expression(message: String) -> Self {
         Self::new(message, CfmlErrorType::Expression)
     }
+
+    /// A missing-file exception whose `type` matches Java's
+    /// `java.io.FileNotFoundException`, the way Lucee/ACF surface a missing file
+    /// from `fileRead*`. CFML code branches on it — e.g. Preside's
+    /// `FileSystemStorageProvider.getObject` does
+    /// `if ( e.type contains "FileNotFoundException" ) { throw objectNotFound }`.
+    pub fn file_not_found(message: String) -> Self {
+        Self::new(
+            message,
+            CfmlErrorType::Custom("java.io.FileNotFoundException".to_string()),
+        )
+    }
 }
 
 impl std::fmt::Display for CfmlErrorType {
