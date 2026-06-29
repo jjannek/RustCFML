@@ -2776,34 +2776,35 @@ impl CfmlVirtualMachine {
     }
 
     fn wrap_error(&self, mut err: CfmlError) -> CfmlError {
+        // Fire the observability `error` hook (debug footer Exceptions section)
+        // exactly once per exception: only on the FIRST wrap, detected by an
+        // empty stack_trace. A thrown error is already recorded + stack-stamped
+        // at the throw site (so it arrives here non-empty and is skipped); a
+        // runtime error raised elsewhere is recorded here on its first wrap and
+        // skipped on any re-wrap as it propagates. `uncaught` stays false — the
+        // try-stack decides catch-vs-propagate after this point.
         if err.stack_trace.is_empty() {
             err.stack_trace = self.build_stack_trace();
-        }
-        // Observability: fire the `error` hook (debug footer exceptions section,
-        // OTel exception events). Guarded by interest so a request with no
-        // subscriber pays nothing. `uncaught` is left false here — this is the
-        // raise site, before the try-stack decides; the footer records all
-        // raised exceptions (Lucee-style), the OTel layer (Phase 3) will refine
-        // caught-vs-uncaught at its own hook.
-        #[cfg(feature = "observability")]
-        if self.interest.contains(observe::Interest::ERROR) {
-            if let Some(o) = &self.observer {
-                let etype = format!("{}", err.error_type);
-                let src = self.source_file.clone().unwrap_or_default();
-                let stack: Vec<(String, usize)> = err
-                    .stack_trace
-                    .iter()
-                    .map(|f| (f.template.clone(), f.line))
-                    .collect();
-                o.on_error(&observe::ErrorEvent {
-                    etype: &etype,
-                    message: &err.message,
-                    detail: "",
-                    src: &src,
-                    line: self.current_line,
-                    uncaught: false,
-                    stack,
-                });
+            #[cfg(feature = "observability")]
+            if self.interest.contains(observe::Interest::ERROR) {
+                if let Some(o) = &self.observer {
+                    let etype = format!("{}", err.error_type);
+                    let src = self.source_file.clone().unwrap_or_default();
+                    let stack: Vec<(String, usize)> = err
+                        .stack_trace
+                        .iter()
+                        .map(|f| (f.template.clone(), f.line))
+                        .collect();
+                    o.on_error(&observe::ErrorEvent {
+                        etype: &etype,
+                        message: &err.message,
+                        detail: "",
+                        src: &src,
+                        line: self.current_line,
+                        uncaught: false,
+                        stack,
+                    });
+                }
             }
         }
         err
@@ -8927,7 +8928,7 @@ impl CfmlVirtualMachine {
                 // `observability` feature is off they fall through to the no-op
                 // stub builtins registered in cfml-stdlib.
                 #[cfg(feature = "observability")]
-                "getdebugdata" | "isdebugmode" | "debugadd" => {
+                "getdebugdata" | "isdebugmode" | "debugadd" | "writelog" | "trace" => {
                     // Will be handled at the end of this function (needs VM access)
                 }
                 _ => {
@@ -12262,6 +12263,60 @@ impl CfmlVirtualMachine {
                     return Ok(CfmlValue::Bool(self.is_debug_mode()));
                 }
                 #[cfg(feature = "observability")]
+                "writelog" => {
+                    // Intercepted (when observability is built in) so the entry
+                    // feeds the debug footer's Trace/Log section, then performs
+                    // the same stderr side-effect as the cfml-stdlib builtin.
+                    // Accepts a bundled options struct (named-arg call) or
+                    // positional text/type/file.
+                    let (text, log_type, file) = match args.first() {
+                        Some(CfmlValue::Struct(s)) => (
+                            s.get_ci("text").map(|v| v.as_string()).unwrap_or_default(),
+                            s.get_ci("type").map(|v| v.as_string()).unwrap_or_else(|| "Information".to_string()),
+                            s.get_ci("file").map(|v| v.as_string()).unwrap_or_else(|| "application".to_string()),
+                        ),
+                        _ => (
+                            args.first().map(|v| v.as_string()).unwrap_or_default(),
+                            args.get(1).map(|v| v.as_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Information".to_string()),
+                            args.get(3).map(|v| v.as_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "application".to_string()),
+                        ),
+                    };
+                    eprintln!("[LOG] {}", text);
+                    if self.interest.contains(observe::Interest::LOG) {
+                        if let Some(o) = &self.observer {
+                            o.on_log(&observe::LogEvent {
+                                text: &text,
+                                log_type: &log_type,
+                                file: &file,
+                            });
+                        }
+                    }
+                    return Ok(CfmlValue::Null);
+                }
+                #[cfg(feature = "observability")]
+                "trace" => {
+                    // cftrace / trace(): feed the footer's Trace/Log section
+                    // (type "Trace"), then the stderr side-effect.
+                    let text = match args.first() {
+                        Some(CfmlValue::Struct(s)) => s
+                            .get_ci("text")
+                            .map(|v| v.as_string())
+                            .unwrap_or_default(),
+                        _ => args.first().map(|v| v.as_string()).unwrap_or_default(),
+                    };
+                    eprintln!("[TRACE] {}", text);
+                    if self.interest.contains(observe::Interest::LOG) {
+                        if let Some(o) = &self.observer {
+                            o.on_log(&observe::LogEvent {
+                                text: &text,
+                                log_type: "Trace",
+                                file: "trace",
+                            });
+                        }
+                    }
+                    return Ok(CfmlValue::Null);
+                }
+                #[cfg(feature = "observability")]
                 "debugadd" => {
                     // debugAdd(category, name, value) OR debugAdd(category, struct)
                     // — append rows to the genericData section (custom panels).
@@ -13168,11 +13223,56 @@ impl CfmlVirtualMachine {
                         .map(|(_, v)| v.as_string())
                         .unwrap_or_default();
 
+                    // Observability: record the raised exception for the debug
+                    // footer's Exceptions section. Fired here (not just at
+                    // `wrap_error`) because an explicit throw that is caught by a
+                    // try/catch never reaches a wrap_error site — yet Lucee still
+                    // lists it. `uncaught` is left false; the try-stack decides
+                    // catch-vs-propagate after this point.
+                    #[cfg(feature = "observability")]
+                    if self.interest.contains(observe::Interest::ERROR) {
+                        if let Some(o) = &self.observer {
+                            let field = |k: &str| {
+                                exception
+                                    .iter()
+                                    .find(|(ek, _)| ek.eq_ignore_ascii_case(k))
+                                    .map(|(_, v)| v.as_string())
+                                    .unwrap_or_default()
+                            };
+                            let etype = field("type");
+                            let detail = field("detail");
+                            let src = self.source_file.clone().unwrap_or_default();
+                            let stack: Vec<(String, usize)> = self
+                                .build_stack_trace()
+                                .iter()
+                                .map(|f| (f.template.clone(), f.line))
+                                .collect();
+                            o.on_error(&observe::ErrorEvent {
+                                etype: &etype,
+                                message: &message,
+                                detail: &detail,
+                                src: &src,
+                                line: self.current_line,
+                                uncaught: false,
+                                stack,
+                            });
+                        }
+                    }
+
                     Self::add_root_cause(&mut exception);
                     let error_val = CfmlValue::strukt(exception);
                     self.last_exception = Some(error_val.clone());
 
-                    return Err(CfmlError::runtime(message));
+                    // Pre-stamp the stack trace so a later `wrap_error` (if this
+                    // throw is caught at an outer frame and crosses a call
+                    // boundary) sees a non-empty trace and does NOT re-record the
+                    // exception — it was already recorded above.
+                    let mut err = CfmlError::runtime(message);
+                    #[cfg(feature = "observability")]
+                    if self.interest.contains(observe::Interest::ERROR) {
+                        err.stack_trace = self.build_stack_trace();
+                    }
+                    return Err(err);
                 }
                 // ---- Cache functions ----
                 "cacheput" => {

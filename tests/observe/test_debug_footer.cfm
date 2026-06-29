@@ -41,6 +41,23 @@ if (isRustCFML()) {
     debugAdd("DebugFooterTest", { "k1": "v1", "k2": "v2" });
     assert("debugAdd struct form added two rows",
         arrayLen(getDebugData().genericData) == b2 + 2, true);
+
+    // A CAUGHT exception still feeds the Exceptions section (Lucee parity —
+    // recorded at the throw site, not only on uncaught propagation).
+    var exBefore = arrayLen(getDebugData().exceptions);
+    try {
+        throw(type="DebugFooterTest.Boom", message="caught on purpose");
+    } catch (any e) {}
+    var exAfter = getDebugData().exceptions;
+    assert("caught exception recorded", arrayLen(exAfter) == exBefore + 1, true);
+    assert("exception type captured", exAfter[arrayLen(exAfter)].type, "DebugFooterTest.Boom");
+
+    // writeLog + trace feed the traces section.
+    var trBefore = arrayLen(getDebugData().traces);
+    writeLog(text="footer test log", type="information", file="debugfootertest");
+    trace("footer test trace");
+    assert("writeLog + trace recorded as traces",
+        arrayLen(getDebugData().traces) == trBefore + 2, true);
 }
 
 suiteEnd();

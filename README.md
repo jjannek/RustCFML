@@ -96,6 +96,7 @@ RustCFML wins six of ten queries outright (and the total), including the 5×UNIO
 | **[Configuration](docs/configuration.md)** | `.cfconfig.json` — datasources, mappings, mail, security, caches, env vars |
 | **[Deployment](docs/deployment.md)** | Web app, Docker, CLI tools, Cloudflare Workers; production mode & sandbox |
 | **[Database](docs/database.md)** | `queryExecute`, datasources, `cfqueryparam`, engine specifics |
+| **[Debugging](docs/debugging.md)** | The classic debug-output footer — queries (with params), template times, exceptions, scopes; activation gates, `getDebugData()`/`isDebugMode()`/`debugAdd()` |
 | **[Object Storage](docs/s3.md)** | S3 / R2 / MinIO — `S3*` functions and transparent `s3://` paths |
 | **[Native Modules](docs/native-modules.md)** | Extend a binary with first-class Rust built-ins and classes |
 | **[Java Shims](docs/java-shims.md)** | Emulated Java classes for `createObject("java", …)` — what's supported and known gaps |

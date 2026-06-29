@@ -476,6 +476,28 @@ fn render_html(
         }
     }
 
+    // Execution Time summary (Lucee's breakdown): Total, time spent in Query,
+    // and Application (= total − query). Load/compilation is not yet tracked
+    // separately, so it folds into Application.
+    let query_total_us: i64 = data.queries.iter().map(|q| q.time).sum();
+    if cfg.database || !data.templates.is_empty() {
+        s.push_str("<h4 style=\"margin:6px 0 2px\">Execution Time</h4>\n");
+        s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
+        s.push_str(&format!(
+            "<tr><td class=\"txt-r\">{} ms</td><td>Total</td></tr>\n",
+            fmt_us(total_us)
+        ));
+        s.push_str(&format!(
+            "<tr><td class=\"txt-r\">{} ms</td><td>Application</td></tr>\n",
+            fmt_us((total_us - query_total_us).max(0))
+        ));
+        s.push_str(&format!(
+            "<tr><td class=\"txt-r\">{} ms</td><td>Query</td></tr>\n",
+            fmt_us(query_total_us)
+        ));
+        s.push_str("</table>\n");
+    }
+
     // Pages (templates) — main page first, then each include / component
     // method / Application.cfc execution, aggregated per file (Lucee parity).
     let pages = aggregate_pages_with_main(&data.templates, main_page, total_us);
@@ -485,14 +507,25 @@ fn render_html(
             pages.iter().map(|p| p.count).sum::<i64>()
         ));
         s.push_str("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\" style=\"border-collapse:collapse\">\n");
-        s.push_str("<tr><th>total ms</th><th>avg ms</th><th>count</th><th>template</th></tr>\n");
+        s.push_str("<tr><th>total ms</th><th>app ms</th><th>query ms</th><th>count</th><th>avg ms</th><th>template</th></tr>\n");
         for p in &pages {
             let avg = if p.count > 0 { p.total / p.count } else { 0 };
+            // Per-template query time: sum of queries issued from this file
+            // (Lucee's per-page Query column). `app` = total − query.
+            let q_us: i64 = data
+                .queries
+                .iter()
+                .filter(|q| q.src == p.id)
+                .map(|q| q.time)
+                .sum();
+            let app_us = (p.total - q_us).max(0);
             s.push_str(&format!(
-                "<tr><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
+                "<tr><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td class=\"txt-r\">{}</td><td>{}</td></tr>\n",
                 fmt_us(p.total),
-                fmt_us(avg),
+                fmt_us(app_us),
+                fmt_us(q_us),
                 p.count,
+                fmt_us(avg),
                 esc(&p.id),
             ));
         }
