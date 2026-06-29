@@ -2918,6 +2918,17 @@ impl CfmlCompiler {
             prop_count += 1;
         }
 
+        // Runtime marker for the implicit accessor constructor: a component with
+        // `accessors=true` and no explicit init() maps NAMED constructor args (and
+        // an argumentCollection spread) onto its declared properties (Lucee/ACF
+        // parity). `__`-prefixed keys are filtered out of all struct iteration /
+        // serialization, so this never leaks into user-visible output.
+        if component.accessors {
+            instructions.push(BytecodeOp::String("__accessors".to_string()));
+            instructions.push(BytecodeOp::True);
+            prop_count += 1;
+        }
+
         // Build the base struct
         instructions.push(BytecodeOp::BuildStruct(prop_count));
 

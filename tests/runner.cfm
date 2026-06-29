@@ -255,6 +255,7 @@ include "harness.cfm";
 <cf_runtest file="oop/test_super_case_insensitive_this.cfm">
 <cf_runtest file="oop/test_inherited_helpers.cfm">
 <cf_runtest file="oop/test_mixin_self_dispatch.cfm">
+<cf_runtest file="oop/test_implicit_accessor_constructor.cfm">
 <cf_runtest file="oop/test_interfaces.cfm">
 <cf_runtest file="oop/test_implements_unqualified_sibling.cfm">
 <cf_runtest file="oop/test_metadata.cfm">

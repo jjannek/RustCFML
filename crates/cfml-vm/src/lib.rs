@@ -6719,9 +6719,23 @@ impl CfmlVirtualMachine {
                                     }
                                     final_obj
                                 } else {
+                                    // init key present but not a function: no
+                                    // constructor runs → apply implicit accessors.
+                                    Self::apply_implicit_accessor_ctor(
+                                        &instance,
+                                        ctor_arg_names.as_deref(),
+                                        &ctor_args,
+                                    );
                                     instance
                                 }
                             } else {
+                                // No init() at all → Lucee/ACF implicit accessor
+                                // constructor populates declared properties.
+                                Self::apply_implicit_accessor_ctor(
+                                    &instance,
+                                    ctor_arg_names.as_deref(),
+                                    &ctor_args,
+                                );
                                 instance
                             }
                         } else {
@@ -15115,6 +15129,93 @@ impl CfmlVirtualMachine {
     /// Whether `builtin_named_arg_index` knows a signature for this BIF.
     fn builtin_has_named_sig(builtin_lc: &str) -> bool {
         matches!(builtin_lc, "directorylist")
+    }
+
+    /// Lucee/ACF implicit accessor constructor. A component declared with
+    /// `accessors=true` and NO explicit `init()` gets a generated constructor
+    /// that maps NAMED constructor arguments (and an `argumentCollection`
+    /// spread) onto its matching declared properties. Positional args are NOT
+    /// mapped, and non-accessor / has-init components are untouched — all three
+    /// rules verified on Lucee 7. Writes the `__variables.<prop>` backing the
+    /// generated getter reads, plus the top-level `this.<prop>` key (mirroring
+    /// the codegen'd setter) UNLESS that key holds a same-named method — a CFC
+    /// may declare both `property name="x"` and a method `x()`, and Lucee keeps
+    /// the method callable while the getter returns the property value. Mutates
+    /// the instance in place via its interior-mutable struct handle.
+    fn apply_implicit_accessor_ctor(
+        instance: &CfmlValue,
+        ctor_arg_names: Option<&[String]>,
+        ctor_args: &[CfmlValue],
+    ) {
+        let Some(s) = instance.as_cfml_struct() else {
+            return;
+        };
+        // Gate strictly on accessors=true: non-accessor and positional-only
+        // construction must keep the declared property defaults.
+        if !matches!(s.get("__accessors"), Some(CfmlValue::Bool(true))) {
+            return;
+        }
+        let Some(names) = ctor_arg_names else {
+            return; // positional-only call → nothing to map
+        };
+        let prop_names: Vec<String> = match s.get("__properties") {
+            Some(CfmlValue::Array(arr)) => arr
+                .iter()
+                .filter_map(|p| {
+                    p.as_cfml_struct()
+                        .and_then(|ps| ps.get_ci("name"))
+                        .map(|n| n.as_string())
+                })
+                .collect(),
+            _ => return,
+        };
+        if prop_names.is_empty() {
+            return;
+        }
+        // Collect provided NAMED args (+ argumentCollection spread), in order.
+        let mut provided: Vec<(String, CfmlValue)> = Vec::new();
+        for (i, val) in ctor_args.iter().enumerate() {
+            let name = names.get(i).map(String::as_str).unwrap_or("");
+            if name.is_empty() {
+                continue; // positional — not mapped to properties
+            }
+            if name.eq_ignore_ascii_case("argumentcollection") {
+                if let CfmlValue::Struct(acs) = val {
+                    for (k, v) in acs.iter() {
+                        if k.starts_with("__") {
+                            continue;
+                        }
+                        provided.push((k, v));
+                    }
+                }
+                continue;
+            }
+            provided.push((name.to_string(), val.clone()));
+        }
+        if provided.is_empty() {
+            return;
+        }
+        let vars = match s.get("__variables") {
+            Some(CfmlValue::Struct(v)) => Some(v),
+            _ => None,
+        };
+        for (pname, pval) in provided {
+            if let Some(actual) = prop_names.iter().find(|p| p.eq_ignore_ascii_case(&pname)) {
+                // The `__variables` backing is what the generated getter reads.
+                if let Some(ref vars) = vars {
+                    vars.insert(actual.clone(), pval.clone());
+                }
+                // Mirror the setter's top-level `this.<prop>` write, BUT never
+                // clobber a same-named method: a CFC may declare both `property
+                // name="x"` and a method `x()`, and Lucee keeps the method
+                // callable while the getter still returns the property value.
+                let collides_with_method =
+                    matches!(s.get_ci(actual), Some(CfmlValue::Function(_)));
+                if !collides_with_method {
+                    s.insert(actual.clone(), pval);
+                }
+            }
+        }
     }
 
     fn reorder_named_args_with_extras(
