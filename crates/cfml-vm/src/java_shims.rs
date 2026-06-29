@@ -1175,6 +1175,93 @@ pub fn handle_java_concurrentlinkedqueue(
     }
 }
 
+// ---- SoftReference / ReferenceQueue ----
+// These are JVM garbage-collection primitives: a SoftReference holds its
+// referent until the GC decides to clear it under memory pressure, enqueuing
+// the cleared reference onto a ReferenceQueue. RustCFML has no JVM and no such
+// GC pass, so we shim them as STRONG references that are never cleared:
+// SoftReference.get() always returns the held referent and the ReferenceQueue
+// stays empty (poll() == null). The practical effect is that CacheBox's default
+// `ConcurrentSoftReferenceStore` constructs and runs unmodified, but loses only
+// memory-pressure eviction — entries still expire via the reap policy /
+// maxObjects, exactly like the non-soft `ConcurrentStore`. See issue #218.
+pub fn handle_java_softreference(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            // new SoftReference(referent[, queue]) — hold the referent strongly.
+            // The optional ReferenceQueue arg is accepted and ignored (nothing is
+            // ever enqueued without a GC clearing the reference).
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.lang.ref.softreference".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert(
+                "__referent".to_string(),
+                args.first().cloned().unwrap_or(CfmlValue::Null),
+            );
+            Ok(CfmlValue::strukt(shim))
+        }
+        "get" => {
+            // The strongly-held referent (a soft ref is never cleared here).
+            if let CfmlValue::Struct(ref shim) = object {
+                return Ok(shim.get("__referent").unwrap_or(CfmlValue::Null));
+            }
+            Ok(CfmlValue::Null)
+        }
+        "clear" => {
+            // Java's clear() drops the referent; mirror that so a subsequent
+            // get() returns null.
+            if let CfmlValue::Struct(ref shim) = object {
+                shim.insert("__referent".to_string(), CfmlValue::Null);
+            }
+            Ok(CfmlValue::Null)
+        }
+        "isenqueued" => Ok(CfmlValue::Bool(false)),
+        "enqueue" => Ok(CfmlValue::Bool(false)),
+        "hashcode" => {
+            // A stable, per-reference identity hash. CacheBox keys its
+            // soft-ref-key map on "hc-#softRef.hashCode()#", so distinct
+            // SoftReference instances must hash distinctly and stably. The shim
+            // struct's Arc backing pointer is exactly that identity.
+            if let CfmlValue::Struct(ref shim) = object {
+                let raw = shim.backing_ptr() as u64;
+                let folded = (raw ^ (raw >> 32)) & 0x7fff_ffff;
+                return Ok(CfmlValue::Int(folded as i64));
+            }
+            Ok(CfmlValue::Int(0))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+pub fn handle_java_referencequeue(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.lang.ref.referencequeue".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // Nothing is ever enqueued (no GC clears the soft refs), so the queue is
+        // permanently empty: poll() returns null, remove(timeout) returns null.
+        "poll" | "remove" => Ok(CfmlValue::Null),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
 // ---- ConcurrentHashMap ----
 // Preside/ColdBox Cachebox uses ConcurrentHashMap as a thread-safe cache
 // pool: init, put, get, remove (returns old value), containsKey, size,

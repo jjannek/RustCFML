@@ -442,6 +442,7 @@ include "harness.cfm";
 <cf_runtest file="java_shims/test_stringbuilder.cfm">
 <cf_runtest file="java_shims/test_system.cfm">
 <cf_runtest file="java_shims/test_concurrent_map.cfm">
+<cf_runtest file="java_shims/test_soft_reference.cfm">
 <cf_runtest file="java_shims/test_classloader_shims.cfm">
 
 <!--- --- Engine Compatibility --- --->

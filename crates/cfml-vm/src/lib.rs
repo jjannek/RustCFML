@@ -11339,6 +11339,15 @@ impl CfmlVirtualMachine {
                                 "java.lang.reflect.array" => {
                                     java_shims::handle_java_reflect_array("init", empty_args, &CfmlValue::Null)
                                 }
+                                // GC soft-reference primitives, shimmed as strong
+                                // never-cleared refs so CacheBox's default
+                                // ConcurrentSoftReferenceStore works. See #218.
+                                "java.lang.ref.softreference" => {
+                                    java_shims::handle_java_softreference("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.lang.ref.referencequeue" => {
+                                    java_shims::handle_java_referencequeue("init", empty_args, &CfmlValue::Null)
+                                }
                                 // cbjavaloader's classloader tower. These are
                                 // "deferred Java objects": their plumbing methods
                                 // no-op so Preside boots, but invoking a class
@@ -15826,6 +15835,12 @@ impl CfmlVirtualMachine {
                     "java.lang.reflect.array" => {
                         java_shims::handle_java_reflect_array(&m, all_args, object)
                     }
+                    "java.lang.ref.softreference" => {
+                        java_shims::handle_java_softreference(&m, all_args, object)
+                    }
+                    "java.lang.ref.referencequeue" => {
+                        java_shims::handle_java_referencequeue(&m, all_args, object)
+                    }
                     "java.net.urlclassloader"
                     | "java.lang.classloader"
                     | "coldfusion.runtime.java.javaproxy"
@@ -15864,12 +15879,19 @@ impl CfmlVirtualMachine {
                 // "The parameter [objectKey] to function [get] is required". Treat
                 // the map shim's getter result as authoritative so a miss returns
                 // null instead of falling through.
-                let map_getter_owns_null = matches!(
+                let map_getter_owns_null = (matches!(
                     java_class.as_str(),
                     "java.util.concurrent.concurrenthashmap"
                         | "java.util.linkedhashmap"
                         | "java.util.treemap"
-                ) && matches!(method_lower.as_str(), "get" | "getordefault");
+                ) && matches!(method_lower.as_str(), "get" | "getordefault"))
+                    // SoftReference.get() and ReferenceQueue.poll() return null
+                    // by design (a cleared/empty reference). Treat that null as
+                    // authoritative, not "method unhandled". See #218.
+                    || (java_class == "java.lang.ref.softreference"
+                        && method_lower == "get")
+                    || (java_class == "java.lang.ref.referencequeue"
+                        && matches!(method_lower.as_str(), "poll" | "remove"));
                 match result {
                     Ok(CfmlValue::Null) if !map_getter_owns_null => {
                         // Shim didn't handle the method — fall through to the
