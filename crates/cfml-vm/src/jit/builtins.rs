@@ -692,12 +692,18 @@ extern "C" fn cfml_is_numeric_boxed(tagged: i64) -> i64 {
     super::arena::box_into_active(CfmlValue::Bool(b)) as i64
 }
 
-/// Mirrors `fn_is_array`: only `CfmlValue::Array(_)` (QueryColumn excluded,
-/// Lucee@7 parity).
+/// Mirrors `fn_is_array`: `CfmlValue::Array(_)` plus the hybrid `arguments`
+/// scope (a Struct carrying the `__arguments_scope` marker). QueryColumn
+/// excluded (Lucee@7 parity).
 extern "C" fn cfml_is_array_boxed(tagged: i64) -> i64 {
     use cfml_common::dynamic::CfmlValue;
     let v = unsafe { super::boxed::materialize_tagged(tagged as usize) };
-    super::arena::box_into_active(CfmlValue::Bool(matches!(v, CfmlValue::Array(_)))) as i64
+    let is = match &v {
+        CfmlValue::Array(_) => true,
+        CfmlValue::Struct(s) => s.contains_key("__arguments_scope"),
+        _ => false,
+    };
+    super::arena::box_into_active(CfmlValue::Bool(is)) as i64
 }
 
 /// Mirrors `fn_is_struct`.

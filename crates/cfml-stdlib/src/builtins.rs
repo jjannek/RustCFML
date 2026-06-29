@@ -2376,9 +2376,24 @@ fn fn_array_clear(args: Vec<CfmlValue>) -> CfmlResult {
 
 fn fn_array_is_defined(args: Vec<CfmlValue>) -> CfmlResult {
     if args.len() >= 2 {
-        if let CfmlValue::Array(arr) = &args[0] {
-            let idx = get_int(&args, 1) as usize;
-            return Ok(CfmlValue::Bool(idx >= 1 && idx <= arr.len()));
+        let idx = get_int(&args, 1) as usize;
+        match &args[0] {
+            CfmlValue::Array(arr) => {
+                return Ok(CfmlValue::Bool(idx >= 1 && idx <= arr.len()));
+            }
+            // The arguments scope is array-like (see fn_is_array/fn_array_len):
+            // arrayIsDefined(arguments, i) tests the i-th bound arg.
+            CfmlValue::Struct(s) if s.contains_key("__arguments_scope") => {
+                let count = s
+                    .keys()
+                    .into_iter()
+                    .filter(|k| {
+                        k.as_str() != "__arguments_scope" && k.as_str() != "__arguments_params"
+                    })
+                    .count();
+                return Ok(CfmlValue::Bool(idx >= 1 && idx <= count));
+            }
+            _ => {}
         }
     }
     Ok(CfmlValue::Bool(false))
@@ -2480,8 +2495,16 @@ fn fn_array_each(_args: Vec<CfmlValue>) -> CfmlResult {
 }
 
 fn fn_is_array(args: Vec<CfmlValue>) -> CfmlResult {
-    // Lucee@7 parity: QueryColumn is NOT an array.
-    Ok(CfmlValue::Bool(matches!(args.first(), Some(CfmlValue::Array(_)))))
+    // Lucee@7 parity: QueryColumn is NOT an array. The `arguments` scope IS an
+    // array (it is a hybrid array/struct): isArray(arguments) is true for
+    // positional, named, and empty arg lists alike. Gated on the private
+    // `__arguments_scope` marker so a plain numeric-keyed struct stays a struct.
+    let is = match args.first() {
+        Some(CfmlValue::Array(_)) => true,
+        Some(CfmlValue::Struct(s)) => s.contains_key("__arguments_scope"),
+        _ => false,
+    };
+    Ok(CfmlValue::Bool(is))
 }
 
 fn fn_array_is_empty(args: Vec<CfmlValue>) -> CfmlResult {

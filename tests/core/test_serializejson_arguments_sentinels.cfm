@@ -35,5 +35,35 @@ function sjasKeys() { var s = {}; structAppend(s, arguments); return structKeyLi
 sjasKl = sjasKeys(from = "a", template = "welcome");
 assertFalse("CONTROL: structKeyList already filters __arguments_scope", listFindNoCase(sjasKl, "__arguments_scope") gt 0);
 
+// --- The arguments scope is a HYBRID array/struct (Lucee/ACF parity) ---------
+// MockBox-style call capture does arrayAppend(log, arguments), then TestBox's
+// equalize() compares the stored scope to an expected array via isArray() +
+// arrayLen() + indexing. Lucee's arguments scope reports isArray=true (for
+// positional, named AND empty arg lists) so that comparison takes the array
+// branch and matches; ours used to report false and leaked the sentinel keys
+// through the struct branch. (Preside TestBox suite, the doNext/webflow specs.)
+function asCapturePos() { var log = []; arrayAppend(log, arguments); return log; }
+asPos = asCapturePos("next", "ID123");
+assertTrue("isArray(arguments) is true for a positional arguments scope", isArray(asPos[1]));
+assert("arrayLen(arguments) counts positional args", arrayLen(asPos[1]), 2);
+assertTrue("arrayIsDefined(arguments, 2) is true", arrayIsDefined(asPos[1], 2));
+assertFalse("arrayIsDefined(arguments, 3) is false", arrayIsDefined(asPos[1], 3));
+assert("arguments scope still indexes positionally as an array", asPos[1][1], "next");
+
+function asCaptureNamed(required any state) { var log = []; arrayAppend(log, arguments); return log; }
+asNamed = asCaptureNamed({ test: true });
+assertTrue("isArray(arguments) is true for a named arguments scope", isArray(asNamed[1]));
+assert("arrayLen(arguments) counts named args", arrayLen(asNamed[1]), 1);
+assertTrue("named arguments scope is still a struct too", isStruct(asNamed[1]));
+
+function asCaptureEmpty() { var log = []; arrayAppend(log, arguments); return log; }
+asEmpty = asCaptureEmpty();
+assertTrue("isArray(arguments) is true for an empty arguments scope", isArray(asEmpty[1]));
+assert("arrayLen of an empty arguments scope is 0", arrayLen(asEmpty[1]), 0);
+
+// A plain numeric-keyed struct is NOT an array (no __arguments_scope marker).
+plainNumeric = { "1": "a", "2": "b" };
+assertFalse("a plain numeric-keyed struct is not an array", isArray(plainNumeric));
+
 suiteEnd();
 </cfscript>
