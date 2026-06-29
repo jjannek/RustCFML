@@ -1455,6 +1455,12 @@ pub struct ThreadSeed {
     pub csrf_enabled: bool,
     pub disallowed_functions: std::collections::HashSet<String>,
     pub disallowed_imports: Vec<regex::Regex>,
+    /// Snapshot of the parent's page-level `thread` soft-scope at spawn. Holds
+    /// any `thread.x = ...` values seeded BEFORE the cfthread (the standard CFML
+    /// idiom for passing data into a thread). Restored into the child's
+    /// `page_thread_scope` so `run_thread_body` can seed the body's `thread`
+    /// scope with them (issue #217).
+    pub page_thread_scope: ValueMap,
     /// The thread body (a `function(){...}` closure) to invoke.
     pub closure: CfmlValue,
     /// Passed `cfthread` attributes, exposed as the `attributes` scope.
@@ -2265,6 +2271,7 @@ impl CfmlVirtualMachine {
             program: self.program.clone(),
             user_functions: self.user_functions.clone(),
             variables_snapshot: self.globals.clone(),
+            page_thread_scope: self.page_thread_scope.snapshot(),
             vfs: self.vfs.clone(),
             server_state: self.server_state.clone(),
             application_scope: self.application_scope.clone(),
@@ -2331,6 +2338,9 @@ impl CfmlVirtualMachine {
         for (k, v) in seed.variables_snapshot {
             self.globals.insert(k, v);
         }
+        // Carry the parent's pre-seeded `thread.*` values so run_thread_body
+        // can seed the body's `thread` scope with them (issue #217).
+        self.page_thread_scope = CfmlStruct::new(seed.page_thread_scope);
         (seed.closure, seed.attributes)
     }
 
@@ -2344,9 +2354,15 @@ impl CfmlVirtualMachine {
         attributes: Option<CfmlValue>,
         parent_locals: &ValueMap,
     ) -> ThreadResult {
-        // Fresh `thread` scope the body writes into (thread.x = ...).
-        self.globals
-            .insert("thread".to_string(), CfmlValue::strukt(ValueMap::default()));
+        // Fresh `thread` scope the body writes into (thread.x = ...), seeded
+        // with any `thread.x = ...` values written BEFORE the cfthread — the
+        // standard CFML idiom for passing data into a thread (issue #217). On a
+        // spawned child VM these arrive via the seed's page_thread_scope; on the
+        // inline path they're already on the parent's page_thread_scope.
+        self.globals.insert(
+            "thread".to_string(),
+            CfmlValue::strukt(self.page_thread_scope.snapshot()),
+        );
         // Expose any passed attributes as the `attributes` scope.
         if let Some(attrs) = attributes {
             self.globals.insert("attributes".to_string(), attrs);

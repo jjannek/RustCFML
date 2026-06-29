@@ -74,6 +74,17 @@ assertTrue("cfthread elapsedtime is numeric", isNumeric(cfthread.t3.elapsedtime)
 <cfscript>
 assert("cfthread thread scope string", cfthread.t5.result, "done");
 assert("cfthread thread scope number", cfthread.t5.count, 42);
+</cfscript>
+
+<!--- Pre-seeded thread scope visible inside the thread (issue #217) --->
+<cfset thread.seeded = "HELLO-FROM-OUTSIDE">
+<cfthread name="t6">
+    <cfset thread.echo = isNull(thread.seeded) ? "NULL-INSIDE-THREAD" : thread.seeded>
+</cfthread>
+<cfthread action="join" name="t6" timeout="5000"/>
+
+<cfscript>
+assert("pre-seeded thread scope visible inside thread", cfthread.t6.echo, "HELLO-FROM-OUTSIDE");
 
 suiteEnd();
 </cfscript>
