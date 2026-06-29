@@ -281,6 +281,28 @@ assert("component labelfield attribute survives tag-comment body", tcMeta.labelf
 //    the whole component.
 assert("deeply nested string interpolation", new PresideFixTagCommentProps().buildSql( "foo" ), ", ?Right( foo, LEN(foo) - ? )");
 
+// H) Custom <cfargument> attributes (esp. WireBox `inject=`) must survive into
+//    getMetadata().functions[].parameters[]. Without this, ColdBox/WireBox's
+//    `buildArgumentCollection` (which discovers constructor args by reading the
+//    `inject` annotation off each parameter's metadata) found ZERO constructor
+//    args for every tag-based CFC, so injected dependencies arrived null —
+//    e.g. cbi18n ResourceService's `controller` => boot 500 on
+//    `controller.settingExists()`.
+tagInitFn = "";
+taMeta = getMetaData( new PresideFixTagArgInject( logger="x" ) );
+for ( taFn in ( taMeta.functions ?: [] ) ) { if ( taFn.name == "init" ) { tagInitFn = taFn; } }
+taParams = tagInitFn.parameters ?: [];
+taByName = {};
+for ( taP in taParams ) { taByName[ taP.name ] = taP; }
+assert("tag cfargument: all params present", arrayLen( taParams ), 4);
+assert("tag cfargument: plain inject annotation surfaces", taByName.controller.inject ?: "(none)", "coldbox");
+assert("tag cfargument: DSL inject value with colons preserved", taByName.features.inject ?: "(none)", "coldbox:setting:features");
+assert("tag cfargument: explicit type surfaces", taByName.features.type ?: "?", "struct");
+assert("tag cfargument: untyped param defaults to type any", taByName.controller.type ?: "?", "any");
+assert("tag cfargument: required attribute surfaces", taByName.logger.required ?: false, true);
+assert("tag cfargument: extra custom attribute (scope) surfaces", taByName.logger.scope ?: "(none)", "prototype");
+assert("tag cfargument: non-required param reports false", taByName.plain.required ?: true, false);
+
 suiteEnd();
 
 // Paramless proxy forwarding a positional arg via argumentCollection to a

@@ -2435,7 +2435,20 @@ fn find_closing_tag(chars: &[char], start: usize, len: usize, tag_name: &str) ->
     None
 }
 
-/// Scan ahead from current position to find <cfargument> tags and extract their names
+/// Scan ahead from current position to find `<cfargument>` tags and build the
+/// script-form parameter declarations for the enclosing `<cffunction>`.
+///
+/// Each declaration mirrors CFScript param syntax — `[required] [type] name
+/// attr="val"...` — so that the type, the `required` flag, AND any custom
+/// attributes (notably WireBox's `inject="coldbox"`) survive into the parsed
+/// `Param` (its `type`, `required`, and `annotations`). Previously only the
+/// bare name was emitted, so `getMetadata().functions[].parameters[].inject`
+/// came back absent and frameworks that drive constructor injection off that
+/// annotation (ColdBox/WireBox `buildArgumentCollection`) silently built every
+/// tag-based CFC with ZERO constructor arguments. The `default` attribute is
+/// NOT emitted here — the `cfargument` tag converter handles it as a body
+/// `if (isNull(arguments.x)) {...}` — and an argument carrying a default is
+/// treated as optional regardless of a `required="true"` attribute.
 fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String> {
     let mut names = Vec::new();
     let mut i = start;
@@ -2462,9 +2475,54 @@ fn scan_cfargument_tags(chars: &[char], start: usize, len: usize) -> Vec<String>
                 while j < len && chars[j].is_alphanumeric() {
                     j += 1;
                 }
-                let (tag_attrs, _, _) = parse_tag_attributes(chars, j, len);
+                let (tag_attrs, _quoted, attr_order, _) =
+                    parse_tag_attributes_ordered(chars, j, len);
                 if let Some(name) = tag_attrs.get("name") {
-                    names.push(name.clone());
+                    let mut decl = String::new();
+                    let has_default = tag_attrs.contains_key("default");
+                    let is_required = tag_attrs
+                        .get("required")
+                        .map(|v| {
+                            matches!(
+                                strip_hashes(v).trim().to_lowercase().as_str(),
+                                "true" | "yes" | "1"
+                            )
+                        })
+                        .unwrap_or(false);
+                    // A defaulted argument is optional even if marked required.
+                    if is_required && !has_default {
+                        decl.push_str("required ");
+                    }
+                    // Always emit an explicit type token. The script param
+                    // grammar needs `type name` (two barewords) to disambiguate
+                    // an annotation (`name attr="v"`) from a defaulted param
+                    // (`type name="v"`); with a single leading bareword the
+                    // parser would read the name AS the type. `any` is the
+                    // cfargument default type, so this stays Lucee-faithful.
+                    let arg_type = tag_attrs
+                        .get("type")
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or("any");
+                    decl.push_str(arg_type);
+                    decl.push(' ');
+                    decl.push_str(name);
+                    // Emit every remaining attribute as a `key="value"` annotation
+                    // in source order. `name`/`type`/`required`/`default` are
+                    // structural and handled above; everything else (chiefly
+                    // `inject`) becomes a Param annotation.
+                    for key in &attr_order {
+                        let kl = key.to_lowercase();
+                        if matches!(kl.as_str(), "name" | "type" | "required" | "default") {
+                            continue;
+                        }
+                        if let Some(val) = tag_attrs.get(key) {
+                            // Double embedded quotes for CFML string escaping.
+                            let escaped = val.replace('"', "\"\"");
+                            decl.push_str(&format!(" {}=\"{}\"", key, escaped));
+                        }
+                    }
+                    names.push(decl);
                 }
                 // Skip to end of tag
                 while i < len && chars[i] != '>' {
