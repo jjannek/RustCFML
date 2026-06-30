@@ -19302,7 +19302,7 @@ impl CfmlVirtualMachine {
             // earlier in `globals` than the just-built component — and short-circuit
             // the `Anonymous` fallback that holds anonymous `component {}` instances.
             let is_struct = |v: &CfmlValue| matches!(v, CfmlValue::Struct(_));
-            let mut result = self
+            let result = self
                 .globals
                 .get(class_name)
                 .filter(|v| is_struct(v))
@@ -19320,8 +19320,16 @@ impl CfmlVirtualMachine {
                         .find(|(k, v)| k.eq_ignore_ascii_case(&lower) && is_struct(v))
                         .map(|(_, v)| v.clone())
                 })
-                .or_else(|| self.globals.get("Anonymous").cloned())
-                .map(|v| v.deep_copy());
+                .or_else(|| self.globals.get("Anonymous").cloned());
+            // Deep-copy the `this` scope and the `variables` scope through ONE
+            // shared `seen` map (below), so an object the pseudo-constructor
+            // stored in BOTH (`variables.x = this.x = new Foo()`) stays a single
+            // shared reference in the instance instead of being split into two
+            // independent copies (GitHub #221). The `this` scope is copied here
+            // first to seed the map; `vars_scope` is copied through `dc_seen`.
+            let mut dc_seen: std::collections::HashMap<usize, CfmlValue> =
+                std::collections::HashMap::new();
+            let mut result = result.map(|v| v.deep_copy_with(&mut dc_seen));
             // The component struct's method values carry stable global_ids (set
             // when the CFC body's DefineFunction ops ran), so no func_idx fixup
             // is needed here any more.
@@ -19464,7 +19472,13 @@ impl CfmlVirtualMachine {
                         Arc::make_mut(&mut clean).captured_scope = None;
                         vars_scope.insert(k.clone(), CfmlValue::Function(clean));
                     } else {
-                        vars_scope.insert(k.clone(), v.clone());
+                        // Deep-copy through the SAME map used for the `this`
+                        // scope above: a value the body stored in both `this.x`
+                        // and `variables.x` was already copied for `this.x`, so
+                        // `dc_seen` returns that copy here — the two stay one
+                        // shared reference (GitHub #221). A variables-only value
+                        // (not in `this`) gets a fresh independent copy.
+                        vars_scope.insert(k.clone(), v.deep_copy_with(&mut dc_seen));
                     }
                 }
                 // Add all component methods (public + private) to variables scope

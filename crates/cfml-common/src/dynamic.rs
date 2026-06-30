@@ -1161,49 +1161,73 @@ impl CfmlValue {
     /// result is fully independent of the source (this is what `duplicate()`
     /// must do now that arrays/structs are reference-typed — a plain `clone()`
     /// only shares the handle). Scalars/immutable variants fall back to
-    /// `clone()`. Cycles (a struct/array reachable from itself) are broken: on
-    /// revisiting an already-seen backing store, the shared handle is reused
-    /// rather than recursing without bound.
+    /// `clone()`. Internal aliasing is PRESERVED: a struct/array/query reachable
+    /// from more than one place in the source graph (a DAG, or a cycle where it
+    /// is reachable from itself) maps to a single shared copy in the result —
+    /// matching Lucee's `duplicate()`, which keeps shared references shared and
+    /// terminates on circular references. The `seen` map records, per source
+    /// backing-store pointer, the new copy already created for it; revisiting a
+    /// pointer returns that same copy rather than splitting it into an
+    /// independent duplicate. (This is also what makes component instantiation
+    /// correct: a single object stored in both `this.x` and `variables.x` stays
+    /// one shared reference after the instance template is deep-copied.)
     pub fn deep_copy(&self) -> CfmlValue {
-        let mut visited: Vec<usize> = Vec::new();
-        self.deep_copy_guarded(&mut visited)
+        let mut seen: HashMap<usize, CfmlValue> = HashMap::new();
+        self.deep_copy_guarded(&mut seen)
     }
 
-    fn deep_copy_guarded(&self, visited: &mut Vec<usize>) -> CfmlValue {
+    /// Deep-copy sharing a caller-supplied `seen` map, so that a series of
+    /// deep-copies preserves aliasing ACROSS calls: an object already copied in
+    /// an earlier `deep_copy_with` (recorded in `seen`) resolves to that same
+    /// copy here. Component instantiation relies on this — the instance's `this`
+    /// scope is deep-copied first, then its `variables` scope is deep-copied
+    /// through the same map, so an object the pseudo-constructor stored in both
+    /// `this.x` and `variables.x` stays one shared reference in the instance.
+    pub fn deep_copy_with(&self, seen: &mut HashMap<usize, CfmlValue>) -> CfmlValue {
+        self.deep_copy_guarded(seen)
+    }
+
+    fn deep_copy_guarded(&self, seen: &mut HashMap<usize, CfmlValue>) -> CfmlValue {
         match self {
             CfmlValue::Array(a) => {
                 let ptr = a.backing_ptr();
-                if visited.contains(&ptr) {
-                    return self.clone();
+                if let Some(existing) = seen.get(&ptr) {
+                    return existing.clone();
                 }
-                visited.push(ptr);
-                let out = CfmlValue::array(
-                    a.snapshot().iter().map(|v| v.deep_copy_guarded(visited)).collect(),
-                );
-                visited.pop();
-                out
+                // Register the (empty) destination BEFORE recursing so a cycle
+                // or a second reference to this same array resolves to this one
+                // copy instead of recursing forever / splitting into two.
+                let dest = CfmlArray::empty();
+                seen.insert(ptr, CfmlValue::Array(dest.clone()));
+                let items: Vec<CfmlValue> =
+                    a.snapshot().iter().map(|v| v.deep_copy_guarded(seen)).collect();
+                dest.with_write(|w| *w = items);
+                CfmlValue::Array(dest)
             }
             CfmlValue::Struct(s) => {
                 let ptr = s.backing_ptr();
-                if visited.contains(&ptr) {
-                    return self.clone();
+                if let Some(existing) = seen.get(&ptr) {
+                    return existing.clone();
                 }
-                visited.push(ptr);
-                let out = CfmlValue::strukt(
-                    s.iter().map(|(k, v)| (k, v.deep_copy_guarded(visited))).collect(),
-                );
-                visited.pop();
-                out
+                let dest = CfmlStruct::empty();
+                seen.insert(ptr, CfmlValue::Struct(dest.clone()));
+                let entries: ValueMap =
+                    s.iter().map(|(k, v)| (k, v.deep_copy_guarded(seen))).collect();
+                dest.with_write(|w| *w = entries);
+                CfmlValue::Struct(dest)
             }
             // Queries are reference-typed, so `duplicate()` must break the
             // shared handle: snapshot the data (releases the lock), deep-copy
             // every cell, and wrap in a fresh backing store.
             CfmlValue::Query(q) => {
                 let ptr = q.backing_ptr();
-                if visited.contains(&ptr) {
-                    return self.clone();
+                if let Some(existing) = seen.get(&ptr) {
+                    return existing.clone();
                 }
-                visited.push(ptr);
+                // Pre-register the original handle as a cycle-breaker (a query
+                // reachable from itself terminates); overwrite with the real
+                // copy once built so later DAG revisits share the duplicate.
+                seen.insert(ptr, self.clone());
                 let (columns, data, sql) =
                     q.with_read(|d| (d.columns.clone(), d.data.clone(), d.sql.clone()));
                 // Genuinely deep-copy each column so the duplicate shares NO
@@ -1214,12 +1238,13 @@ impl CfmlValue {
                     .into_iter()
                     .map(|col| {
                         Arc::new(
-                            col.iter().map(|v| v.deep_copy_guarded(visited)).collect(),
+                            col.iter().map(|v| v.deep_copy_guarded(seen)).collect(),
                         )
                     })
                     .collect();
-                visited.pop();
-                CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql, execution_time: None }))
+                let copy = CfmlValue::Query(CfmlQuery::from_data(CfmlQueryData { columns, data, sql, execution_time: None }));
+                seen.insert(ptr, copy.clone());
+                copy
             }
             other => other.clone(),
         }
