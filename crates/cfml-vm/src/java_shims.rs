@@ -1349,6 +1349,338 @@ pub fn handle_java_referencequeue(
     }
 }
 
+// ---- .properties-file reader chain: FileInputStream / InputStreamReader /
+//      PropertyResourceBundle / Enumeration ----
+// Preside's i18n ResourceBundleService._propertiesFileToStruct() reads a Java
+// `.properties` resource bundle with the classic three-class dance:
+//   fis = FileInputStream(path)
+//   fir = InputStreamReader(fis, "UTF-8")
+//   prb = PropertyResourceBundle(fir)
+//   keys = prb.getKeys(); while (keys.hasMoreElements()) prb.handleGetObject(keys.nextElement())
+// There is no JVM, but this is pure data: read the file off disk and parse the
+// `.properties` text into a struct. FileInputStream just carries the path,
+// InputStreamReader carries path+charset, and PropertyResourceBundle does the
+// actual read+parse and exposes the key enumeration.
+
+pub fn handle_java_fileinputstream(
+    method: &str,
+    args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            // new FileInputStream(path) — path may be a String or a java.io.File
+            // shim (which stores its path under __file_path).
+            let path = match args.first() {
+                Some(CfmlValue::Struct(s)) => s
+                    .get("__file_path")
+                    .map(|v| v.as_string())
+                    .unwrap_or_default(),
+                Some(v) => v.as_string(),
+                None => String::new(),
+            };
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.io.fileinputstream".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__stream_path".to_string(), CfmlValue::string(path));
+            Ok(CfmlValue::strukt(shim))
+        }
+        // close() is a no-op (no underlying OS handle is held open). Return an
+        // empty string rather than Null so it isn't treated as "unhandled" and
+        // re-dispatched against the caller.
+        "close" => Ok(CfmlValue::string(String::new())),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+pub fn handle_java_inputstreamreader(
+    method: &str,
+    args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            // new InputStreamReader(fis[, charset]) — carry the path forward off
+            // the FileInputStream shim; record the charset for completeness.
+            let path = match args.first() {
+                Some(CfmlValue::Struct(s)) => s
+                    .get("__stream_path")
+                    .map(|v| v.as_string())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let charset = args
+                .get(1)
+                .map(|v| v.as_string())
+                .unwrap_or_else(|| "UTF-8".to_string());
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.io.inputstreamreader".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__stream_path".to_string(), CfmlValue::string(path));
+            shim.insert("__charset".to_string(), CfmlValue::string(charset));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "close" => Ok(CfmlValue::string(String::new())),
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+pub fn handle_java_propertyresourcebundle(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    match method {
+        "init" => {
+            // new PropertyResourceBundle(reader) — read the file the reader points
+            // at and parse the `.properties` text into an ordered struct. The
+            // bare construction (no reader yet, before the chained .init(reader)
+            // member call) just returns an empty shim — don't try to read.
+            let path = match args.first() {
+                Some(CfmlValue::Struct(s)) => s
+                    .get("__stream_path")
+                    .map(|v| v.as_string())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            if path.is_empty() {
+                let mut shim = ValueMap::default();
+                shim.insert(
+                    "__java_class".to_string(),
+                    CfmlValue::string("java.util.propertyresourcebundle".to_string()),
+                );
+                shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                shim.insert("__prb_data".to_string(), CfmlValue::strukt(ValueMap::default()));
+                return Ok(CfmlValue::strukt(shim));
+            }
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                CfmlError::runtime(format!(
+                    "PropertyResourceBundle: cannot read properties file [{}]: {}",
+                    path, e
+                ))
+            })?;
+            let mut data = ValueMap::default();
+            for (k, v) in parse_properties(&content) {
+                data.insert(k, CfmlValue::string(v));
+            }
+            let mut shim = ValueMap::default();
+            shim.insert(
+                "__java_class".to_string(),
+                CfmlValue::string("java.util.propertyresourcebundle".to_string()),
+            );
+            shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+            shim.insert("__prb_data".to_string(), CfmlValue::strukt(data));
+            Ok(CfmlValue::strukt(shim))
+        }
+        "getkeys" | "keyset" => {
+            // getKeys() returns an Enumeration; keySet() returns a Set. Both feed
+            // a hasMoreElements()/nextElement() (or iterator) loop here, so we
+            // return an Enumeration shim over the parsed key order.
+            if let CfmlValue::Struct(ref shim) = object {
+                if let Some(CfmlValue::Struct(data)) = shim.get("__prb_data") {
+                    let keys: Vec<CfmlValue> =
+                        data.keys().into_iter().map(CfmlValue::string).collect();
+                    return Ok(make_enumeration(keys));
+                }
+            }
+            Ok(make_enumeration(Vec::new()))
+        }
+        "handlegetobject" | "getobject" | "getstring" => {
+            // Look the key up in the parsed data.
+            if let (CfmlValue::Struct(ref shim), Some(key)) = (object, args.first()) {
+                if let Some(CfmlValue::Struct(data)) = shim.get("__prb_data") {
+                    return Ok(data.get(&key.as_string()).unwrap_or(CfmlValue::Null));
+                }
+            }
+            Ok(CfmlValue::Null)
+        }
+        "containskey" => {
+            if let (CfmlValue::Struct(ref shim), Some(key)) = (object, args.first()) {
+                if let Some(CfmlValue::Struct(data)) = shim.get("__prb_data") {
+                    return Ok(CfmlValue::Bool(data.get(&key.as_string()).is_some()));
+                }
+            }
+            Ok(CfmlValue::Bool(false))
+        }
+        _ => Ok(CfmlValue::Null),
+    }
+}
+
+// A java.util.Enumeration shim (also serves Iterator) over a fixed list of
+// values, advancing an in-place cursor. Yielded by
+// PropertyResourceBundle.getKeys().
+fn make_enumeration(items: Vec<CfmlValue>) -> CfmlValue {
+    let mut shim = ValueMap::default();
+    shim.insert(
+        "__java_class".to_string(),
+        CfmlValue::string("java.util.enumeration".to_string()),
+    );
+    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    shim.insert("__enum_items".to_string(), CfmlValue::array(items));
+    shim.insert("__enum_pos".to_string(), CfmlValue::Int(0));
+    CfmlValue::strukt(shim)
+}
+
+pub fn handle_java_enumeration(
+    method: &str,
+    _args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    if let CfmlValue::Struct(ref s) = object {
+        let pos = s.get("__enum_pos").map(|v| java_int_arg(&v)).unwrap_or(0);
+        let len = match s.get("__enum_items") {
+            Some(CfmlValue::Array(ref a)) => a.len() as i64,
+            _ => 0,
+        };
+        match method {
+            "hasmoreelements" | "hasnext" => {
+                return Ok(CfmlValue::Bool(pos < len));
+            }
+            "nextelement" | "next" => {
+                if pos < len {
+                    // Advance the cursor in place (the shim struct is Arc-backed).
+                    s.insert("__enum_pos".to_string(), CfmlValue::Int(pos + 1));
+                    if let Some(CfmlValue::Array(ref a)) = s.get("__enum_items") {
+                        return Ok(a.get(pos as usize).unwrap_or(CfmlValue::Null));
+                    }
+                }
+                return Ok(CfmlValue::Null);
+            }
+            _ => {}
+        }
+    }
+    Ok(CfmlValue::Null)
+}
+
+// Minimal but faithful java.util.Properties / .properties text parser: one
+// logical entry per line, `#` or `!` comment lines, `=`/`:`/whitespace as the
+// first key/value separator, trailing-backslash line continuation, and the
+// standard `\t \n \r \f \uXXXX \\` (and escaped separator) escapes.
+fn parse_properties(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let raw_lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    while i < raw_lines.len() {
+        // Strip leading whitespace; skip blank and comment lines.
+        let mut logical = raw_lines[i].trim_start().to_string();
+        i += 1;
+        if logical.is_empty() || logical.starts_with('#') || logical.starts_with('!') {
+            continue;
+        }
+        // Join continuation lines (line ends with an odd number of backslashes).
+        while ends_with_odd_backslash(&logical) {
+            logical.pop(); // drop the trailing backslash
+            if i < raw_lines.len() {
+                logical.push_str(raw_lines[i].trim_start());
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        // Find the first unescaped separator (= or :), else first unescaped
+        // whitespace, to split key from value.
+        let chars: Vec<char> = logical.chars().collect();
+        let mut sep = None;
+        let mut j = 0;
+        while j < chars.len() {
+            let c = chars[j];
+            if c == '\\' {
+                j += 2; // skip escaped char
+                continue;
+            }
+            if c == '=' || c == ':' {
+                sep = Some(j);
+                break;
+            }
+            if (c == ' ' || c == '\t' || c == '\u{c}') && sep.is_none() {
+                // Whitespace separator only if no '='/':' found later; remember
+                // it but keep scanning in case an explicit separator follows.
+                let rest: String = chars[j..].iter().collect();
+                if rest.trim_start().starts_with(['=', ':']) {
+                    // explicit separator follows the whitespace — let it win
+                    let mut k = j;
+                    while k < chars.len()
+                        && (chars[k] == ' ' || chars[k] == '\t' || chars[k] == '\u{c}')
+                    {
+                        k += 1;
+                    }
+                    sep = Some(k);
+                } else {
+                    sep = Some(j);
+                }
+                break;
+            }
+            j += 1;
+        }
+        let (key_part, val_part) = match sep {
+            Some(s) => {
+                let key: String = chars[..s].iter().collect();
+                // value starts after the separator char, skipping surrounding ws
+                let mut vs = s;
+                if chars.get(vs).is_some_and(|c| *c == '=' || *c == ':') {
+                    vs += 1;
+                }
+                while vs < chars.len()
+                    && (chars[vs] == ' ' || chars[vs] == '\t' || chars[vs] == '\u{c}')
+                {
+                    vs += 1;
+                }
+                let val: String = chars[vs..].iter().collect();
+                (key.trim_end().to_string(), val)
+            }
+            None => (logical.trim_end().to_string(), String::new()),
+        };
+        out.push((unescape_properties(&key_part), unescape_properties(&val_part)));
+    }
+    out
+}
+
+fn ends_with_odd_backslash(s: &str) -> bool {
+    let mut count = 0;
+    for c in s.chars().rev() {
+        if c == '\\' {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count % 2 == 1
+}
+
+fn unescape_properties(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{c}'),
+            Some('u') => {
+                let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                    if let Some(ch) = char::from_u32(cp) {
+                        out.push(ch);
+                    }
+                }
+            }
+            Some(other) => out.push(other), // \\, \=, \:, \<space>, etc.
+            None => {}
+        }
+    }
+    out
+}
+
 // ---- ConcurrentHashMap ----
 // Preside/ColdBox Cachebox uses ConcurrentHashMap as a thread-safe cache
 // pool: init, put, get, remove (returns old value), containsKey, size,

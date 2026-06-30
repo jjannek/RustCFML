@@ -11513,6 +11513,17 @@ impl CfmlVirtualMachine {
                                 "java.lang.ref.weakreference" => {
                                     java_shims::handle_java_weakreference("init", empty_args, &CfmlValue::Null)
                                 }
+                                // .properties-file reader chain (Preside i18n
+                                // ResourceBundleService). Pure-data: read+parse.
+                                "java.io.fileinputstream" => {
+                                    java_shims::handle_java_fileinputstream("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.io.inputstreamreader" => {
+                                    java_shims::handle_java_inputstreamreader("init", empty_args, &CfmlValue::Null)
+                                }
+                                "java.util.propertyresourcebundle" => {
+                                    java_shims::handle_java_propertyresourcebundle("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.lang.ref.referencequeue" => {
                                     java_shims::handle_java_referencequeue("init", empty_args, &CfmlValue::Null)
                                 }
@@ -16257,6 +16268,18 @@ impl CfmlVirtualMachine {
                     "java.lang.ref.weakreference" => {
                         java_shims::handle_java_weakreference(&m, all_args, object)
                     }
+                    "java.io.fileinputstream" => {
+                        java_shims::handle_java_fileinputstream(&m, all_args, object)
+                    }
+                    "java.io.inputstreamreader" => {
+                        java_shims::handle_java_inputstreamreader(&m, all_args, object)
+                    }
+                    "java.util.propertyresourcebundle" => {
+                        java_shims::handle_java_propertyresourcebundle(&m, all_args, object)
+                    }
+                    "java.util.enumeration" => {
+                        java_shims::handle_java_enumeration(&m, all_args, object)
+                    }
                     "java.lang.ref.referencequeue" => {
                         java_shims::handle_java_referencequeue(&m, all_args, object)
                     }
@@ -16312,7 +16335,17 @@ impl CfmlVirtualMachine {
                     || (java_class == "java.lang.ref.weakreference"
                         && method_lower == "get")
                     || (java_class == "java.lang.ref.referencequeue"
-                        && matches!(method_lower.as_str(), "poll" | "remove"));
+                        && matches!(method_lower.as_str(), "poll" | "remove"))
+                    // PropertyResourceBundle getters and the Enumeration cursor
+                    // may legitimately return null (absent key / past end-of-list);
+                    // treat that as authoritative, not "method unhandled".
+                    || (java_class == "java.util.propertyresourcebundle"
+                        && matches!(
+                            method_lower.as_str(),
+                            "handlegetobject" | "getobject" | "getstring"
+                        ))
+                    || (java_class == "java.util.enumeration"
+                        && matches!(method_lower.as_str(), "nextelement" | "next"));
                 match result {
                     Ok(CfmlValue::Null) if !map_getter_owns_null => {
                         // Shim didn't handle the method — fall through to the
