@@ -803,6 +803,13 @@ fn compile_and_run(
     // when they pass. A request that won't show debug output collects nothing.
     vm.maybe_install_debug_collector();
 
+    // Start logging this request's container allocations so the request-boundary
+    // cycle collector can reclaim any reference cycles it built (the serve-mode
+    // leak fix). Armed only in serve mode; a no-op otherwise. See cfml_common::cycle_gc.
+    if cfml_common::cycle_gc::is_armed() {
+        cfml_common::cycle_gc::enable();
+    }
+
     // Run the lifecycle. In serve mode (`persist_jit`), adopt this worker
     // thread's persistent JIT engine for the duration via `JitLease` so
     // compiled native code + hotness counters accumulate across requests
@@ -846,37 +853,51 @@ fn compile_and_run(
         other => other,
     };
 
-    match result {
-        Ok(value) => {
-            let mut output = String::new();
-            if !vm.output_buffer.is_empty() {
-                output.push_str(&vm.output_buffer);
-            }
-            if debug {
-                println!("Result: {:?}", value);
-            }
-            Ok(CfmlResponse {
-                output,
-                response_headers: vm.response_headers,
-                response_status: vm.response_status,
-                response_content_type: vm.response_content_type,
-                response_body: vm.response_body,
-                redirect_url: vm.redirect_url,
-                session_id: vm.session_id,
-                session_record_created: vm.session_record_created,
-                session_cookie_policy: vm.session_cookie_policy,
-                missing_template_handled: vm.missing_template_handled,
-            })
-        }
-        Err(e) => {
-            // Preserve any output generated before the error
-            let mut output = String::new();
-            if !vm.output_buffer.is_empty() {
-                output.push_str(&vm.output_buffer);
-            }
-            Err(CfmlRunError { output, message: format!("{}", e) })
+    if debug {
+        if let Ok(ref value) = result {
+            println!("Result: {:?}", value);
         }
     }
+
+    // Take the response out of the VM via `mem::take` (leaving every field a
+    // valid default) so the VM can then be DROPPED — releasing all of this
+    // request's transient roots (page `variables`, request/thread scopes, call
+    // frames, the per-request application-scope wrapper) in one go. Persistent
+    // state already lives in `ServerState` (Arc-shared), so it survives the drop.
+    let response = match result {
+        Ok(_) => Ok(CfmlResponse {
+            output: std::mem::take(&mut vm.output_buffer),
+            response_headers: std::mem::take(&mut vm.response_headers),
+            response_status: vm.response_status.take(),
+            response_content_type: vm.response_content_type.take(),
+            response_body: vm.response_body.take(),
+            redirect_url: vm.redirect_url.take(),
+            session_id: vm.session_id.take(),
+            session_record_created: vm.session_record_created,
+            session_cookie_policy: vm.session_cookie_policy.clone(),
+            missing_template_handled: vm.missing_template_handled,
+        }),
+        Err(e) => Err(CfmlRunError {
+            output: std::mem::take(&mut vm.output_buffer),
+            message: format!("{}", e),
+        }),
+    };
+
+    // Reclaim any reference cycles this request built (the serve-mode leak fix).
+    // SKIP when a `cfthread` is still live — it shares scope Arcs across threads,
+    // so `strong_count` reads would race. Dropping the VM first means the only
+    // remaining strong refs into the request's graph are from persistent scopes
+    // (live roots) or genuine garbage cycles, which `collect` then reclaims.
+    if cfml_common::cycle_gc::is_armed() {
+        let skip_collect = !vm.live_threads.is_empty();
+        drop(vm);
+        if !skip_collect {
+            cfml_common::cycle_gc::collect();
+        }
+        cfml_common::cycle_gc::disable_and_clear();
+    }
+
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +932,15 @@ fn run_server(
     production: bool,
     cfconfig: Arc<RustCfmlConfig>,
 ) {
+    // Arm the request-boundary cycle collector so a long-lived serve process
+    // reclaims reference cycles instead of leaking them on every request. Opt
+    // out with RUSTCFML_NO_CYCLE_GC=1.
+    if std::env::var("RUSTCFML_NO_CYCLE_GC").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        log::info!("cycle collector disabled via RUSTCFML_NO_CYCLE_GC");
+    } else {
+        cfml_common::cycle_gc::arm();
+    }
+
     let rt = if single_threaded {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -92,7 +92,9 @@ pub struct CfmlArray(Arc<PlRwLock<Vec<CfmlValue>>>);
 impl CfmlArray {
     #[inline]
     pub fn new(v: Vec<CfmlValue>) -> Self {
-        CfmlArray(Arc::new(PlRwLock::new(v)))
+        let arc = Arc::new(PlRwLock::new(v));
+        crate::cycle_gc::log_array(&arc);
+        CfmlArray(arc)
     }
 
     #[inline]
@@ -315,11 +317,13 @@ pub struct CfmlStruct(Arc<PlRwLock<StructInner>>);
 impl CfmlStruct {
     #[inline]
     pub fn new(m: ValueMap) -> Self {
-        CfmlStruct(Arc::new(PlRwLock::new(StructInner {
+        let arc = Arc::new(PlRwLock::new(StructInner {
             map: m,
             shape_id: next_shape_id(),
             this_alias: None,
-        })))
+        }));
+        crate::cycle_gc::log_struct(&arc);
+        CfmlStruct(arc)
     }
 
     #[inline]
@@ -1689,13 +1693,17 @@ pub struct CfmlQuery(Arc<PlRwLock<CfmlQueryData>>);
 impl CfmlQuery {
     /// A query with the given columns and no rows.
     pub fn new(columns: Vec<String>) -> Self {
-        CfmlQuery(Arc::new(PlRwLock::new(CfmlQueryData::new(columns))))
+        let arc = Arc::new(PlRwLock::new(CfmlQueryData::new(columns)));
+        crate::cycle_gc::log_query(&arc);
+        CfmlQuery(arc)
     }
 
     /// Wrap an already-built data block (e.g. a QoQ result) into a handle.
     #[inline]
     pub fn from_data(data: CfmlQueryData) -> Self {
-        CfmlQuery(Arc::new(PlRwLock::new(data)))
+        let arc = Arc::new(PlRwLock::new(data));
+        crate::cycle_gc::log_query(&arc);
+        CfmlQuery(arc)
     }
 
     /// Build from columns + row-shaped data (sql = None). Rows are unpacked

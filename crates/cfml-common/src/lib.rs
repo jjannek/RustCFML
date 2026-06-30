@@ -4,6 +4,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod clock;
+pub mod cycle_gc;
 pub mod dynamic;
 pub mod encodings;
 pub mod introspection;

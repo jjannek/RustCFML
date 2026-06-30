@@ -2329,7 +2329,7 @@ impl CfmlVirtualMachine {
                 .as_ref()
                 .map(|cap| cap.read().map(|g| g.clone()).unwrap_or_default());
             if let Some(snap) = snap {
-                Arc::make_mut(f).captured_scope = Some(Arc::new(std::sync::RwLock::new(snap)));
+                Arc::make_mut(f).captured_scope = Some(cfml_common::cycle_gc::tracked_scope(snap));
             }
         }
         ThreadSeed {
@@ -3737,7 +3737,7 @@ impl CfmlVirtualMachine {
                                 }
                                 let mut bound_fn = (**f).clone();
                                 bound_fn.captured_scope =
-                                    Some(Arc::new(std::sync::RwLock::new(bound)));
+                                    Some(cfml_common::cycle_gc::tracked_scope(bound));
                                 CfmlValue::Function(Arc::new(bound_fn))
                             } else {
                                 val
@@ -3766,7 +3766,7 @@ impl CfmlVirtualMachine {
                             .filter(|(_, v)| !matches!(v, CfmlValue::Function(_)))
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
-                        let scope = Arc::new(RwLock::new(filtered));
+                        let scope = cfml_common::cycle_gc::tracked_scope(filtered);
                         CfmlValue::Function(Arc::new(cfml_common::dynamic::CfmlFunction {
                             name: bc_func.name.clone(),
                             params: bc_func
@@ -6437,7 +6437,7 @@ impl CfmlVirtualMachine {
                                                 }
                                                 let mut bound_fn = (**f).clone();
                                                 bound_fn.captured_scope =
-                                                    Some(Arc::new(std::sync::RwLock::new(bound)));
+                                                    Some(cfml_common::cycle_gc::tracked_scope(bound));
                                                 CfmlValue::Function(Arc::new(bound_fn))
                                             } else {
                                                 v
@@ -6899,7 +6899,7 @@ impl CfmlVirtualMachine {
                                     seed.insert(k.clone(), cv);
                                 }
                             }
-                            closure_env.insert(Arc::new(RwLock::new(seed)))
+                            closure_env.insert(cfml_common::cycle_gc::tracked_scope(seed))
                         }
                     };
                     // Push function reference — encode func_idx in body for super dispatch
@@ -16023,7 +16023,7 @@ impl CfmlVirtualMachine {
                     nf.captured_scope = if cleaned.is_empty() {
                         None
                     } else {
-                        Some(Arc::new(std::sync::RwLock::new(cleaned)))
+                        Some(cfml_common::cycle_gc::tracked_scope(cleaned))
                     };
                     return CfmlValue::Function(Arc::new(nf));
                 }
