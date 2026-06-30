@@ -937,6 +937,23 @@ enum HeldLock {
     Reentrant,
 }
 
+/// Turn an inclusive (wall-clock) call duration into EXCLUSIVE (self) time using
+/// a stack of per-frame child-time accumulators. The top of `stack` is the
+/// currently-finishing frame's accumulated child time; we pop it, credit this
+/// frame's *inclusive* time to the parent (so the parent excludes us in turn),
+/// and return `inclusive − own_children` (floored at 0). Self-times produced
+/// this way are non-overlapping, so they sum to ≈ the outermost inclusive span
+/// instead of being multiplied up by call-nesting depth. See
+/// `tmpl_child_us_stack` for why this matters.
+#[cfg(feature = "observability")]
+fn frame_exclusive_us(stack: &mut Vec<i64>, inclusive_us: i64) -> i64 {
+    let child_us = stack.pop().unwrap_or(0);
+    if let Some(parent) = stack.last_mut() {
+        *parent += inclusive_us;
+    }
+    (inclusive_us - child_us).max(0)
+}
+
 pub struct CfmlVirtualMachine {
     pub program: BytecodeProgram,
     pub globals: ValueMap,
@@ -1395,6 +1412,17 @@ pub struct CfmlVirtualMachine {
     /// never dereferences the `Arc` just to decide whether to fire.
     #[cfg(feature = "observability")]
     interest: observe::Interest,
+    /// Per-frame accumulator of nested instrumented-call time (microseconds),
+    /// one entry per currently-executing timed template/method. Used to turn the
+    /// inclusive wall-clock of each include / component-method / lifecycle call
+    /// into EXCLUSIVE (self) time before firing the `template` hook: a frame's
+    /// self-time = its inclusive elapsed − the inclusive time of the nested
+    /// timed calls it made. Without this, deeply-nested re-entrant boots (e.g.
+    /// WireBox Injector→Builder→Singleton calling itself thousands of times)
+    /// attribute the same microseconds to every frame, so per-template totals
+    /// balloon far past the real request time.
+    #[cfg(feature = "observability")]
+    tmpl_child_us_stack: Vec<i64>,
     /// Typed handle to the footer collector (also stored as `observer`), kept so
     /// the render/`getDebugData()` paths can read it back without downcasting.
     #[cfg(feature = "observability")]
@@ -1676,6 +1704,8 @@ impl CfmlVirtualMachine {
             observer: None,
             #[cfg(feature = "observability")]
             interest: observe::Interest::NONE,
+            #[cfg(feature = "observability")]
+            tmpl_child_us_stack: Vec::new(),
             #[cfg(feature = "observability")]
             debug_collector: None,
             #[cfg(feature = "observability")]
@@ -2212,6 +2242,27 @@ impl CfmlVirtualMachine {
         if let Some(o) = &self.observer {
             o.on_template(&observe::TemplateEvent { path, elapsed_us });
         }
+    }
+
+    /// Mark the start of a timed template/method frame: push a fresh child-time
+    /// accumulator. Pair every call with [`template_frame_end`].
+    #[cfg(feature = "observability")]
+    #[inline]
+    fn template_frame_begin(&mut self) {
+        self.tmpl_child_us_stack.push(0);
+    }
+
+    /// End a timed frame and fire its `template` hook with EXCLUSIVE (self) time.
+    /// `inclusive_us` is the wall-clock the whole call took (including nested
+    /// timed calls). We subtract the child time this frame accumulated to get
+    /// its self-time, then credit this frame's *inclusive* time to the parent so
+    /// the parent can subtract it in turn. Net effect: every microsecond is
+    /// attributed to exactly one frame, and self-times sum to ≈ the request
+    /// total instead of being multiplied up by nesting depth.
+    #[cfg(feature = "observability")]
+    fn template_frame_end(&mut self, path: &str, inclusive_us: i64) {
+        let self_us = frame_exclusive_us(&mut self.tmpl_child_us_stack, inclusive_us);
+        self.fire_template(path, self_us);
     }
 
     /// Flatten a queryExecute params argument into the debug footer's param
@@ -7923,6 +7974,10 @@ impl CfmlVirtualMachine {
                                 .interest
                                 .contains(observe::Interest::TEMPLATE)
                                 .then(std::time::Instant::now);
+                            #[cfg(feature = "observability")]
+                            if __tmpl_start.is_some() {
+                                self.template_frame_begin();
+                            }
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
@@ -7932,7 +7987,7 @@ impl CfmlVirtualMachine {
                             #[cfg(feature = "observability")]
                             if let Some(start) = __tmpl_start {
                                 let us = start.elapsed().as_micros() as i64;
-                                self.fire_template(&resolved, us);
+                                self.template_frame_end(&resolved, us);
                             }
                             // Merge newly created variables from the include back
                             // into the caller's locals. This makes variables set via
@@ -8048,6 +8103,10 @@ impl CfmlVirtualMachine {
                                 .interest
                                 .contains(observe::Interest::TEMPLATE)
                                 .then(std::time::Instant::now);
+                            #[cfg(feature = "observability")]
+                            if __tmpl_start.is_some() {
+                                self.template_frame_begin();
+                            }
                             let result = self.execute_function_with_args(
                                 &inc_func,
                                 Vec::new(),
@@ -8057,7 +8116,7 @@ impl CfmlVirtualMachine {
                             #[cfg(feature = "observability")]
                             if let Some(start) = __tmpl_start {
                                 let us = start.elapsed().as_micros() as i64;
-                                self.fire_template(&resolved, us);
+                                self.template_frame_end(&resolved, us);
                             }
                             // Merge new non-function variables from the include
                             if let Some(inc_locals) = self.captured_locals.take() {
@@ -15997,8 +16056,9 @@ impl CfmlVirtualMachine {
                 };
                 if let Some(src) = src {
                     let start = std::time::Instant::now();
+                    self.template_frame_begin();
                     let r = self.call_member_function_impl(object, method, extra_args, arg_names);
-                    self.fire_template(&src, start.elapsed().as_micros() as i64);
+                    self.template_frame_end(&src, start.elapsed().as_micros() as i64);
                     return r;
                 }
             }
@@ -21763,8 +21823,9 @@ impl CfmlVirtualMachine {
                 };
                 if let Some(src) = src {
                     let start = std::time::Instant::now();
+                    self.template_frame_begin();
                     let r = self.call_lifecycle_method_impl(template, method, args);
-                    self.fire_template(&src, start.elapsed().as_micros() as i64);
+                    self.template_frame_end(&src, start.elapsed().as_micros() as i64);
                     return r;
                 }
             }
@@ -23682,6 +23743,40 @@ mod debug_footer_gate_tests {
         assert!(!vm.footer_activation_allowed());
         vm.maybe_install_debug_collector();
         assert!(!vm.is_debug_mode());
+    }
+
+    // Template timings must be EXCLUSIVE (self) time, not inclusive wall-clock —
+    // otherwise deeply-nested re-entrant boots attribute the same microseconds to
+    // every frame and per-template totals balloon past the request total (the
+    // Preside boot bug: Injector.cfc showed 14377ms inside a 5731ms request).
+    #[test]
+    fn template_timings_are_exclusive_self_time() {
+        // Simulate: outer (inclusive 100) makes two nested calls — innerA
+        // (inclusive 30) and innerB (inclusive 20). The begin/end order mirrors
+        // the VM: push on enter, frame_exclusive_us on exit.
+        let mut stack: Vec<i64> = Vec::new();
+
+        stack.push(0); // outer enters
+        stack.push(0); // innerA enters
+        let a_self = frame_exclusive_us(&mut stack, 30); // innerA exits
+        stack.push(0); // innerB enters
+        let b_self = frame_exclusive_us(&mut stack, 20); // innerB exits
+        let outer_self = frame_exclusive_us(&mut stack, 100); // outer exits
+
+        // Leaves keep their full time; outer keeps only its own work.
+        assert_eq!(a_self, 30);
+        assert_eq!(b_self, 20);
+        assert_eq!(outer_self, 50); // 100 − (30 + 20)
+        // Self-times sum to the outer inclusive span — no double counting.
+        assert_eq!(a_self + b_self + outer_self, 100);
+        assert!(stack.is_empty());
+
+        // A frame whose children somehow over-report never goes negative.
+        stack.push(0);
+        stack.push(0);
+        let _child = frame_exclusive_us(&mut stack, 200);
+        let parent = frame_exclusive_us(&mut stack, 100); // child(200) > parent(100)
+        assert_eq!(parent, 0);
     }
 
     #[test]
