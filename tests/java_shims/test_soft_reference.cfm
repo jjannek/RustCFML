@@ -32,6 +32,26 @@ assertTrue( "SoftReference.get() null after clear", isNull( sr.get() ) );
 
 suiteEnd();
 
+// WeakReference: same reference-holder shim as SoftReference (no JVM/GC means it
+// is never cleared on its own). Preside's _createWeakReference() helpers
+// (WebflowSpecLibrary / DatamanagerWorkflowSpecLibrary) construct -> init -> get.
+suiteBegin( "Java Shims: WeakReference (##218 sibling)" );
+
+wr = createObject( "java", "java.lang.ref.WeakReference" ).init( { a = 1 } );
+assertTrue( "WeakReference isInstanceOf",
+    isInstanceOf( wr, "java.lang.ref.WeakReference" ) );
+assert( "WeakReference.get() returns the referent", wr.get().a, 1 );
+
+h1 = wr.hashCode();
+assertTrue( "WeakReference.hashCode() stable", h1 == wr.hashCode() );
+wr2 = createObject( "java", "java.lang.ref.WeakReference" ).init( { a = 2 } );
+assertTrue( "WeakReference.hashCode() distinct per instance", h1 != wr2.hashCode() );
+
+wr.clear();
+assertTrue( "WeakReference.get() is null after clear()", isNull( wr.get() ) );
+
+suiteEnd();
+
 // End-to-end: the real CacheBox store builds + runs on these shims. Mirrors
 // ConcurrentSoftReferenceStore's set(timeout>0) -> SoftReference, get() ->
 // isInstanceOf + .get(), lookup hit/miss, clear() -> softRefKeyMap.remove(hash).

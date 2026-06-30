@@ -11510,6 +11510,9 @@ impl CfmlVirtualMachine {
                                 "java.lang.ref.softreference" => {
                                     java_shims::handle_java_softreference("init", empty_args, &CfmlValue::Null)
                                 }
+                                "java.lang.ref.weakreference" => {
+                                    java_shims::handle_java_weakreference("init", empty_args, &CfmlValue::Null)
+                                }
                                 "java.lang.ref.referencequeue" => {
                                     java_shims::handle_java_referencequeue("init", empty_args, &CfmlValue::Null)
                                 }
@@ -16251,6 +16254,9 @@ impl CfmlVirtualMachine {
                     "java.lang.ref.softreference" => {
                         java_shims::handle_java_softreference(&m, all_args, object)
                     }
+                    "java.lang.ref.weakreference" => {
+                        java_shims::handle_java_weakreference(&m, all_args, object)
+                    }
                     "java.lang.ref.referencequeue" => {
                         java_shims::handle_java_referencequeue(&m, all_args, object)
                     }
@@ -16302,6 +16308,8 @@ impl CfmlVirtualMachine {
                     // by design (a cleared/empty reference). Treat that null as
                     // authoritative, not "method unhandled". See #218.
                     || (java_class == "java.lang.ref.softreference"
+                        && method_lower == "get")
+                    || (java_class == "java.lang.ref.weakreference"
                         && method_lower == "get")
                     || (java_class == "java.lang.ref.referencequeue"
                         && matches!(method_lower.as_str(), "poll" | "remove"));

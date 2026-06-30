@@ -1254,6 +1254,29 @@ pub fn handle_java_softreference(
     args: Vec<CfmlValue>,
     object: &CfmlValue,
 ) -> CfmlResult {
+    handle_java_reference("java.lang.ref.softreference", method, args, object)
+}
+
+// A WeakReference is the same kind of reference holder as a SoftReference,
+// differing only in when the JVM's GC clears it. With no JVM/GC we shim both as
+// strong references that are never cleared on our own, so they share one body.
+// Preside's `_createWeakReference()` helpers (WebflowSpecLibrary /
+// DatamanagerWorkflowSpecLibrary) construct → init(referent) → store → later
+// get() the referent back.
+pub fn handle_java_weakreference(
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
+    handle_java_reference("java.lang.ref.weakreference", method, args, object)
+}
+
+fn handle_java_reference(
+    class: &str,
+    method: &str,
+    args: Vec<CfmlValue>,
+    object: &CfmlValue,
+) -> CfmlResult {
     match method {
         "init" => {
             // new SoftReference(referent[, queue]) — hold the referent strongly.
@@ -1262,7 +1285,7 @@ pub fn handle_java_softreference(
             let mut shim = ValueMap::default();
             shim.insert(
                 "__java_class".to_string(),
-                CfmlValue::string("java.lang.ref.softreference".to_string()),
+                CfmlValue::string(class.to_string()),
             );
             shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
             shim.insert(
