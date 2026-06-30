@@ -11,7 +11,18 @@
 use cfml_common::dynamic::CfmlValue;
 use cfml_common::vm::{CfmlError, CfmlResult};
 
+// DHAT heap profiler (feature `dhat-heap`). Swaps in DHAT's global allocator so
+// every allocation is tracked; the Profiler created in `main` is held for the
+// whole process and writes `dhat-heap.json` (in cwd) when it drops on graceful
+// shutdown. Builds without the feature pay zero cost.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     if std::env::var("RUSTCFML_NATIVE_SMOKE_TEST").as_deref() == Ok("1") {
         rustcfml_cli::run_with_registrar(|vm| {
             vm.register_native_fn("nativeAdd", native_add);

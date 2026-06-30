@@ -56,9 +56,15 @@ socket2 = { version = "0.5", optional = true, features = ["all"] }
 # client speaks Engine.IO v4 (socketioxide's default); we own fan-out via our
 # own registry/Broker, so `state`/`extensions`/`v4` are unnecessary.
 socketioxide = "0.16.3"
+# Heap profiler (leak hunting). Off by default; build with `--features dhat-heap`
+# to swap in DHAT's global allocator and dump `dhat-heap.json` on clean shutdown.
+dhat = { version = "0.3", optional = true }
 
 [features]
 default = ["memcached", "cluster", "jit"]
+# Enable DHAT heap profiling. Adds a global allocator + a Profiler held for the
+# whole process lifetime; writes dhat-heap.json on graceful (Ctrl+C) shutdown.
+dhat-heap = ["dep:dhat"]
 memcached = ["dep:memcache", "dep:openssl"]
 cluster = ["dep:memberlist", "dep:automerge", "dep:bincode", "dep:socket2"]
 # Passthrough to the VM's Cranelift JIT (native only). **On by default** via

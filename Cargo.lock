@@ -3,6 +3,15 @@
 version = 3
 
 [[package]]
+name = "addr2line"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b5d307320b3181d6d7954e663bd7c774a838b8220fe0593c86d9fb09f498b4b"
+dependencies = [
+ "gimli 0.32.3",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -941,6 +950,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "backtrace"
+version = "0.3.76"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb531853791a215d7c62a30daf0dde835f381ab5de4589cfe7c649d2cbe92bd6"
+dependencies = [
+ "addr2line",
+ "cfg-if",
+ "libc",
+ "miniz_oxide",
+ "object",
+ "rustc-demangle",
+ "windows-link",
+]
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1303,7 +1327,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cfml-codegen"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "cfml-common",
  "cfml-compiler",
@@ -1313,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-common"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "indexmap",
  "js-sys",
@@ -1328,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-compiler"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "cfml-common",
  "log",
@@ -1337,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-config"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "indexmap",
  "log",
@@ -1348,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-qoq"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "cfml-common",
  "indexmap",
@@ -1359,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-stdlib"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "aes",
  "argon2",
@@ -1413,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-vm"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "anyhow",
  "cfml-codegen",
@@ -1443,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "cfml-worker"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "cfml-codegen",
  "cfml-common",
@@ -1747,7 +1771,7 @@ dependencies = [
  "cranelift-control",
  "cranelift-entity",
  "cranelift-isle",
- "gimli",
+ "gimli 0.33.0",
  "hashbrown 0.17.1",
  "libm",
  "log",
@@ -2190,6 +2214,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
 dependencies = [
  "cipher",
+]
+
+[[package]]
+name = "dhat"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98cd11d84628e233de0ce467de10b8633f4ddaecafadefc86e13b84b8739b827"
+dependencies = [
+ "backtrace",
+ "lazy_static",
+ "mintex",
+ "parking_lot",
+ "rustc-hash 1.1.0",
+ "serde",
+ "serde_json",
+ "thousands",
 ]
 
 [[package]]
@@ -2869,6 +2909,12 @@ dependencies = [
  "wasip2",
  "wasip3",
 ]
+
+[[package]]
+name = "gimli"
+version = "0.32.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "gimli"
@@ -4089,6 +4135,12 @@ dependencies = [
  "adler2",
  "simd-adler32",
 ]
+
+[[package]]
+name = "mintex"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c505b3e17ed6b70a7ed2e67fbb2c560ee327353556120d6e72f5232b6880d536"
 
 [[package]]
 name = "mio"
@@ -5432,6 +5484,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-demangle"
+version = "0.1.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5454,7 +5512,7 @@ dependencies = [
 
 [[package]]
 name = "rustcfml-cli"
-version = "0.374.0"
+version = "0.375.0"
 dependencies = [
  "anyhow",
  "automerge",
@@ -5469,6 +5527,7 @@ dependencies = [
  "cfml-stdlib",
  "cfml-vm",
  "clap",
+ "dhat",
  "env_logger",
  "futures-util",
  "indexmap",
@@ -6350,6 +6409,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "thousands"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bf63baf9f5039dadc247375c29eb13706706cfde997d0330d05aa63a77d8820"
 
 [[package]]
 name = "tiberius"

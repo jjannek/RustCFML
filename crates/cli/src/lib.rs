@@ -889,12 +889,54 @@ fn compile_and_run(
     // remaining strong refs into the request's graph are from persistent scopes
     // (live roots) or genuine garbage cycles, which `collect` then reclaims.
     if cfml_common::cycle_gc::is_armed() {
-        let skip_collect = !vm.live_threads.is_empty();
-        drop(vm);
-        if !skip_collect {
-            cfml_common::cycle_gc::collect();
+        // Pull out the join handles of any `cfthread` still GENUINELY RUNNING
+        // (not merely lingering-but-finished). A finished thread has returned
+        // from its body and dropped every Arc it held, so `strong_count` reads
+        // are stable even though its handle still sits in `live_threads`
+        // (cfthreads are fire-and-forget — nothing joins them). Only an
+        // *executing* thread can race the count.
+        //
+        //  - No thread still running  → collect this request's cycles now.
+        //  - Some thread still running → DEFER this request's log until those
+        //    threads finish (never discard it — that would leak its cycles
+        //    permanently). The deferred log is collected at a later request
+        //    boundary or by the periodic sweep, once the threads complete.
+        let running_joins: Vec<std::thread::JoinHandle<()>> = vm
+            .live_threads
+            .values_mut()
+            .filter_map(|h| match &h.join {
+                Some(j) if !j.is_finished() => h.join.take(),
+                _ => None,
+            })
+            .collect();
+        let any_running = !running_joins.is_empty();
+        if std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+            let (s, a, q, sc) = cfml_common::cycle_gc::log_type_breakdown();
+            eprintln!(
+                "[cycle_gc] request end: live_threads={} running={} log_len={:?} \
+                 (structs={} arrays={} queries={} scopes={}) deferred_pending={}",
+                vm.live_threads.len(),
+                running_joins.len(),
+                cfml_common::cycle_gc::log_len(),
+                s, a, q, sc,
+                cfml_common::cycle_gc::deferred_pending(),
+            );
+            if let Some(sites) = cfml_common::cycle_gc::drain_top_sites(25) {
+                eprintln!("[cycle_gc] top sampled struct/array allocation sites this request:");
+                for (site, n) in sites {
+                    eprintln!("    {:>7}  {}", n, site);
+                }
+            }
         }
-        cfml_common::cycle_gc::disable_and_clear();
+        drop(vm);
+        if any_running {
+            cfml_common::cycle_gc::defer_current_log(running_joins);
+        } else {
+            cfml_common::cycle_gc::collect();
+            cfml_common::cycle_gc::disable_and_clear();
+        }
+        // Reclaim any previously-deferred logs whose threads have since finished.
+        cfml_common::cycle_gc::collect_ready_deferred();
     }
 
     response
@@ -1446,6 +1488,24 @@ async fn async_run_server(
     // for the owning application. Disabled when reapIntervalSecs = 0.
     spawn_session_reaper(server_state.clone(), &cfconfig);
 
+    // Spawn the deferred cycle-GC sweep (serve mode only, when the collector is
+    // armed). Request boundaries already drain deferred logs under load; this
+    // timer guarantees a request that spawned a background thread is still
+    // reclaimed once that thread finishes even if NO further request ever
+    // arrives (an otherwise-idle server). Cheap: an uncontended lock + a length
+    // check per tick when the queue is empty.
+    if cfml_common::cycle_gc::is_armed() {
+        tokio::spawn(async move {
+            let tick = std::time::Duration::from_secs(2);
+            loop {
+                tokio::time::sleep(tick).await;
+                tokio::task::spawn_blocking(cfml_common::cycle_gc::collect_ready_deferred)
+                    .await
+                    .ok();
+            }
+        });
+    }
+
     let app_state = Arc::new(AppState {
         doc_root: doc_root.to_path_buf(),
         port,
@@ -1534,7 +1594,16 @@ async fn async_run_server(
             let listener = listener.tap_io(|tcp_stream| {
                 let _ = tcp_stream.set_nodelay(true);
             });
-            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+            // Graceful shutdown on Ctrl+C so `main` returns normally. This lets
+            // a held resource (e.g. the DHAT Profiler under `--features
+            // dhat-heap`) run its Drop and flush its dump instead of being
+            // killed mid-flight by the signal.
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .with_graceful_shutdown(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await
+                .unwrap();
         }
     }
 }

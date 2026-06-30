@@ -97,15 +97,41 @@ thread_local! {
     static ALLOC_LOG: RefCell<Option<Vec<TrackedAlloc>>> = const { RefCell::new(None) };
 }
 
-/// Cap on the per-request allocation log. A request that allocates more than this
-/// (a cold framework boot wiring thousands of singletons, or a bulk data job)
-/// overflows the log, which is then dropped and collection skipped for that
-/// request — bounding the collector's own memory to ~`LOG_CAP * sizeof(Weak)`
-/// (a few MB) instead of ballooning to gigabytes. Dropping a partial log only
-/// means that one request's cycles are not reclaimed (safe: such requests are
-/// one-off, and refcounting still frees all acyclic garbage). Normal requests
-/// allocate far below this and collect as usual.
-const LOG_CAP: usize = 1_000_000;
+/// Soft cap on the per-request allocation log, as a pure MEMORY safety valve —
+/// NOT a functional gate. A real framework request (Preside, ColdBox, Wheels)
+/// routinely allocates well over a million containers, so the old 1M cap caused
+/// every such request to "overflow and skip collection", which is exactly the
+/// runaway serve-mode leak this collector exists to prevent. The cap is now set
+/// far above real request sizes, and — critically — overflowing it no longer
+/// abandons collection: logging simply STOPS (bounding the log's own memory to
+/// ~`LOG_CAP * sizeof(Weak)` ≈ 16 bytes each) while `collect()` still reclaims
+/// every cycle among the allocations logged BEFORE the cap was reached.
+///
+/// Collecting a partial log is provably conservative: any allocation that was
+/// never logged is absent from the survivor set, so edges to it are counted as
+/// external ownership (a live root) and its subgraph is protected. Thus a
+/// partial pass may under-collect (leak a little, that request only) but can
+/// NEVER over-collect a live object. Acyclic garbage is freed eagerly by
+/// refcounting regardless. The cap therefore only ever trades a little extra
+/// retained memory on a pathological alloc-churning request for a hard bound on
+/// the collector's transient bookkeeping — it never silently disables the
+/// collector the way the old threshold did.
+const LOG_CAP_DEFAULT: usize = 16_000_000;
+
+/// Effective per-request log cap. Overridable via `RUSTCFML_GC_LOG_CAP` (read
+/// once) so the bound can be tuned/experimented with at runtime without a
+/// rebuild. Falls back to `LOG_CAP_DEFAULT`.
+fn log_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("RUSTCFML_GC_LOG_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(LOG_CAP_DEFAULT)
+    })
+}
 
 /// Begin logging allocations for a request. Call at the very top of a top-level
 /// request execution (serve mode only).
@@ -118,22 +144,242 @@ pub fn disable_and_clear() {
     ALLOC_LOG.with(|c| *c.borrow_mut() = None);
 }
 
+/// Current length of this thread's allocation log (`None` if not logging). For
+/// diagnostics only.
+pub fn log_len() -> Option<usize> {
+    ALLOC_LOG.with(|c| c.borrow().as_ref().map(|v| v.len()))
+}
+
+/// Composition of this thread's allocation log by container type
+/// `(structs, arrays, queries, closure_scopes)`. Diagnostics only — answers
+/// "what are the N tracked allocations a request made?" without a heap profiler.
+pub fn log_type_breakdown() -> (usize, usize, usize, usize) {
+    ALLOC_LOG.with(|c| {
+        let b = c.borrow();
+        let mut t = (0usize, 0usize, 0usize, 0usize);
+        if let Some(v) = b.as_ref() {
+            for a in v {
+                match a {
+                    TrackedAlloc::Struct(_) => t.0 += 1,
+                    TrackedAlloc::Array(_) => t.1 += 1,
+                    TrackedAlloc::Query(_) => t.2 += 1,
+                    TrackedAlloc::Scope(_) => t.3 += 1,
+                }
+            }
+        }
+        t
+    })
+}
+
+// --- Deferred collection (requests that end with a thread still running) -----
+//
+// A request may end while a `cfthread` it spawned is STILL executing (true
+// fire-and-forget background work that outlives the response — explicitly
+// allowed by CFML). We must not collect then: a running thread can hold and
+// mutate Arcs into the request's graph, so `strong_count` reads would race, and
+// joining it would wrongly block the response. We also must not DISCARD the log
+// (that would leak the request's cycles forever — nothing else records them).
+//
+// Instead we DEFER: stash the request's log together with the still-running
+// threads' join handles in a small global queue. Later — at every request
+// boundary and on a periodic sweep — we collect each entry whose threads have
+// ALL finished. A finished thread has returned from its body and dropped every
+// Arc it held (verified: the spawn closure drops its child VM, sends-or-drops
+// its result, and drops its sender before `is_finished()` flips true), so the
+// entry's pure cycles then have stable, internal-only refcounts and collect
+// safely. This guarantees there is no scenario in which unused data is never
+// collected.
+
+/// One deferred request log plus the join handles of the threads whose
+/// completion gates its collection.
+struct DeferredEntry {
+    log: Vec<TrackedAlloc>,
+    joins: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Global queue of deferred logs. Small: one entry per in-flight
+/// background-thread-spawning request, drained as those threads finish.
+/// `parking_lot::Mutex::new` is const, so this needs no lazy init.
+static DEFERRED: parking_lot::Mutex<Vec<DeferredEntry>> = parking_lot::Mutex::new(Vec::new());
+
+/// Number of deferred logs currently awaiting their threads (observability).
+pub fn deferred_pending() -> usize {
+    DEFERRED.lock().len()
+}
+
+/// Take this thread's current allocation log and defer its collection until the
+/// given still-running threads finish. Call this INSTEAD of `collect` +
+/// `disable_and_clear` when a request ends with a thread still executing. If the
+/// log is empty/absent there is nothing to track — the join handles are simply
+/// dropped (detaching the threads, which keep running as before).
+pub fn defer_current_log(joins: Vec<std::thread::JoinHandle<()>>) {
+    let log = ALLOC_LOG.with(|c| c.borrow_mut().take());
+    match log {
+        Some(log) if !log.is_empty() && !joins.is_empty() => {
+            DEFERRED.lock().push(DeferredEntry { log, joins });
+        }
+        // No cycles logged, or no still-running threads to wait on: nothing to
+        // defer. Dropping `joins` just detaches (the default for cfthread).
+        _ => {}
+    }
+}
+
+/// Sweep the deferred queue: collect every entry whose threads have all
+/// finished, leaving the rest. Cheap when the queue is empty (one uncontended
+/// lock + length check). Called at each request boundary and by the periodic
+/// sweep so deferred logs are reclaimed even on an otherwise-idle server.
+/// Returns the number of cycle nodes reclaimed this sweep.
+pub fn collect_ready_deferred() -> usize {
+    // Phase 1: under the lock, move out the entries whose threads are all done.
+    // Keep the lock hold short — do the actual (potentially heavy) collection
+    // outside it. Each ready entry is owned by exactly one sweeping thread.
+    let ready: Vec<DeferredEntry> = {
+        let mut q = DEFERRED.lock();
+        if q.is_empty() {
+            return 0;
+        }
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < q.len() {
+            if q[i].joins.iter().all(|j| j.is_finished()) {
+                ready.push(q.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    };
+
+    let mut total = 0;
+    for entry in ready {
+        // Join the finished threads to release their OS resources (returns
+        // immediately — they have already completed).
+        for j in entry.joins {
+            let _ = j.join();
+        }
+        total += collect_from_log(entry.log);
+    }
+    if total > 0 && std::env::var("RUSTCFML_GC_DEBUG").is_ok() {
+        eprintln!("[cycle_gc] deferred sweep reclaimed {} node(s)", total);
+    }
+    total
+}
+
 #[inline]
 fn log_push(t: TrackedAlloc) {
     ALLOC_LOG.with(|c| {
         let mut b = c.borrow_mut();
         if let Some(v) = b.as_mut() {
-            if v.len() >= LOG_CAP {
-                // Overflow: drop the partial log and stop logging for the rest of
-                // this request. `collect` will then see `None` and skip — bounding
-                // memory on cold boots / bulk jobs. Safe: only this request's
-                // cycles go unreclaimed.
-                *b = None;
+            if v.len() >= log_cap() {
+                // Overflow: STOP logging further allocations for this request, but
+                // KEEP what we have so `collect()` still reclaims the cycles among
+                // the logged subset. Collecting a partial log is conservative
+                // (unlogged objects read as external roots → never over-collect),
+                // so this caps the collector's bookkeeping memory without ever
+                // disabling collection. The skip stays quiet unless debugging.
+                if !OVERFLOW_WARNED.swap(true, Ordering::Relaxed)
+                    && std::env::var("RUSTCFML_GC_DEBUG").is_ok()
+                {
+                    eprintln!(
+                        "[cycle_gc] log reached cap={} — logging paused for this request; \
+                         partial (conservative) collection will still run",
+                        log_cap()
+                    );
+                }
+                // Leave the log in place (do not null it out); just drop `t`.
             } else {
                 v.push(t);
             }
         }
     });
+}
+
+/// One-shot guard so the cap-reached notice is printed at most once per process
+/// (it is otherwise per-allocation noise once a request crosses the cap).
+static OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
+
+// --- Sampling allocation profiler (diagnostics; off unless env-enabled) -------
+//
+// Set `RUSTCFML_GC_SAMPLE=N` to capture a backtrace on 1-in-N struct/array
+// allocations, aggregate by call site, and print the top sites at each request
+// end (see cli `request end` handler). Per-request + thread-local, so it scopes
+// to one steady-state request and skips boot noise. Build with
+// `--profile profiling` for symbol names. Zero cost when the env var is unset
+// (one OnceLock load returning 0 → the hot path never captures).
+
+fn sample_rate() -> usize {
+    use std::sync::OnceLock;
+    static RATE: OnceLock<usize> = OnceLock::new();
+    *RATE.get_or_init(|| {
+        std::env::var("RUSTCFML_GC_SAMPLE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+thread_local! {
+    /// `(counter, site -> count)` for the current request when sampling is on.
+    static SAMPLES: RefCell<(usize, HashMap<String, usize>)> =
+        RefCell::new((0, HashMap::new()));
+}
+
+#[inline]
+fn maybe_sample() {
+    let rate = sample_rate();
+    if rate == 0 {
+        return;
+    }
+    SAMPLES.with(|c| {
+        let mut s = c.borrow_mut();
+        s.0 += 1;
+        if s.0 % rate != 0 {
+            return;
+        }
+        // Capture + symbolize a backtrace, then key by the first CFML engine
+        // frame below the allocation hooks (the actual allocating call site).
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let site = bt
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| {
+                (l.contains("cfml_vm")
+                    || l.contains("cfml_stdlib")
+                    || l.contains("cfml_codegen")
+                    || l.contains("cfml_compiler"))
+                    && !l.contains("cycle_gc")
+                    && !l.contains("maybe_sample")
+                    && !l.contains("log_struct")
+                    && !l.contains("log_array")
+                    && !l.contains("::strukt")
+                    && !l.contains("CfmlValue::array")
+                    && !l.contains("CfmlArray::new")
+                    && !l.contains("CfmlStruct::new")
+            })
+            .map(|l| {
+                // strip the leading "N: " frame index and trailing hash
+                let l = l.splitn(2, ": ").nth(1).unwrap_or(l);
+                l.split("::h").next().unwrap_or(l).to_string()
+            })
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        *s.1.entry(site).or_insert(0) += 1;
+    });
+}
+
+/// Drain and format the top-`k` sampled allocation sites for this request.
+/// Returns `None` when sampling is disabled. Resets the per-request state.
+pub fn drain_top_sites(k: usize) -> Option<Vec<(String, usize)>> {
+    if sample_rate() == 0 {
+        return None;
+    }
+    SAMPLES.with(|c| {
+        let mut s = c.borrow_mut();
+        let mut v: Vec<(String, usize)> = s.1.drain().collect();
+        s.0 = 0;
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(k);
+        Some(v)
+    })
 }
 
 // --- Allocation hooks (called from the container constructors) ---------------
@@ -143,6 +389,7 @@ fn log_push(t: TrackedAlloc) {
 pub fn log_struct(arc: &Arc<PlRwLock<StructInner>>) {
     if is_armed() {
         log_push(TrackedAlloc::Struct(Arc::downgrade(arc)));
+        maybe_sample();
     }
 }
 
@@ -150,6 +397,7 @@ pub fn log_struct(arc: &Arc<PlRwLock<StructInner>>) {
 pub fn log_array(arc: &Arc<PlRwLock<Vec<CfmlValue>>>) {
     if is_armed() {
         log_push(TrackedAlloc::Array(Arc::downgrade(arc)));
+        maybe_sample();
     }
 }
 
@@ -316,13 +564,26 @@ fn classify(v: &CfmlValue, in_set: &HashSet<usize>, emit: &mut impl FnMut(usize)
 /// returns the number of nodes reclaimed.
 ///
 /// PRECONDITIONS (the VM caller must establish these):
-///  1. No live `cfthread`s (`live_threads.is_empty()`).
+///  1. No `cfthread` is still *running* (finished-but-lingering handles are OK —
+///     a request that ends with a thread still executing must instead
+///     `defer_current_log` so its log is collected later, not discarded).
 ///  2. Persistent scopes already written back to `ServerState`.
-///  3. Transient roots (page `variables`, request scope, thread scope) cleared.
+///  3. Transient roots (page `variables`, request scope, thread scope) cleared
+///     — in practice satisfied by dropping the VM before calling this.
 pub fn collect() -> usize {
     let Some(log) = ALLOC_LOG.with(|c| c.borrow_mut().take()) else {
         return 0;
     };
+    collect_from_log(log)
+}
+
+/// The collection pass over an explicit allocation log (the live request's,
+/// drained by `collect`, or a previously-deferred one). Identical algorithm
+/// either way; factored out so deferred logs can be collected after their
+/// spawning request's threads finish. Safe to run concurrently with unrelated
+/// requests: the cycles it touches are internal to one finished request and
+/// unreachable from anywhere else, so their `strong_count`s are stable.
+fn collect_from_log(log: Vec<TrackedAlloc>) -> usize {
     if log.is_empty() {
         return 0;
     }
