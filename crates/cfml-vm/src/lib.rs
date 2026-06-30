@@ -11536,6 +11536,13 @@ impl CfmlVirtualMachine {
                                 "org.yaml.snakeyaml.yaml" => {
                                     java_shims::handle_java_yaml("init", empty_args, &CfmlValue::Null)
                                 }
+                                // Legacy Preside cfflow JSON-schema validation.
+                                // .init(schema,baseUri)/.isValid(json) route to
+                                // the native validateJSON builtin (see
+                                // handle_jsonvalidator_method).
+                                "ca.vanmulligen.json.schema.validator" => {
+                                    java_shims::handle_java_jsonvalidator("init", empty_args, &CfmlValue::Null)
+                                }
                                 _ => Err(CfmlError::runtime(format!(
                                     "createObject: Java class [{}] is not supported. \
                                      RustCFML has no JVM, so only a curated set of \
@@ -15259,6 +15266,56 @@ impl CfmlVirtualMachine {
         )))
     }
 
+    /// Legacy Preside JSON-schema validation: `ca.vanmulligen.json.schema
+    /// .Validator`. `.init(schema, baseUri)` returns a configured shim carrying
+    /// the schema + base URI; `.isValid(json)` validates via the native
+    /// validateJSON builtin and returns the `{"valid":bool,"error":{…}}` JSON
+    /// string Preside's JsonSchemaValidator.validate() deserializes.
+    fn handle_jsonvalidator_method(
+        &self,
+        method: &str,
+        object: &CfmlValue,
+        mut args: Vec<CfmlValue>,
+    ) -> CfmlResult {
+        match method {
+            "init" => {
+                let schema = args.first().map(|v| v.as_string()).unwrap_or_default();
+                let base = args.get(1).map(|v| v.as_string()).unwrap_or_default();
+                let mut shim = ValueMap::default();
+                shim.insert(
+                    "__java_class".to_string(),
+                    CfmlValue::string("ca.vanmulligen.json.schema.validator".to_string()),
+                );
+                shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+                shim.insert("__schema".to_string(), CfmlValue::string(schema));
+                shim.insert("__baseuri".to_string(), CfmlValue::string(base));
+                Ok(CfmlValue::strukt(shim))
+            }
+            "isvalid" => {
+                let json = if args.is_empty() {
+                    CfmlValue::string(String::new())
+                } else {
+                    args.remove(0)
+                };
+                let (schema, base) = match object {
+                    CfmlValue::Struct(s) => (
+                        s.get("__schema").map(|v| v.as_string()).unwrap_or_default(),
+                        s.get("__baseuri").map(|v| v.as_string()).unwrap_or_default(),
+                    ),
+                    _ => (String::new(), String::new()),
+                };
+                self.call_named_builtin(
+                    "__jsonSchemaValidateResult",
+                    vec![json, CfmlValue::string(schema), CfmlValue::string(base)],
+                )
+            }
+            other => Err(CfmlError::runtime(format!(
+                "ca.vanmulligen.json.schema.Validator shim has no method [{}]",
+                other
+            ))),
+        }
+    }
+
     /// Legacy Preside YAML: `org.yaml.snakeyaml.Yaml` instance methods routed to
     /// the native YAML builtins. cfflow's YamlParser only ever calls `.load()`.
     fn handle_snakeyaml_method(&self, method: &str, mut args: Vec<CfmlValue>) -> CfmlResult {
@@ -16142,6 +16199,9 @@ impl CfmlVirtualMachine {
                 let result = match java_class.as_str() {
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
                     "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),
+                    "ca.vanmulligen.json.schema.validator" => {
+                        self.handle_jsonvalidator_method(&m, object, all_args)
+                    }
                     "java.security.messagedigest" => {
                         handle_java_messagedigest(&m, all_args, object)
                     }
@@ -16802,6 +16862,10 @@ impl CfmlVirtualMachine {
                 "clear" => Some("structClear"),
                 "copy" => Some("structCopy"),
                 "append" => Some("structAppend"),
+                // java.util.Map.putAll — merge another struct/map in place
+                // (overwrite). Lucee exposes it on structs; Preside's cfflow
+                // YamlParser.toCF() relies on `cfObj.putAll( javaMap )`.
+                "putall" => Some("structAppend"),
                 "isempty" => Some("structIsEmpty"),
                 "sort" => Some("structSort"),
                 "each" => {

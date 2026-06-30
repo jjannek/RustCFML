@@ -42,6 +42,24 @@ pub fn handle_java_yaml(
     Ok(CfmlValue::strukt(shim))
 }
 
+/// `ca.vanmulligen.json.schema.Validator` construction. Returns an unconfigured
+/// marker shim; `.init(schema, baseUri)` (VM-routed) returns a configured shim,
+/// and `.isValid(json)` validates via the native validateJSON builtin. Lets
+/// legacy Preside's cfflow JsonSchemaValidator work without a JVM.
+pub fn handle_java_jsonvalidator(
+    _method: &str,
+    _args: Vec<CfmlValue>,
+    _object: &CfmlValue,
+) -> CfmlResult {
+    let mut shim = ValueMap::default();
+    shim.insert(
+        "__java_class".to_string(),
+        CfmlValue::string("ca.vanmulligen.json.schema.validator".to_string()),
+    );
+    shim.insert("__java_shim".to_string(), CfmlValue::Bool(true));
+    Ok(CfmlValue::strukt(shim))
+}
+
 pub fn handle_java_messagedigest(
     method: &str,
     args: Vec<CfmlValue>,

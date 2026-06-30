@@ -947,6 +947,15 @@ pub fn get_builtin_functions() -> HashMap<String, BuiltinFunction> {
         f.insert("yamlDeserializeFile".into(), fn_yaml_deserialize_file);
     }
 
+    // ---- JSON Schema validation (Lucee `validateJSON`) ----
+    #[cfg(feature = "jsonschema")]
+    {
+        f.insert("validateJSON".into(), fn_validate_json);
+        // Internal: returns Preside's {valid,error} JSON string for the
+        // ca.vanmulligen.json.schema.Validator shim's isValid().
+        f.insert("__jsonSchemaValidateResult".into(), fn_json_schema_validate_result);
+    }
+
     // ---- XML functions ----
     #[cfg(feature = "xml")]
     {
@@ -14630,6 +14639,141 @@ fn fn_yaml_deserialize_file(args: Vec<CfmlValue>) -> CfmlResult {
         CfmlError::runtime(format!("yamlDeserializeFile: cannot read [{}]: {}", path, e))
     })?;
     fn_yaml_deserialize(vec![CfmlValue::string(content)])
+}
+
+// ===============================================
+// JSON SCHEMA VALIDATION (Lucee validateJSON + ca.vanmulligen shim helper)
+// ===============================================
+
+/// Resolves external `$ref`s by reading the referenced file from disk. Preside's
+/// cfflow schemas use relative cross-file refs (`"$ref":"transition.schema.json"`)
+/// against a `file://<dir>` base URI; this reads each from the local filesystem
+/// (no network — the crate is built without HTTP resolution).
+#[cfg(feature = "jsonschema")]
+struct FileRefRetriever;
+
+#[cfg(feature = "jsonschema")]
+impl jsonschema::Retrieve for FileRefRetriever {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let s = uri.as_str();
+        // file:///abs/path -> /abs/path ; tolerate a plain path too.
+        let path = s.strip_prefix("file://").unwrap_or(s);
+        let content = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+}
+
+/// Core JSON-schema validation. Returns the list of (instancePointer, message)
+/// violations (empty = valid), or Err if the instance/schema can't be parsed or
+/// the schema is itself invalid. `base_uri` (e.g. `file://<dir>/`) anchors
+/// relative cross-file `$ref` resolution.
+#[cfg(feature = "jsonschema")]
+fn json_schema_validate_core(
+    json_str: &str,
+    schema_str: &str,
+    base_uri: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let instance: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("invalid JSON instance: {}", e))?;
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_str).map_err(|e| format!("invalid JSON schema: {}", e))?;
+
+    let mut opts = jsonschema::options().with_retriever(FileRefRetriever);
+    if let Some(b) = base_uri {
+        if !b.is_empty() {
+            opts = opts.with_base_uri(b.to_string());
+        }
+    }
+    let validator = opts.build(&schema).map_err(|e| format!("{}", e))?;
+
+    let errors = validator
+        .iter_errors(&instance)
+        .map(|err| (err.instance_path().to_string(), err.to_string()))
+        .collect();
+    Ok(errors)
+}
+
+/// validateJSON( json, schema, throwOnError=false [, baseUri] ) — Lucee BIF.
+/// Returns an array of error structs (`{message, pointerToViolation}`); an empty
+/// array means valid. With `throwOnError=true`, throws on the first violation.
+/// The optional 4th arg `baseUri` anchors cross-file `$ref` resolution (used by
+/// the ca.vanmulligen shim; not part of the Lucee signature).
+#[cfg(feature = "jsonschema")]
+fn fn_validate_json(args: Vec<CfmlValue>) -> CfmlResult {
+    let json = get_str(&args, 0);
+    let schema = get_str(&args, 1);
+    let throw_on_error = args.get(2).map(|v| v.is_true()).unwrap_or(false);
+    let base_uri = args.get(3).map(|v| v.as_string());
+
+    match json_schema_validate_core(&json, &schema, base_uri.as_deref()) {
+        Ok(errs) => {
+            if throw_on_error && !errs.is_empty() {
+                return Err(CfmlError::runtime(format!(
+                    "JSON validation failed: {}",
+                    errs[0].1
+                )));
+            }
+            let arr: Vec<CfmlValue> = errs
+                .into_iter()
+                .map(|(path, msg)| {
+                    let mut m = ValueMap::default();
+                    m.insert("message".to_string(), CfmlValue::string(msg));
+                    m.insert("pointerToViolation".to_string(), CfmlValue::string(path));
+                    CfmlValue::strukt(m)
+                })
+                .collect();
+            Ok(CfmlValue::array(arr))
+        }
+        Err(e) => Err(CfmlError::runtime(format!("validateJSON: {}", e))),
+    }
+}
+
+/// Internal helper for the `ca.vanmulligen.json.schema.Validator` shim: validates
+/// and returns the `{"valid":bool,"error":{…}}` JSON STRING that Preside's
+/// JsonSchemaValidator.validate() deserializes. Args: (json, schema [, baseUri]).
+#[cfg(feature = "jsonschema")]
+fn fn_json_schema_validate_result(args: Vec<CfmlValue>) -> CfmlResult {
+    let json = get_str(&args, 0);
+    let schema = get_str(&args, 1);
+    let base_uri = args.get(2).map(|v| v.as_string());
+
+    match json_schema_validate_core(&json, &schema, base_uri.as_deref()) {
+        Ok(errs) => {
+            let result = if errs.is_empty() {
+                serde_json::json!({ "valid": true, "error": {} })
+            } else {
+                let all: Vec<String> = errs.iter().map(|(_, m)| m.clone()).collect();
+                let first_ptr = errs
+                    .first()
+                    .map(|(p, _)| if p.is_empty() { "#".to_string() } else { p.clone() })
+                    .unwrap_or_else(|| "#".to_string());
+                let first_msg = errs.first().map(|(_, m)| m.clone()).unwrap_or_default();
+                serde_json::json!({
+                    "valid": false,
+                    "error": {
+                        "violationCount": errs.len(),
+                        "pointerToViolation": first_ptr,
+                        "message": first_msg,
+                        "keyword": "",
+                        "allMessages": all,
+                    }
+                })
+            };
+            Ok(CfmlValue::string(result.to_string()))
+        }
+        // A schema/instance that can't even be parsed/built: report invalid with
+        // the message rather than 500'ing (mirrors the Java validator's catch).
+        Err(e) => Ok(CfmlValue::string(
+            serde_json::json!({
+                "valid": false,
+                "error": { "violationCount": 1, "pointerToViolation": "#", "message": e, "keyword": "", "allMessages": [] }
+            })
+            .to_string(),
+        )),
+    }
 }
 
 /// generateSCryptHash(password)
