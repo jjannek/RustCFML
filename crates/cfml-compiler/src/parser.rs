@@ -5290,6 +5290,46 @@ impl Parser {
 
         loop {
             if self.match_token(&Token::Dot) {
+                // CFML allows a numeric-literal member key: `a.1` is equivalent
+                // to `a[1]` for both arrays (index) and structs (key "1").
+                // Lucee/ACF accept this; treat it as bracket access.
+                if let Token::Integer(i) = self.peek(0).clone() {
+                    self.advance();
+                    let loc = self.current_location();
+                    expr = Expression::ArrayAccess(Box::new(ArrayAccess {
+                        array: Box::new(expr),
+                        index: Box::new(Expression::Literal(Literal {
+                            value: LiteralValue::Int(i),
+                            location: loc.clone(),
+                        })),
+                        location: loc,
+                    }));
+                    continue;
+                }
+                // Chained numeric keys like `m.1.2` lex the `1.2` as a single
+                // Double token after the leading dot. Decompose it into two
+                // successive integer-key accesses (`m[1][2]`).
+                if let Token::Double(d) = self.peek(0).clone() {
+                    let text = format!("{}", d);
+                    let parts: Vec<&str> = text.split('.').collect();
+                    if parts.len() == 2 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
+                        self.advance();
+                        let loc = self.current_location();
+                        for part in parts {
+                            if let Ok(n) = part.parse::<i64>() {
+                                expr = Expression::ArrayAccess(Box::new(ArrayAccess {
+                                    array: Box::new(expr),
+                                    index: Box::new(Expression::Literal(Literal {
+                                        value: LiteralValue::Int(n),
+                                        location: loc.clone(),
+                                    })),
+                                    location: loc.clone(),
+                                }));
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let method = self.extract_property_name().unwrap_or_default();
                 if self.match_token(&Token::LParen) {
                     let args = self.parse_arguments()?;
