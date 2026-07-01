@@ -30,6 +30,29 @@ if ( isRustCFML() ) {
 	assertTrue( "shim invalid result carries an error message", len( badRes.error.message ?: "" ) > 0 );
 	assert( "shim invalid result violationCount", badRes.error.violationCount >= 1, true );
 
+	// --- trailing-comma tolerance (Preside schema files carry trailing commas;
+	//     serde_json is strict, the Java validators Preside targets are lenient) ---
+	// Trailing comma in the SCHEMA string.
+	tcSchema = '{"type":"object","properties":{"name":{"type":"string"},}}';
+	tcValid  = validateJSON( '{"name":"Bob"}', tcSchema );
+	assertTrue( "trailing comma in schema tolerated -> valid", isArray( tcValid ) && arrayLen( tcValid ) == 0 );
+
+	// Trailing comma in the INSTANCE string.
+	tcInst = validateJSON( '{"name":"Bob",}', schema );
+	assertTrue( "trailing comma in instance tolerated -> valid", isArray( tcInst ) && arrayLen( tcInst ) == 0 );
+
+	// Comma inside a string literal must NOT be stripped.
+	strComma = validateJSON( '{"name":"a,}"}', schema );
+	assertTrue( "comma inside string literal preserved -> valid", isArray( strComma ) && arrayLen( strComma ) == 0 );
+
+	// --- cross-file $ref where the referenced file has a trailing comma
+	//     (mirrors Preside webflow.schema.json -> webflow.init.schema.json) ---
+	schemaDir  = getDirectoryFromPath( getCurrentTemplatePath() ) & "jsonschema/";
+	rootSchema = fileRead( schemaDir & "root.schema.json" );
+	baseUri    = "file://" & schemaDir;
+	refValid   = validateJSON( '{"name":"Bob","child":{"flag":true}}', rootSchema, false, baseUri );
+	assertTrue( "$ref'd file with trailing comma resolves -> valid", isArray( refValid ) && arrayLen( refValid ) == 0 );
+
 }
 
 suiteEnd();

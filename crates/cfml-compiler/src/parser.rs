@@ -5530,6 +5530,42 @@ impl Parser {
                 name: id,
                 location: self.current_location(),
             })),
+            // `throw(...)` in EXPRESSION position. Lucee exposes throw() as a
+            // BIF, so idioms like `x ?: throw("msg","type")` are valid (Preside
+            // `WebflowSpecLibrary.getWebflow` uses exactly this). The statement
+            // form is handled in `parse_statement`; here we mirror its lowering
+            // to a VM-intercepted `throw(...)` call, supporting both positional
+            // and named args.
+            Token::Throw => {
+                let loc = self.current_location();
+                if self.check(&Token::LParen) {
+                    self.consume(&Token::LParen)?;
+                    let is_named = matches!(self.peek(0), Token::Identifier(_))
+                        && (matches!(self.peek(1), Token::Equal | Token::Colon));
+                    let arguments = if is_named {
+                        let named = self.parse_throw_named_attrs(true)?;
+                        self.throw_named_to_positional(named, loc)
+                    } else {
+                        self.parse_arguments()?
+                    };
+                    self.consume(&Token::RParen)?;
+                    Ok(Expression::FunctionCall(Box::new(FunctionCall {
+                        name: Box::new(Expression::Identifier(Identifier {
+                            name: "throw".to_string(),
+                            location: loc,
+                        })),
+                        arguments,
+                        location: loc,
+                    })))
+                } else {
+                    // Bare `throw` with no parens — treat as an identifier
+                    // (permissive, matching the soft-keyword arms below).
+                    Ok(Expression::Identifier(Identifier {
+                        name: "throw".to_string(),
+                        location: loc,
+                    }))
+                }
+            }
             // CFML soft keywords used as variables in expressions
             Token::Component => Ok(Expression::Identifier(Identifier {
                 name: "component".to_string(),

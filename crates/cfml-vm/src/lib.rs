@@ -5380,6 +5380,19 @@ impl CfmlVirtualMachine {
                                     }
                                     continue;
                                 }
+                                // An ARRAY argumentCollection spreads as POSITIONAL
+                                // args by index (Lucee/ACF/BoxLang:
+                                // `argumentCollection=[a,b]` == calling `(a, b)`).
+                                // Emit each with an EMPTY name so the reorder binds
+                                // it to a param SLOT. MockBox's
+                                // `$results( argumentCollection=arr )` relies on this.
+                                if let Some(CfmlValue::Array(items)) = named_values.get(i) {
+                                    for v in items.iter() {
+                                        expanded_names.push(String::new());
+                                        expanded_values.push(v);
+                                    }
+                                    continue;
+                                }
                             }
                             expanded_names.push(name.clone());
                             expanded_values
@@ -15598,6 +15611,16 @@ impl CfmlVirtualMachine {
                         }
                         expanded_names.push(k.clone());
                         expanded_values.push(v.clone());
+                    }
+                    continue;
+                }
+                // An ARRAY argumentCollection spreads as POSITIONAL args by index
+                // (Lucee/ACF/BoxLang: `argumentCollection=[a,b]` == calling
+                // `(a, b)`). MockBox's `$results( argumentCollection=arr )` relies
+                // on this to register one sequential result per element.
+                if let CfmlValue::Array(items) = &value {
+                    for (idx, v) in items.iter().enumerate() {
+                        numeric_positional.push((idx, v));
                     }
                     continue;
                 }

@@ -14645,6 +14645,72 @@ fn fn_yaml_deserialize_file(args: Vec<CfmlValue>) -> CfmlResult {
 // JSON SCHEMA VALIDATION (Lucee validateJSON + ca.vanmulligen shim helper)
 // ===============================================
 
+/// Removes trailing commas (a comma immediately before a closing `}`/`]`, modulo
+/// whitespace) from a JSON string. String-aware: commas inside string literals
+/// (and escaped quotes) are left untouched. `serde_json` is strict and rejects
+/// trailing commas, but the Java JSON-schema validators Preside targets tolerate
+/// them — several Preside schema files (e.g. `webflow.init.schema.json`) carry a
+/// trailing comma, so we sanitize before parsing schema JSON to match Lucee.
+#[cfg(feature = "jsonschema")]
+fn strip_trailing_commas(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut pending_comma = false;
+    let mut pending_ws = String::new();
+    for c in s.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if pending_comma {
+            if c.is_whitespace() {
+                pending_ws.push(c);
+                continue;
+            }
+            // Only drop the comma when the next token closes an object/array.
+            if c != '}' && c != ']' {
+                out.push(',');
+            }
+            out.push_str(&pending_ws);
+            pending_ws.clear();
+            pending_comma = false;
+            // fall through to emit `c` normally
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if c == ',' {
+            pending_comma = true;
+        } else {
+            out.push(c);
+        }
+    }
+    if pending_comma {
+        out.push(',');
+        out.push_str(&pending_ws);
+    }
+    out
+}
+
+/// Lenient JSON parse for the schema-validation path: tries strict `serde_json`
+/// first, then retries with trailing commas stripped. Keeps the common (valid)
+/// case on the fast path and only pays the sanitizer cost on a parse error.
+#[cfg(feature = "jsonschema")]
+fn parse_json_lenient(s: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match serde_json::from_str(s) {
+        Ok(v) => Ok(v),
+        Err(_) => serde_json::from_str(&strip_trailing_commas(s)),
+    }
+}
+
 /// Resolves external `$ref`s by reading the referenced file from disk. Preside's
 /// cfflow schemas use relative cross-file refs (`"$ref":"transition.schema.json"`)
 /// against a `file://<dir>` base URI; this reads each from the local filesystem
@@ -14662,7 +14728,7 @@ impl jsonschema::Retrieve for FileRefRetriever {
         // file:///abs/path -> /abs/path ; tolerate a plain path too.
         let path = s.strip_prefix("file://").unwrap_or(s);
         let content = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&content)?)
+        Ok(parse_json_lenient(&content)?)
     }
 }
 
@@ -14676,10 +14742,10 @@ fn json_schema_validate_core(
     schema_str: &str,
     base_uri: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
-    let instance: serde_json::Value = serde_json::from_str(json_str)
+    let instance: serde_json::Value = parse_json_lenient(json_str)
         .map_err(|e| format!("invalid JSON instance: {}", e))?;
     let schema: serde_json::Value =
-        serde_json::from_str(schema_str).map_err(|e| format!("invalid JSON schema: {}", e))?;
+        parse_json_lenient(schema_str).map_err(|e| format!("invalid JSON schema: {}", e))?;
 
     let mut opts = jsonschema::options().with_retriever(FileRefRetriever);
     if let Some(b) = base_uri {

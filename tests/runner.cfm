@@ -730,6 +730,7 @@ include "harness.cfm";
 <!--- and a method call on a null receiver must throw — composed, the two --->
 <!--- gaps turn Wheels' create() into a silent no-op that reports success. --->
 <cf_runtest file="core/test_new_udf_dispatch_and_null_call.cfm">
+<cf_runtest file="core/test_argumentcollection_array_and_throw_expr.cfm">
 <!--- - struct_key_case_parity: struct keys are case-insensitive on WRITE, not --->
 <!--- just read — a differently-cased write must update the existing key in --->
 <!--- place (one key; first-written casing wins the key list), never fork a --->
