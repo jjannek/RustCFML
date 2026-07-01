@@ -16967,6 +16967,17 @@ impl CfmlVirtualMachine {
                 // (overwrite). Lucee exposes it on structs; Preside's cfflow
                 // YamlParser.toCF() relies on `cfObj.putAll( javaMap )`.
                 "putall" => Some("structAppend"),
+                // java.util.Map.get(key) passthrough. Lucee/ACF expose Map
+                // members on structs, so `someStruct.get("k")` returns the value
+                // for that key (case-insensitive) or null if absent — it is NOT
+                // structGet's dotted-path form. (GH #223: ColdBox ConcurrentStore
+                // does `variables.pool.get(key)` where pool is a plain struct.)
+                "get" => {
+                    if let Some(key) = extra_args.first() {
+                        return Ok(s.get_ci(&key.as_string()).unwrap_or(CfmlValue::Null));
+                    }
+                    return Ok(CfmlValue::Null);
+                }
                 "isempty" => Some("structIsEmpty"),
                 "sort" => Some("structSort"),
                 "each" => {

@@ -44,5 +44,11 @@ s4 = {a: 1};
 s4.append({b: 2});
 assert("struct.append() then count", s4.count(), 2);
 
+// --- get (java.util.Map member passthrough, GH #223) ---
+s5 = { myKey: "123", Other: 7 };
+assert("struct.get() returns value", s5.get("myKey"), "123");
+assert("struct.get() is case-insensitive", s5.get("OTHER"), 7);
+assertTrue("struct.get() missing key is null", isNull(s5.get("nope")));
+
 suiteEnd();
 </cfscript>
