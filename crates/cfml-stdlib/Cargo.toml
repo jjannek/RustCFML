@@ -48,7 +48,7 @@ jsonschema = { version = "0.46", optional = true, default-features = false }
 sha1 = "0.10"
 ureq = { version = "2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-mysql = { version = "25", optional = true }
+mysql = { version = "28", optional = true }
 postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 tokio-postgres = { version = "0.7", optional = true }
 tokio-postgres-rustls = { version = "0.14", optional = true }
@@ -56,7 +56,12 @@ rustls = { version = "0.23", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["db-postgres"], optional = true }
 uuid = { version = "1", optional = true }
-tiberius = { version = "0.12", default-features = false, features = ["rustls", "chrono", "tds73"], optional = true }
+# native-tls (tiberius's default TLS) instead of its `rustls` feature, which
+# hard-pins tokio-rustls 0.24 → rustls 0.21 + rustls-webpki 0.101 (RUSTSEC).
+# tiberius 0.12.3 is the latest and has no rustls-0.23 path. native-tls uses the
+# OS TLS stack / vendored openssl (already vendored globally via the cli's
+# memcache openssl dep). MSSQL is not built for the wasm targets.
+tiberius = { version = "0.12", default-features = false, features = ["native-tls", "chrono", "tds73"], optional = true }
 tokio = { version = "1", features = ["rt", "net"], optional = true }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 r2d2 = "0.8"
@@ -76,6 +81,10 @@ scraper = { version = "0.22", optional = true }
 ego-tree = { version = "0.10", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"], optional = true }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
-aws-config = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
+# Use the modern HTTPS connector (aws-lc-rs + rustls 0.23) rather than the
+# legacy `rustls` feature, which resolves to aws-smithy's `legacy-rustls-ring`
+# (rustls 0.21 + hyper-rustls 0.24 — flagged by RUSTSEC/rustls-webpki 0.101).
+# `default-https-client` pulls aws-smithy-http-client's `rustls-aws-lc`.
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-config = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-credential-types = { version = "1", optional = true }
