@@ -12501,52 +12501,67 @@ impl CfmlVirtualMachine {
                     // Committing a nested block releases its savepoint and leaves
                     // the outer transaction open (Lucee/ACF/BoxLang semantics).
                     if self.transaction_depth >= 2 {
-                        if let Some(Some(name)) = self.transaction_savepoints.pop() {
+                        // Pop the savepoint and drop the depth BEFORE issuing the
+                        // driver call so that a failing RELEASE SAVEPOINT can't
+                        // leave the nesting depth stuck — otherwise the next
+                        // sibling block would keep climbing (cftxn_sp6, sp7 …).
+                        let popped = self.transaction_savepoints.pop();
+                        self.transaction_depth -= 1;
+                        if let Some(Some(name)) = popped {
                             if let (Some(release), Some(conn)) =
                                 (self.txn_release_savepoint, self.transaction_conn.as_mut())
                             {
                                 release(conn, &name)?;
                             }
                         }
-                        self.transaction_depth -= 1;
                         return Ok(CfmlValue::Null);
                     }
-                    if let Some(ref mut conn) = self.transaction_conn {
-                        if let Some(txn_commit) = self.txn_commit {
-                            txn_commit(conn)?;
-                        }
-                    }
+                    // Top-level commit. The block is definitively over once we get
+                    // here, so ALL transaction state must reset even if the driver
+                    // commit itself errors — otherwise a stale depth/conn leaks
+                    // into the next transaction, which then behaves as nested and
+                    // issues a SAVEPOINT on a connection that has none (GH #224:
+                    // "SAVEPOINT cftxn_spN does not exist", counter climbing across
+                    // specs).
+                    let commit_result = match (self.transaction_conn.as_mut(), self.txn_commit) {
+                        (Some(conn), Some(txn_commit)) => txn_commit(conn),
+                        _ => Ok(()),
+                    };
                     self.transaction_conn = None;
                     self.transaction_datasource = None;
                     self.transaction_pending = false;
                     self.transaction_depth = 0;
                     self.transaction_savepoints.clear();
+                    commit_result?;
                     return Ok(CfmlValue::Null);
                 }
                 "__cftransaction_rollback" => {
                     // Rolling back a nested block rolls back to its savepoint and
                     // leaves the outer transaction open.
                     if self.transaction_depth >= 2 {
-                        if let Some(Some(name)) = self.transaction_savepoints.pop() {
+                        let popped = self.transaction_savepoints.pop();
+                        self.transaction_depth -= 1;
+                        if let Some(Some(name)) = popped {
                             if let (Some(rollback_to), Some(conn)) =
                                 (self.txn_rollback_to_savepoint, self.transaction_conn.as_mut())
                             {
                                 rollback_to(conn, &name)?;
                             }
                         }
-                        self.transaction_depth -= 1;
                         return Ok(CfmlValue::Null);
                     }
-                    if let Some(ref mut conn) = self.transaction_conn {
-                        if let Some(txn_rollback) = self.txn_rollback {
-                            txn_rollback(conn)?;
-                        }
-                    }
+                    // Top-level rollback — reset all state unconditionally (see the
+                    // commit handler above for why). GH #224.
+                    let rollback_result = match (self.transaction_conn.as_mut(), self.txn_rollback) {
+                        (Some(conn), Some(txn_rollback)) => txn_rollback(conn),
+                        _ => Ok(()),
+                    };
                     self.transaction_conn = None;
                     self.transaction_datasource = None;
                     self.transaction_pending = false;
                     self.transaction_depth = 0;
                     self.transaction_savepoints.clear();
+                    rollback_result?;
                     return Ok(CfmlValue::Null);
                 }
                 "__cflog" => {
@@ -21280,14 +21295,24 @@ impl CfmlVirtualMachine {
         if self.app_datasources.is_empty() && self.app_default_datasource.is_none() {
             return args;
         }
-        let Some(CfmlValue::Struct(opts)) = args.get(2) else {
-            return args;
+        // The options struct lives at args[2]. A bare `queryExecute(sql)` or
+        // `queryExecute(sql, params)` omits it entirely, so we START from the
+        // existing options (if any) or an empty map and always resolve the
+        // per-application default. Without this, a bare query fell through to the
+        // process-wide default (historically `:memory:` SQLite) even though
+        // `this.datasource` was set — diverging from the transaction path, which
+        // resolves the default via get_default_datasource. That inconsistency
+        // (bare query hit SQLite outside a transaction but this.datasource inside
+        // one) is the root cause behind GH #224.
+        let mut map = match args.get(2) {
+            Some(CfmlValue::Struct(opts)) => opts.snapshot(),
+            _ => ValueMap::default(),
         };
-        let mut map = opts.snapshot();
         let current = map
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("datasource"))
-            .map(|(_, v)| v.as_string());
+            .map(|(_, v)| v.as_string())
+            .filter(|s| !s.is_empty());
         let new_url = match current {
             Some(ref name) => self.resolve_app_datasource(name),
             None => self.app_default_datasource.clone(),
@@ -21301,7 +21326,16 @@ impl CfmlVirtualMachine {
             .cloned()
             .unwrap_or_else(|| "datasource".to_string());
         map.insert(key, CfmlValue::string(url));
-        args[2] = CfmlValue::strukt(map);
+        // Pad positional args so the options struct lands at index 2 when the
+        // call omitted params and/or options.
+        while args.len() < 2 {
+            args.push(CfmlValue::Null);
+        }
+        if args.len() == 2 {
+            args.push(CfmlValue::strukt(map));
+        } else {
+            args[2] = CfmlValue::strukt(map);
+        }
         args
     }
 
