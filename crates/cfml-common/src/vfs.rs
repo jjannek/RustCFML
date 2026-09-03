@@ -17,6 +17,46 @@ pub struct VfsDirEntry {
     pub is_dir: bool,
 }
 
+/// A streaming line reader over one file.
+///
+/// Exists so `loop file=` can bound its memory to a single line instead of
+/// materialising the whole file (GH #367): the reporter's files run to over a
+/// million rows, and the eager path cost file-size + one `String` per line
+/// *before the first iteration* — strictly worse than the `fileRead()` +
+/// `listToArray()` workaround the construct is supposed to replace.
+///
+/// Line semantics match the eager path exactly (`str::lines`): the terminator
+/// is stripped, `\r\n` and `\n` both end a line, a trailing newline does NOT
+/// yield a final empty line, and interior blank lines ARE yielded so line
+/// numbers stay accurate.
+pub trait VfsLines: Send {
+    /// The next line, or `None` at end of file.
+    fn next_line(&mut self) -> io::Result<Option<String>>;
+}
+
+/// Eager fallback: the whole file split up-front, handed back one line at a time.
+///
+/// The default for VFS implementations that have nothing to stream *from* — an
+/// embedded archive is already resident in memory, so a "streaming" read of it
+/// would save nothing. Callers get the same values either way; only the peak
+/// memory differs, and for those implementations it cannot be improved.
+pub struct EagerLines {
+    lines: std::vec::IntoIter<String>,
+}
+
+impl EagerLines {
+    pub fn new(content: &str) -> Self {
+        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        EagerLines { lines: lines.into_iter() }
+    }
+}
+
+impl VfsLines for EagerLines {
+    fn next_line(&mut self) -> io::Result<Option<String>> {
+        Ok(self.lines.next())
+    }
+}
+
 /// Virtual filesystem trait — abstracts source file I/O so the VM can read
 /// from disk or from an embedded archive.
 pub trait Vfs: Send + Sync {
@@ -30,6 +70,18 @@ pub trait Vfs: Send + Sync {
     fn modified(&self, path: &str) -> io::Result<SystemTime>;
     /// Canonicalize a path (resolve symlinks, make absolute).
     fn canonicalize(&self, path: &str) -> io::Result<String>;
+
+    /// Open a file for line-by-line streaming (see [`VfsLines`]).
+    ///
+    /// Defaults to reading the file whole and iterating the result, which is
+    /// correct for every implementation and optimal for the in-memory ones.
+    /// [`RealFs`] overrides it with a buffered reader so a large file on disk
+    /// costs one line of resident memory rather than its whole size.
+    /// Delegating implementations must forward this, or they silently drop
+    /// back to the eager path for the files that most need streaming.
+    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+        Ok(Box::new(EagerLines::new(&self.read_to_string(path)?)))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -39,29 +91,123 @@ pub trait Vfs: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct RealFs;
 
+/// Lucee-like case-insensitive path resolution on case-sensitive filesystems.
+///
+/// Walks **every** path segment (not just the last, and not only `.cfc`/`.cfm`):
+/// `storage/testDir/loading.gif` finds on-disk `storage/testdir/loading.gif`.
+/// Exact-case `exists` is the per-segment fast path; a directory listing is
+/// paid only on a miss whose parent exists.
+///
+/// Returns the on-disk spelling when the path exists ignoring case, else `None`.
+pub fn lucee_case_fold_path(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.exists() {
+        return Some(path.to_string());
+    }
+    let mut acc = std::path::PathBuf::new();
+    let comps: Vec<_> = p.components().collect();
+    if comps.is_empty() {
+        return None;
+    }
+    for comp in comps {
+        match comp {
+            std::path::Component::Prefix(pre) => acc.push(pre.as_os_str()),
+            std::path::Component::RootDir => acc.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                acc.push(comp.as_os_str());
+            }
+            std::path::Component::Normal(seg) => {
+                let next = acc.join(seg);
+                if next.exists() {
+                    acc = next;
+                    continue;
+                }
+                if acc.as_os_str().is_empty() || !acc.is_dir() {
+                    return None;
+                }
+                let want = seg.to_str()?;
+                let mut hit: Option<std::ffi::OsString> = None;
+                let entries = std::fs::read_dir(&acc).ok()?;
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name
+                        .to_str()
+                        .map(|n| n.eq_ignore_ascii_case(want))
+                        .unwrap_or(false)
+                    {
+                        hit = Some(name);
+                        break;
+                    }
+                }
+                acc.push(hit?);
+            }
+        }
+    }
+    if acc.exists() {
+        Some(acc.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+fn real_fs_folded(path: &str) -> Option<String> {
+    if Path::new(path).exists() {
+        Some(path.to_string())
+    } else {
+        lucee_case_fold_path(path)
+    }
+}
+
 impl Vfs for RealFs {
     fn read_to_string(&self, path: &str) -> io::Result<String> {
-        std::fs::read_to_string(path)
+        match std::fs::read_to_string(path) {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::read_to_string(folded)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        match std::fs::read(path) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::read(folded)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn exists(&self, path: &str) -> bool {
-        Path::new(path).exists()
+        Path::new(path).exists() || lucee_case_fold_path(path).is_some()
     }
 
     fn is_file(&self, path: &str) -> bool {
         Path::new(path).is_file()
+            || lucee_case_fold_path(path)
+                .map(|p| Path::new(&p).is_file())
+                .unwrap_or(false)
     }
 
     fn is_dir(&self, path: &str) -> bool {
         Path::new(path).is_dir()
+            || lucee_case_fold_path(path)
+                .map(|p| Path::new(&p).is_dir())
+                .unwrap_or(false)
     }
 
     fn read_dir(&self, path: &str) -> io::Result<Vec<VfsDirEntry>> {
-        let entries = std::fs::read_dir(path)?;
+        let resolved = real_fs_folded(path).unwrap_or_else(|| path.to_string());
+        let entries = std::fs::read_dir(&resolved)?;
         let mut result = Vec::new();
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
@@ -83,11 +229,49 @@ impl Vfs for RealFs {
     }
 
     fn modified(&self, path: &str) -> io::Result<SystemTime> {
-        std::fs::metadata(path)?.modified()
+        match std::fs::metadata(path) {
+            Ok(md) => md.modified(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::metadata(folded)?.modified()
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Buffered, one line resident at a time — this is the whole point of
+    /// [`Vfs::open_lines`]. `BufRead::lines` strips the terminator and a
+    /// preceding `\r` exactly as `str::lines` does, so the values are
+    /// identical to the eager path's.
+    ///
+    /// One deliberate divergence from the eager path: invalid UTF-8 surfaces
+    /// when the loop reaches the offending line rather than before the first
+    /// iteration, because nothing reads ahead of the cursor. That is what
+    /// Lucee's buffered reader does too, and it is inherent to streaming — the
+    /// alternative is to scan the whole file first, which is the cost being
+    /// removed.
+    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+        let file = std::fs::File::open(path)?;
+        Ok(Box::new(BufReaderLines {
+            lines: io::BufRead::lines(io::BufReader::new(file)),
+        }))
     }
 
     fn canonicalize(&self, path: &str) -> io::Result<String> {
-        std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string())
+        match std::fs::canonicalize(path) {
+            Ok(p) => Ok(p.to_string_lossy().to_string()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(folded) = lucee_case_fold_path(path) {
+                    std::fs::canonicalize(folded).map(|p| p.to_string_lossy().to_string())
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -184,6 +368,17 @@ impl EmbeddedFs {
             }
         }
         parts.join("/")
+    }
+}
+
+/// [`RealFs`]'s streaming reader — a `BufReader` over the open file.
+struct BufReaderLines {
+    lines: io::Lines<io::BufReader<std::fs::File>>,
+}
+
+impl VfsLines for BufReaderLines {
+    fn next_line(&mut self) -> io::Result<Option<String>> {
+        self.lines.next().transpose()
     }
 }
 
@@ -315,6 +510,14 @@ impl Vfs for FallbackFs {
         let result = self.embedded.read_to_string(path);
         if result.is_ok() || self.sandbox { return result; }
         self.real.read_to_string(path)
+    }
+    /// Forwarded, not defaulted — the whole point of a `--build` binary reading
+    /// a large data file off disk is that it streams. Resolution order mirrors
+    /// `read_to_string`: embedded first, then the real FS unless sandboxed.
+    fn open_lines(&self, path: &str) -> io::Result<Box<dyn VfsLines>> {
+        let result = self.embedded.open_lines(path);
+        if result.is_ok() || self.sandbox { return result; }
+        self.real.open_lines(path)
     }
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         let result = self.embedded.read(path);
@@ -639,4 +842,73 @@ mod tests {
         assert!(names.contains(&"application.cfc".to_string()), "{names:?}");
         assert!(names.contains(&"index.cfm".to_string()), "{names:?}");
     }
+
+    /// GH #387: a mid-path directory case mismatch must resolve, not only the
+    /// last segment. Preside FileStorage fixtures live at `storage/testdir/`
+    /// while tests ask for `storage/testDir/loading.gif`.
+    #[test]
+    fn real_fs_folds_every_path_segment() {
+        let dir = TempDir::new("segfold");
+        let on_disk = dir.0.join("storage").join("testdir");
+        std::fs::create_dir_all(&on_disk).expect("mkdir testdir");
+        std::fs::write(on_disk.join("loading.gif"), b"GIF89a").expect("write gif");
+
+        let fs = RealFs;
+        let asked = format!("{}/storage/testDir/loading.gif", dir.str());
+        assert!(fs.exists(&asked), "exists must fold testDir -> testdir");
+        assert!(fs.is_file(&asked), "is_file must fold testDir -> testdir");
+        assert_eq!(fs.read(&asked).expect("read folded gif"), b"GIF89a");
+        assert_eq!(
+            fs.read_to_string(&asked).expect("read_to_string folded gif"),
+            "GIF89a"
+        );
+        let canon = fs.canonicalize(&asked).expect("canonicalize folded gif");
+        assert!(
+            canon.to_lowercase().ends_with("testdir/loading.gif")
+                || canon.to_lowercase().ends_with("testdir\\\\loading.gif"),
+            "canonicalize should land on testdir: {canon}"
+        );
+        let parent_asked = format!("{}/storage/testDir", dir.str());
+        assert!(fs.is_dir(&parent_asked), "directory segment itself folds");
+        // A genuinely missing path stays missing.
+        let missing = format!("{}/storage/testDir/nope.gif", dir.str());
+        assert!(!fs.exists(&missing));
+    }
+
+    #[test]
+    fn lucee_case_fold_path_returns_on_disk_spelling() {
+        let dir = TempDir::new("foldret");
+        let on_disk = dir.0.join("storage").join("testdir");
+        std::fs::create_dir_all(&on_disk).expect("mkdir");
+        std::fs::write(on_disk.join("loading.gif"), b"x").expect("write");
+        let asked = format!("{}/storage/testDir/loading.gif", dir.str());
+        let folded = lucee_case_fold_path(&asked).expect("should fold");
+        assert!(
+            folded.ends_with("testdir/loading.gif") || folded.ends_with("testdir\\\\loading.gif"),
+            "folded={folded}"
+        );
+        assert!(!folded.contains("testDir"), "must not keep requested case: {folded}");
+    }
+
+}
+
+/// The system temp directory WITH a trailing separator, which is what Lucee and
+/// Adobe CF both return from `getTempDirectory()`.
+///
+/// `std::env::temp_dir()` trails on macOS (TMPDIR happens to) but not on Linux,
+/// where a bare `/tmp` turned the ubiquitous `getTempDirectory() & name` join
+/// into `/tmpname` — a path at the filesystem ROOT — so every following
+/// directoryCreate/fileWrite failed with a permission error (GH #380). That
+/// platform difference is exactly why it went unseen in local development.
+///
+/// Lives here rather than in `cfml-stdlib` because the VM's sandbox intercept
+/// needs it too, and `cfml-stdlib` is an OPTIONAL dependency of `cfml-vm`
+/// (feature `s3`) — calling into it unconditionally builds only when that
+/// feature happens to be on.
+pub fn temp_dir_with_separator() -> String {
+    let mut dir = std::env::temp_dir().to_string_lossy().to_string();
+    if !dir.ends_with(std::path::MAIN_SEPARATOR) && !dir.ends_with('/') {
+        dir.push(std::path::MAIN_SEPARATOR);
+    }
+    dir
 }

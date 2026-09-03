@@ -458,6 +458,22 @@ pub(crate) fn is_component_struct(s: &cfml_common::dynamic::CfmlStruct) -> bool 
 /// [`CfmlVirtualMachine::build_inheritance_metadata`] (GitHub #210). Mirrors the
 /// `extract_component_meta` helper inside the `getcomponentmetadata` arm, but
 /// returns a `ValueMap` so the caller can attach a recursive `extends`.
+/// Metadata `path` is the component's file, and Lucee/ACF always report it as an
+/// ABSOLUTE path — frameworks treat it as an identity and re-resolve it (WireBox
+/// maps an object by `md.path`). Serve mode already resolves absolutely; a CLI
+/// run resolves against the process directory, so join it back on. Deliberately
+/// NOT `canonicalize`: that resolves symlinks, which expandPath must not do.
+fn absolute_metadata_path(src: &str) -> String {
+    let p = std::path::Path::new(src);
+    if p.is_absolute() {
+        return src.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
+        Err(_) => src.to_string(),
+    }
+}
+
 fn component_leaf_metadata(s: &ValueMap, fallback_name: &str) -> ValueMap {
     let mut meta = ValueMap::default();
     let name_val = s
@@ -468,7 +484,10 @@ fn component_leaf_metadata(s: &ValueMap, fallback_name: &str) -> ValueMap {
     meta.insert("fullname".to_string(), name_val);
     meta.insert("type".to_string(), CfmlValue::string("component".to_string()));
     if let Some(CfmlValue::String(src)) = s.get("__source_file") {
-        meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
+        meta.insert(
+            "path".to_string(),
+            CfmlValue::string(absolute_metadata_path(src)),
+        );
     }
     if let Some(imp) = build_implements_meta(s) {
         meta.insert("implements".to_string(), imp);
@@ -1223,6 +1242,21 @@ pub fn compile_file_cached(
     Ok(program)
 }
 
+/// The lock behind a `<cflock name=…>` / `scope=` entry in `named_locks`.
+///
+/// `parking_lot`, not `std`, specifically because acquisition must PARK rather
+/// than poll. This used to be a `std::sync::RwLock` acquired by `try_write()` in
+/// a 10ms sleep loop, which meant a waiter did not wake when the lock was
+/// released — it woke on the next tick — so every contended acquisition
+/// quantised to 10ms and, because waiters raced on wake with no queue, a loser
+/// re-slept a full interval and could be starved repeatedly (GH #401: a lock
+/// held 3.5 ms produced a 380 ms wait, and p99 went 4.8 ms → 331.8 ms from 1 to
+/// 16 concurrent requests while p50 never moved).
+///
+/// `parking_lot` also gives eventual fairness on unlock, which bounds the
+/// starvation the old loop had no answer to.
+type NamedLock = parking_lot::RwLock<()>;
+
 /// Bound the `named_locks` map so long-lived `--serve` processes using
 /// dynamic lock names (e.g. `name="user_#id#"`) don't grow it unboundedly.
 /// When the map is at/over `cap` and `new_name` isn't already present, evict
@@ -1231,7 +1265,7 @@ pub fn compile_file_cached(
 /// invalidate a live `held_locks` guard. Entries with `strong_count > 1` (held
 /// or contended) are always kept.
 fn evict_idle_named_locks(
-    locks: &mut HashMap<String, Arc<RwLock<()>>>,
+    locks: &mut HashMap<String, Arc<NamedLock>>,
     new_name: &str,
     cap: usize,
 ) {
@@ -1312,6 +1346,28 @@ static EXISTS_NEG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// real application's static tree while still bounding a workload that probes
 /// attacker- or user-shaped paths.
 const EXISTS_L2_MAX_ENTRIES: usize = 100_000;
+
+/// One directory's case-folding index: lowercased entry name -> (on-disk
+/// spelling, is_dir). Behind an `Arc` so a lookup clones a pointer rather than
+/// the map.
+pub type FoldIndex = Arc<HashMap<String, (String, bool)>>;
+
+/// A cached directory listing used for case-insensitive template lookup.
+///
+/// Stamped with the negative-answer generation for the same reason an absent
+/// `ExistsEntry` is: the *absence* of a name from this index is a negative
+/// answer, and a file created since the listing was taken must be visible.
+#[derive(Clone)]
+pub struct DirFoldEntry {
+    pub neg_gen: u64,
+    pub index: FoldIndex,
+}
+
+/// Cap on `ServerState::dir_fold_cache` entries. One entry per *directory* that
+/// has ever needed a case-folded lookup — orders of magnitude smaller than the
+/// per-path existence cache, and only populated on a case mismatch, so this is
+/// a runaway guard rather than a working limit.
+const DIR_FOLD_L2_MAX_ENTRIES: usize = 10_000;
 
 /// Retire every cached NEGATIVE existence answer in the process, leaving every
 /// positive intact. O(1) — see [`EXISTS_NEG_GENERATION`].
@@ -1534,7 +1590,7 @@ pub struct ServerState {
     pub applications: Arc<dyn ApplicationStore>,
     pub sessions: Arc<dyn SessionStore>,
     /// Named locks for cflock: name → RwLock (exclusive = write, readonly = read)
-    pub named_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
+    pub named_locks: Arc<Mutex<HashMap<String, Arc<NamedLock>>>>,
     /// Bytecode cache — skips recompilation when file mtime is unchanged
     pub bytecode_cache: BytecodeCache,
     /// Document root for `--serve` mode. Used as a fallback search path
@@ -1613,6 +1669,10 @@ pub struct ServerState {
     /// unconditionally — see that static for why the guard is a process-global
     /// generation and not a per-path invalidation list.
     pub exists_cache: Arc<parking_lot::RwLock<HashMap<String, ExistsEntry>>>,
+    /// Application-lifetime layer for the per-directory case-folding index used
+    /// by case-insensitive template lookup (GH #387). Production serve mode
+    /// only, under the same `exists_l2()` contract as `exists_cache`.
+    pub dir_fold_cache: Arc<parking_lot::RwLock<HashMap<String, DirFoldEntry>>>,
     /// Persistent `application` scope for the Application.cfc *pseudo-constructor*
     /// phase, keyed by Application.cfc path.
     ///
@@ -1701,6 +1761,7 @@ impl ServerState {
             canonicalize_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             custom_tag_path_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             exists_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            dir_fold_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             pseudo_ctor_app_scopes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             cfconfig,
             pending_session_ends: Arc::new(Mutex::new(HashMap::new())),
@@ -1766,12 +1827,12 @@ impl ServerState {
 #[allow(dead_code)]
 enum HeldLock {
     Write(
-        std::sync::RwLockWriteGuard<'static, ()>,
-        Arc<RwLock<()>>,
+        parking_lot::RwLockWriteGuard<'static, ()>,
+        Arc<NamedLock>,
     ),
     Read(
-        std::sync::RwLockReadGuard<'static, ()>,
-        Arc<RwLock<()>>,
+        parking_lot::RwLockReadGuard<'static, ()>,
+        Arc<NamedLock>,
     ),
     /// A reentrant re-acquire of a lock already held by this request/thread.
     /// Holds no real guard — named locks are reentrant per thread, so the inner
@@ -2790,6 +2851,22 @@ pub struct CfmlVirtualMachine {
     /// can only go stale via a *delete*, and every filesystem-mutating BIF clears
     /// this cache (see `builtin_may_remove_path`). Dropped at request end.
     pub request_exists_cache: parking_lot::RwLock<HashMap<String, ExistsEntry>>,
+    /// Request-lifetime layer for the per-directory case-folding index (GH
+    /// #387). Every mode, mirroring `request_exists_cache`.
+    pub request_dir_fold_cache: parking_lot::RwLock<HashMap<String, DirFoldEntry>>,
+    /// Open `loop file=` line cursors, keyed by the handle the loop lowering
+    /// carries in a local (GH #367).
+    ///
+    /// The loop closes its own handle on both normal exit and `break`. A
+    /// `return` or an exception out of the body leaks one entry, which is
+    /// bounded and deliberate: in serve mode this VM is per-request, so the
+    /// cursor — and the file descriptor under it — is dropped at request end.
+    /// Unwinding a handle through every `?` in the interpreter would buy
+    /// nothing over that.
+    file_line_cursors: HashMap<i64, Box<dyn cfml_common::vfs::VfsLines>>,
+    /// Monotonic handle counter. Never reused, so a stale handle from a closed
+    /// cursor reports "closed" rather than silently reading someone else's file.
+    next_file_line_cursor: i64,
     /// Request epoch for the existence-probe census (`exists-census` builds
     /// only). Taken once per `Vm`, which in serve mode is once per request, so
     /// the census can tell a repeat probe *within* a request from one that
@@ -2800,7 +2877,7 @@ pub struct CfmlVirtualMachine {
     /// Stashed compile error from the most recent failed component load. Lets the
     /// "Could not find the component" call sites surface the real parse/tag error
     /// (with file + line) instead of a misleading missing-file message.
-    pub last_component_compile_error: Option<String>,
+    pub last_component_compile_error: Option<CfmlError>,
     /// Optional Cranelift JIT engine. `Some` only under `--features jit` on a
     /// native target when not disabled via `RUSTCFML_JIT=0`. Consulted at the
     /// top of `execute_function_with_args`; the interpreter is always the
@@ -3543,6 +3620,9 @@ impl CfmlVirtualMachine {
             request_validated_files: parking_lot::RwLock::new(std::collections::HashSet::new()),
             request_custom_tag_cache: parking_lot::RwLock::new(HashMap::new()),
             request_exists_cache: parking_lot::RwLock::new(HashMap::new()),
+            request_dir_fold_cache: parking_lot::RwLock::new(HashMap::new()),
+            file_line_cursors: HashMap::new(),
+            next_file_line_cursor: 1,
             #[cfg(feature = "exists-census")]
             exists_census_epoch: cfml_common::perf_counters::exists_census::next_epoch(),
             last_component_compile_error: None,
@@ -3749,6 +3829,71 @@ fn jit_udf_lookup(
         global_id: f.global_id,
         nparams: f.params.len(),
     })
+}
+
+/// The per-application start gate — one lock per application NAME.
+///
+/// CFML's lifecycle contract is that `onApplicationStart` runs to completion
+/// before ANY request executes against the new application scope. Flipping
+/// `started = true` up front stops a second request from *re-firing* the handler,
+/// but it does not make that request WAIT: it sails past the block into
+/// `onRequest` against whatever half-built state the start handler has reached.
+/// On a restart under live traffic that is a window of 500s ("Variable 'auth' is
+/// undefined") and then 404s from a route registry that has not loaded yet — one
+/// bypass per concurrent request. GitHub #383.
+///
+/// `parking_lot::Mutex` rather than `std::sync::Mutex` deliberately: a panic
+/// inside a user's `onApplicationStart` must not poison the gate for the life of
+/// the process.
+static APP_START_GATES: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Arc<parking_lot::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn app_start_gate(app_name: &str) -> Arc<parking_lot::Mutex<()>> {
+    let gates =
+        APP_START_GATES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut g = gates.lock();
+    Arc::clone(
+        g.entry(app_name.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(()))),
+    )
+}
+
+thread_local! {
+    /// Applications this thread is currently starting.
+    ///
+    /// The gate is not reentrant, so a start handler that re-enters application
+    /// loading for its OWN app on the same thread (an `include` that touches the
+    /// app, an `applicationStop()` mid-start) would deadlock against a lock it
+    /// already holds. The pre-gate `started` flip means such a re-entry has
+    /// nothing left to do, so it skips the gate rather than waiting on itself.
+    static STARTING_APPS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds a name in [`STARTING_APPS`] for the duration of one start.
+struct StartingAppGuard(String);
+
+impl StartingAppGuard {
+    fn enter(name: &str) -> Self {
+        STARTING_APPS.with(|s| s.borrow_mut().push(name.to_string()));
+        StartingAppGuard(name.to_string())
+    }
+}
+
+impl Drop for StartingAppGuard {
+    fn drop(&mut self) {
+        STARTING_APPS.with(|s| {
+            let mut v = s.borrow_mut();
+            if let Some(i) = v.iter().rposition(|n| n == &self.0) {
+                v.remove(i);
+            }
+        });
+    }
+}
+
+fn app_start_in_flight_on_this_thread(app_name: &str) -> bool {
+    STARTING_APPS.with(|s| s.borrow().iter().any(|n| n == app_name))
 }
 
 impl CfmlVirtualMachine {
@@ -6102,13 +6247,12 @@ impl CfmlVirtualMachine {
                 // get_ci does exact-then-CI under one read lock, cloning only the
                 // matched value — replaces the old get/get(upper)/get(lower) chain
                 // plus a full `s.iter()` snapshot (whole-IndexMap clone) per miss.
-                let val = s.get_ci(name).or_else(|| {
-                    if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                        vars.get_ci(name)
-                    } else {
-                        None
-                    }
-                });
+                // GH #417 — no fall-back into `__variables`; see
+                // `Instance::get_public_member`. This is the path
+                // `LoadLocalProperty` takes, which is what the fused `c.x` read
+                // actually compiles to — gating only `GetProperty` and
+                // `lookup_property_opt` left the leak wide open through here.
+                let val = s.get_ci(name);
                 if let Some(v) = val {
                     return v;
                 }
@@ -6176,7 +6320,9 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             CfmlValue::Instance(inst) => {
                 let g = inst.read();
-                if let Some(v) = g.get_member(name) {
+                // GH #417 — PUBLIC view only; the private `variables` scope is
+                // not part of a component's external surface.
+                if let Some(v) = g.get_public_member(name) {
                     v
                 } else if let Some(CfmlValue::NativeObject(parent)) = &g.native_parent {
                     parent
@@ -6207,7 +6353,8 @@ impl CfmlVirtualMachine {
         #[cfg(feature = "component-instance")]
         if let CfmlValue::Instance(inst) = obj {
             let g = inst.read();
-            if let Some(v) = g.get_member(name) {
+            // GH #417 — PUBLIC view only (see `get_public_member`).
+            if let Some(v) = g.get_public_member(name) {
                 return Some(v);
             }
             // Fall through to a `rust:` native parent's `get_property` before
@@ -6224,13 +6371,13 @@ impl CfmlVirtualMachine {
             return None;
         }
         if let CfmlValue::Struct(s) = obj {
-            let val = s.get_ci(name).or_else(|| {
-                if let Some(CfmlValue::Struct(vars)) = s.get(&*cfml_common::key::well_known::VARIABLES) {
-                    vars.get_ci(name)
-                } else {
-                    None
-                }
-            });
+            // GH #417 — no fall-back into `__variables`: the private member
+            // scope is not part of a component's public surface. The marker
+            // (Struct) representation keeps it as a sentinel key inside the
+            // component's own map, so without this gate every private member
+            // was externally readable and `c.__variables` handed out the live
+            // map. The `Instance` arm above gates the same way.
+            let val = s.get_ci(name);
             if let Some(v) = val {
                 return Some(v);
             }
@@ -7046,8 +7193,20 @@ impl CfmlVirtualMachine {
         // falls through to the interpreter unchanged. `func`/`args` are the
         // caller's, not borrowed from `self.jit`, so there is no borrow conflict;
         // with the feature off the whole block compiles away. See `jit/mod.rs`.
+        // §29 — a declared parameter type is enforced by the binding prologue
+        // below, which a JIT-compiled body never runs. Validate here, BEFORE
+        // the compiled body can execute (a type violation must throw instead of
+        // running the function), and record it so the prologue does not repeat
+        // the work when the JIT declines the call. Costs nothing for a function
+        // that declares no parameter types, which is the common case.
+        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+        let mut param_types_checked = false;
         #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
         {
+            if self.jit.is_some() && func.param_types.iter().any(|t| t.is_some()) {
+                self.check_declared_param_types(func, &args)?;
+                param_types_checked = true;
+            }
             // The shadowing guard makes sure a user-defined function or
             // global with the same name as an allowlisted builtin (e.g.
             // `function abs(x) { … }`) wins over the JIT's native call. We
@@ -7114,6 +7273,17 @@ impl CfmlVirtualMachine {
                             .find(|(k, _)| k.eq_ignore_ascii_case(&lower))
                             .map(|(_, v)| v)
                     })?;
+                    // §29 — refuse to bind a callee that declares parameter
+                    // types. A bound callee is invoked by the caller's COMPILED
+                    // body as a direct native call: it never re-enters the VM,
+                    // so the declared-type validation on the dispatch path
+                    // below cannot run and `function f( numeric n )` accepted
+                    // anything. Declining the binding costs this caller its
+                    // compilation, not its correctness; the callee itself stays
+                    // JIT-eligible through the checked dispatch path.
+                    if f.param_types.iter().any(|t| t.is_some()) {
+                        return None;
+                    }
                     Some(jit::UdfMeta {
                         global_id: f.global_id,
                         nparams: f.params.len(),
@@ -7577,8 +7747,14 @@ impl CfmlVirtualMachine {
                     // Validation only, never coercion: the value goes into the
                     // frame exactly as passed. See type_check.rs.
                     if let Some(Some(ptype)) = func.param_types.get(i) {
-                        _p4_typechecks += 1;
-                        self.check_declared_param_type(func, i, param_name, ptype, &value)?;
+                        #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
+                        let already = param_types_checked;
+                        #[cfg(not(all(feature = "jit", not(target_arch = "wasm32"))))]
+                        let already = false;
+                        if !already {
+                            _p4_typechecks += 1;
+                            self.check_declared_param_type(func, i, param_name, ptype, &value)?;
+                        }
                     }
                     _p4_supplied += 1;
                     locals.insert(param_keys[i].clone(), value.clone());
@@ -8605,6 +8781,23 @@ impl CfmlVirtualMachine {
                         } else if Self::is_web_request_scope(&name_lower)
                             && !declared_locals.contains(name.as_str())
                             && !func.params.iter().any(|p| p.eq_ignore_ascii_case(&name_lower))
+                            // Only a SCOPE round-trip commits here. A whole-value
+                            // store of something that isn't a struct is not the
+                            // scope — most importantly a NAMED FUNCTION DECLARATION
+                            // whose name happens to be a scope word (`function
+                            // url( key )` on an S3-proxy CFC is the common shape:
+                            // `DefineFunction` + this `StoreLocal("url")`). Without
+                            // this guard the method value REPLACED `globals["url"]`,
+                            // so merely instantiating the component emptied the
+                            // caller's url scope for the rest of the request — reads
+                            // went undefined and later `url.x = …` writes vanished
+                            // (PR #369; Moopa's re-init always landing on the home
+                            // page because `url.route` disappeared). Falling through
+                            // stores the method in the component/page `variables`
+                            // scope like any other method, matching what the
+                            // request/application/session branches above already do
+                            // by testing `if let CfmlValue::Struct`.
+                            && matches!(val, CfmlValue::Struct(_))
                         {
                             // Web request scopes (url/form/cgi/cookie) are always
                             // request-global: a `url.path = x` writeback (LoadLocal
@@ -8777,10 +8970,22 @@ impl CfmlVirtualMachine {
                         }
                     }
                 }
-                BytecodeOp::SetDynamicVar => { ops::frame::op_set_dynamic_var(self, &mut stack, &mut locals, effective_local_mode_modern); }
-                BytecodeOp::UnsetPath(path) => { ops::locals::op_unset_path(self, func, &mut locals, &mut slots, &closure_env, &mut inherited_or_param_keys, effective_local_mode_modern, path); }
+                BytecodeOp::SetDynamicVar => {
+                    if let Err(e) = ops::frame::op_set_dynamic_var(self, &mut stack, &mut locals, effective_local_mode_modern) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
+                BytecodeOp::UnsetPath(path) => {
+                    if let Err(e) = ops::locals::op_unset_path(self, func, &mut locals, &mut slots, &closure_env, &mut inherited_or_param_keys, effective_local_mode_modern, path) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
 
-                BytecodeOp::DeleteScopeKey(scope) => { ops::frame::op_delete_scope_key(self, &mut stack, &mut locals, effective_local_mode_modern, scope); }
+                BytecodeOp::DeleteScopeKey(scope) => {
+                    if let Err(e) = ops::frame::op_delete_scope_key(self, &mut stack, &mut locals, effective_local_mode_modern, scope) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
                 BytecodeOp::ArrayAppendLocal(name) | BytecodeOp::ArrayAppendSlot(_, name) => { ops::locals::op_array_append_local(self, &mut stack, func, &mut locals, &mut slots, &closure_env, &declared_locals, effective_local_mode_modern, is_inside_function, op, name)?; }
                 BytecodeOp::LoadGlobal(name) | BytecodeOp::LoadVariablesKey(name) => {
                     // Avoid allocating a lowercase String when the identifier is
@@ -9847,7 +10052,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
                                 // Reconcile any nested-closure writeback that reached
                                 // the shared env behind an intermediate frame (see the
                                 // CallMethod arm / reconcile_closure_env_into_locals).
@@ -10033,7 +10238,7 @@ impl CfmlVirtualMachine {
                                                 &mut inherited_or_param_keys,
                                                 &mut declared_locals,
                                                 effective_local_mode_modern,
-                                            );
+                                            )?;
                                         }
                                     }
                                     stack.push(result);
@@ -10289,12 +10494,12 @@ impl CfmlVirtualMachine {
                                             Self::spill_slots_for_writeback(&mut locals, &func.slot_names, &mut slots, &mut slot_blocked);
                                         }
                                         if var.contains('.') {
-                                            self.store_runtime_path(&var, result.clone(), &mut locals, effective_local_mode_modern);
+                                            self.store_runtime_path(&var, result.clone(), &mut locals, effective_local_mode_modern)?;
                                         } else {
                                             locals.insert(var, result.clone());
                                         }
                                     }
-                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
+                                    self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
                                     stack.push(result);
                                 }
                                 Err(e) => {
@@ -10534,7 +10739,7 @@ impl CfmlVirtualMachine {
                                     }
                                 }
                                 // queryExecute result=/cfquery name= delivery
-                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern);
+                                self.apply_pending_result_writeback(&mut locals, &mut inherited_or_param_keys, &mut declared_locals, effective_local_mode_modern)?;
                                 Self::reconcile_closure_env_into_locals(&closure_env, &mut locals);
                                 stack.push(result);
                             }
@@ -10860,7 +11065,11 @@ impl CfmlVirtualMachine {
                 BytecodeOp::BuildArray(count) => ops::value::op_build_array(&mut stack, *count),
                 BytecodeOp::BuildStruct(count) => ops::value::op_build_struct(&mut stack, *count),
                 BytecodeOp::GetIndex => { ops::access::op_get_index(self, &mut stack, &mut ip)?; }
-                BytecodeOp::SetIndex => { ops::frame::op_set_index(&mut stack); }
+                BytecodeOp::SetIndex => {
+                    if let Err(e) = ops::frame::op_set_index(&mut stack) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
 
                 BytecodeOp::LoadLocalProperty(local_name, prop_name)
                 | BytecodeOp::TryLoadLocalProperty(local_name, prop_name)
@@ -10900,6 +11109,13 @@ impl CfmlVirtualMachine {
                                 .globals
                                 .entry(local_name.to_lowercase())
                                 .or_insert_with(|| CfmlValue::strukt(ValueMap::default()));
+                            // GitHub #372: `cgi` is read-only (Lucee rejects the
+                            // write; url/form/cookie stay writable, and carry no
+                            // mark, so they cost nothing here).
+                            if let Err(e) = entry.check_struct_writable(&prop_name.to_uppercase()) {
+                                ip = self.route_call_error(e, &mut stack)?;
+                                continue;
+                            }
                             if let Some(s) = entry.as_cfml_struct() {
                                 s.insert(prop_name.to_string(), value);
                             }
@@ -10968,6 +11184,14 @@ impl CfmlVirtualMachine {
                                 }
                                 continue;
                             }
+                            // GitHub #372: a read-only scope struct (`cgi`) reached
+                            // through ANY name — the scope itself, or a local
+                            // holding it (`local.c = cgi; local.c.x = 1`), which is
+                            // why the mark is on the struct and not on the name.
+                            if let Err(e) = obj.check_struct_writable(&prop_name.to_uppercase()) {
+                                ip = self.route_call_error(e, &mut stack)?;
+                                continue;
+                            }
                             if let Some(s) = obj.as_cfml_struct() {
                                 s.insert(prop_name.to_string(), value);
                             } else {
@@ -11032,6 +11256,10 @@ impl CfmlVirtualMachine {
                                 // (struct backing or the instance's public data map),
                                 // so this write is visible through `variables.<name>`.
                                 // `set` handles both Struct and flyweight Instance.
+                                if let Err(e) = existing.check_struct_writable(&prop_name.to_uppercase()) {
+                                ip = self.route_call_error(e, &mut stack)?;
+                                continue;
+                            }
                                 existing.set(prop_name.to_string(), value);
                             } else {
                                 // Auto-vivification: assigning to a member path of a
@@ -11076,7 +11304,14 @@ impl CfmlVirtualMachine {
                 BytecodeOp::LoadStaticHolder(name) => { ops::frame::op_load_static_holder(self, &mut stack, &locals, name); }
                 BytecodeOp::GetStaticProperty(member) => ops::value::op_get_static_property(&mut stack, member),
                 BytecodeOp::MarkAccessorPrivate(name) => { ops::frame::op_mark_accessor_private(&locals, name); }
-                BytecodeOp::SetProperty(name) => { ops::access::op_set_property(&mut stack, name)?; }
+                BytecodeOp::SetProperty(name) => {
+                    // Routed through the try handler rather than `?`-propagated:
+                    // a member-store failure must be catchable, which is what
+                    // `try { cgi.x = 1 } catch( any e )` depends on (GitHub #372).
+                    if let Err(e) = ops::access::op_set_property(&mut stack, name) {
+                        ip = self.route_call_error(e, &mut stack)?;
+                    }
+                }
 
                 BytecodeOp::NewObject(arg_count)
                 | BytecodeOp::NewObjectNamed(_, arg_count) => {
@@ -11413,6 +11648,48 @@ impl CfmlVirtualMachine {
                             ))));
                         }
                     };
+                    // Fast path — a component method being (re)declared by its
+                    // OWN CFC pseudo-constructor body.
+                    //
+                    // `body_vars` hoists every method of the class into
+                    // `method_arc_cache` BEFORE the body runs (full hoist, Lucee
+                    // parity), so the value this op is about to build already
+                    // exists and is class-invariant. Building it again cost, PER
+                    // METHOD PER CONSTRUCTION: a name `String` clone, a
+                    // `to_lowercase` + builtin-shadowing probe, an O(locals)
+                    // closure-env seed/sync (so O(N^2) over a body declaring N
+                    // methods), and a fresh `CfmlFunction` with a fresh `params`
+                    // `Vec` of cloned names/types/annotations — and then the
+                    // instance assembly below `Arc::make_mut`-cloned it again just
+                    // to strip the `captured_scope` this path had attached, and
+                    // `canonicalize_method_arcs` replaced it with this very cached
+                    // `Arc` anyway.
+                    //
+                    // Measured on an 86-method CFC (TestBox's `Expectation.cfc`,
+                    // one `new` per `expect()`): 93 -> 26 us per construction.
+                    //
+                    // Guards: only inside `__cfc_body__` (the pseudo-constructor
+                    // frame built by `cfc_body_variant`), only for a method the
+                    // hoist actually cached, and only when name AND access match —
+                    // the same pair `canon_method_scope` checks, so this can never
+                    // widen a private method to public. Anything else (a closure, a
+                    // `__`-prefixed synthetic like `__cfc_static_init__`, a method
+                    // defined outside a CFC body) falls through to the full path.
+                    if bc_func_arc.is_component_method
+                        && func.is_template_frame
+                        && func.name == "__cfc_body__"
+                    {
+                        if let Some(shared) = self.method_arc_cache.get(&(global_id as u32)) {
+                            if shared.name == bc_func_arc.name
+                                && shared.access == bc_func_arc.access
+                            {
+                                let shared = shared.clone();
+                                self.app_fn_table_dirty = true;
+                                stack.push(CfmlValue::Function(shared));
+                                continue;
+                            }
+                        }
+                    }
                     let func_name = bc_func_arc.name.clone();
                     // Lucee parity: a named function declaration that collides
                     // with a built-in function is a compile/parse-time error in
@@ -12820,7 +13097,11 @@ impl CfmlVirtualMachine {
                     // parent. The prefix check MUST come first: relative
                     // includes never need the existence probe.
                     let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
-                        self.resolve_leading_slash_include(&path)
+                        self.resolve_leading_slash_include(&path, false)
+                            // GH #387: only once the whole order has missed
+                            // exactly, re-walk it accepting a case-insensitive
+                            // match. `or_else` keeps this off the hot path.
+                            .or_else(|| self.resolve_leading_slash_include(&path, true))
                             .unwrap_or(resolved)
                     } else {
                         resolved
@@ -13020,7 +13301,11 @@ impl CfmlVirtualMachine {
                     };
 
                     let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
-                        self.resolve_leading_slash_include(&path)
+                        self.resolve_leading_slash_include(&path, false)
+                            // GH #387: only once the whole order has missed
+                            // exactly, re-walk it accepting a case-insensitive
+                            // match. `or_else` keeps this off the hot path.
+                            .or_else(|| self.resolve_leading_slash_include(&path, true))
                             .unwrap_or(resolved)
                     } else {
                         resolved
@@ -13539,8 +13824,10 @@ impl CfmlVirtualMachine {
             path.clone()
         };
         let resolved = if path.starts_with('/') && !self.exists_cached_path(&resolved) {
-            self.resolve_leading_slash_include(&path)
-                .or_else(|| self.resolve_include_with_mappings(&path))
+            self.resolve_leading_slash_include(&path, false)
+                .or_else(|| self.resolve_include_with_mappings(&path, false))
+                .or_else(|| self.resolve_leading_slash_include(&path, true))
+                .or_else(|| self.resolve_include_with_mappings(&path, true))
                 .unwrap_or(resolved)
         } else {
             resolved
@@ -13637,11 +13924,12 @@ impl CfmlVirtualMachine {
                     evict_idle_named_locks(&mut locks, lock_name.as_str(), NAMED_LOCK_CAP);
                     locks
                         .entry(lock_name.clone())
-                        .or_insert_with(|| Arc::new(RwLock::new(())))
+                        .or_insert_with(|| Arc::new(NamedLock::new(())))
                         .clone()
                 };
 
-                // Acquire lock with timeout using try_lock in a spin loop.
+                // Acquire the lock, PARKING until it is released.
+                //
                 // `timeout_ms == 0` means NO timeout — wait indefinitely, which is
                 // also what an omitted `timeout` means. Lucee semantics, measured
                 // against 7.0.4.34 (it waits 1594ms / 6600ms for a held lock
@@ -13656,31 +13944,35 @@ impl CfmlVirtualMachine {
                 // framework — 8 concurrent cold requests did 8 boots (~7s each).
                 // Do NOT reintroduce a snapshot application scope without also
                 // reverting this to fail-fast.
-                let deadline = (timeout_ms > 0).then(|| {
-                    cfml_common::clock::Monotonic::now()
-                        + std::time::Duration::from_millis(timeout_ms)
-                });
-                let timed_out = |deadline: Option<cfml_common::clock::Monotonic>| {
-                    deadline.is_some_and(|d| cfml_common::clock::Monotonic::now() >= d)
-                };
+                //
+                // ⚠️ Do NOT reintroduce a `try_*` + `sleep` poll here. That was the
+                // shape until GH #401: a waiter did not wake on release but on the
+                // next 10ms tick, so contended latency quantised to the poll
+                // interval and, with no queue, waiters raced on wake and a loser
+                // re-slept a whole interval. `try_write_for`/`try_read_for` park on
+                // the lock's own queue and wake on handover.
                 let is_exclusive = lock_type != "readonly";
+                let timeout = (timeout_ms > 0)
+                    .then(|| std::time::Duration::from_millis(timeout_ms));
 
+                // SAFETY (both arms): the lifetime extension is sound because we
+                // store the owning `Arc<NamedLock>` (`lock`) alongside the guard in
+                // the same `HeldLock`. The Arc keeps the RwLock allocation alive for
+                // at least as long as the guard, and HeldLock's field order drops the
+                // guard (unlock) before the Arc (free). See HeldLock docs.
                 if is_exclusive {
-                    loop {
-                        if let Ok(guard) = lock.try_write() {
-                            // SAFETY: the lifetime extension is sound because we
-                            // store the owning `Arc<RwLock<()>>` (`lock`) alongside
-                            // the guard in the same `HeldLock`. The Arc keeps the
-                            // RwLock allocation alive for at least as long as the
-                            // guard, and HeldLock's field order drops the guard
-                            // (unlock) before the Arc (free). See HeldLock docs.
-                            let guard: std::sync::RwLockWriteGuard<'static, ()> =
+                    let acquired = match timeout {
+                        Some(d) => lock.try_write_for(d),
+                        None => Some(lock.write()),
+                    };
+                    match acquired {
+                        Some(guard) => {
+                            let guard: parking_lot::RwLockWriteGuard<'static, ()> =
                                 unsafe { std::mem::transmute(guard) };
                             self.held_locks
                                 .push((lock_name.clone(), HeldLock::Write(guard, lock.clone())));
-                            break;
                         }
-                        if timed_out(deadline) {
+                        None => {
                             if !throw_on_timeout {
                                 // throwOnTimeout="false": the body is skipped and
                                 // execution continues. The lowering guards the body
@@ -13689,27 +13981,25 @@ impl CfmlVirtualMachine {
                             }
                             return Err(lock_timeout_error(timeout_ms, true, &lock_label));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 } else {
-                    loop {
-                        if let Ok(guard) = lock.try_read() {
-                            // SAFETY: see the exclusive branch above — the owning
-                            // Arc is stored next to the guard, keeping the RwLock
-                            // alive (and unevictable) for the guard's whole life.
-                            let guard: std::sync::RwLockReadGuard<'static, ()> =
+                    let acquired = match timeout {
+                        Some(d) => lock.try_read_for(d),
+                        None => Some(lock.read()),
+                    };
+                    match acquired {
+                        Some(guard) => {
+                            let guard: parking_lot::RwLockReadGuard<'static, ()> =
                                 unsafe { std::mem::transmute(guard) };
                             self.held_locks
                                 .push((lock_name.clone(), HeldLock::Read(guard, lock.clone())));
-                            break;
                         }
-                        if timed_out(deadline) {
+                        None => {
                             if !throw_on_timeout {
                                 return Ok(false);
                             }
                             return Err(lock_timeout_error(timeout_ms, false, &lock_label));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 }
             }
@@ -16653,7 +16943,10 @@ impl CfmlVirtualMachine {
                         // file (re-parsing it for declared-property order); without
                         // it the value was null and `.reReplace()` threw.
                         if let Some(CfmlValue::String(src)) = s.get("__source_file") {
-                            meta.insert("path".to_string(), CfmlValue::string((**src).clone()));
+                            meta.insert(
+                                "path".to_string(),
+                                CfmlValue::string(absolute_metadata_path(src)),
+                            );
                         }
                         // `extends`: a component stores __extends as a single
                         // parent name (a String, surfaced via __extends_chain
@@ -16941,6 +17234,24 @@ impl CfmlVirtualMachine {
                             }
                             return Ok(self_.memo_path_metadata(meta_key, resolved));
                         }
+                        // The named component could not be loaded. Lucee THROWS
+                        // here; returning an empty struct is what turned a syntax
+                        // error inside a Preside service into ColdBox's
+                        // "Variable 'name' is undefined" three frames away, with
+                        // no mention of the file that would not parse. Surface the
+                        // stashed parse/tag error when there is one (it carries
+                        // file + line), otherwise Lucee's not-found message.
+                        let comp_name = comp_name.clone();
+                        return Err(match self_.last_component_compile_error.take() {
+                            Some(err) => err,
+                            None => CfmlError::new(
+                                format!(
+                                    "invalid component definition, can't find component [{}]",
+                                    comp_name
+                                ),
+                                CfmlErrorType::Expression,
+                            ),
+                        });
                     }
                     return Ok(CfmlValue::strukt(ValueMap::default()));
                 }
@@ -17320,6 +17631,14 @@ impl CfmlVirtualMachine {
                                 // shim's load() routes to the native
                                 // yamlDeserialize builtin (see
                                 // handle_snakeyaml_method).
+                                // OWASP ESAPI's default SecurityConfiguration.
+                                // Preside's saml2-sso extension constructs it
+                                // purely to read getClass().getName() into a
+                                // system property. See
+                                // java_shims::handle_esapi_security_config.
+                                java_shims::ESAPI_SECURITY_CONFIG_CLASS => {
+                                    java_shims::handle_esapi_security_config("init", empty_args, &CfmlValue::Null)
+                                }
                                 "org.yaml.snakeyaml.yaml" => {
                                     java_shims::handle_java_yaml("init", empty_args, &CfmlValue::Null)
                                 }
@@ -18646,8 +18965,12 @@ impl CfmlVirtualMachine {
                     // registers a module's cfmapping (e.g. "/HTMLHelper") through
                     // exactly this path, so a subsequent expandPath("/HTMLHelper/
                     // models") (Binder.mapDirectory) resolves to the module dir.
-                    // Other cfapplication attributes (name/sessionmanagement/...)
-                    // are established at application start and ignored here.
+                    // The remaining attributes (name/sessionManagement/
+                    // sessionTimeout/...) are applied by
+                    // `apply_cfapplication_settings` below — <cfapplication> is
+                    // the pre-Application.cfc way to DECLARE an application, so
+                    // for a page that uses it there is no application start to
+                    // establish them at (GH #374).
                     if let Some(CfmlValue::Struct(opts)) = args.get(0) {
                         let mapping_struct = opts
                             .iter()
@@ -18702,6 +19025,10 @@ impl CfmlVirtualMachine {
                             // the application's to drop.
                             self.apply_extension_mappings();
                         }
+                    }
+                    if let Some(CfmlValue::Struct(opts)) = args.get(0) {
+                        let snapshot = opts.snapshot();
+                        self.apply_cfapplication_settings(&snapshot)?;
                     }
                     return Ok(CfmlValue::Null);
                 }
@@ -19634,6 +19961,60 @@ impl CfmlVirtualMachine {
                 // through the VFS like fileRead so it works in CLI and serve modes.
                 // Without a `file=` handler `<cfloop file=…>` previously fell through
                 // to `while(true)` and hung the request (GitHub issue #158).
+                // ---- <cfloop file="..."> streaming line cursor (GH #367) ----
+                // The three halves of one construct: the loop lowering opens a
+                // cursor, pumps `next` until it yields Null, and closes. Peak
+                // memory is one line, which is the property `loop file=` exists
+                // for — the eager `__cfloop_file_lines` below materialised the
+                // whole file plus one String per line BEFORE the first
+                // iteration, so on the reporter's million-row files it was
+                // strictly worse than the fileRead()+listToArray() workaround
+                // it is meant to replace.
+                "__cfloop_file_open" => {
+                    let path = args.first().map(|v| v.as_string()).unwrap_or_default();
+                    let cursor = self.vfs.open_lines(&path).map_err(|e| {
+                        CfmlError::runtime(format!("cfloop file: cannot read '{}': {}", path, e))
+                    })?;
+                    let handle = self.next_file_line_cursor;
+                    self.next_file_line_cursor += 1;
+                    self.file_line_cursors.insert(handle, cursor);
+                    return Ok(CfmlValue::Int(handle));
+                }
+                // Null means end of file. Unambiguous: a line is always a
+                // string, and a blank line is `""`, not Null — so the loop's
+                // null test cannot mistake an interior empty line for EOF.
+                "__cfloop_file_next" => {
+                    let handle = match args.first() {
+                        Some(CfmlValue::Int(h)) => *h,
+                        other => other.map(|v| v.as_string().parse().unwrap_or(0)).unwrap_or(0),
+                    };
+                    let Some(cursor) = self.file_line_cursors.get_mut(&handle) else {
+                        // Only reachable if the handle local was clobbered — the
+                        // lowering never calls next after close. Report it
+                        // rather than ending the loop silently on a short read.
+                        return Err(CfmlError::runtime(
+                            "cfloop file: line cursor is closed or invalid".to_string(),
+                        ));
+                    };
+                    return match cursor.next_line() {
+                        Ok(Some(line)) => Ok(CfmlValue::string(line)),
+                        Ok(None) => Ok(CfmlValue::Null),
+                        Err(e) => Err(CfmlError::runtime(format!(
+                            "cfloop file: error reading line: {}",
+                            e
+                        ))),
+                    };
+                }
+                "__cfloop_file_close" => {
+                    let handle = match args.first() {
+                        Some(CfmlValue::Int(h)) => *h,
+                        other => other.map(|v| v.as_string().parse().unwrap_or(0)).unwrap_or(0),
+                    };
+                    // Dropping the cursor closes the underlying file descriptor.
+                    self.file_line_cursors.remove(&handle);
+                    return Ok(CfmlValue::Null);
+                }
+
                 "__cfloop_file_lines" => {
                     let path = args.get(0).map(|v| v.as_string()).unwrap_or_default();
                     return match self.vfs.read_to_string(&path) {
@@ -21713,7 +22094,11 @@ impl CfmlVirtualMachine {
                         ns
                     }
                 },
-                CfmlValue::Instance(inst) => match inst.read().get_member(k) {
+                // GH #409/#417 — PUBLIC view for the intermediate segment of an
+                // external nested write. `c.__variables.x = v` was resolving the
+                // private map here and mutating it in place; Lucee's equivalent
+                // write lands on an inert public key instead.
+                CfmlValue::Instance(inst) => match inst.read().get_public_member(k) {
                     Some(v @ CfmlValue::Struct(_)) => v,
                     Some(v @ CfmlValue::Instance(_)) => v,
                     _ => {
@@ -21743,13 +22128,14 @@ impl CfmlVirtualMachine {
         value: CfmlValue,
         locals: &mut ValueMap,
         local_mode_modern: bool,
-    ) {
+    ) -> Result<(), CfmlError> {
         // CFML null-assignment: storing Null through a scope path (a dynamic
         // `"variables.x" = voidFn()` LHS, or a null result-writeback delivery)
         // DELETES the target rather than materializing a null-valued key.
         if matches!(value, CfmlValue::Null) {
-            self.delete_scope_path(path, locals, local_mode_modern);
-            return;
+            self.check_scope_path_writable(path, locals)?;
+            self.delete_scope_path(path, locals, local_mode_modern)?;
+            return Ok(());
         }
         let parts: Vec<&str> = path.split('.').collect();
         if parts.len() >= 2 {
@@ -21757,6 +22143,10 @@ impl CfmlVirtualMachine {
             let root = self
                 .scope_aware_load(scope, locals)
                 .unwrap_or_else(|| CfmlValue::strukt(ValueMap::default()));
+            // GitHub #372: refuse a write into a read-only scope (`cgi`) before
+            // any of the walks below mutate it. Checked on the RESOLVED root, so
+            // it also catches the path reaching the scope under another name.
+            root.check_struct_writable(&parts[1].to_uppercase())?;
             // A Rust-backed object root (e.g. the live `socket` handle): descend
             // through its `CfmlNative` accessors instead of rebuilding the path
             // as a plain struct — otherwise `socket.data.x = v` would replace the
@@ -21769,7 +22159,7 @@ impl CfmlVirtualMachine {
                     if let Ok(mut g) = obj.write() {
                         let _ = g.set_property(seg, value);
                     }
-                    return;
+                    return Ok(());
                 }
                 let prop = obj.read().ok().and_then(|g| g.get_property(seg));
                 if let Some(CfmlValue::Struct(s)) = prop {
@@ -21779,7 +22169,7 @@ impl CfmlVirtualMachine {
                     }
                     cur.insert(parts[parts.len() - 1].to_string(), value);
                 }
-                return;
+                return Ok(());
             }
             // A flyweight component-instance root (`a.b.c = v` where `a` is an
             // Instance): descend through its data members IN PLACE rather than
@@ -21790,7 +22180,7 @@ impl CfmlVirtualMachine {
             #[cfg(feature = "component-instance")]
             if matches!(root, CfmlValue::Instance(_)) {
                 Self::store_member_path_in_place(&root, &parts[1..], value);
-                return;
+                return Ok(());
             }
             let root = if matches!(root, CfmlValue::Struct(_)) {
                 root
@@ -21873,6 +22263,7 @@ impl CfmlVirtualMachine {
             // Bare name (no scope prefix) — single-variable store.
             self.scope_aware_store(path, value, locals, local_mode_modern);
         }
+        Ok(())
     }
 
     /// Delete a scope-qualified / nested variable path, the deletion half of
@@ -21880,7 +22271,32 @@ impl CfmlVirtualMachine {
     /// rather than materializing a null one). The bare-name case is handled
     /// inline in the `UnsetPath` opcode (it also clears globals + closure env);
     /// this covers `<scope>.leaf` and deeper `<scope>.a.b…leaf` paths.
-    fn delete_scope_path(&mut self, path: &str, locals: &mut ValueMap, modern: bool) {
+    /// Refuses a write through a scope-qualified path whose ROOT is a read-only
+    /// scope — `cgi` (GitHub #372).
+    ///
+    /// Used by the null-assignment routes (`cgi.x = nullValue()`), which delete
+    /// rather than store but which Lucee compiles as a set and rejects as one.
+    /// Deliberately NOT used by `structDelete`/`DeleteScopeKey`: Lucee lets that
+    /// through (silently doing nothing), and refusing it would be a restrictive
+    /// divergence. The key is upper-cased because these paths always come from an
+    /// identifier, which is the form Lucee upper-cases in its message.
+    pub(crate) fn check_scope_path_writable(
+        &mut self,
+        path: &str,
+        locals: &ValueMap,
+    ) -> Result<(), CfmlError> {
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.len() < 2 {
+            return Ok(());
+        }
+        let leaf = parts[parts.len() - 1];
+        if let Some(root) = self.scope_aware_load(parts[0], locals) {
+            root.check_struct_writable(&leaf.to_uppercase())?;
+        }
+        Ok(())
+    }
+
+    fn delete_scope_path(&mut self, path: &str, locals: &mut ValueMap, modern: bool) -> Result<(), CfmlError> {
         // `modern` is the live frame's effective localMode (not the app default),
         // threaded from the callers so the scope-container store-backs below
         // commit a classic-localmode component var back to __variables rather
@@ -21894,7 +22310,7 @@ impl CfmlVirtualMachine {
                 vars.remove_ci(path);
             }
             imap_remove_ci(&mut self.globals, path);
-            return;
+            return Ok(());
         }
         let scope = parts[0];
         let leaf = parts[parts.len() - 1];
@@ -21950,7 +22366,7 @@ impl CfmlVirtualMachine {
                             let g = inst.read();
                             g.remove_public_member(leaf);
                             g.remove_private_member(leaf);
-                            return;
+                            return Ok(());
                         }
                         if let Some(s) = obj.as_cfml_struct() {
                             s.remove_ci(leaf);
@@ -21959,7 +22375,7 @@ impl CfmlVirtualMachine {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
 
         // Nested target: `<scope>.a.b…leaf`. Walk to the parent container — every
@@ -21978,12 +22394,12 @@ impl CfmlVirtualMachine {
                     let member = inst.read().get_member(key);
                     match member {
                         Some(next) => { cur = next; continue; }
-                        None => return,
+                        None => return Ok(()),
                     }
                 }
                 match cur.as_cfml_struct().and_then(|s| s.get_ci(key)) {
                     Some(next) => cur = next,
-                    None => return,
+                    None => return Ok(()),
                 }
             }
             // Flyweight component leaf-parent: remove from the live data maps.
@@ -21993,7 +22409,7 @@ impl CfmlVirtualMachine {
                 g.remove_public_member(leaf);
                 g.remove_private_member(leaf);
                 self.scope_aware_store(scope, root, locals, modern);
-                return;
+                return Ok(());
             }
             if let Some(s) = cur.as_cfml_struct() {
                 s.remove_ci(leaf);
@@ -22005,6 +22421,7 @@ impl CfmlVirtualMachine {
             // scopes the leaf is removed in place and this re-commit is a no-op.
             self.scope_aware_store(scope, root, locals, modern);
         }
+        Ok(())
     }
 
     /// Apply (and clear) any caller-scope deliveries requested by the call
@@ -22075,10 +22492,10 @@ impl CfmlVirtualMachine {
         inherited_or_param_keys: &mut InheritedKeys,
         declared_locals: &mut DeclaredLocals,
         local_mode_modern: bool,
-    ) {
+    ) -> Result<(), CfmlError> {
         if let Some(sets) = self.pending_result_writeback.take() {
             for (path, value) in sets {
-                self.store_runtime_path(&path, value, locals, local_mode_modern);
+                self.store_runtime_path(&path, value, locals, local_mode_modern)?;
                 let parts: Vec<&str> = path.split('.').collect();
                 if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("local") {
                     inherited_or_param_keys.remove(parts[1]);
@@ -22100,6 +22517,7 @@ impl CfmlVirtualMachine {
                 }
             }
         }
+        Ok(())
     }
 
     /// Reject calls that mix positional and named arguments.
@@ -22676,6 +23094,39 @@ impl CfmlVirtualMachine {
             type_check::value_label(value, &Self::component_type_label),
             declared.trim()
         ))))
+    }
+
+    /// §29 — validate every supplied argument against its declared parameter
+    /// type, in parameter order.
+    ///
+    /// Extracted so the interpreter's binding prologue and the JIT dispatch
+    /// path cannot drift. They did: a JIT-compiled body is the function's
+    /// BODY, and it is entered without the prologue that performs this check,
+    /// so `function f( numeric n )` silently accepted `"1,000"`, `"0x10"`,
+    /// `[]` and `{}` for as long as the compiled body served the call. The
+    /// declared RETURN type never had this hole — it is enforced in the call
+    /// wrapper (`execute_function_with_args`), which the JIT path still
+    /// returns through.
+    ///
+    /// `Null` is "not supplied" in CFML and is never checked, matching the
+    /// prologue: an omitted optional argument is simply absent.
+    fn check_declared_param_types(
+        &mut self,
+        func: &BytecodeFunction,
+        args: &[CfmlValue],
+    ) -> Result<(), CfmlError> {
+        for (i, param_name) in func.params.iter().enumerate() {
+            let Some(Some(ptype)) = func.param_types.get(i) else {
+                continue;
+            };
+            match args.get(i) {
+                Some(value) if !matches!(value, CfmlValue::Null) => {
+                    self.check_declared_param_type(func, i, param_name, ptype, value)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// §29 — enforce a declared RETURN type, on the way out of a call.
@@ -24282,6 +24733,9 @@ impl CfmlVirtualMachine {
                 let result = match java_class.as_str() {
                     "org.mindrot.jbcrypt.bcrypt" => self.handle_jbcrypt_method(&m, all_args),
                     "org.yaml.snakeyaml.yaml" => self.handle_snakeyaml_method(&m, all_args),
+                    java_shims::ESAPI_SECURITY_CONFIG_CLASS => {
+                        java_shims::handle_esapi_security_config(&m, all_args, object)
+                    }
                     "ca.vanmulligen.json.schema.validator" => {
                         self.handle_jsonvalidator_method(&m, object, all_args)
                     }
@@ -24443,7 +24897,14 @@ impl CfmlVirtualMachine {
                     java_security::BIGINTEGER_CLASS => {
                         java_security::handle_java_biginteger(&m, all_args, object)
                     }
+                    java_security::KEYPAIRGEN_CLASS => {
+                        java_security::handle_java_keypairgenerator(&m, all_args, object)
+                    }
+                    java_security::KEYPAIR_CLASS => {
+                        java_security::handle_java_keypair(&m, all_args, object)
+                    }
                     java_security::X509_SPEC_CLASS
+                    | java_security::ECGEN_SPEC_CLASS
                     | java_security::PKCS8_SPEC_CLASS
                     | java_security::RSA_PUBLIC_SPEC_CLASS
                     | java_security::PUBLIC_KEY_CLASS
@@ -27157,17 +27618,30 @@ impl CfmlVirtualMachine {
                 }
                 // isDefined("q.col") — a query column counts as defined (Lucee).
                 CfmlValue::Query(q) => return q.has_column_ci(segment),
-                // Flyweight instance: resolve the member through the Instance
-                // (public then private data maps, each table-aware so METHODS
-                // resolve too). Without this arm, walking a path THROUGH an
-                // Instance hit `_ => return false`, so `IsDefined(
+                // Flyweight instance: resolve the member through the Instance's
+                // PUBLIC view (table-aware, so public METHODS resolve). Without
+                // this arm at all, walking a path THROUGH an Instance hit
+                // `_ => return false`, so `IsDefined(
                 // "application.cbBootstrap.getController")` was false — Preside's
-                // `_getColdboxController()` then returned null, `_getSessionStorage()`
-                // returned null, and `_persistSession()` silently skipped persist,
-                // so admin login never stuck (no session row, no `psid` cookie).
+                // `_getColdboxController()` then returned null,
+                // `_getSessionStorage()` returned null, and `_persistSession()`
+                // silently skipped persist, so admin login never stuck (no
+                // session row, no `psid` cookie). That is why the arm exists.
+                //
+                // It uses the PUBLIC view, not the full one: `isDefined` must
+                // not claim a member exists that a read cannot reach (GH #417).
+                // This is Lucee PARITY, verified member by member — private
+                // data, private methods and a genuine miss all answer `false`
+                // there, while public data and public methods answer `true`.
+                //
+                // Beware the probe that suggests otherwise: `isDefined("c.x")`
+                // DOES read `true` on Lucee once an external `c.x = …` has run
+                // in the same request, because that write creates a real public
+                // key. Measure it on an untouched instance or the write
+                // contaminates the answer.
                 #[cfg(feature = "component-instance")]
                 CfmlValue::Instance(inst) => {
-                    let member = inst.read().get_member(&seg_lower);
+                    let member = inst.read().get_public_member(&seg_lower);
                     match member {
                         Some(v) => current = v,
                         None => return false,
@@ -28163,7 +28637,7 @@ impl CfmlVirtualMachine {
         self.mappings_fingerprint = compute_mappings_fingerprint(&self.mappings);
     }
 
-    fn resolve_path_with_mappings(&self, class_name: &str) -> Option<String> {
+    fn resolve_path_with_mappings(&self, class_name: &str, fold: bool) -> Option<String> {
         // Convert dot-path to slash-path: "taffy.core.api" → "/taffy/core/api"
         let slash_path = format!("/{}", class_name.replace('.', "/"));
         let slash_lower = slash_path.to_lowercase();
@@ -28201,8 +28675,8 @@ impl CfmlVirtualMachine {
                     path.trim_end_matches('/'),
                     remainder.replace('/', std::path::MAIN_SEPARATOR_STR)
                 );
-                if self.exists_cached_path(&cfc_path) {
-                    return Some(cfc_path);
+                if let Some(real) = self.template_path_exists(&cfc_path, fold) {
+                    return Some(real);
                 }
             }
         }
@@ -28216,15 +28690,15 @@ impl CfmlVirtualMachine {
     /// directory. Returns `None` only if none of those produce an existing
     /// file. Leading-slash means "webroot-relative" in CFML — it must not be
     /// interpreted as OS-absolute.
-    fn resolve_leading_slash_include(&self, include_path: &str) -> Option<String> {
-        if let Some(via_mapping) = self.resolve_include_with_mappings(include_path) {
+    fn resolve_leading_slash_include(&self, include_path: &str, fold: bool) -> Option<String> {
+        if let Some(via_mapping) = self.resolve_include_with_mappings(include_path, fold) {
             return Some(via_mapping);
         }
         let stripped = include_path.trim_start_matches('/');
         if let Some(webroot) = self.server_state.as_ref().and_then(|s| s.webroot.as_ref()) {
             let candidate = webroot.join(stripped).to_string_lossy().to_string();
-            if self.exists_cached_path(&candidate) {
-                return Some(candidate);
+            if let Some(real) = self.template_path_exists(&candidate, fold) {
+                return Some(real);
             }
         }
         if let Some(ref base) = self.base_template_path {
@@ -28232,14 +28706,14 @@ impl CfmlVirtualMachine {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
             let candidate = base_dir.join(stripped).to_string_lossy().to_string();
-            if self.exists_cached_path(&candidate) {
-                return Some(candidate);
+            if let Some(real) = self.template_path_exists(&candidate, fold) {
+                return Some(real);
             }
         }
         None
     }
 
-    fn resolve_include_with_mappings(&self, include_path: &str) -> Option<String> {
+    fn resolve_include_with_mappings(&self, include_path: &str, fold: bool) -> Option<String> {
         if self.mappings.is_empty() {
             return None;
         }
@@ -28256,8 +28730,8 @@ impl CfmlVirtualMachine {
                 };
                 let remainder = remainder.trim_start_matches('/');
                 let resolved = format!("{}/{}", mapping.path.trim_end_matches('/'), remainder);
-                if self.exists_cached_path(&resolved) {
-                    return Some(resolved);
+                if let Some(real) = self.template_path_exists(&resolved, fold) {
+                    return Some(real);
                 }
             }
         }
@@ -28544,7 +29018,12 @@ impl CfmlVirtualMachine {
             // through this.mappings (Application.cfc), then webroot, then the
             // entry template dir. Must NOT be treated as OS-absolute or as a
             // source-relative path.
-            if let Some(resolved) = self.resolve_leading_slash_include(path_spec) {
+            if let Some(resolved) = self
+                .resolve_leading_slash_include(path_spec, false)
+                // GH #387 second pass — same reason as the include sites: an
+                // exact hit in a later candidate must beat a folded one here.
+                .or_else(|| self.resolve_leading_slash_include(path_spec, true))
+            {
                 Ok(resolved)
             } else {
                 Err(CfmlError::runtime(format!(
@@ -29404,8 +29883,8 @@ impl CfmlVirtualMachine {
     /// it points at the real syntax problem with file + line. Otherwise the file
     /// genuinely was not found, so report the missing-component message.
     fn component_load_error(&mut self, class_name: &str) -> CfmlError {
-        if let Some(msg) = self.last_component_compile_error.take() {
-            CfmlError::runtime(msg)
+        if let Some(err) = self.last_component_compile_error.take() {
+            err
         } else {
             CfmlError::runtime(format!("Could not find the component [{}].", class_name))
         }
@@ -29896,6 +30375,30 @@ impl CfmlVirtualMachine {
     /// (this was TestBox's `targetMD.name` "Variable 'name' is undefined" crash
     /// when a virtualized bundle's metadata was built in a context where the
     /// inheritance walk couldn't resolve the template).
+    /// The dotted component name Lucee reports for a `.cfc` at `file`: the path
+    /// relative to the webroot (serve) or the process directory (CLI), without
+    /// the extension and with separators as dots. `None` when the file is not
+    /// under that root, so callers keep whatever name they already had.
+    fn webroot_relative_component_name(&self, file: &str) -> Option<String> {
+        let path = std::path::Path::new(file);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        let root = match self.server_state.as_ref().and_then(|s| s.webroot.clone()) {
+            Some(w) => w,
+            None => std::env::current_dir().ok()?,
+        };
+        let rel = abs.strip_prefix(&root).ok()?;
+        let rel = rel.to_string_lossy();
+        let rel = rel.strip_suffix(".cfc").unwrap_or(&rel);
+        if rel.is_empty() {
+            return None;
+        }
+        Some(rel.replace(['/', '\\'], "."))
+    }
+
     #[cfg(feature = "component-instance")]
     fn instance_metadata(
         &mut self,
@@ -29914,8 +30417,44 @@ impl CfmlVirtualMachine {
             ValueMap::default()
         } else {
             let mut visited = std::collections::HashSet::new();
-            self.build_inheritance_metadata(&name, src, parent_locals, &mut visited)
-                .unwrap_or_default()
+            let built =
+                self.build_inheritance_metadata(&name, src.clone(), parent_locals, &mut visited);
+            match built {
+                Some(m) => m,
+                // A component created by a RELATIVE dotted name — `new
+                // algorithms.Rsa()` inside another CFC — records that name
+                // verbatim, and re-resolving it against the component's OWN
+                // directory looks for `algorithms/algorithms/Rsa.cfc` and fails.
+                // The class already knows the file, so build from THAT instead of
+                // from a name that only meant something in the caller's directory.
+                // Without this the metadata collapsed to bare `{ name }`: no
+                // `path`, no `type`, no `functions`. WireBox reads `md.path` as an
+                // object's identity (Injector.autowire), so every relatively
+                // instantiated model got a mapping whose path was a bare name, and
+                // resolving THAT later threw "can't find component [Rsa]".
+                None => {
+                    let by_file = src.as_ref().and_then(|file| {
+                        let mut visited = std::collections::HashSet::new();
+                        self.build_inheritance_metadata(file, None, parent_locals, &mut visited)
+                    });
+                    match by_file {
+                        Some(mut m) => {
+                            // Built from a FILE path, so `name` came out as that
+                            // path dotted. Lucee reports the webroot-relative
+                            // dotted path; fall back to the name as written when
+                            // the file lives outside the webroot.
+                            let dotted = src
+                                .as_ref()
+                                .and_then(|f| self.webroot_relative_component_name(f))
+                                .unwrap_or_else(|| name.clone());
+                            m.insert("name".to_string(), CfmlValue::string(dotted.clone()));
+                            m.insert("fullname".to_string(), CfmlValue::string(dotted));
+                            m
+                        }
+                        None => ValueMap::default(),
+                    }
+                }
+            }
         };
         let has_name = meta_map.keys().any(|k| k.eq_ignore_ascii_case("name"));
         if !name.is_empty() && !has_name {
@@ -29928,6 +30467,29 @@ impl CfmlVirtualMachine {
             *inst.read().class.metadata_cache.write() = Some(meta.clone());
         }
         meta
+    }
+
+    /// The `__cfc_body__` variant of a CFC's `__main__`, memoised on the
+    /// function itself (see `BytecodeFunction::cfc_body`).
+    ///
+    /// The pseudo-constructor runs `__main__` under a different name and with
+    /// `is_template_frame` set. Producing that used to mean `(*cfc_func).clone()`
+    /// on EVERY construction — a deep copy of the whole instruction `Vec` to
+    /// change a `String` and a `bool`. The variant is class-invariant, so it is
+    /// built once per process and handed out as an `Arc`.
+    fn cfc_body_variant(
+        f: &Arc<cfml_codegen::compiler::BytecodeFunction>,
+    ) -> Arc<cfml_codegen::compiler::BytecodeFunction> {
+        f.cfc_body
+            .get_or_init(|| {
+                let mut b = (**f).clone();
+                b.name = "__cfc_body__".to_string();
+                b.is_template_frame = true;
+                // Never nest the memo inside the memoised copy.
+                b.cfc_body = std::sync::OnceLock::new();
+                Arc::new(b)
+            })
+            .clone()
     }
 
     /// Dedup a freshly-built instance's method `CfmlFunction` values against the
@@ -30063,7 +30625,32 @@ impl CfmlVirtualMachine {
                 }
             }
         }
-        let program = compile_file_cached(path, cache, self.vfs.as_ref())?;
+        let program = match compile_file_cached(path, cache, self.vfs.as_ref()) {
+            Ok(program) => program,
+            // GH #387: on a case-sensitive filesystem the only thing wrong with
+            // the path may be its spelling. Retry once against the on-disk
+            // casing. Deliberately on the ERROR path — a template that reads
+            // pays nothing, and this covers every template read (includes,
+            // components, custom tags) from one place. Only a genuine
+            // "cannot read" is retried; a parse error in a file we did find
+            // must surface as itself.
+            Err(e) => {
+                let folded = e
+                    .message
+                    .starts_with("Cannot read '")
+                    .then(|| self.fold_template_path(path))
+                    .flatten()
+                    .filter(|f| f != path);
+                match folded {
+                    Some(f) => {
+                        let program = compile_file_cached(&f, cache, self.vfs.as_ref())?;
+                        self.request_validated_files.write().insert(f);
+                        return Ok(program);
+                    }
+                    None => return Err(e),
+                }
+            }
+        };
         self.request_validated_files.write().insert(path.to_string());
         Ok(program)
     }
@@ -30129,7 +30716,199 @@ impl CfmlVirtualMachine {
         }
     }
 
+    /// Build (or fetch) a component template. Timed for the debug footer: this
+    /// is where a `new X()` actually spends its time — executing the CFC body and
+    /// materialising its method values — and until now NONE of it was visible.
+    /// Component *methods* opened a timed frame but construction did not, so on a
+    /// framework request every microsecond of object building landed in the
+    /// top-level page's residual row. Measured: 200 `new` of a 40-method CFC cost
+    /// 7.4ms with no row of its own anywhere in the footer.
+    ///
+    /// Zero cost when the footer is off: `interest` is `Interest::NONE` unless an
+    /// observer is installed, so the guard is one bitflag test and neither the
+    /// clock nor the frame stack is touched. Same shape as the method/include
+    /// sites.
     fn resolve_component_template(
+        &mut self,
+        class_name: &str,
+        locals: &ValueMap,
+    ) -> Option<CfmlValue> {
+        #[cfg(feature = "observability")]
+        {
+            if self.interest.contains(observe::Interest::TEMPLATE) {
+                let start = std::time::Instant::now();
+                self.template_frame_begin();
+                let r = self.resolve_component_template_impl(class_name, locals);
+                // Attribute to the RESOLVED file, so the row names the CFC that was
+                // built rather than the (possibly dotted, possibly mapped) path the
+                // caller typed.
+                let src = match &r {
+                    Some(CfmlValue::Struct(s)) => s
+                        .get_ci("__source_file")
+                        .map(|v| v.as_string())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
+                let us = start.elapsed().as_micros() as i64;
+                match src {
+                    Some(src) => self.template_frame_end(&src, Some("<constructor>"), us),
+                    // Nothing to name (unresolved path, or a non-struct template):
+                    // still pop the frame so the child-time stack stays balanced,
+                    // and credit the time to the caller rather than losing it.
+                    None => {
+                        let _ = frame_exclusive_us(&mut self.tmpl_child_us_stack, us);
+                    }
+                }
+                return r;
+            }
+        }
+        self.resolve_component_template_impl(class_name, locals)
+    }
+
+    /// One pass of the component-name -> template-path resolution order.
+    ///
+    /// Run twice by `resolve_component_template_impl`: first with `fold =
+    /// false` (exact spelling only, today's behaviour and today's cost), and
+    /// only if that produced nothing that exists, again with `fold = true`.
+    ///
+    /// Two passes rather than folding inside one is what preserves priority.
+    /// Folding in-place would let a case-insensitive match in an early mapping
+    /// beat an EXACT match in a later one — silently loading the wrong CFC on a
+    /// tree where both spellings exist.
+    fn probe_component_template_path(&self, class_name: &str, fold: bool) -> String {
+        // If class_name is already an absolute path or has .cfc extension, use directly
+        let as_path = std::path::Path::new(class_name);
+        if class_name.starts_with('/') {
+            // A CFML leading-slash component path ("/oop/Widget") is
+            // webroot/mapping-relative, NOT OS-absolute. Resolve it the same
+            // way as a leading-slash include: configured mappings, then the
+            // serve-mode webroot, then the entry template's parent directory.
+            // Only fall back to treating it as a literal filesystem path when
+            // none of those produce an existing file (preserving the case
+            // where a genuinely OS-absolute .cfc is passed).
+            //
+            // Lucee treats BOTH '/' and '.' as path separators after the
+            // leading slash, so a slash-rooted *dotted* component path
+            // ("/wheels/tests/_assets/plugins/cat.Plugin.Plugin") maps to
+            // ".../plugins/cat/Plugin/Plugin.cfc". The literal form is tried
+            // first (a genuinely slash-only path like "/oop/Widget", or an
+            // OS-absolute .cfc, keeps its existing behavior); the
+            // dot-normalized form is the fallback. (Wheels' plugin loader
+            // builds exactly this slash-rooted dotted path — fixes ~64 specs.)
+            let ends_cfc = class_name.to_lowercase().ends_with(".cfc");
+            let literal = if ends_cfc {
+                class_name.to_string()
+            } else {
+                format!("{}.cfc", class_name)
+            };
+            let mut candidates = vec![literal.clone()];
+            if !ends_cfc && class_name[1..].contains('.') {
+                let body = class_name.trim_start_matches('/').replace('.', "/");
+                candidates.push(format!("/{}.cfc", body));
+            }
+            let mut resolved_path = None;
+            for cand in &candidates {
+                if let Some(real) = self.template_path_exists(cand, fold) {
+                    resolved_path = Some(real);
+                    break;
+                } else if let Some(resolved) = self.resolve_leading_slash_include(cand, fold) {
+                    resolved_path = Some(resolved);
+                    break;
+                }
+            }
+            resolved_path.unwrap_or(literal)
+        } else if as_path.is_absolute() || class_name.to_lowercase().ends_with(".cfc") {
+            let p = if class_name.to_lowercase().ends_with(".cfc") {
+                class_name.to_string()
+            } else {
+                format!("{}.cfc", class_name)
+            };
+            if let Some(real) = self.template_path_exists(&p, fold) {
+                real
+            } else if let Some(ref source) = self.source_file {
+                // Try relative to source file
+                let source_dir = std::path::Path::new(source)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let joined = source_dir.join(&p).to_string_lossy().to_string();
+                self.template_path_exists(&joined, fold).unwrap_or(joined)
+            } else {
+                p
+            }
+        } else {
+            // Dot-path: convert dots to path separators
+            let relative_path = if let Some(ref source) = self.source_file {
+                let source_dir = std::path::Path::new(source)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+                source_dir
+                    .join(format!("{}.cfc", file_name))
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                format!(
+                    "{}.cfc",
+                    class_name.replace('.', std::path::MAIN_SEPARATOR_STR)
+                )
+            };
+            if let Some(real) = self.template_path_exists(&relative_path, fold) {
+                real
+            } else if let Some(mapped) = self.resolve_path_with_mappings(class_name, fold) {
+                mapped
+            } else if let Some(ref base) = self.base_template_path {
+                // Try resolving relative to the base template (web root equivalent)
+                let base_dir = std::path::Path::new(base)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+                let base_path = base_dir
+                    .join(format!("{}.cfc", file_name))
+                    .to_string_lossy()
+                    .to_string();
+                if let Some(real) = self.template_path_exists(&base_path, fold) {
+                    real
+                } else if let Some(webroot_path) = self
+                    .server_state
+                    .as_ref()
+                    .and_then(|s| s.webroot.as_ref())
+                    .map(|w| {
+                        w.join(format!("{}.cfc", &file_name))
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                {
+                    if let Some(real) = self.template_path_exists(&webroot_path, fold) {
+                        real
+                    } else {
+                        relative_path
+                    }
+                } else {
+                    relative_path
+                }
+            } else if let Some(webroot_path) = self
+                .server_state
+                .as_ref()
+                .and_then(|s| s.webroot.as_ref())
+                .map(|w| {
+                    let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
+                    w.join(format!("{}.cfc", file_name))
+                        .to_string_lossy()
+                        .to_string()
+                })
+            {
+                if let Some(real) = self.template_path_exists(&webroot_path, fold) {
+                    real
+                } else {
+                    relative_path
+                }
+            } else {
+                relative_path // Fall back to relative (will fail at read_to_string below)
+            }
+        }
+    }
+
+    fn resolve_component_template_impl(
         &mut self,
         class_name: &str,
         locals: &ValueMap,
@@ -30288,136 +31067,24 @@ impl CfmlVirtualMachine {
             hit
         } else {
             cfml_common::perf_counters::bump(&cfml_common::perf_counters::RESOLVE_PROBE_WALKS);
-            let resolved = {
-            // If class_name is already an absolute path or has .cfc extension, use directly
-            let as_path = std::path::Path::new(class_name);
-            if class_name.starts_with('/') {
-                // A CFML leading-slash component path ("/oop/Widget") is
-                // webroot/mapping-relative, NOT OS-absolute. Resolve it the same
-                // way as a leading-slash include: configured mappings, then the
-                // serve-mode webroot, then the entry template's parent directory.
-                // Only fall back to treating it as a literal filesystem path when
-                // none of those produce an existing file (preserving the case
-                // where a genuinely OS-absolute .cfc is passed).
-                //
-                // Lucee treats BOTH '/' and '.' as path separators after the
-                // leading slash, so a slash-rooted *dotted* component path
-                // ("/wheels/tests/_assets/plugins/cat.Plugin.Plugin") maps to
-                // ".../plugins/cat/Plugin/Plugin.cfc". The literal form is tried
-                // first (a genuinely slash-only path like "/oop/Widget", or an
-                // OS-absolute .cfc, keeps its existing behavior); the
-                // dot-normalized form is the fallback. (Wheels' plugin loader
-                // builds exactly this slash-rooted dotted path — fixes ~64 specs.)
-                let ends_cfc = class_name.to_lowercase().ends_with(".cfc");
-                let literal = if ends_cfc {
-                    class_name.to_string()
-                } else {
-                    format!("{}.cfc", class_name)
-                };
-                let mut candidates = vec![literal.clone()];
-                if !ends_cfc && class_name[1..].contains('.') {
-                    let body = class_name.trim_start_matches('/').replace('.', "/");
-                    candidates.push(format!("/{}.cfc", body));
-                }
-                let mut resolved_path = None;
-                for cand in &candidates {
-                    if self.exists_cached_path(cand) {
-                        resolved_path = Some(cand.clone());
-                        break;
-                    } else if let Some(resolved) = self.resolve_leading_slash_include(cand) {
-                        resolved_path = Some(resolved);
-                        break;
-                    }
-                }
-                resolved_path.unwrap_or(literal)
-            } else if as_path.is_absolute() || class_name.to_lowercase().ends_with(".cfc") {
-                let p = if class_name.to_lowercase().ends_with(".cfc") {
-                    class_name.to_string()
-                } else {
-                    format!("{}.cfc", class_name)
-                };
-                if self.exists_cached_path(&p) {
-                    p
-                } else if let Some(ref source) = self.source_file {
-                    // Try relative to source file
-                    let source_dir = std::path::Path::new(source)
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    source_dir.join(&p).to_string_lossy().to_string()
-                } else {
-                    p
-                }
+            let resolved = self.probe_component_template_path(class_name, false);
+            // GH #387: on a case-sensitive filesystem the dotted component name
+            // may disagree with the on-disk spelling of the file OR of any
+            // directory above it (Preside ships `SqlRunner.cfc` for
+            // `...database.sqlRunner`). Re-run the whole order accepting a
+            // case-insensitive match, but ONLY once the exact order has failed,
+            // so a tree that resolves exactly pays nothing beyond the probe the
+            // fallback already needed. This is the cold side of
+            // `component_path_cache`, so it happens once per class name.
+            let resolved = if self.exists_cached_path(&resolved) {
+                resolved
             } else {
-                // Dot-path: convert dots to path separators
-                let relative_path = if let Some(ref source) = self.source_file {
-                    let source_dir = std::path::Path::new(source)
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
-                    source_dir
-                        .join(format!("{}.cfc", file_name))
-                        .to_string_lossy()
-                        .to_string()
+                let folded = self.probe_component_template_path(class_name, true);
+                if self.exists_cached_path(&folded) {
+                    folded
                 } else {
-                    format!(
-                        "{}.cfc",
-                        class_name.replace('.', std::path::MAIN_SEPARATOR_STR)
-                    )
-                };
-                if self.exists_cached_path(&relative_path) {
-                    relative_path
-                } else if let Some(mapped) = self.resolve_path_with_mappings(class_name) {
-                    mapped
-                } else if let Some(ref base) = self.base_template_path {
-                    // Try resolving relative to the base template (web root equivalent)
-                    let base_dir = std::path::Path::new(base)
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
-                    let base_path = base_dir
-                        .join(format!("{}.cfc", file_name))
-                        .to_string_lossy()
-                        .to_string();
-                    if self.exists_cached_path(&base_path) {
-                        base_path
-                    } else if let Some(webroot_path) = self
-                        .server_state
-                        .as_ref()
-                        .and_then(|s| s.webroot.as_ref())
-                        .map(|w| {
-                            w.join(format!("{}.cfc", &file_name))
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                    {
-                        if self.exists_cached_path(&webroot_path) {
-                            webroot_path
-                        } else {
-                            relative_path
-                        }
-                    } else {
-                        relative_path
-                    }
-                } else if let Some(webroot_path) = self
-                    .server_state
-                    .as_ref()
-                    .and_then(|s| s.webroot.as_ref())
-                    .map(|w| {
-                        let file_name = class_name.replace('.', std::path::MAIN_SEPARATOR_STR);
-                        w.join(format!("{}.cfc", file_name))
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                {
-                    if self.exists_cached_path(&webroot_path) {
-                        webroot_path
-                    } else {
-                        relative_path
-                    }
-                } else {
-                    relative_path // Fall back to relative (will fail at read_to_string below)
+                    resolved
                 }
-            }
             };
             let resolved: Arc<str> = Arc::from(resolved);
             // Entry-with-parts, built once here on the miss path (the only place
@@ -30471,7 +31138,7 @@ impl CfmlVirtualMachine {
         // a not-found and the component-name message is the right one.
         if let Err(ref e) = compiled {
             if !e.message.starts_with(&format!("Cannot read '{}'", cfc_path)) {
-                self.last_component_compile_error = Some(e.message.clone());
+                self.last_component_compile_error = Some(e.clone());
             }
         }
         if let Ok(sub_program) = compiled {
@@ -30786,9 +31453,7 @@ impl CfmlVirtualMachine {
             // unscoped lookups inside the child body resolve inherited values).
             // Mark as "__cfc_body__" so the VM treats it as function scope
             // (prevents globals leaking into `variables` via LoadLocal).
-            let mut cfc_body = (*cfc_func).clone();
-            cfc_body.name = "__cfc_body__".to_string();
-            cfc_body.is_template_frame = true;
+            let cfc_body = Self::cfc_body_variant(&cfc_func);
             // Expose `super` to the body so `super.method(...)` calls in the
             // pseudo-constructor resolve to the parent (see pseudo_ctor_super).
             let pushed_super = super_value.is_some();
@@ -30809,7 +31474,17 @@ impl CfmlVirtualMachine {
             // construction in progress (a nested `new` inside the body restores
             // the outer stash on its own return). See pseudo_ctor_super_this_writes.
             let saved_super_this_writes = self.pseudo_ctor_super_this_writes.take();
-            let _ = self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
+            // An error thrown by the pseudo-constructor must NOT be discarded.
+            // Lucee propagates it, and swallowing it here left the half-built
+            // component to be assembled from a corrupted stack: a nested
+            // `new Child()` that threw inside a struct literal
+            // (`variables.x = { a = new sub.Child() }`) left ITS `__extends` on
+            // the stack, the enclosing BuildStruct absorbed it, and the outer
+            // component silently acquired the inner one's parent. A missing EC
+            // algorithm in a Preside module's `init()` was reported three steps
+            // later as "invalid component definition, can't find component [Rsa]".
+            let body_result =
+                self.execute_function_with_args(&cfc_body, Vec::new(), Some(&injected_scope));
             let body_super_this_writes = self.pseudo_ctor_super_this_writes.take();
             self.pseudo_ctor_super_this_writes = saved_super_this_writes;
             self.pending_pseudo_ctor_parent_this = None;
@@ -30827,6 +31502,14 @@ impl CfmlVirtualMachine {
             // there is no merge-append, op remap, or index fixup to do — just
             // restore the caller's program.
             self.pop_program_swap(old_program);
+            // Cleanup above is unconditional; only now is it safe to bail. This
+            // function reports failure as `None`, so the error travels in the
+            // same stash a parse failure uses — `component_load_error` and
+            // getComponentMetaData both surface it verbatim.
+            if let Err(e) = body_result {
+                self.last_component_compile_error = Some(e);
+                return None;
+            }
             let short_name = class_name.split('.').last().unwrap_or(class_name);
             // Deep-copy the cached template into an independent instance. Structs
             // are reference-typed, so a plain handle clone would alias mutable
@@ -31321,6 +32004,25 @@ impl CfmlVirtualMachine {
                         .insert(cache_key, v.deep_copy());
                 }
             }
+            // Bound mid-request cycle retention.
+            //
+            // A CFC instance is inherently CYCLIC: the body keeps the instance in
+            // a local named after the component (used to hang methods and
+            // generated accessors off it), that local is captured into
+            // `variables`, and `this.__variables` points back — so
+            // `this -> __variables -> variables -> this` and refcounting can
+            // never free it. The collector reclaims it happily, but it only ran
+            // at REQUEST END, so a request that constructs many components grew
+            // without bound: 100k constructions of an 86-method CFC held 1.8 GB
+            // and 400k held 7.2 GB, with three uncollectable cycles per
+            // construction.
+            //
+            // Component construction is where those cycles are minted, so this
+            // is the natural place to check. `collect_incremental` is a no-op
+            // until the request's tracked-allocation log passes its threshold,
+            // so an ordinary request (which never gets near it) pays one
+            // thread-local length read per `new`.
+            cfml_common::cycle_gc::collect_incremental();
             return result;
         }
         None
@@ -32722,6 +33424,145 @@ impl CfmlVirtualMachine {
         self.exists_cached(path, EXISTS_ANY, |vfs| vfs.exists(path))
     }
 
+    /// Does a template exist at `path`, and under what on-disk spelling?
+    ///
+    /// The exact spelling is always tried first and is the answer in every
+    /// normal case, so this costs one memoised existence probe — the same one
+    /// the call sites already paid. `RealFs` is deliberately NOT case-folding,
+    /// so "exists" means the requested spelling IS the on-disk spelling and no
+    /// second probe is needed to learn it.
+    ///
+    /// `fold` is the GH #387 second pass: only when an entire resolution order
+    /// has failed exactly do we re-walk it accepting a case-insensitive
+    /// filename match. Running it as a distinct second pass (rather than
+    /// folding inside the first) is what keeps priority intact — an exact hit
+    /// in the *last* mapping must still beat a case-folded hit in the first.
+    ///
+    /// Scope note: this is template/component lookup only. `fileRead`,
+    /// `fileExists`, `directoryList` and friends stay case-sensitive, which is
+    /// what Lucee does on a case-sensitive filesystem (verified against Lucee
+    /// 7.1.0.204 on a case-sensitive APFS volume). Folding those too would make
+    /// `fileDelete("./Foo.txt")` delete an on-disk `foo.txt`.
+    fn template_path_exists(&self, path: &str, fold: bool) -> Option<String> {
+        if self.exists_cached_path(path) {
+            return Some(path.to_string());
+        }
+        if fold {
+            return self.fold_template_path(path);
+        }
+        None
+    }
+
+    /// Walk `path` a segment at a time, accepting a case-insensitive match for
+    /// any segment that does not exist exactly, and return the on-disk
+    /// spelling. `None` when no case folding of the path exists.
+    ///
+    /// Every segment folds, not just the filename: a dotted component name
+    /// disagrees with directory spelling as readily as with the file's
+    /// (`preside.system.sitetree.SiteService` over an on-disk `siteTree/`).
+    ///
+    /// Only reached after an exact probe missed, so on a case-insensitive
+    /// filesystem (macOS, Windows) this never runs at all.
+    fn fold_template_path(&self, path: &str) -> Option<String> {
+        let p = std::path::Path::new(path);
+        let comps: Vec<_> = p.components().collect();
+        if comps.is_empty() {
+            return None;
+        }
+        let mut acc = std::path::PathBuf::new();
+        for (i, comp) in comps.iter().enumerate() {
+            match comp {
+                std::path::Component::Prefix(pre) => acc.push(pre.as_os_str()),
+                std::path::Component::RootDir => acc.push(std::path::MAIN_SEPARATOR_STR),
+                std::path::Component::CurDir | std::path::Component::ParentDir => {
+                    acc.push(comp.as_os_str())
+                }
+                std::path::Component::Normal(seg) => {
+                    let next = acc.join(seg);
+                    if self.exists_cached_path(next.to_string_lossy().as_ref()) {
+                        acc = next;
+                        continue;
+                    }
+                    // The parent must itself be a directory before a listing is
+                    // worth taking: the common "override CFC absent" probe walks
+                    // real directories and must not pay for a missing one.
+                    let parent = acc.to_string_lossy().into_owned();
+                    if parent.is_empty() || !self.is_dir_cached(&parent) {
+                        return None;
+                    }
+                    let index = self.dir_fold_index(&parent)?;
+                    let (name, is_dir) = index.get(&seg.to_str()?.to_lowercase())?;
+                    // A path segment must be a directory; only the final one may
+                    // be the file.
+                    if *is_dir == (i + 1 == comps.len()) {
+                        return None;
+                    }
+                    acc.push(name);
+                }
+            }
+        }
+        Some(acc.to_string_lossy().into_owned())
+    }
+
+    /// The case-folding index for one directory, behind the same two layers as
+    /// the existence memo (request-scoped always, application-scoped in
+    /// production).
+    ///
+    /// Indexed per DIRECTORY rather than per path on purpose. Preside probes
+    /// many absent override CFCs in the same directory; a per-path fold cache
+    /// would pay one `read_dir` per absent name, while one listing answers
+    /// every name in that directory, present or absent.
+    ///
+    /// An unreadable directory caches as an empty index — "nothing to fold to"
+    /// is the same answer either way, and caching it stops a re-listing.
+    fn dir_fold_index(&self, dir: &str) -> Option<FoldIndex> {
+        let gen_now = exists_neg_generation();
+        let l1 = self.request_dir_fold_cache.read().get(dir).cloned();
+        if let Some(e) = l1 {
+            if e.neg_gen == gen_now {
+                return Some(e.index);
+            }
+        }
+        if let Some(ss) = self.exists_l2() {
+            let l2 = ss.dir_fold_cache.read().get(dir).cloned();
+            if let Some(e) = l2 {
+                if e.neg_gen == gen_now {
+                    self.request_dir_fold_cache
+                        .write()
+                        .insert(dir.to_string(), e.clone());
+                    return Some(e.index);
+                }
+            }
+        }
+        let mut map: HashMap<String, (String, bool)> = HashMap::new();
+        for entry in self.vfs.read_dir(dir).unwrap_or_default() {
+            let lower = entry.name.to_lowercase();
+            // Two on-disk spellings differing only in case can both fold to the
+            // same request. Neither is more correct, and `read_dir` order is not
+            // stable, so pick deterministically rather than by listing order.
+            match map.get(&lower) {
+                Some((have, _)) if have.as_str() <= entry.name.as_str() => {}
+                _ => {
+                    map.insert(lower, (entry.name, entry.is_dir));
+                }
+            }
+        }
+        let e = DirFoldEntry {
+            neg_gen: gen_now,
+            index: Arc::new(map),
+        };
+        self.request_dir_fold_cache
+            .write()
+            .insert(dir.to_string(), e.clone());
+        if let Some(ss) = self.exists_l2() {
+            let mut w = ss.dir_fold_cache.write();
+            if w.len() < DIR_FOLD_L2_MAX_ENTRIES {
+                w.insert(dir.to_string(), e.clone());
+            }
+        }
+        Some(e.index)
+    }
+
     /// Is the application-lifetime layer 2 in play?
     ///
     /// Production serve mode only, and only while the scope knob leaves it on —
@@ -32881,8 +33722,10 @@ impl CfmlVirtualMachine {
     /// which ones.
     fn clear_exists_caches_wholesale(&self) {
         self.request_exists_cache.write().clear();
+        self.request_dir_fold_cache.write().clear();
         if let Some(ss) = self.server_state.as_ref() {
             ss.exists_cache.write().clear();
+            ss.dir_fold_cache.write().clear();
         }
         invalidate_exists_negatives();
     }
@@ -32907,6 +33750,18 @@ impl CfmlVirtualMachine {
         self.request_exists_cache.write().retain(|k, _| !matches(k));
         if let Some(ss) = self.server_state.as_ref() {
             ss.exists_cache.write().retain(|k, _| !matches(k));
+        }
+        // A create or delete changes the PARENT directory's listing, which is
+        // what the fold index caches. Generation stamping alone would not cover
+        // a delete: `invalidate_exists_path` deliberately does not bump it.
+        if let Some(parent) = std::path::Path::new(path)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+        {
+            self.request_dir_fold_cache.write().remove(&parent);
+            if let Some(ss) = self.server_state.as_ref() {
+                ss.dir_fold_cache.write().remove(&parent);
+            }
         }
         // Deliberately NO global negative retirement here. This function exists to
         // invalidate exactly one path, and bumping the generation on top of that
@@ -33507,8 +34362,10 @@ impl CfmlVirtualMachine {
                 }
             }
             "fileclose" => Some(Ok(CfmlValue::Null)),
+            // Trailing separator, matching the unsandboxed builtin and
+            // Lucee/ACF (GH #380).
             "gettempdirectory" => Some(Ok(CfmlValue::string(
-                std::env::temp_dir().to_string_lossy().to_string(),
+                cfml_common::vfs::temp_dir_with_separator(),
             ))),
 
             // --- Write operations: blocked ---
@@ -33791,7 +34648,7 @@ impl CfmlVirtualMachine {
             return Some(path.to_string());
         }
         if path.starts_with('/') {
-            return self.resolve_include_with_mappings(path);
+            return self.resolve_include_with_mappings(path, false);
         }
         if let Some(ref base) = self.base_template_path {
             let base_dir = std::path::Path::new(base)
@@ -34529,9 +35386,7 @@ impl CfmlVirtualMachine {
         let cfc_func = self.program.functions[main_idx].clone();
         // Mark as __cfc_body__ so the VM treats it as function scope
         // (prevents globals leaking into `variables` via LoadLocal)
-        let mut cfc_body = (*cfc_func).clone();
-        cfc_body.name = "__cfc_body__".to_string();
-        cfc_body.is_template_frame = true;
+        let cfc_body = Self::cfc_body_variant(&cfc_func);
 
         // Application.cfc commonly extends a framework Bootstrap and calls
         // `super.setupApplication(...)` at body level (Preside, FW/1, ColdBox).
@@ -34976,6 +35831,150 @@ impl CfmlVirtualMachine {
             }
         }
         Ok(Some(resolved))
+    }
+
+    /// Apply a `<cfapplication …>` / script `application …;` declaration made
+    /// from inside a running page.
+    ///
+    /// This is the pre-`Application.cfc` way to define an application, and it
+    /// still turns up in older code. It differs from `Application.cfc` in one
+    /// way that shapes everything here: it declares an application but brings NO
+    /// lifecycle component, so there is no `onApplicationStart`/`onSessionStart`
+    /// to fire and no `this` scope to read settings out of at request start. The
+    /// tag's own attributes ARE the settings, and they take effect at the point
+    /// the tag runs — mid-page, after the scopes for this request are already
+    /// bound. So this re-binds them in place rather than going through
+    /// `execute_with_lifecycle`'s startup path.
+    ///
+    /// `mappings` is handled by the caller (the `action="update"` path, which
+    /// predates this); everything else lands here.
+    fn apply_cfapplication_settings(&mut self, opts: &ValueMap) -> Result<(), CfmlError> {
+        let get = |key: &str| -> Option<CfmlValue> {
+            opts.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.clone())
+        };
+        fn truthy(v: &CfmlValue) -> bool {
+            match v {
+                CfmlValue::Bool(b) => *b,
+                other => matches!(
+                    other.as_string().to_lowercase().as_str(),
+                    "true" | "yes" | "1"
+                ),
+            }
+        }
+
+        // 1. Fold the declared attributes into the application metadata, so
+        //    getApplicationMetadata()/getApplicationSettings() report them the
+        //    way they report an Application.cfc's `this.*`. Built as a FRESH
+        //    struct from a snapshot rather than written into the existing
+        //    template — that one is shared, and mutating it would leak this
+        //    page's declaration into other requests.
+        let mut meta = match &self.app_cfc_template {
+            Some(CfmlValue::Struct(existing)) => existing.snapshot(),
+            _ => ValueMap::default(),
+        };
+        for (k, v) in opts.iter() {
+            // `action` is the verb, not a setting; `mappings` is already applied
+            // to `self.mappings` and is surfaced from there by the metadata BIF.
+            if k.eq_ignore_ascii_case("action") || k.eq_ignore_ascii_case("mappings") {
+                continue;
+            }
+            // ValueMap keys are case-insensitive and `insert` keeps the
+            // first-written casing while replacing the value, so this overwrites
+            // a `this.sessionManagement` from an Application.cfc rather than
+            // adding a second spelling of it.
+            meta.insert(k.as_str().to_string(), v.clone());
+        }
+        self.app_cfc_template = Some(CfmlValue::strukt(meta));
+
+        // 2. Bind the named application scope. Skipped when this request is
+        //    already on that application (an Application.cfc bound it, or the
+        //    tag ran twice) so a live scope handle is never swapped out from
+        //    under the page.
+        let app_name = get("name").map(|v| v.as_string()).unwrap_or_default();
+        if !app_name.is_empty()
+            && self.current_application_name.as_deref() != Some(app_name.as_str())
+        {
+            if let Some(server_state) = self.server_state.clone() {
+                if !server_state.applications.contains(&app_name) {
+                    server_state.applications.insert(
+                        &app_name,
+                        ApplicationState {
+                            name: app_name.clone(),
+                            variables: CfmlStruct::empty(),
+                            // NOT `true`: a <cfapplication> app has no start
+                            // handler to run, but an Application.cfc that later
+                            // claims the same name still needs its
+                            // onApplicationStart to fire.
+                            started: false,
+                            config: ValueMap::default(),
+                            app_function_table: Vec::new(),
+                            app_fn_prune_at: 0,
+                            session_storage: None,
+                            app_caches: indexmap::IndexMap::new(),
+                        },
+                    );
+                }
+                if let Some(snapshot) = server_state.applications.get(&app_name) {
+                    // Handle clone (Arc bump), not a copy — see step 4 of
+                    // execute_with_lifecycle: every in-flight request on this
+                    // application shares the one live scope.
+                    self.application_scope = Some(snapshot.variables.clone());
+                }
+            } else if self.application_scope.is_none() {
+                // CLI single-run: no ServerState to hold the scope.
+                self.application_scope = Some(CfmlStruct::empty());
+            }
+            self.current_application_name = Some(app_name.clone());
+            if let Some(ref scope) = self.application_scope {
+                if !scope.contains_key_ci("applicationname") {
+                    scope.insert(
+                        "applicationName".to_string(),
+                        CfmlValue::string(app_name.clone()),
+                    );
+                }
+            }
+        }
+
+        // 3. Session management. `sessionmanagement="false"` (the default) leaves
+        //    the session scope alone entirely.
+        if get("sessionmanagement").map(|v| truthy(&v)).unwrap_or(false) {
+            if let Some(timeout) = get("sessiontimeout") {
+                if let Some(secs) = Self::timeout_value_to_secs(&timeout) {
+                    self.session_timeout_secs = secs;
+                }
+            }
+            if self.server_state.is_some() {
+                let sid = self.session_id.clone().unwrap_or_default();
+                let existing = if sid.is_empty() { None } else { self.session_record() };
+                if let Some(mut session) = existing {
+                    session.last_accessed_secs = now_epoch_secs();
+                    session.timeout_secs = self.session_timeout_secs;
+                    self.store_session_record(session);
+                    self.attach_session_scope();
+                } else {
+                    // No record yet: defer creation to the first session write,
+                    // exactly like the Application.cfc path's lazy default
+                    // (issue #88). The scope attaches then.
+                    self.session_lazy_pending = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A CFML session/application timeout attribute as whole seconds.
+    /// `createTimeSpan()` yields a day-FRACTION, so it has to be scaled; a bare
+    /// integer or numeric string is already a seconds count.
+    fn timeout_value_to_secs(v: &CfmlValue) -> Option<u64> {
+        let secs = match v {
+            CfmlValue::Double(d) | CfmlValue::TimeSpan(d) => (d * 86_400.0).round() as u64,
+            CfmlValue::Int(i) => *i as u64,
+            CfmlValue::String(s) => s.parse::<u64>().ok()?,
+            _ => return None,
+        };
+        Some(secs.max(MIN_SESSION_TIMEOUT_SECS))
     }
 
     /// Extract application config from a component struct.
@@ -36235,64 +37234,122 @@ impl CfmlVirtualMachine {
             // 5. onApplicationStart (if not yet started)
             let already_started = app_snapshot.started;
             if !already_started {
-                // Flip `started` first so concurrent requests don't re-fire
-                // onApplicationStart. Release any internal lock the store
-                // holds before calling the lifecycle method, since it may
-                // recursively touch the store.
-                server_state
-                    .applications
-                    .modify(&app_name, &mut |app| {
-                        app.started = true;
-                    });
+                // A start already running further up THIS thread's stack (the
+                // handler itself re-entering application loading — an `include`
+                // that touches the app) must not run the handler a second time,
+                // and must not wait on a gate this thread already holds.
+                let reentrant = app_start_in_flight_on_this_thread(&app_name);
 
-                // Functions created during onApplicationStart (factory beans,
-                // resource CFCs) that stay reachable from application scope are
-                // re-homed into the stable function table by the end-of-request
-                // pass; no separate "delta added during start" cache is needed,
-                // and a warm request needs no append/remap — app-scope `Function`
-                // bodies already hold stable ids resolved via the table loaded at
-                // request start.
-                if let Err(e) =
-                    self.call_lifecycle_method(&mut template, "onApplicationStart", vec![])
-                {
-                    // Roll the flag back so the NEXT request retries the boot.
-                    //
-                    // Without this, a single failed start — a database that was
-                    // slow or black-holed for one request, a transient upstream
-                    // blip — left `started = true` forever. The only other reset
-                    // is an explicit `applicationStop()`, so the process served
-                    // every subsequent request against an application that had
-                    // never run its start handler: empty application scope, empty
-                    // function table, permanently. That is GitHub #302's "the
-                    // worker's failed application boot is cached for its
-                    // lifetime", and it is why the reported symptom survived
-                    // every engine-version change the reporter tried.
-                    //
-                    // Deliberately NOT persisting the partial application scope
-                    // here: a retry must start clean, or a half-populated scope
-                    // would make the next run's guard-once blocks skip the
-                    // initialisation they exist to do. `persist_application_state`
-                    // is the only writer of `app.variables`, so skipping it leaves
-                    // the stored scope untouched for the retry.
-                    //
-                    // The cost is that a *permanently* failing start now re-runs
-                    // on every request instead of failing fast. That is the
-                    // correct trade: whether to keep retrying an app that cannot
-                    // boot is the application's call, not the engine's.
-                    server_state
+                // Take the application's start gate. A request that arrives while
+                // onApplicationStart is mid-flight BLOCKS here until it finishes
+                // rather than sailing past into onRequest against a half-built
+                // scope — that is the lifecycle contract, and skipping the wait is
+                // GitHub #383.
+                //
+                // `started` is flipped AFTER the handler returns, not before. The
+                // pre-flip this replaces did stop a concurrent request re-firing
+                // the handler, but only by making it skip the whole block — which
+                // is precisely the bypass. Mutual exclusion on the gate plus the
+                // re-check below give the same once-only guarantee while actually
+                // making the second request wait.
+                let gate = (!reentrant).then(|| app_start_gate(&app_name));
+                let _gate_guard = gate.as_ref().map(|g| g.lock());
+
+                // Re-read under the gate: the request we queued behind may have
+                // completed the start while we waited. The application SCOPE needs
+                // no refresh — `self.application_scope` is a handle on the same Arc
+                // the starter mutated, so its writes are already visible here.
+                let started_while_waiting = reentrant
+                    || server_state
                         .applications
-                        .modify(&app_name, &mut |app| {
-                            app.started = false;
-                        });
-                    let _ = self.call_lifecycle_method(
-                        &mut template,
-                        "onError",
-                        vec![
-                            CfmlValue::string(e.message.clone()),
-                            CfmlValue::string("onApplicationStart".to_string()),
-                        ],
-                    );
-                    return Err(e);
+                        .get(&app_name)
+                        .map(|a| a.started)
+                        .unwrap_or(false);
+                if started_while_waiting {
+                    // Adopt what the starter registered; our own copy came from
+                    // the pre-start snapshot.
+                    if let Some(app) = server_state.applications.get(&app_name) {
+                        self.app_function_table = app.app_function_table.clone();
+                        let carried = self.app_function_table.clone();
+                        for f in &carried {
+                            self.register_fn_local(f);
+                        }
+                        publish_shared_fns(carried.iter());
+                    }
+                } else {
+                    let _starting = StartingAppGuard::enter(&app_name);
+
+                    // Functions created during onApplicationStart (factory beans,
+                    // resource CFCs) that stay reachable from application scope are
+                    // re-homed into the stable function table by the end-of-request
+                    // pass; no separate "delta added during start" cache is needed,
+                    // and a warm request needs no append/remap — app-scope `Function`
+                    // bodies already hold stable ids resolved via the table loaded at
+                    // request start.
+                    if let Err(e) =
+                        self.call_lifecycle_method(&mut template, "onApplicationStart", vec![])
+                    {
+                        // Leave the app UNSTARTED so the NEXT request retries the boot.
+                        //
+                        // Without this, a single failed start — a database that was
+                        // slow or black-holed for one request, a transient upstream
+                        // blip — left the app marked started forever. The only other
+                        // reset is an explicit `applicationStop()`, so the process
+                        // served every subsequent request against an application that
+                        // had never run its start handler: empty application scope,
+                        // empty function table, permanently. That is GitHub #302's
+                        // "the worker's failed application boot is cached for its
+                        // lifetime", and it is why the reported symptom survived every
+                        // engine-version change the reporter tried.
+                        //
+                        // Since v0.646.0 the flag is only SET on success (see below),
+                        // so the failure path has nothing to roll back — it just has
+                        // to not set it. The store is still written explicitly rather
+                        // than left implicit, because `applicationStop()` inside the
+                        // handler may have created a fresh entry behind us.
+                        //
+                        // Deliberately NOT persisting the partial application scope
+                        // here: a retry must start clean, or a half-populated scope
+                        // would make the next run's guard-once blocks skip the
+                        // initialisation they exist to do. `persist_application_state`
+                        // is the only writer of `app.variables`, so skipping it leaves
+                        // the stored scope untouched for the retry.
+                        //
+                        // The cost is that a *permanently* failing start now re-runs
+                        // on every request instead of failing fast. That is the
+                        // correct trade: whether to keep retrying an app that cannot
+                        // boot is the application's call, not the engine's.
+                        server_state
+                            .applications
+                            .modify(&app_name, &mut |app| {
+                                app.started = false;
+                            });
+                        let _ = self.call_lifecycle_method(
+                            &mut template,
+                            "onError",
+                            vec![
+                                CfmlValue::string(e.message.clone()),
+                                CfmlValue::string("onApplicationStart".to_string()),
+                            ],
+                        );
+                        return Err(e);
+                    }
+
+                    // Started — and only now, with the gate still held, so the
+                    // requests queued behind it are released into a scope that is
+                    // fully built rather than one that merely exists.
+                    //
+                    // Skipped when the handler called `applicationStop()`: it asked
+                    // for the application to be torn down, and marking it started
+                    // would resurrect a stopped app as a started one with an empty
+                    // scope.
+                    if !self.application_stopped {
+                        server_state
+                            .applications
+                            .modify(&app_name, &mut |app| {
+                                app.started = true;
+                            });
+                    }
                 }
             }
         } else {
@@ -37785,17 +38842,56 @@ fn query_sort_by_columns(
 
 #[cfg(test)]
 mod named_lock_tests {
-    use super::evict_idle_named_locks;
+    use super::{evict_idle_named_locks, NamedLock};
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
-    fn lock() -> Arc<RwLock<()>> {
-        Arc::new(RwLock::new(()))
+    fn lock() -> Arc<NamedLock> {
+        Arc::new(NamedLock::new(()))
+    }
+
+    /// GH #401 regression guard.
+    ///
+    /// The defect was not a wrong result — it was an acquisition that POLLED
+    /// (`try_write()` + `sleep(10ms)`) instead of parking, so a waiter woke on
+    /// the next tick rather than on handover. Nothing about the engine's
+    /// observable behaviour changes when that regresses: every lock test still
+    /// passes, the suite stays green, and only tail latency under concurrency
+    /// moves. A behavioural test would have to race to see it, and a racing test
+    /// on a loaded box is a flaky test.
+    ///
+    /// So this reads the source instead, the way `no_mutable_statics` does. Fast,
+    /// deterministic, and it fails the build the moment someone reintroduces a
+    /// poll loop here.
+    #[test]
+    fn named_lock_acquisition_parks_rather_than_polling() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read own source");
+        let start = src.find("fn acquire_named_lock").expect("acquire_named_lock exists");
+        // The body ends at the next item at the same indentation.
+        let rest = &src[start..];
+        let end = rest[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        // Built at run time so this assertion cannot match its own source text
+        // if the scan is ever widened past the extracted body.
+        let sleep_needle = format!("thread::{}", "sleep");
+        assert!(
+            !body.contains(&sleep_needle),
+            "acquire_named_lock sleeps — a contended lock must PARK on the lock's \
+             own queue and wake on handover, not poll on a timer. See GH #401: a \
+             10ms poll made a 3.5ms lock cost up to 380ms and cut throughput ~30%."
+        );
+        assert!(
+            body.contains("try_write_for") && body.contains("try_read_for"),
+            "acquire_named_lock should acquire with parking_lot's timed, parking \
+             try_write_for/try_read_for (or an equivalent blocking wait)."
+        );
     }
 
     #[test]
     fn evicts_idle_entries_when_over_cap() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         for i in 0..1024 {
             locks.insert(format!("idle_{i}"), lock());
         }
@@ -37814,10 +38910,10 @@ mod named_lock_tests {
 
     #[test]
     fn never_evicts_a_held_lock() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         let held = lock();
         let held_clone = held.clone();
-        let _guard = held_clone.write().unwrap(); // simulate a live held_locks guard
+        let _guard = held_clone.write(); // simulate a live held_locks guard
         locks.insert("held".to_string(), held);
         for i in 0..2000 {
             locks.insert(format!("idle_{i}"), lock());
@@ -37828,7 +38924,7 @@ mod named_lock_tests {
 
     #[test]
     fn no_eviction_below_cap() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         for i in 0..10 {
             locks.insert(format!("idle_{i}"), lock());
         }
@@ -37838,7 +38934,7 @@ mod named_lock_tests {
 
     #[test]
     fn no_eviction_when_name_already_present() {
-        let mut locks: HashMap<String, Arc<RwLock<()>>> = HashMap::new();
+        let mut locks: HashMap<String, Arc<NamedLock>> = HashMap::new();
         for i in 0..1024 {
             locks.insert(format!("idle_{i}"), lock());
         }
